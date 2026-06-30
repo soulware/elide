@@ -50,6 +50,39 @@ use elide_coordinator::{
     new_readiness_tracker, new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
 };
 
+/// Exponential backoff for an idempotent startup S3 publish that should pend
+/// through transient failures (network blip, Tigris 5xx) rather than exit into
+/// a crash-loop. Mirrors `wait_for_ready`'s 100ms→5s cadence and throttled
+/// logging. A permanent error (e.g. an identity conflict) is the caller's to
+/// surface; this only governs the retry wait.
+struct StartupBackoff {
+    what: &'static str,
+    attempt: u64,
+    delay: Duration,
+}
+
+impl StartupBackoff {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            attempt: 0,
+            delay: Duration::from_millis(100),
+        }
+    }
+
+    async fn pause(&mut self, e: &std::io::Error) {
+        self.attempt += 1;
+        if self.attempt == 1 || self.attempt.is_multiple_of(10) {
+            warn!(
+                "[coordinator] {} failed ({e}); retrying (attempt {})",
+                self.what, self.attempt
+            );
+        }
+        tokio::time::sleep(self.delay).await;
+        self.delay = (self.delay * 2).min(Duration::from_secs(5));
+    }
+}
+
 pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Result<()> {
     let drain_interval = config.supervisor.drain_interval;
     let scan_interval = config.supervisor.scan_interval;
@@ -102,8 +135,19 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // Publishing coordinator.pub is a coordinator-wide write
     // (`coordinator/<id>.pub`), not a per-volume op.
     let coord_wide = stores.writer();
-    if let Err(e) = identity.publish_pub(coord_wide.as_ref()).await {
-        return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
+    // Pend through a transient S3 failure here rather than exit (a crash-loop
+    // on Fly): the readiness probe already waited out a flaky mint, so the very
+    // next write shouldn't undo that. An identity conflict is permanent and
+    // surfaces.
+    let mut backoff = StartupBackoff::new("publish coordinator.pub");
+    loop {
+        match identity.publish_pub(coord_wide.as_ref()).await {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(anyhow::anyhow!("publish coordinator.pub: {e}"));
+            }
+            Err(e) => backoff.pause(&e).await,
+        }
     }
     // If peer-fetch is configured, advertise our endpoint at
     // `coordinators/<id>/peer-endpoint.toml` so other coordinators
@@ -120,11 +164,15 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             .peer_fetch
             .advertised_host(identity.hostname(), &addr.ip().to_string());
         let endpoint = elide_peer_fetch::PeerEndpoint::new(host, addr.port());
-        if let Err(e) = endpoint
-            .publish(coord_wide.as_ref(), identity.coordinator_id_str())
-            .await
-        {
-            return Err(anyhow::anyhow!("publish peer-endpoint.toml: {e}"));
+        let mut backoff = StartupBackoff::new("publish peer-endpoint.toml");
+        loop {
+            match endpoint
+                .publish(coord_wide.as_ref(), identity.coordinator_id_str())
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => backoff.pause(&e).await,
+            }
         }
         info!(
             "[coordinator] peer-fetch endpoint advertised: {} (bind {addr})",

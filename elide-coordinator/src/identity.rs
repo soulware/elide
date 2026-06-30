@@ -213,10 +213,17 @@ impl CoordinatorIdentity {
                     .map_err(|e| io::Error::other(format!("read existing coordinator.pub: {e}")))?;
                 let existing_vk = parse_pub_hex(&existing)?;
                 if existing_vk.to_bytes() != self.verifying_key().to_bytes() {
-                    return Err(io::Error::other(format!(
-                        "coordinators/{}/coordinator.pub already exists with different bytes",
-                        self.coordinator_id_str
-                    )));
+                    // A coordinator-id/key conflict is permanent (id derives
+                    // from the key, so this is a collision or a corrupt
+                    // object) — a distinct kind so the startup retry surfaces
+                    // it instead of pending forever.
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "coordinators/{}/coordinator.pub already exists with different bytes",
+                            self.coordinator_id_str
+                        ),
+                    ));
                 }
                 Ok(())
             }
