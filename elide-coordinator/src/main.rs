@@ -104,7 +104,7 @@ enum Command {
         #[arg(long)]
         force: bool,
         /// Enrol as a read-only attestation authority (coord B): request
-        /// `coord-ro` only, not the full coordinator role set.
+        /// `attest-ro` only, not the full coordinator role set.
         #[arg(long)]
         attestation: bool,
     },
@@ -315,10 +315,12 @@ async fn run() -> Result<()> {
             mint_cfg.validate()?;
             std::fs::create_dir_all(&config.data_dir)
                 .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
-            let identity = elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
-                &config.data_dir,
-            )
-            .with_context(|| "loading coordinator identity")?;
+            let identity = std::sync::Arc::new(
+                elide_coordinator::identity::CoordinatorIdentity::load_or_generate(
+                    &config.data_dir,
+                )
+                .with_context(|| "loading coordinator identity")?,
+            );
             // The enroll/exchange gates are operator-discharged. In the
             // shared-key demo the coordinator self-issues them from the
             // `K_M-A` it shares with mint (`[auth.demo]`), stamped with the

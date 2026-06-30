@@ -30,6 +30,7 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -41,8 +42,8 @@ use elide_coordinator::config::MintConfig;
 use elide_coordinator::identity::CoordinatorIdentity;
 
 use crate::mint_client::{
-    INTERMEDIATE_FILE, ROLE_ATTEST_RO, ROLE_COORD_RO, ROLE_COORD_RW, ROLE_VOLUME_RO,
-    ROLE_VOLUME_RW, WireMacaroon, json_str_field, now_unix, pop_digest, post,
+    AssumeTarget, INTERMEDIATE_FILE, MintEndpoint, ROLE_ATTEST_RO, ROLE_COORD_RO, ROLE_COORD_RW,
+    ROLE_VOLUME_RO, ROLE_VOLUME_RW, WireMacaroon, json_str_field, now_unix, pop_digest, post,
     write_credential_file,
 };
 
@@ -59,6 +60,11 @@ const SCOPE_EXCHANGE: &str = "mint:exchange";
 /// approval. Foreground operator command — a short, predictable cadence
 /// the operator can watch, not a cache-driven one.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// TTL for the validity probe assume-role taken when all artifacts are
+/// already present. The vended credential is discarded, so the value only
+/// has to clear mint's lower bound.
+const ENROLL_PROBE_TTL_SECS: u64 = 300;
 
 /// `ed25519:<base64 pub>` — the `cnf` value mint seals into the ticket
 /// and verifies the PoP against (`mint/src/pop.rs::cnf_value`).
@@ -132,7 +138,7 @@ const ATTESTATION_ROLES: &[EnrollRole] = &[EnrollRole {
 pub(crate) enum EnrollProfile {
     /// A full coordinator: the four coordinator roles.
     Coordinator,
-    /// A read-only attestation authority: `coord-ro` only.
+    /// A read-only attestation authority: `attest-ro` only.
     Attestation,
 }
 
@@ -151,6 +157,16 @@ impl EnrollProfile {
             Self::Coordinator => COORDINATOR_ROLES,
             Self::Attestation => ATTESTATION_ROLES,
         }
+    }
+
+    /// The directly-assumable read role used to probe enrollment validity:
+    /// the first non-intermediate role (a coord role renders with no
+    /// discharge; an intermediate can't be assumed without a volume target).
+    fn probe_role(self) -> &'static str {
+        self.roles()
+            .iter()
+            .find(|r| !r.intermediate)
+            .map_or(ROLE_COORD_RO, |r| r.name)
     }
 }
 
@@ -412,7 +428,7 @@ pub(crate) fn assert_enrolled(data_dir: &Path, profile: EnrollProfile) -> io::Re
 /// after this returns).
 pub(crate) async fn run<S: DischargeSource>(
     cfg: &MintConfig,
-    identity: &CoordinatorIdentity,
+    identity: &Arc<CoordinatorIdentity>,
     data_dir: &Path,
     invite_src: &str,
     opts: EnrollOptions,
@@ -425,12 +441,48 @@ pub(crate) async fn run<S: DischargeSource>(
         .filter(|r| opts.force || !credential_present_at(&r.path(data_dir)))
         .collect();
     if remaining.is_empty() {
-        info!(
-            "[enroll] all {} enrollment artifact(s) already present under {}; nothing to do",
-            opts.profile.roles().len(),
-            credentials_dir(data_dir).display()
-        );
-        return Ok(());
+        // Presence isn't validity: a de-authorized enrollment leaves the
+        // local artifacts in place but mint answers 401. Probe one
+        // assume-role so this reports the truth instead of a false "nothing
+        // to do" — on a 401 the operator must re-run with `--force`.
+        let endpoint = MintEndpoint::new(cfg, data_dir.to_path_buf(), identity.clone());
+        let count = opts.profile.roles().len();
+        let dir = credentials_dir(data_dir);
+        match endpoint
+            .assume_role(
+                opts.profile.probe_role(),
+                ENROLL_PROBE_TTL_SECS,
+                AssumeTarget::Coord,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "[enroll] all {count} enrollment artifact(s) present under {} and accepted by mint; nothing to do",
+                    dir.display()
+                );
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "enrollment artifact(s) present under {} but mint rejected them as \
+                         unauthorized ({e}); the enrollment was de-authorized — re-run with \
+                         `--force` to re-enroll",
+                        dir.display()
+                    ),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "[enroll] all {count} artifact(s) present under {}, but could not verify with \
+                     mint ({e}); leaving them in place",
+                    dir.display()
+                );
+                return Ok(());
+            }
+        }
     }
 
     let invite = resolve_invite(invite_src)?;
@@ -617,6 +669,14 @@ mod tests {
         assert_eq!(names(EnrollProfile::Attestation), vec![ROLE_ATTEST_RO]);
         assert_eq!(EnrollProfile::Coordinator.as_str(), "coordinator");
         assert_eq!(EnrollProfile::Attestation.as_str(), "attestation");
+    }
+
+    #[test]
+    fn probe_role_is_the_base_read_role() {
+        // The validity probe must use a directly-assumable (non-intermediate)
+        // coord role, not a volume intermediate.
+        assert_eq!(EnrollProfile::Coordinator.probe_role(), ROLE_COORD_RO);
+        assert_eq!(EnrollProfile::Attestation.probe_role(), ROLE_ATTEST_RO);
     }
 
     #[test]
