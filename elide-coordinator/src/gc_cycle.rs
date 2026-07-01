@@ -18,7 +18,7 @@ use ulid::Ulid;
 use crate::config::GcConfig;
 use crate::segment_head;
 use crate::volume_data::VolumeData;
-use crate::volume_state::IMPORTING_FILE;
+use crate::volume_state::{IMPORTING_FILE, STOPPED_FILE};
 use crate::{SnapshotLockRegistry, control, gc, snapshot_lock_for, upload};
 
 /// Outcome of a single tick. `Stop` is returned when the fork directory has
@@ -122,6 +122,69 @@ impl GcCycleOrchestrator {
         &self.fork_dir
     }
 
+    /// Fence this fork if it has been displaced — another coordinator has
+    /// force-claimed the name and `names/<name>` now binds a different fork.
+    ///
+    /// This is the previous-owner half of forced-claim fencing
+    /// (`docs/design/displaced-fork-rehome.md`). The credential-liveness
+    /// fence (`docs/design/force-release-fencing.md`) is the load-bearing
+    /// safety for the *claimant*; this stops the *guest* writing into a WAL
+    /// that can no longer drain. It is conservative: only a definite
+    /// mismatch fences — a missing record or a read error leaves the fork
+    /// alone and lets the credential fence backstop.
+    ///
+    /// Returns `Some(Stop)` once the device is halted (the per-volume task
+    /// then exits), `Some(Continue)` to retry a failed halt next tick, or
+    /// `None` when the fork is still the bound owner.
+    async fn fence_if_displaced(&self) -> Option<TickOutcome> {
+        let name = self.volume_name.as_ref()?;
+        let rec = match self.name_claims.read(name).await {
+            Ok(Some(rec)) if rec.vol_ulid == self.vol_ulid => return None,
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                warn!(
+                    "[fence {}] names/{name} record is gone; not fencing",
+                    self.vol_ulid
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    "[fence {}] reading names/{name}: {e}; not fencing",
+                    self.vol_ulid
+                );
+                return None;
+            }
+        };
+
+        warn!(
+            "[fence {}] names/{name} now binds {} (coordinator {}); \
+             fencing local device",
+            self.vol_ulid,
+            rec.vol_ulid,
+            rec.coordinator_id.as_deref().unwrap_or("?")
+        );
+        if let Err(e) = std::fs::write(self.fork_dir.join(STOPPED_FILE), "") {
+            warn!("[fence {}] writing {STOPPED_FILE}: {e}", self.vol_ulid);
+        }
+        match control::shutdown(&self.fork_dir).await {
+            control::ShutdownOutcome::Acknowledged | control::ShutdownOutcome::NotRunning => {
+                info!(
+                    "[fence {}] local device stopped; displaced by {}",
+                    self.vol_ulid, rec.vol_ulid
+                );
+                Some(TickOutcome::Stop)
+            }
+            control::ShutdownOutcome::Failed(msg) => {
+                warn!(
+                    "[fence {}] shutdown failed: {msg}; retrying next tick",
+                    self.vol_ulid
+                );
+                Some(TickOutcome::Continue)
+            }
+        }
+    }
+
     pub async fn run_tick(&mut self) -> TickOutcome {
         if !self.fork_dir.exists() {
             info!(
@@ -129,6 +192,12 @@ impl GcCycleOrchestrator {
                 self.fork_dir.display()
             );
             return TickOutcome::Stop;
+        }
+
+        // Fence and stop before any drain/GC if this fork has been
+        // displaced — another coordinator now owns the name.
+        if let Some(outcome) = self.fence_if_displaced().await {
+            return outcome;
         }
 
         // Skip drain/GC while an import is in its write phase (volume.importing
@@ -974,5 +1043,52 @@ mod tests {
         assert!(head.added.contains(&drained));
         assert!(head.added.contains(&output));
         assert!(head.superseded.contains_key(&input));
+    }
+
+    #[tokio::test]
+    async fn fence_skips_when_still_owner() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, _tmp) = orchestrator_named(store.clone(), Some("vol2"));
+        let rec = elide_core::name_record::NameRecord::live_minimal(vol_ulid(), 0);
+        crate::name_store::create_name_record(&store, "vol2", &rec)
+            .await
+            .unwrap();
+        assert!(orch.fence_if_displaced().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fence_stops_and_marks_stopped_when_displaced() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, tmp) = orchestrator_named(store.clone(), Some("vol2"));
+        // names/vol2 now binds a different fork — this one is displaced.
+        let other = Ulid::from_string("01J0000000000000000000000W").unwrap();
+        let rec = elide_core::name_record::NameRecord::live_minimal(other, 0);
+        crate::name_store::create_name_record(&store, "vol2", &rec)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            orch.fence_if_displaced().await,
+            Some(TickOutcome::Stop)
+        ));
+        let fork_dir = tmp.path().join("by_id").join(vol_ulid().to_string());
+        assert!(
+            fork_dir.join(STOPPED_FILE).exists(),
+            "a fenced fork must be marked stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn fence_skips_when_record_absent() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, _tmp) = orchestrator_named(store, Some("vol2"));
+        assert!(orch.fence_if_displaced().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fence_skips_nameless_fork() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, _tmp) = orchestrator(store);
+        assert!(orch.fence_if_displaced().await.is_none());
     }
 }
