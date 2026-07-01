@@ -10,10 +10,10 @@ or import a full coordinator runs (`docs/design/mint-volume-attestation.md`
 ## Prerequisites
 
 - A deployed mint app (`deploy/mint`) and a Tigris data bucket.
-- `K_M-B` and `K_M-A` in `coord.toml` must be **byte-identical** to mint's
-  and to `deploy/elide/coord.toml`: mint seals attested CIDs under `K_M-B`
-  and coord B opens them; `K_M-A` self-issues the enroll gate. A mismatch
-  fails every discharge open.
+- `K_M-B` in `coord.toml` must be **byte-identical** to mint's, and `K_M-A`
+  to mint's and to `deploy/elide/coord.toml`: mint seals attested CIDs under
+  `K_M-B` and coord B opens them; `K_M-A` self-issues the enroll gate. A
+  mismatch fails every discharge open.
 
 ## Deploy
 
@@ -43,12 +43,7 @@ enrollment grants `attest-ro` only.
 
 ## Point the volume coordinator(s) at it
 
-On each volume coordinator (`deploy/elide`), drop the local `[attestation]`
-block and set, under `[mint]`:
-
-```toml
-attestation_transport = "http://<this-app>.internal:8087"
-```
-
-so it fetches discharges here instead of running its own co-located
-authority.
+Each volume coordinator (`deploy/elide`) fetches discharges from here rather
+than running its own authority. Set `ATTEST_APP` to this app in its `fly.toml`
+build args — it bakes into `coord.toml`'s `attestation_transport` as
+`http://<this-app>.internal:8087` — then redeploy that coordinator.

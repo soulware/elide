@@ -17,6 +17,10 @@ primary_region = "iad"
     # MINT_APP: the mint Fly app this coordinator enrols against; baked into
     # coord.toml [mint].url as http://<MINT_APP>.internal:8085.
     MINT_APP = "mint-for-elide"
+    # ATTEST_APP: the dedicated attestation authority (deploy/attest) this
+    # coordinator fetches discharges from; baked into coord.toml
+    # [mint].attestation_transport as http://<ATTEST_APP>.internal:8087.
+    ATTEST_APP = "elide-attest"
 
 [env]
   RUST_LOG = "info"

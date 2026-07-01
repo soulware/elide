@@ -984,9 +984,10 @@ mod tests {
     #[test]
     fn shipped_coordinator_demo_config_parses() {
         // The committed shared-key demo config (deploy/elide/) — nothing else
-        // loads it, so this is its guard: it must parse, and its
-        // [auth.demo].k_m_a and [attestation].k_m_b must each decode to 32
-        // bytes (matching mint-fly.toml).
+        // loads it, so this is its guard: it must parse, its [auth.demo].k_m_a
+        // must decode to 32 bytes (matching mint-fly.toml), and it must dial a
+        // dedicated attestation authority (coord B) via [mint]
+        // attestation_transport rather than run its own [attestation] listener.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/elide/coord.toml");
         let text = std::fs::read_to_string(path).expect("read coord.toml");
         let cfg: CoordinatorConfig =
@@ -995,9 +996,16 @@ mod tests {
             cfg.demo_k_m_a().expect("k_m_a decodes").map(|k| k.len()),
             Some(32)
         );
-        cfg.mint.as_ref().expect("[mint] present");
-        let att = cfg.attestation.as_ref().expect("[attestation] present");
-        assert_eq!(att.load_discharge_key().expect("k_m_b decodes").len(), 32);
+        let mint = cfg.mint.as_ref().expect("[mint] present");
+        mint.validate().expect("[mint] dial targets valid");
+        assert!(
+            mint.attestation_transport.is_some(),
+            "coord A must dial a dedicated attestation authority"
+        );
+        assert!(
+            cfg.attestation.is_none(),
+            "coord A must not run a co-located [attestation] authority"
+        );
     }
 
     #[test]
@@ -1026,11 +1034,11 @@ mod tests {
     fn shipped_attestation_config_parses() {
         // The committed attestation-authority config (deploy/attest/) — nothing
         // else loads it, so this is its guard. It must parse; carry [mint]
-        // (coord B assumes coord-ro through mint); have an [attestation] whose
+        // (coord B assumes attest-ro through mint); have an [attestation] whose
         // K_M-B decodes to 32 bytes and whose listen is a TCP 6PN address; and
-        // self-issue the enroll gate from a 32-byte K_M-A. K_M-B and K_M-A must
-        // be identical to deploy/elide/coord.toml — mint seals what coord B
-        // opens, so a drift between the two would fail every discharge.
+        // self-issue the enroll gate from a 32-byte K_M-A that matches
+        // deploy/elide/coord.toml — coord A self-issues its own enroll gate from
+        // the same key. K_M-B is shared with mint, which seals what coord B opens.
         let load = |rel: &str| -> CoordinatorConfig {
             let text = std::fs::read_to_string(format!("{}/../{rel}", env!("CARGO_MANIFEST_DIR")))
                 .expect("read coord.toml");
@@ -1054,16 +1062,6 @@ mod tests {
         assert_eq!(k_m_a.len(), 32);
 
         let coord = load("deploy/elide/coord.toml");
-        assert_eq!(
-            att.load_discharge_key().unwrap(),
-            coord
-                .attestation
-                .as_ref()
-                .unwrap()
-                .load_discharge_key()
-                .unwrap(),
-            "K_M-B must match deploy/elide/coord.toml"
-        );
         assert_eq!(
             k_m_a,
             coord.demo_k_m_a().unwrap().unwrap(),

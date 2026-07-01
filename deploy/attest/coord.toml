@@ -5,8 +5,8 @@
 # (docs/design/mint-volume-attestation.md § "A dedicated attestation
 # instance", shape 2).
 #
-# Set [store].bucket and [mint].url for your deployment. The K_M-B and K_M-A
-# values below must be byte-identical to mint's and to deploy/elide/coord.toml.
+# Set [store].bucket and [mint].url for your deployment. K_M-B must be
+# byte-identical to mint's; K_M-A must match mint's and deploy/elide/coord.toml.
 
 data_dir = "/data/elide_data"
 
@@ -25,7 +25,7 @@ url = "http://mint-for-elide.internal:8085"
 # it at http://<this-app>.internal:8087.
 listen = "0.0.0.0:8087"
 # K_M-B, standard base64 of 32 bytes — identical to the value mint is deployed
-# with and to deploy/elide/coord.toml.
+# with.
 k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
 
 [auth.demo]
