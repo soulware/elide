@@ -564,8 +564,8 @@ impl ClaimOrchestrator {
     /// before [`Self::finalize`] materialises those dirs.
     ///
     /// The provenance written here is provisional: its `ParentRef` points at
-    /// the immediate released volume, not yet the effective (deepest
-    /// non-empty) ancestor that `skip_empty_intermediates` resolves.
+    /// the immediate released volume, not yet the effective ancestor that
+    /// `skip_empty_intermediates` resolves.
     /// `finalize` overwrites it once `effective` is known.
     ///
     /// Crash semantics. If the coordinator dies between this returning and
@@ -998,22 +998,20 @@ impl ClaimOrchestrator {
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
-/// Walk back through empty intermediate forks and return the deepest non-empty
-/// ancestor as the source the new fork should pin to.
+/// Walk back through empty intermediate forks and return the source the new
+/// fork should pin to: the deepest fork that carries its own segments, or the
+/// root if the whole chain is empty.
 ///
 /// Each iteration:
 ///   1. Read the current effective fork's signed `volume.provenance` to find
 ///      its `parent` ref (if any).
 ///   2. Fetch and verify its handoff manifest from S3.
-///   3. Decide emptiness:
-///      * Non-root: empty if `max(segment_ulids) < parent.snapshot_ulid` —
-///        every segment was inherited from the parent.
-///      * Root: empty if `segment_ulids` is empty — the fork has no content
-///        and no ancestor to fall back to.
-///   4. If non-root and empty, advance to the parent and loop. If non-root
-///      and non-empty, return this fork. If root and non-empty, return this
-///      fork. If root and empty, error: the entire chain is empty, so pinning
-///      a new fork here would produce a volume that can never serve a read.
+///   3. Root (no parent): the terminal pin target — return it. An empty root
+///      is a never-written volume; its lbamap is empty and every read is zeros,
+///      so it is a valid pin target with no ancestor to fall back to.
+///   4. Non-root: empty if `max(segment_ulids) < parent.snapshot_ulid` — every
+///      segment was inherited from the parent. If empty, advance to the parent
+///      and loop; if non-empty, return this fork.
 ///
 /// On loop advance, also pulls the parent's directory locally if not already
 /// present — chain-pull in stage 3 stops at the first existing dir, but the
@@ -1073,17 +1071,10 @@ pub(crate) async fn skip_empty_intermediates_impl(
                 .await?;
 
         let Some(parent) = lineage.parent().cloned() else {
-            // Root volume. The function's contract is "deepest non-empty
-            // ancestor", so a root with zero segments is a contract
-            // violation — pinning a new fork here would yield a volume
-            // whose every read demand-fetches NotFound.
-            if manifest.segment_ulids.is_empty() {
-                return Err(IpcError::conflict(format!(
-                    "empty ancestor chain: claim source walked to root \
-                     {effective_vol}/{effective_snap} with no segments; \
-                     cannot pin a new fork to a chain with no data"
-                )));
-            }
+            // Root volume — the terminal pin target. A root with zero
+            // segments is a never-written volume: its lbamap is empty, so
+            // every read short-circuits to zeros with no demand-fetch. That
+            // is a valid all-zeros volume to pin a new fork to.
             break;
         };
 
@@ -1543,11 +1534,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_root_with_no_parent_errors() {
-        // Released name points at a root volume that has no segments and
-        // no parent — pinning a new fork here would produce a volume
-        // whose every read demand-fetches NotFound. The contract is
-        // "non-empty ancestor", so this is rejected at the claim layer.
+    async fn empty_root_with_no_parent_is_returned() {
+        // Released name points at a never-written root: zero segments, no
+        // parent. Its lbamap is empty, so every read is zeros — a valid pin
+        // target. The walk returns the root itself.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1559,7 +1549,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let err = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             Ulid::new(),
@@ -1571,20 +1561,16 @@ mod tests {
             &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
         )
         .await
-        .expect_err("empty root violates the non-empty-ancestor contract");
-        assert_eq!(err.kind, elide_core::ipc::IpcErrorKind::Conflict);
-        assert!(
-            err.message.contains("empty ancestor chain"),
-            "error should name the empty-chain condition: {}",
-            err.message
-        );
+        .unwrap();
+        assert_eq!(vol, r.vol);
+        assert_eq!(snap, r.snap);
     }
 
     #[tokio::test]
-    async fn chain_of_empties_to_empty_root_errors() {
+    async fn chain_of_empties_to_empty_root_is_returned() {
         // R(empty) → F1(empty) → F2(empty, released). The walk skips
-        // F2 → F1 → R, then finds R itself has no segments. Reject
-        // rather than silently pin the new fork to a dead chain.
+        // F2 → F1 → R and returns R: the whole chain is a never-written
+        // volume, a valid all-zeros pin target.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path();
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1604,7 +1590,7 @@ mod tests {
 
         let job = ClaimJob::new();
         let stores = passthrough(store);
-        let err = skip_empty_intermediates_impl(
+        let (vol, snap) = skip_empty_intermediates_impl(
             &job,
             "vol",
             Ulid::new(),
@@ -1616,19 +1602,9 @@ mod tests {
             &mut PulledAncestorsGuard::new(data_dir.join("by_id")),
         )
         .await
-        .expect_err("chain of empties terminating in empty root must error");
-        assert_eq!(err.kind, elide_core::ipc::IpcErrorKind::Conflict);
-        assert!(
-            err.message.contains("empty ancestor chain"),
-            "error should name the empty-chain condition: {}",
-            err.message
-        );
-        // The error should name the root we reached, not the released vol.
-        assert!(
-            err.message.contains(&r.vol.to_string()),
-            "error should identify the empty root: {}",
-            err.message
-        );
+        .unwrap();
+        assert_eq!(vol, r.vol);
+        assert_eq!(snap, r.snap);
     }
 
     #[tokio::test]
