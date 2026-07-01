@@ -1180,36 +1180,23 @@ pub(crate) async fn start_volume_op(
             // <name>-displaced-<ulid> so the diverged fork survives as a
             // first-class stopped volume rather than a dead-end local
             // binding (docs/design/displaced-fork-rehome.md).
-            let local_ulid = vol_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .and_then(|s| ulid::Ulid::from_string(s).ok());
-            if let Some(local_ulid) = local_ulid {
-                match elide_coordinator::rehome::rehome_displaced_fork(
-                    core.identity.as_ref(),
-                    core.stores.as_ref(),
-                    data_dir,
-                    &vol_dir,
-                    volume_name,
-                    local_ulid,
-                )
-                .await
-                {
-                    Ok(new_name) => {
-                        // Drop the stale local binding; we own neither the
-                        // name nor its record now.
-                        let _ = std::fs::remove_file(data_dir.join("by_name").join(volume_name));
-                        return Err(IpcError::conflict(format!(
-                            "name '{volume_name}' is owned by coordinator {held_by}; \
-                             your displaced fork was rehomed as '{new_name}' (stopped) \
-                             — start it to recover, or run \
-                             `volume claim --force {volume_name}` to take the name"
-                        )));
-                    }
-                    Err(e) => {
-                        warn!("[inbound] start {volume_name}: rehoming displaced fork: {e}");
-                    }
-                }
+            if let Some(new_name) = elide_coordinator::rehome::rehome_existing_local_fork(
+                core.identity.as_ref(),
+                core.stores.as_ref(),
+                data_dir,
+                volume_name,
+            )
+            .await
+            {
+                // Drop the stale local binding; we own neither the name
+                // nor its record now.
+                let _ = std::fs::remove_file(data_dir.join("by_name").join(volume_name));
+                return Err(IpcError::conflict(format!(
+                    "name '{volume_name}' is owned by coordinator {held_by}; \
+                     your displaced fork was rehomed as '{new_name}' (stopped) \
+                     — start it to recover, or run \
+                     `volume claim --force {volume_name}` to take the name"
+                )));
             }
             return Err(IpcError::conflict(format!(
                 "name '{volume_name}' is owned by coordinator {held_by}; \

@@ -804,34 +804,13 @@ impl ForceClaimOrchestrator {
             // <name>-displaced-<old_ulid> instead of orphaning it
             // (docs/design/displaced-fork-rehome.md). Best-effort — a
             // rehome failure must not fail the force-claim itself.
-            let old_ulid = std::fs::read_link(&symlink_path).ok().and_then(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok())
-            });
-            if let Some(old_ulid) = old_ulid {
-                let old_fork_dir = self
-                    .ctx
-                    .core
-                    .data_dir
-                    .join("by_id")
-                    .join(old_ulid.to_string());
-                if let Err(e) = elide_coordinator::rehome::rehome_displaced_fork(
-                    self.ctx.core.identity.as_ref(),
-                    self.ctx.core.stores.as_ref(),
-                    &self.ctx.core.data_dir,
-                    &old_fork_dir,
-                    &self.volume,
-                    old_ulid,
-                )
-                .await
-                {
-                    warn!(
-                        "[force-claim {}] rehoming displaced fork {old_ulid}: {e}",
-                        self.volume
-                    );
-                }
-            }
+            elide_coordinator::rehome::rehome_existing_local_fork(
+                self.ctx.core.identity.as_ref(),
+                self.ctx.core.stores.as_ref(),
+                &self.ctx.core.data_dir,
+                &self.volume,
+            )
+            .await;
             std::fs::remove_file(&symlink_path)
                 .map_err(|e| IpcError::internal(format!("removing stale by_name link: {e}")))?;
         }

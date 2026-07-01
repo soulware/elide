@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use tracing::info;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use elide_core::volume_event::EventKind;
@@ -177,6 +177,47 @@ pub async fn rehome_displaced_fork(
     Ok(new_name)
 }
 
+/// If `by_name/<name>` points at a local fork, rehome that
+/// (soon-to-be-displaced) fork before the caller rebinds or drops the
+/// binding. Recovers the fork ULID from the symlink target, then
+/// delegates to [`rehome_displaced_fork`]. Best-effort: returns the
+/// rehomed name, or `None` when there is no local binding or the rehome
+/// fails (logged).
+///
+/// The two triggers that only hold the *name* — `force_claim` finalize
+/// and start-refusal — use this; the poll trigger calls
+/// [`rehome_displaced_fork`] directly with the fork it already serves.
+pub async fn rehome_existing_local_fork(
+    identity: &CoordinatorIdentity,
+    stores: &dyn ScopedStores,
+    data_dir: &Path,
+    old_name: &str,
+) -> Option<String> {
+    let symlink = data_dir.join("by_name").join(old_name);
+    let old_ulid = std::fs::read_link(&symlink).ok().and_then(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| Ulid::from_string(s).ok())
+    })?;
+    let old_fork_dir = data_dir.join("by_id").join(old_ulid.to_string());
+    match rehome_displaced_fork(
+        identity,
+        stores,
+        data_dir,
+        &old_fork_dir,
+        old_name,
+        old_ulid,
+    )
+    .await
+    {
+        Ok(new_name) => Some(new_name),
+        Err(e) => {
+            warn!("[rehome] {old_name} fork {old_ulid}: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +344,121 @@ mod tests {
             first, second,
             "re-run must resolve to the same rehomed name"
         );
+    }
+
+    #[tokio::test]
+    async fn rehome_existing_local_fork_reads_symlink() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let stores: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let identity = CoordinatorIdentity::load_or_generate(data_dir).unwrap();
+
+        let our_fork = Ulid::from_string("01J0000000000000000000000V").unwrap();
+        let their_fork = Ulid::from_string("01J0000000000000000000000W").unwrap();
+        std::fs::create_dir_all(data_dir.join("by_id").join(our_fork.to_string())).unwrap();
+        let by_name = data_dir.join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        std::os::unix::fs::symlink(format!("../by_id/{our_fork}"), by_name.join("prod")).unwrap();
+        stores
+            .name_claims()
+            .mark_initial(
+                "prod",
+                "01PEERCOORDXXXXXXXXXXXXXXXX",
+                None,
+                their_fork,
+                4096,
+            )
+            .await
+            .unwrap();
+
+        // Resolves the fork from the by_name symlink and rehomes it — the
+        // force_claim / start-refusal call path.
+        let new_name = rehome_existing_local_fork(&identity, stores.as_ref(), data_dir, "prod")
+            .await
+            .expect("existing local fork must be rehomed");
+        assert_eq!(new_name, format!("prod-displaced-{our_fork}"));
+        let rec = stores.name_claims().read(&new_name).await.unwrap().unwrap();
+        assert_eq!(rec.vol_ulid, our_fork);
+        assert_eq!(rec.state, NameState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn rehome_existing_local_fork_none_without_binding() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let stores: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let identity = CoordinatorIdentity::load_or_generate(data_dir).unwrap();
+
+        // No by_name/prod symlink → nothing to rehome.
+        assert!(
+            rehome_existing_local_fork(&identity, stores.as_ref(), data_dir, "prod")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rehome_emits_displaced_event() {
+        use futures::StreamExt;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let stores: Arc<dyn ScopedStores> = Arc::new(PassthroughStores::new(Arc::clone(&store)));
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let identity = CoordinatorIdentity::load_or_generate(data_dir).unwrap();
+
+        let our_fork = Ulid::from_string("01J0000000000000000000000V").unwrap();
+        let their_fork = Ulid::from_string("01J0000000000000000000000W").unwrap();
+        let fork_dir = data_dir.join("by_id").join(our_fork.to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        stores
+            .name_claims()
+            .mark_initial(
+                "prod",
+                "01PEERCOORDXXXXXXXXXXXXXXXX",
+                None,
+                their_fork,
+                4096,
+            )
+            .await
+            .unwrap();
+
+        let new_name = rehome_displaced_fork(
+            &identity,
+            stores.as_ref(),
+            data_dir,
+            &fork_dir,
+            "prod",
+            our_fork,
+        )
+        .await
+        .unwrap();
+
+        // A Displaced event landed on the new name's log with the right
+        // provenance (source name + the fork that displaced us).
+        let prefix = object_store::path::Path::from(format!("events/{new_name}"));
+        let metas: Vec<_> = store.list(Some(&prefix)).collect().await;
+        let event_key = metas
+            .into_iter()
+            .map(|m| m.unwrap().location)
+            .find(|k| k.filename() != Some("HEAD"))
+            .expect("a Displaced event object must be written");
+        let body = store.get(&event_key).await.unwrap().bytes().await.unwrap();
+        let ev =
+            elide_core::volume_event::VolumeEvent::from_toml(std::str::from_utf8(&body).unwrap())
+                .unwrap();
+        match ev.kind {
+            elide_core::volume_event::EventKind::Displaced {
+                source_name,
+                source_fork,
+                ..
+            } => {
+                assert_eq!(source_name, "prod");
+                assert_eq!(source_fork, their_fork);
+            }
+            other => panic!("expected Displaced event, got {other:?}"),
+        }
+        assert_eq!(ev.vol_ulid, our_fork);
     }
 }
