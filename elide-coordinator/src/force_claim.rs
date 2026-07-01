@@ -818,14 +818,6 @@ impl ForceClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
         std::fs::write(fork.dir.join(STOPPED_FILE), "")
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-        if let Err(e) =
-            elide_coordinator::remote_breadcrumb::remove(&self.ctx.core.data_dir, &self.volume)
-        {
-            warn!(
-                "[force-claim {}] clearing remote breadcrumb: {e}",
-                self.volume
-            );
-        }
 
         register_prefetch_or_get(&self.ctx.prefetch_tracker, fork.vol_ulid);
         crate::rescan::trigger();

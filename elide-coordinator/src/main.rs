@@ -25,7 +25,6 @@ mod mint_stores;
 mod pidfile;
 mod rescan;
 mod shutdown;
-mod start_remote;
 mod supervisor;
 
 // Re-use the library's shared modules so types are identical across the

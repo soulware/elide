@@ -234,33 +234,13 @@ pub(crate) async fn release_volume_op(
     let link = data_dir.join("by_name").join(volume_name);
     let (vol_dir, shape) = VolumeLifecycle::resolve(&link)
         .map_err(|e| IpcError::internal(format!("resolving local fork: {e}")))?;
-    let vol_dir = match (vol_dir, &shape) {
-        (Some(d), _) => d,
-        (None, _) => {
-            // No local fork — but a `remote/<name>` breadcrumb plus a
-            // bucket record that names us as owner is enough to release:
-            // the stop-snapshot from the preceding clean `stop` (which
-            // ran before `remove`) already covers the durable state, so
-            // there's no drain to do. Just flip the bucket to Released
-            // using that snapshot as the handoff, and clear the
-            // breadcrumb.
-            //
-            // This makes `stop → remove → release` work without forcing
-            // the operator to detour through `start → stop` first just
-            // to hand off a name they've already mentally given up.
-            let journal = ctx.stores.event_journal();
-            let claims = ctx.stores.name_claims();
-            return release_breadcrumb_only(
-                volume_name,
-                data_dir,
-                stores,
-                journal.as_ref(),
-                claims.as_ref(),
-                identity,
-                coord_id,
-                started,
-            )
-            .await;
+    let vol_dir = match vol_dir {
+        Some(d) => d,
+        None => {
+            return Err(IpcError::not_found(format!(
+                "volume '{volume_name}' has no local fork to release; \
+                 recover it locally first with `elide volume claim {volume_name}`"
+            )));
         }
     };
 
@@ -325,8 +305,7 @@ pub(crate) async fn release_volume_op(
             // Freshly claimed/reclaimed and never started: no local
             // snapshot or segments, but the S3 record already carries
             // a handoff snapshot from the prior release. Reuse it —
-            // release is a pure bucket-flip here, identical to the
-            // breadcrumb-only path minus the breadcrumb. This makes
+            // release is a pure bucket-flip here. This makes
             // `claim → release` work without a `start → stop` detour.
             let vol_ulid = position.vol_ulid().ok_or_else(|| {
                 IpcError::internal(format!(
@@ -356,7 +335,6 @@ pub(crate) async fn release_volume_op(
             let claims = ctx.stores.name_claims();
             let result = perform_release_flip(
                 volume_name,
-                data_dir,
                 &vol_dir,
                 journal.as_ref(),
                 claims.as_ref(),
@@ -411,7 +389,6 @@ pub(crate) async fn release_volume_op(
     let claims = ctx.stores.name_claims();
     let result = perform_release_flip(
         volume_name,
-        data_dir,
         &vol_dir,
         journal.as_ref(),
         claims.as_ref(),
@@ -426,125 +403,89 @@ pub(crate) async fn release_volume_op(
     result
 }
 
-/// Final S3 conditional PUT flipping `names/<name>` to Released.
+/// Release `<volume_name>` if this coordinator still owns it in S3, as
+/// the first step of `volume remove`. Composes the same handoff
+/// selection and bucket-flip helpers as [`release_volume_op`], but is a
+/// no-op when the name isn't ours to release (absent, already
+/// `Released`, `Readonly`, or foreign-owned) — the caller then proceeds
+/// to tear down local state.
 ///
-/// On success also writes `volume.released` into `vol_dir` as a
-/// best-effort display marker — the bucket record is authoritative,
-/// the local marker only drives `volume list` rendering.
-/// Breadcrumb-only release: there's no local fork, but a
-/// `data_dir/remote/<name>` breadcrumb plus a bucket record that
-/// names us as owner is enough to release. The preceding clean
-/// `stop` published a stop-snapshot that covers the durable state;
-/// use it as the handoff, flip `names/<name>` to `Released`, and
-/// clear the breadcrumb.
-///
-/// Refuses if:
-///   - The breadcrumb is absent (no record of ever owning this).
-///   - The bucket record is missing or owned by another coordinator
-///     (the cross-host case — recovery is `claim --force` from the
-///     host that wants the volume).
-///   - The bucket record is already `Released` (idempotent failure
-///     to give better operator feedback).
-#[allow(clippy::too_many_arguments)]
-async fn release_breadcrumb_only(
+/// `--force` reuses the recorded handoff or synthesises an empty one,
+/// discarding state past the last snapshot the same way `--force`
+/// already discards unflushed local state on `remove`.
+pub(crate) async fn release_owned_for_remove(
     volume_name: &str,
-    data_dir: &Path,
-    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
-    journal: &dyn elide_coordinator::event_journal::EventJournal,
-    claims: &dyn elide_coordinator::name_claims::NameClaims,
-    identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
-    coord_id: &str,
-    started: std::time::Instant,
-) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::MarkReleasedOutcome;
+    vol_dir: &Path,
+    force: bool,
+    ctx: &IpcContext,
+) -> Result<(), IpcError> {
+    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
 
-    // Breadcrumb is the local fingerprint of "we still own this
-    // name remotely". Without one, this volume isn't a candidate for
-    // breadcrumb-only release — surface the same not-found error
-    // operators expect.
-    let breadcrumb = elide_coordinator::remote_breadcrumb::read(data_dir, volume_name)
-        .map_err(|e| IpcError::internal(format!("reading breadcrumb: {e}")))?;
-    let Some(_breadcrumb) = breadcrumb else {
-        return Err(IpcError::not_found(format!(
-            "volume not found: {volume_name}"
-        )));
-    };
-
-    let writer = stores.writer();
-    use elide_coordinator::bucket_position::fetch_position;
+    let coord_id = ctx.identity.coordinator_id_str();
+    let data_dir: &Path = &ctx.data_dir;
+    let writer = ctx.stores.writer();
     let (position, fetched) = fetch_position(&writer, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
-    ensure_release_eligible(
-        &position,
-        volume_name,
-        format!(
-            "name '{volume_name}' has no S3 record despite local breadcrumb; \
-             stale breadcrumb — remove `{}/remote/{volume_name}` to dismiss",
-            data_dir.display()
-        ),
-    )?;
-    let rec = fetched
-        .expect("ensure_release_eligible(OwnedByUs) implies fetched is Some")
-        .0;
+    let OwnershipPosition::OwnedByUs { vol_ulid, .. } = position else {
+        return Ok(());
+    };
 
-    // Find the latest published snapshot for this vol_ulid to use as
-    // the handoff. The bucket should have a stop-snapshot from the
-    // preceding `stop` even though the local fork is gone. If there
-    // is no snapshot at all (the volume was minted via `claim`, never
-    // started or stopped, then removed), synthesise an empty handoff
-    // signed by the volume's own key from the local shadow.
-    let snap_ulid = match reuse_handoff_snapshot(&rec) {
-        Some(snap_ulid) => snap_ulid,
-        // No handoff recorded (root volume claimed/created and removed
-        // without ever writing): breadcrumb-only has no local fork dir
-        // to materialise into, so synthesise an empty owner-signed
-        // handoff.
-        None => {
-            let vd = stores.volume_data(&rec.vol_ulid);
-            synthesise_empty_owner_handoff(volume_name, data_dir, &vd, None).await?
+    let vd = ctx.stores.volume_data(&vol_ulid);
+    let recorded_handoff = fetched
+        .as_ref()
+        .map(|(rec, _)| rec)
+        .and_then(reuse_handoff_snapshot);
+
+    let snap_ulid = if force {
+        match recorded_handoff {
+            Some(snap) => snap,
+            None => {
+                synthesise_empty_owner_handoff(volume_name, data_dir, &vd, Some(vol_dir)).await?
+            }
+        }
+    } else {
+        match release_fast_path_handoff(vol_dir)
+            .map_err(|e| IpcError::internal(format!("release fast-path inspection failed: {e}")))?
+        {
+            FastPathDisposition::Cover(cover) => {
+                if cover.kind == elide_core::signing::SnapshotKind::Stop {
+                    promote_stop_snapshot(vol_dir, &vd, cover.snap_ulid).await?;
+                }
+                cover.snap_ulid
+            }
+            FastPathDisposition::NeverRan => match recorded_handoff {
+                Some(snap) => snap,
+                None => {
+                    synthesise_empty_owner_handoff(volume_name, data_dir, &vd, Some(vol_dir))
+                        .await?
+                }
+            },
+            FastPathDisposition::NeedsDrain => {
+                return Err(IpcError::conflict(format!(
+                    "volume '{volume_name}' has durable state past the last snapshot; \
+                     snapshot it first with `elide volume snapshot {volume_name}`, \
+                     or pass --force to discard it"
+                )));
+            }
         }
     };
-    info!(
-        "[release {volume_name}] breadcrumb-only: handoff snapshot {snap_ulid} \
-         (no local fork, no drain needed)"
-    );
 
-    let outcome = claims.mark_released(volume_name, coord_id, snap_ulid).await;
-    match outcome {
-        Ok(MarkReleasedOutcome::Updated { vol_ulid }) => {
-            info!(
-                "[release {volume_name}] released at handoff snapshot {snap_ulid} \
-                 (breadcrumb-only, total {:.2?})",
-                started.elapsed()
-            );
-            emit_release_aftermath(
-                data_dir,
-                journal,
-                identity,
-                volume_name,
-                None,
-                snap_ulid,
-                vol_ulid,
-                elide_core::volume_event::EventKind::Released {
-                    handoff_snapshot: snap_ulid,
-                },
-                true,
-                "release",
-            )
-            .await;
-            Ok(ReleaseReply {
-                handoff_snapshot: snap_ulid,
-            })
-        }
-        Ok(other) => Err(IpcError::store(format!(
-            "release flip for {volume_name}: unexpected outcome {other:?}"
-        ))),
-        Err(e) => Err(IpcError::store(format!("release flip: {e}"))),
-    }
+    let journal = ctx.stores.event_journal();
+    let claims = ctx.stores.name_claims();
+    perform_release_flip(
+        volume_name,
+        vol_dir,
+        journal.as_ref(),
+        claims.as_ref(),
+        &ctx.identity,
+        snap_ulid,
+    )
+    .await
+    .map(|_| ())
 }
 
-/// The handoff snapshot to reuse for a breadcrumb / never-started
+/// The handoff snapshot to reuse for a never-started
 /// release, read off the already-fetched `names/<name>` record — no
 /// snapshot LIST, no event walk (`docs/plans/list-elimination-plan.md`
 /// § *Identity axes*).
@@ -575,21 +516,12 @@ fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Optio
     record.handoff_snapshot
 }
 
-/// Server-side promote a stop-snapshot to a stable user manifest in
-/// S3, without touching any local state. Used by breadcrumb-only
-/// release when the latest published basis is `<S>-stop.manifest` —
-/// claimants resolve the handoff via the stable filename, so the
-/// auto must be re-addressed before the bucket flip. Equivalent to
-/// the S3-side half of `promote_stop_snapshot` (used by the local
-/// fast path); shared helper would be nice but the local variant
-/// also needs to rename the sentinel + manifest on disk, which
-/// doesn't apply here.
 /// Sign and publish an empty handoff manifest for an owned volume
-/// that never accumulated any segments. Reached when
-/// `latest_release_handoff_snapshot` returns `None` from either the
-/// `NeverRan` release path (a fork claimed and released without ever
-/// being started) or the breadcrumb-only path
-/// (`volume claim` → `volume remove` → `volume release`).
+/// that never accumulated any segments. Reached when the fetched
+/// `names/<name>` record has no reusable `handoff_snapshot` — a fork
+/// claimed (or created) and released without ever being started,
+/// including the release that `volume remove` performs before local
+/// teardown.
 ///
 /// Signs with the volume's own key (loaded from the local
 /// `data_dir/keys/<vol_ulid>.key` shadow). The result is a normal
@@ -597,10 +529,10 @@ fn reuse_handoff_snapshot(record: &elide_core::name_record::NameRecord) -> Optio
 /// identical shape to what `volume stop` would have published if the
 /// volume had run with no writes.
 ///
-/// `local_fork_dir` is `Some` only on the `NeverRan` path, where a
-/// fork dir still exists on disk; the manifest is then mirrored
-/// locally (see `materialise_handoff_locally`) so this coordinator
-/// serves it to subsequent peer claims without a peer-fetch miss.
+/// `local_fork_dir` names the fork dir on disk; the manifest is then
+/// mirrored locally (see `materialise_handoff_locally`) so this
+/// coordinator serves it to subsequent peer claims without a
+/// peer-fetch miss.
 ///
 /// Refuses if no key shadow exists. That would mean we own the
 /// bucket record but the host has no record of ever minting the
@@ -688,9 +620,8 @@ fn materialise_handoff_locally(
 /// `<S>-stop.manifest` to `<S>.manifest`, then DELETE of the auto
 /// key. Best-effort on the DELETE — a leftover redundant
 /// `-stop.manifest` is benign (the reader path prefers User on a
-/// tie). Shared between the breadcrumb-only release path (S3 only)
-/// and the local fast-path release (which wraps with local file +
-/// sentinel renames).
+/// tie). The local fast-path release wraps this with local file +
+/// sentinel renames.
 ///
 /// Writes under `by_id/<vol>/snapshots/` — must ride the per-vol
 /// `volume-rw` credential, hence the typed [`VolumeData`] argument.
@@ -704,10 +635,13 @@ async fn promote_stop_in_store(
         .map_err(|e| IpcError::store(format!("promoting stop→user for {snap_ulid}: {e}")))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Final S3 conditional PUT flipping `names/<name>` to Released.
+///
+/// On success also writes `volume.released` into `vol_dir` as a
+/// best-effort display marker — the bucket record is authoritative,
+/// the local marker only drives `volume list` rendering.
 async fn perform_release_flip(
     volume_name: &str,
-    data_dir: &Path,
     vol_dir: &Path,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
     claims: &dyn elide_coordinator::name_claims::NameClaims,
@@ -732,11 +666,7 @@ async fn perform_release_flip(
                  (flip {:.2?})",
                 flip_started.elapsed()
             );
-            // No breadcrumb to clear here: this path runs when a
-            // local fork existed, which means no breadcrumb was
-            // written (`remove` is the only producer).
             emit_release_aftermath(
-                data_dir,
                 journal,
                 identity,
                 volume_name,
@@ -746,7 +676,6 @@ async fn perform_release_flip(
                 elide_core::volume_event::EventKind::Released {
                     handoff_snapshot: snap_ulid,
                 },
-                false,
                 "release",
             )
             .await;
@@ -1029,18 +958,18 @@ fn latest_segment_ulid(index_dir: &Path) -> std::io::Result<Option<ulid::Ulid>> 
 /// The CLI calls `start` afterwards if `volume start --claim` was the
 /// composed flow.
 /// Resolve `volume start <name>` against the bucket when no local fork
-/// exists. Hydrates a remote-owned volume into local state on success;
-/// surfaces the appropriate error otherwise (foreign-owned → conflict,
-/// released → claim hint, unknown → not_found).
+/// exists. `start` resumes a local fork only; with no fork it routes the
+/// operator to the recovery verb for the bucket state — `claim` for a
+/// `Released` name, `claim --force` for one still owned (by us with no
+/// fork, or by a dead peer), `not_found` for an unknown name.
 pub(crate) async fn hydrate_or_route(
     volume_name: &str,
     store: &Arc<dyn ObjectStore>,
     coord_id: &str,
-    core: &CoordinatorCore,
 ) -> Result<(), IpcError> {
     use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
 
-    let (position, record) = fetch_position(store, volume_name, coord_id)
+    let (position, _record) = fetch_position(store, volume_name, coord_id)
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
 
@@ -1048,15 +977,10 @@ pub(crate) async fn hydrate_or_route(
         OwnershipPosition::Absent => Err(IpcError::not_found(format!(
             "volume '{volume_name}' not found locally or in the bucket"
         ))),
-        OwnershipPosition::OwnedByUs { vol_ulid, .. } => {
-            // Need `size` for the hydrate; pulled from the record we
-            // already read.
-            let size = record
-                .expect("fetch_position returned OwnedByUs => record is Some")
-                .0
-                .size;
-            crate::start_remote::hydrate_remote_owned(volume_name, vol_ulid, size, core).await
-        }
+        OwnershipPosition::OwnedByUs { .. } => Err(IpcError::conflict(format!(
+            "name '{volume_name}' is owned by this coordinator but has no local fork; \
+             recover with: elide volume claim --force {volume_name}"
+        ))),
         OwnershipPosition::OwnedByOther {
             coord_id: held_by, ..
         } => Err(IpcError::conflict(format!(
@@ -1106,7 +1030,7 @@ pub(crate) async fn start_volume_op(
         match maybe_dir {
             Some(dir) => (dir, shape),
             None => {
-                hydrate_or_route(volume_name, &store, coord_id, core).await?;
+                hydrate_or_route(volume_name, &store, coord_id).await?;
                 let (dir, shape) = VolumeLifecycle::resolve(&link).map_err(|e| {
                     IpcError::internal(format!("resolving local fork post-hydrate: {e}"))
                 })?;
@@ -2270,8 +2194,8 @@ mod tests {
         use elide_coordinator::ipc::IpcErrorKind;
         let tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> = mem_store();
-        let core = make_core(&tmp, Arc::clone(&store));
-        let err = hydrate_or_route("ghost", &store, "coord-A", &core)
+        let _core = make_core(&tmp, Arc::clone(&store));
+        let err = hydrate_or_route("ghost", &store, "coord-A")
             .await
             .expect_err("missing bucket record should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -2285,13 +2209,13 @@ mod tests {
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> = mem_store();
-        let core = make_core(&tmp, Arc::clone(&store));
+        let _core = make_core(&tmp, Arc::clone(&store));
         let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = NameState::Stopped;
         rec.coordinator_id = Some("coord-OTHER".into());
         create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+        let err = hydrate_or_route("vol", &store, "coord-A")
             .await
             .expect_err("foreign-owned record should conflict");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -2310,13 +2234,13 @@ mod tests {
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> = mem_store();
-        let core = make_core(&tmp, Arc::clone(&store));
+        let _core = make_core(&tmp, Arc::clone(&store));
         let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = NameState::Released;
         rec.coordinator_id = Some("coord-A".into());
         create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+        let err = hydrate_or_route("vol", &store, "coord-A")
             .await
             .expect_err("released record should conflict");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -2331,12 +2255,12 @@ mod tests {
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> = mem_store();
-        let core = make_core(&tmp, Arc::clone(&store));
+        let _core = make_core(&tmp, Arc::clone(&store));
         let mut rec = NameRecord::live_minimal(sample_ulid(), SAMPLE_SIZE);
         rec.state = NameState::Readonly;
         create_name_record(&store, "vol", &rec).await.unwrap();
 
-        let err = hydrate_or_route("vol", &store, "coord-A", &core)
+        let err = hydrate_or_route("vol", &store, "coord-A")
             .await
             .expect_err("readonly record should refuse start");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
