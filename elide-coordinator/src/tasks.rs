@@ -136,6 +136,7 @@ fn dir_has_entries(p: &Path) -> bool {
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
     stores: Arc<dyn crate::stores::ScopedStores>,
+    identity: Arc<crate::identity::CoordinatorIdentity>,
     journal: Arc<dyn crate::event_journal::EventJournalReader>,
     drain_interval: Duration,
     gc_config: GcConfig,
@@ -290,6 +291,7 @@ pub async fn run_volume_tasks(
         gc_config,
         &snapshot_locks,
         read_volume_name(&fork_dir),
+        identity,
     );
 
     let mut tick = tokio::time::interval(drain_interval);

@@ -71,9 +71,20 @@ pub struct GcCycleOrchestrator {
     /// Name bound to this fork, if it has one. Nameless forks (pulled
     /// ancestors) have no `names/<name>` record to bump.
     volume_name: Option<String>,
+    /// Coordinator identity — signs the `Displaced` event and stamps the
+    /// rehomed name record when a displaced fork is fenced
+    /// (`fence_if_displaced`).
+    identity: Arc<crate::identity::CoordinatorIdentity>,
+    /// Scoped stores — the rehome mints `names/<name>-displaced-<ulid>`
+    /// and emits its `Displaced` event through these.
+    stores: Arc<dyn crate::stores::ScopedStores>,
 }
 
 impl GcCycleOrchestrator {
+    // A per-volume orchestrator is assembled from its collaborators (data
+    // store, scoped stores, identity, config, locks); folding them into an
+    // args struct would add ceremony without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fork_dir: PathBuf,
         vol_ulid: Ulid,
@@ -82,6 +93,7 @@ impl GcCycleOrchestrator {
         gc_config: GcConfig,
         snapshot_locks: &SnapshotLockRegistry,
         volume_name: Option<String>,
+        identity: Arc<crate::identity::CoordinatorIdentity>,
     ) -> Self {
         let meta_store = stores.writer();
         let name_claims = stores.name_claims();
@@ -115,6 +127,8 @@ impl GcCycleOrchestrator {
             tick_superseded: Vec::new(),
             name_claims,
             volume_name,
+            identity,
+            stores: Arc::clone(stores),
         }
     }
 
@@ -133,9 +147,11 @@ impl GcCycleOrchestrator {
     /// mismatch fences — a missing record or a read error leaves the fork
     /// alone and lets the credential fence backstop.
     ///
-    /// Returns `Some(Stop)` once the device is halted (the per-volume task
-    /// then exits), `Some(Continue)` to retry a failed halt next tick, or
-    /// `None` when the fork is still the bound owner.
+    /// Halts the device, then rehomes the fork under
+    /// `<name>-displaced-<ulid>` (a first-class stopped volume) and drops
+    /// the stale local name binding. Returns `Some(Stop)` once halted (the
+    /// per-volume task then exits), `Some(Continue)` to retry a failed halt
+    /// next tick, or `None` when the fork is still the bound owner.
     async fn fence_if_displaced(&self) -> Option<TickOutcome> {
         let name = self.volume_name.as_ref()?;
         let rec = match self.name_claims.read(name).await {
@@ -159,30 +175,56 @@ impl GcCycleOrchestrator {
 
         warn!(
             "[fence {}] names/{name} now binds {} (coordinator {}); \
-             fencing local device",
+             fencing + rehoming",
             self.vol_ulid,
             rec.vol_ulid,
             rec.coordinator_id.as_deref().unwrap_or("?")
         );
-        if let Err(e) = std::fs::write(self.fork_dir.join(STOPPED_FILE), "") {
-            warn!("[fence {}] writing {STOPPED_FILE}: {e}", self.vol_ulid);
-        }
+
+        // Stop the device first: the guest must stop writing into a WAL
+        // that can no longer drain.
         match control::shutdown(&self.fork_dir).await {
-            control::ShutdownOutcome::Acknowledged | control::ShutdownOutcome::NotRunning => {
-                info!(
-                    "[fence {}] local device stopped; displaced by {}",
-                    self.vol_ulid, rec.vol_ulid
-                );
-                Some(TickOutcome::Stop)
-            }
+            control::ShutdownOutcome::Acknowledged | control::ShutdownOutcome::NotRunning => {}
             control::ShutdownOutcome::Failed(msg) => {
                 warn!(
                     "[fence {}] shutdown failed: {msg}; retrying next tick",
                     self.vol_ulid
                 );
-                Some(TickOutcome::Continue)
+                return Some(TickOutcome::Continue);
             }
         }
+
+        // Rehome the fork under <name>-displaced-<ulid> so it survives as a
+        // first-class stopped volume, then drop our stale local binding.
+        let data_dir = self.by_id_dir.parent().unwrap_or(&self.by_id_dir);
+        match crate::rehome::rehome_displaced_fork(
+            self.identity.as_ref(),
+            self.stores.as_ref(),
+            data_dir,
+            &self.fork_dir,
+            name,
+            self.vol_ulid,
+        )
+        .await
+        {
+            Ok(new_name) => {
+                let _ = std::fs::remove_file(data_dir.join("by_name").join(name));
+                info!(
+                    "[fence {}] rehomed as {new_name}; displaced by {}",
+                    self.vol_ulid, rec.vol_ulid
+                );
+            }
+            Err(e) => {
+                // Fall back to stopped-but-not-rehomed; a later start
+                // rehomes it via the start-refusal path.
+                let _ = std::fs::write(self.fork_dir.join(STOPPED_FILE), "");
+                warn!(
+                    "[fence {}] rehoming displaced fork: {e}; left stopped",
+                    self.vol_ulid
+                );
+            }
+        }
+        Some(TickOutcome::Stop)
     }
 
     pub async fn run_tick(&mut self) -> TickOutcome {
@@ -699,6 +741,8 @@ mod tests {
         let locks = crate::new_snapshot_lock_registry();
         let stores: Arc<dyn crate::stores::ScopedStores> =
             Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
+        let identity =
+            Arc::new(crate::identity::CoordinatorIdentity::load_or_generate(tmp.path()).unwrap());
         let orch = GcCycleOrchestrator::new(
             fork_dir,
             vol,
@@ -707,6 +751,7 @@ mod tests {
             crate::config::GcConfig::default(),
             &locks,
             volume_name.map(String::from),
+            identity,
         );
         (orch, tmp)
     }
@@ -1057,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_stops_and_marks_stopped_when_displaced() {
+    async fn fence_stops_and_rehomes_when_displaced() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (orch, tmp) = orchestrator_named(store.clone(), Some("vol2"));
         // names/vol2 now binds a different fork — this one is displaced.
@@ -1071,11 +1116,21 @@ mod tests {
             orch.fence_if_displaced().await,
             Some(TickOutcome::Stop)
         ));
-        let fork_dir = tmp.path().join("by_id").join(vol_ulid().to_string());
-        assert!(
-            fork_dir.join(STOPPED_FILE).exists(),
-            "a fenced fork must be marked stopped"
-        );
+
+        // The displaced fork is rehomed as a Stopped, named volume.
+        let our = vol_ulid();
+        let new_name = format!("vol2-displaced-{our}");
+        let rehomed = orch
+            .name_claims
+            .read(&new_name)
+            .await
+            .unwrap()
+            .expect("displaced fork must be rehomed");
+        assert_eq!(rehomed.vol_ulid, our);
+        assert_eq!(rehomed.state, elide_core::name_record::NameState::Stopped);
+        let fork_dir = tmp.path().join("by_id").join(our.to_string());
+        assert!(fork_dir.join(STOPPED_FILE).exists());
+        assert!(tmp.path().join("by_name").join(&new_name).exists());
     }
 
     #[tokio::test]
