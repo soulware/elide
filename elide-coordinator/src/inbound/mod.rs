@@ -1212,12 +1212,12 @@ async fn remove_volume(
     // kernel device is QUIESCED and ready for del_dev. Leaving it in
     // place would orphan a kernel device whose stamped owner points at
     // a now-deleted vol_dir.
-    let teardown_id: Option<i32> = bound_ublk_id(&vol_dir);
+    let teardown_id: Option<i32> = elide_coordinator::ublk_sweep::bound_ublk_id(&vol_dir);
     // Capture the pid alongside, before `remove_dir_all` takes the file
     // with it. `stop`'s IPC ack returns before the daemon's `exit(0)`
     // fires, so a quick stop → remove sequence can still race the ublk
     // queue io_uring fds being released.
-    let prev_pid: Option<u32> = crate::ublk_sweep::read_volume_pid(&vol_dir);
+    let prev_pid: Option<u32> = elide_coordinator::ublk_sweep::read_volume_pid(&vol_dir);
 
     import::kill_all_for_volume(&vol_dir);
 
@@ -1250,9 +1250,9 @@ async fn remove_volume(
 
     if let Some(id) = teardown_id {
         if let Some(pid) = prev_pid {
-            crate::ublk_sweep::wait_for_pid_exit(pid).await;
+            elide_coordinator::ublk_sweep::wait_for_pid_exit(pid).await;
         }
-        crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
+        elide_coordinator::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
     match local_name.as_deref() {
@@ -1316,17 +1316,6 @@ async fn maybe_write_remote_breadcrumb(
         owned_state
     );
     Ok(())
-}
-
-/// Read the bound ublk `dev_id` from `vol_dir/volume.toml`, if any.
-///
-/// Returns `None` when the config is missing/unreadable, has no `[ublk]`
-/// section, or the section has no `dev_id` (volume was never started, so
-/// there's no kernel device to tear down).
-fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
-    elide_core::config::VolumeConfig::read(vol_dir)
-        .ok()
-        .and_then(|cfg| cfg.ublk.and_then(|u| u.dev_id))
 }
 
 /// Returns a human-readable reason if the fork has on-disk state that
@@ -1759,7 +1748,7 @@ async fn update_volume_op(
     // wait for the OLD process to actually exit (releasing its ublk
     // queue io_uring fds) before issuing `del_dev`.
     let prev_pid: Option<u32> =
-        teardown_id.and_then(|_| crate::ublk_sweep::read_volume_pid(&vol_dir));
+        teardown_id.and_then(|_| elide_coordinator::ublk_sweep::read_volume_pid(&vol_dir));
 
     cfg.write(&vol_dir)
         .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;
@@ -1792,9 +1781,9 @@ async fn update_volume_op(
     // device, so there is no conflict.
     if let Some(id) = teardown_id {
         if let Some(pid) = prev_pid {
-            crate::ublk_sweep::wait_for_pid_exit(pid).await;
+            elide_coordinator::ublk_sweep::wait_for_pid_exit(pid).await;
         }
-        crate::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
+        elide_coordinator::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
     Ok(UpdateReply { restarted })
@@ -3174,50 +3163,6 @@ mod tests {
         let err = resolve_volume_name(tmp.path(), &macaroon::Verified::for_test(ulid::Ulid::new()))
             .expect_err("no claim → reject");
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
-    }
-
-    #[test]
-    fn bound_ublk_id_missing_config_returns_none() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(bound_ublk_id(tmp.path()), None);
-    }
-
-    #[test]
-    fn bound_ublk_id_no_ublk_section_returns_none() {
-        let tmp = TempDir::new().unwrap();
-        elide_core::config::VolumeConfig {
-            size: Some(SAMPLE_SIZE),
-            ..Default::default()
-        }
-        .write(tmp.path())
-        .unwrap();
-        assert_eq!(bound_ublk_id(tmp.path()), None);
-    }
-
-    #[test]
-    fn bound_ublk_id_section_without_dev_id_returns_none() {
-        let tmp = TempDir::new().unwrap();
-        elide_core::config::VolumeConfig {
-            size: Some(SAMPLE_SIZE),
-            ublk: Some(elide_core::config::UblkConfig { dev_id: None }),
-            ..Default::default()
-        }
-        .write(tmp.path())
-        .unwrap();
-        assert_eq!(bound_ublk_id(tmp.path()), None);
-    }
-
-    #[test]
-    fn bound_ublk_id_returns_dev_id() {
-        let tmp = TempDir::new().unwrap();
-        elide_core::config::VolumeConfig {
-            size: Some(SAMPLE_SIZE),
-            ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),
-            ..Default::default()
-        }
-        .write(tmp.path())
-        .unwrap();
-        assert_eq!(bound_ublk_id(tmp.path()), Some(7));
     }
 
     #[tokio::test]
