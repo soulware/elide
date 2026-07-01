@@ -103,11 +103,11 @@ operator interaction.
 ## Deployment shapes
 
 - **Single-host dev** — coordinator + mint co-resident over the UDS `socket`,
-  with the demo auth issuer and a co-located coord B. This is the shape the
-  `attested-e2e` job exercises; see `docs/design/mint.md` for `[auth.demo]` and
-  the co-located attestation listener.
+  with the demo auth issuer (`[auth.demo]`) colocated in mint. The attestation
+  authority is a separate `attest` instance that mint shares `K_M-B` with; see
+  `docs/design/mint.md`.
 - **Production** — mint standalone on a TCP `bind`, with a separate
-  auth-service and attestation coordinator at the `PER-DEPLOYMENT` discharge
+  auth-service and attestation authority at the `PER-DEPLOYMENT` discharge
   URLs.
 
 ## Fly.io deployment
@@ -123,9 +123,9 @@ surface, and demo secrets live on the
 `mint_data` volume and survive redeploys.
 
 The runtime config is `mint-fly.toml` — a self-contained restatement of
-`mint-elide.toml` with the Fly `data_dir`, listener, and colocated demo
-auth/attestation. Both configs share the one `catalog.toml` (the Dockerfile
-copies it next to the config in the image).
+`mint-elide.toml` with the Fly `data_dir`, listener, colocated demo auth, and
+the shared attestation key. Both configs share the one `catalog.toml` (the
+Dockerfile copies it next to the config in the image).
 
 Prerequisites: the `fly` CLI, a Tigris bucket, and an admin credential that can
 manage it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
@@ -186,9 +186,9 @@ With the VM joined to 6PN (`fly wireguard create`):
 
 That enrols the coordinator and lets it assume the issuer-only `coord-ro` /
 `coord-rw` roles. The attested `volume-*` roles additionally need `K_M-B`,
-shared the same way as `K_M-A`: one value set as `[attestation.demo].k_m_b` in
-mint's config and `[attestation].k_m_b` in the coordinator's. mint persists it
-at `<data_dir>/attestation-shared.key`.
+shared the same way as `K_M-A`: one value set as `[attestation].k_m_b` in both
+mint's config and the attestation authority's. mint persists it at
+`<data_dir>/attestation-shared.key`.
 
 The keyring is the root of trust and auto-generates onto the `mint_data` volume;
 losing the volume invalidates every issued credential, so back it up.

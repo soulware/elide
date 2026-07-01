@@ -956,8 +956,8 @@ more machinery than a demo needs, so the trust anchor is shared directly:
 rather than one mint generates.
 
 ```toml
-# mint-fly.toml — mint's demo attestation seal key
-[attestation.demo]
+# mint-fly.toml — mint's shared attestation seal key
+[attestation]
 k_m_b = "<base64 32-byte AEAD key>"
 
 # deploy/attest/coord.toml — the dedicated coord B
@@ -972,13 +972,10 @@ delivery. The `cid` construction and the discharge MAC are unchanged; only
 the holder of the key differs, exactly as shared-`K_M-A` leaves mint's
 discharge verifier untouched.
 
-**Mint-side requirement (the one cross-repo change).** mint's
-`[attestation.demo]` must source `K_M-B` from a `k_m_b` field rather than
-generating it at first start — the `K_M-B` analog of the `k_m_a` field
-`[auth.demo]` already carries. The colocated `[attestation.demo].socket`
-that stands up mint's *own* discharge authority is unused in this shape: the
-dedicated attestation instance is coord B, so mint seals `cid`s but serves
-no discharge.
+**Mint side.** mint sources `K_M-B` from `[attestation].k_m_b` — the analog
+of the `k_m_a` field `[auth.demo]` carries — and seals every attested `cid`
+under it. The dedicated attestation instance is coord B and the sole
+discharge authority; mint issues no discharge of its own.
 
 Demo-tier only: a shared forgeable `K_M-B` is offline discharge-forgery
 capability for every attested credential (§ *Proposed: `K_M-B` stays at

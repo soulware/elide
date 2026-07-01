@@ -3,7 +3,7 @@
 #
 #   ./deploy.sh            deploy the latest release
 #   ./deploy.sh latest     same, stated explicitly
-#   ./deploy.sh v0.1.1     deploy a specific tag
+#   ./deploy.sh v0.1.5     deploy a specific tag
 #
 # Resolves the version to a concrete tag, checks the release assets exist, and
 # passes the tag as the MINT_VERSION build-arg the Dockerfile requires. Any

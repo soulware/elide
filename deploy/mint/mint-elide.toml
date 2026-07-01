@@ -33,10 +33,14 @@ socket = "mint_data/mint.sock"
 location = "https://auth.elide.internal/v1/discharge"
 
 [attestation]
-# PER-DEPLOYMENT. Discharge URL of the attestation coordinator (coord B).
-# Required: the volume roles bind a non-reserved caveat, which makes them
-# attested.
-location = "https://coord-b.elide.internal/v1/discharge"
+# PER-DEPLOYMENT. Discharge URL of the attestation authority (the dedicated
+# attest instance). Required: the volume roles bind a non-reserved caveat,
+# which makes them attested.
+location = "https://attest.elide.internal/v1/discharge"
+# K_M-B, the shared attestation-CID wrapping key — the identical value the
+# attest instance holds. Omit to load it from
+# <data_dir>/attestation-shared.key, provisioned out of band.
+# k_m_b = "REPLACE_WITH_BASE64_32_BYTE_KEY"
 
 [store]
 # PER-DEPLOYMENT. The bucket mint administers, holding mint's own `_mint/*`
