@@ -28,6 +28,7 @@ pub mod role;
 pub mod segment_head;
 pub mod stores;
 pub mod tasks;
+pub mod ublk_sweep;
 pub mod upload;
 pub mod volume_data;
 pub mod volume_state;

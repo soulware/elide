@@ -183,6 +183,8 @@ impl GcCycleOrchestrator {
 
         // Stop the device first: the guest must stop writing into a WAL
         // that can no longer drain.
+        let bound_id = crate::ublk_sweep::bound_ublk_id(&self.fork_dir);
+        let prev_pid = crate::ublk_sweep::read_volume_pid(&self.fork_dir);
         match control::shutdown(&self.fork_dir).await {
             control::ShutdownOutcome::Acknowledged | control::ShutdownOutcome::NotRunning => {}
             control::ShutdownOutcome::Failed(msg) => {
@@ -192,6 +194,16 @@ impl GcCycleOrchestrator {
                 );
                 return Some(TickOutcome::Continue);
             }
+        }
+
+        // The daemon parks its kernel device QUIESCED for a fast re-serve;
+        // a displaced fork won't serve here again without an explicit
+        // `start` (which re-ADDs at the persisted id), so del_dev it now.
+        if let Some(id) = bound_id {
+            if let Some(pid) = prev_pid {
+                crate::ublk_sweep::wait_for_pid_exit(pid).await;
+            }
+            crate::ublk_sweep::teardown_bound_device(&self.fork_dir, id).await;
         }
 
         // Rehome the fork under <name>-displaced-<ulid> so it survives as a

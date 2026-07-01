@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use elide_coordinator::volume_state::PID_FILE;
+use crate::volume_state::PID_FILE;
 use elide_core::process::pid_is_alive;
 
 const SYSFS_UBLK_CHAR: &str = "/sys/class/ublk-char";
@@ -251,9 +251,20 @@ const PID_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Read `vol_dir/volume.pid` and return the parsed pid, if any. Absent or
 /// malformed pid files map to `None` — the daemon is not running, or its
 /// pid is unknown; either way the caller has nothing to wait for.
-pub(crate) fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
+pub fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(vol_dir.join(PID_FILE)).ok()?;
     text.trim().parse().ok()
+}
+
+/// Read the bound ublk `dev_id` from `vol_dir/volume.toml`, if any.
+///
+/// Returns `None` when the config is missing/unreadable, has no `[ublk]`
+/// section, or the section has no `dev_id` (volume was never started, so
+/// there's no kernel device to tear down).
+pub fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
+    elide_core::config::VolumeConfig::read(vol_dir)
+        .ok()
+        .and_then(|cfg| cfg.ublk.and_then(|u| u.dev_id))
 }
 
 /// Poll until `pid` exits or `POST_SHUTDOWN_EXIT_WAIT` elapses. Bridges the
@@ -261,7 +272,7 @@ pub(crate) fn read_volume_pid(vol_dir: &Path) -> Option<u32> {
 /// observed) and the daemon's `std::process::exit(0)` actually firing —
 /// the volume writes its reply *before* exiting, so the kernel still
 /// holds references on the ublk_device when the coord proceeds.
-pub(crate) async fn wait_for_pid_exit(pid: u32) {
+pub async fn wait_for_pid_exit(pid: u32) {
     let deadline = tokio::time::Instant::now() + POST_SHUTDOWN_EXIT_WAIT;
     loop {
         if !pid_is_alive(pid) {
@@ -289,7 +300,7 @@ pub(crate) async fn wait_for_pid_exit(pid: u32) {
 /// Caller must have already shut the volume daemon down so the kernel's
 /// queue io_uring fds are released. `kill_dev` itself is safe-from-
 /// anywhere, but `del_dev` blocks until refcounts drop.
-pub(crate) async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
+pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
     info!(
         "[ublk-teardown] removing kernel device ublk{bound_id} bound to {}",
         vol_dir.display()
@@ -492,5 +503,34 @@ mod tests {
         // No by_id/ subdirectory.
         let out = scan_bindings(tmp.path());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn bound_ublk_id_missing_config_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_no_ublk_section_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        elide_core::config::VolumeConfig::default()
+            .write(tmp.path())
+            .unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_section_without_dev_id_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cfg(tmp.path(), None);
+        assert_eq!(bound_ublk_id(tmp.path()), None);
+    }
+
+    #[test]
+    fn bound_ublk_id_returns_dev_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cfg(tmp.path(), Some(7));
+        assert_eq!(bound_ublk_id(tmp.path()), Some(7));
     }
 }

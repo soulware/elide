@@ -720,7 +720,9 @@ async fn perform_release_flip(
         "[release {volume_name}] flipping names/<name> -> Released \
          with handoff snapshot {snap_ulid}"
     );
-    match claims
+    let bound_id = elide_coordinator::ublk_sweep::bound_ublk_id(vol_dir);
+    let prev_pid = elide_coordinator::ublk_sweep::read_volume_pid(vol_dir);
+    let reply = match claims
         .mark_released(volume_name, identity.coordinator_id_str(), snap_ulid)
         .await
     {
@@ -748,9 +750,9 @@ async fn perform_release_flip(
                 "release",
             )
             .await;
-            Ok(ReleaseReply {
+            ReleaseReply {
                 handoff_snapshot: snap_ulid,
-            })
+            }
         }
         Ok(_) => {
             info!(
@@ -766,17 +768,28 @@ async fn perform_release_flip(
                      (display-only; bucket state authoritative)"
                 );
             }
-            Ok(ReleaseReply {
+            ReleaseReply {
                 handoff_snapshot: snap_ulid,
-            })
+            }
         }
         Err(e) => {
             warn!("[release {volume_name}] state flip failed: {e}");
-            Err(IpcError::store(format!(
+            return Err(IpcError::store(format!(
                 "snapshot {snap_ulid} published but names/<name> update failed: {e}"
-            )))
+            )));
         }
+    };
+
+    // A released fork won't serve here again without a fresh claim + `start`
+    // (which re-ADDs at the persisted id), so del_dev the QUIESCED device now.
+    if let Some(id) = bound_id {
+        if let Some(pid) = prev_pid {
+            elide_coordinator::ublk_sweep::wait_for_pid_exit(pid).await;
+        }
+        elide_coordinator::ublk_sweep::teardown_bound_device(vol_dir, id).await;
     }
+
+    Ok(reply)
 }
 
 /// Decide whether `release` can short-circuit using a previously
