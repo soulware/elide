@@ -14,7 +14,7 @@
 //! document.
 //!
 //! ```toml
-//! version = 2
+//! version = 3
 //! event_ulid = "01HHHHHHHH0000000000000000"
 //! kind = "claimed"
 //! at = "2024-01-19T22:35:43.328Z"
@@ -135,6 +135,20 @@ pub enum EventKind {
         old_name: String,
         inherits_log_from: String,
     },
+    /// Rehomes a fork displaced from another name. A peer force-claimed
+    /// `source_name`; this coordinator re-homed its now-orphaned fork
+    /// under a fresh name rather than discard it. The event's `vol_ulid`
+    /// is the rehomed fork; `source_name` is the name it was displaced
+    /// from; `source_fork` is the fork now bound to `source_name`;
+    /// `displaced_by` is the coordinator that force-claimed it (`None`
+    /// if that record carried no owner identity). Emitted only on this
+    /// (new) name's log.
+    Displaced {
+        source_name: String,
+        source_fork: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced_by: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -150,6 +164,7 @@ impl EventKind {
             Self::ForkedFrom { .. } => "forked_from",
             Self::RenamedTo { .. } => "renamed_to",
             Self::RenamedFrom { .. } => "renamed_from",
+            Self::Displaced { .. } => "displaced",
         }
     }
 }
@@ -232,7 +247,7 @@ pub struct VolumeEvent {
 }
 
 impl VolumeEvent {
-    pub const CURRENT_VERSION: u32 = 2;
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// Construct a new unsigned event. `at` is derived from
     /// `event_ulid` so writers cannot desync the two fields.
@@ -331,6 +346,19 @@ impl VolumeEvent {
             } => {
                 push_field(&mut buf, "old_name", old_name);
                 push_field(&mut buf, "inherits_log_from", inherits_log_from);
+            }
+            EventKind::Displaced {
+                source_name,
+                source_fork,
+                displaced_by,
+            } => {
+                push_field(
+                    &mut buf,
+                    "displaced_by",
+                    displaced_by.as_deref().unwrap_or(""),
+                );
+                push_field(&mut buf, "source_name", source_name);
+                push_field(&mut buf, "source_fork", &source_fork.to_string());
             }
         }
         buf
@@ -469,6 +497,16 @@ mod tests {
             EventKind::RenamedFrom {
                 old_name: "stale".to_string(),
                 inherits_log_from: "stale".to_string(),
+            },
+            EventKind::Displaced {
+                source_name: "prod".to_string(),
+                source_fork: vol_ulid(),
+                displaced_by: Some("01NEWCOORDXXXXXXXXXXXXXXXX".to_string()),
+            },
+            EventKind::Displaced {
+                source_name: "prod".to_string(),
+                source_fork: vol_ulid(),
+                displaced_by: None,
             },
         ];
         for kind in kinds {

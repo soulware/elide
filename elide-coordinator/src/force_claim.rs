@@ -800,6 +800,17 @@ impl ForceClaimOrchestrator {
         std::fs::create_dir_all(&by_name_dir)
             .map_err(|e| IpcError::internal(format!("creating by_name dir: {e}")))?;
         if symlink_path.exists() || symlink_path.is_symlink() {
+            // Preserve the fork we're displacing: rehome it under
+            // <name>-displaced-<old_ulid> instead of orphaning it
+            // (docs/design/displaced-fork-rehome.md). Best-effort — a
+            // rehome failure must not fail the force-claim itself.
+            elide_coordinator::rehome::rehome_existing_local_fork(
+                self.ctx.core.identity.as_ref(),
+                self.ctx.core.stores.as_ref(),
+                &self.ctx.core.data_dir,
+                &self.volume,
+            )
+            .await;
             std::fs::remove_file(&symlink_path)
                 .map_err(|e| IpcError::internal(format!("removing stale by_name link: {e}")))?;
         }

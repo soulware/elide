@@ -74,6 +74,19 @@ pub trait NameClaims: NameClaimsReader {
         size: u64,
     ) -> Result<MarkInitialOutcome, LifecycleError>;
 
+    /// Create-time claim landing the record `Stopped`, not `Live`: the
+    /// rehome of a fork displaced from another name
+    /// (`docs/design/displaced-fork-rehome.md`). Same `If-None-Match`
+    /// idempotency as [`Self::mark_initial`].
+    async fn mark_rehomed(
+        &self,
+        name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        vol_ulid: Ulid,
+        size: u64,
+    ) -> Result<MarkInitialOutcome, LifecycleError>;
+
     /// Create-time claim of a fresh name at **import start**. Same
     /// conditional-create mechanics as [`Self::mark_initial`]; the
     /// record carries `state = Importing` and `size = 0` (unknown
@@ -242,6 +255,17 @@ impl NameClaims for BucketNameClaims {
         size: u64,
     ) -> Result<MarkInitialOutcome, LifecycleError> {
         crate::lifecycle::mark_initial(&self.writer, name, coord_id, hostname, vol_ulid, size).await
+    }
+
+    async fn mark_rehomed(
+        &self,
+        name: &str,
+        coord_id: &str,
+        hostname: Option<&str>,
+        vol_ulid: Ulid,
+        size: u64,
+    ) -> Result<MarkInitialOutcome, LifecycleError> {
+        crate::lifecycle::mark_rehomed(&self.writer, name, coord_id, hostname, vol_ulid, size).await
     }
 
     async fn mark_importing(

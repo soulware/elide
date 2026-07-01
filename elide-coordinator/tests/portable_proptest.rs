@@ -3,12 +3,19 @@
 // inbound ops compose — against a shared `InMemory` bucket plus two
 // `CoordinatorIdentity` instances.
 //
-// Op alphabet: { Create, Release, ForceClaim, ClaimReleased, ReclaimLocal }.
+// Op alphabet: { Create, Release, ForceClaim, ClaimReleased,
+// ReclaimLocal, Tick }.
 // `Stop` is omitted (it is a single state flip already exhaustively
 // covered by `lifecycle::tests`); `start --remote` is modelled as the
 // `ClaimReleased` op since its bucket-side effect is identical;
 // `start --claim` and `claim` against a locally-owned released fork are
 // both modelled by `ReclaimLocal`, differing only in `target_state`.
+// `Tick` is the per-running-volume ownership poll of
+// `docs/design/displaced-fork-rehome.md`: for each fork a coordinator
+// serves locally it re-reads `names/<name>` and, on a `vol_ulid`
+// mismatch (a peer force-claimed the name out from under it), rehomes
+// the displaced fork under `<name>-displaced-<forkUlid>` via
+// `rehome::rehome_displaced_fork`.
 //
 // The proptest enforces the invariants the design doc requires after
 // any sequence of ops:
@@ -26,6 +33,16 @@
 //      `handoff_snapshot` because the prior owner's published handoff
 //      remains the valid basis until the new owner writes and
 //      `mark_released` overwrites it).
+//   6. Preserve-never-orphan: every fork a coordinator rehomed on a
+//      tick has its `<name>-displaced-<forkUlid>` record present,
+//      `Stopped`, self-owned by that coordinator, and bound to the
+//      displaced fork's ULID.
+//   7. Single-writer: no two `Live` records anywhere in the bucket bind
+//      the same `vol_ulid` simultaneously.
+//   8. A ticked coordinator no longer serves any fork whose name it
+//      lost (its local `serving` flag is cleared).
+//   9. Rehome is idempotent: a re-tick resolves to the same
+//      `<name>-displaced-<forkUlid>` — no divergent duplicate.
 //
 // Cases run in a single tokio runtime per test case; ops are
 // interleaved sequentially. The interesting non-trivial races
@@ -35,22 +52,26 @@
 // consistent.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::lifecycle::{
-    self, MarkClaimedForceOutcome, MarkClaimedOutcome, MarkReclaimedLocalOutcome,
-    MarkReleasedOutcome, ObservedRecord,
+    self, MarkClaimedForceOutcome, MarkClaimedOutcome, MarkInitialOutcome,
+    MarkReclaimedLocalOutcome, MarkReleasedOutcome, ObservedRecord,
 };
 use elide_coordinator::name_store as ns;
+use elide_coordinator::rehome::rehome_displaced_fork;
+use elide_coordinator::stores::{PassthroughStores, ScopedStores};
 use elide_coordinator::volume_data::VolumeData;
 use elide_core::name_record::NameState;
 use elide_core::segment::SegmentSigner;
 use elide_core::signing::{
     build_snapshot_manifest_bytes, generate_ephemeral_signer, read_snapshot_manifest_from_bytes,
 };
+use futures::StreamExt;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutPayload};
 use proptest::prelude::*;
@@ -94,6 +115,15 @@ enum Op {
         coord: u8,
         as_live: bool,
     },
+    /// The per-running-volume ownership poll
+    /// (`docs/design/displaced-fork-rehome.md`). For each fork `coord`
+    /// serves locally, re-reads `names/<name>`; a `vol_ulid` mismatch
+    /// means a peer force-claimed the name, so the displaced fork is
+    /// rehomed via `rehome::rehome_displaced_fork` and `coord` stops
+    /// serving it.
+    Tick {
+        coord: u8,
+    },
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -105,17 +135,43 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::Release { name, coord }),
         (name.clone(), rec).prop_map(|(name, claimant)| Op::ForceClaim { name, claimant }),
         (name.clone(), coord.clone()).prop_map(|(name, coord)| Op::ClaimReleased { name, coord }),
-        (name, coord, any::<bool>()).prop_map(|(name, coord, as_live)| Op::ReclaimLocal {
+        (name, coord.clone(), any::<bool>()).prop_map(|(name, coord, as_live)| Op::ReclaimLocal {
             name,
             coord,
             as_live,
         }),
+        coord.prop_map(|coord| Op::Tick { coord }),
     ]
+}
+
+/// One coordinator's local per-fork state, standing in for the on-disk
+/// `by_id/<ulid>/` fork dir plus the `by_name/<name>` symlink and the
+/// ublk device. There is no real device in-process, so `serving` is the
+/// model's proxy for "the device is up": an acquisition sets it, and a
+/// tick that finds the fork displaced clears it (the fence the design
+/// doc pairs with the rehome).
+struct LocalFork {
+    ulid: Ulid,
+    name: u8,
+    serving: bool,
+    /// The `<name>-displaced-<ulid>` this fork resolved to once a tick
+    /// rehomed it. `None` until then.
+    rehomed_as: Option<String>,
+}
+
+/// A coordinator: its identity, a `ScopedStores` handle over the shared
+/// bucket, its own `data_dir` (so `by_name`/`by_id` never collide with
+/// a peer's), and the forks it holds locally.
+struct Coord {
+    identity: CoordinatorIdentity,
+    stores: Arc<dyn ScopedStores>,
+    data_dir: PathBuf,
+    forks: Vec<LocalFork>,
 }
 
 struct World {
     store: Arc<dyn ObjectStore>,
-    coords: Vec<CoordinatorIdentity>,
+    coords: Vec<Coord>,
     /// Per-fork volume signing key. Populated when the fork is created
     /// or claimed. `Release` consults this to sign its (synthetic)
     /// handoff snapshot.
@@ -138,11 +194,18 @@ impl World {
         let mut coords = Vec::with_capacity(NUM_COORDS);
         for _ in 0..NUM_COORDS {
             let d = TempDir::new().unwrap();
-            let id = CoordinatorIdentity::load_or_generate(d.path()).unwrap();
+            let identity = CoordinatorIdentity::load_or_generate(d.path()).unwrap();
             // Publish coordinator.pub so event-journal signature
             // verification can resolve each emitter's pubkey.
-            id.publish_pub(store.as_ref()).await.unwrap();
-            coords.push(id);
+            identity.publish_pub(store.as_ref()).await.unwrap();
+            let stores: Arc<dyn ScopedStores> =
+                Arc::new(PassthroughStores::new(Arc::clone(&store)));
+            coords.push(Coord {
+                identity,
+                stores,
+                data_dir: d.path().to_path_buf(),
+                forks: Vec::new(),
+            });
             dirs.push(d);
         }
         Self {
@@ -150,6 +213,41 @@ impl World {
             coords,
             vol_signers: HashMap::new(),
             _coord_dirs: dirs,
+        }
+    }
+
+    /// Materialize `coord`'s local layout for a freshly acquired fork:
+    /// `by_id/<fork>/` and `by_name/<name> -> ../by_id/<fork>`, then
+    /// record it as a served fork. Called on the acquiring side of
+    /// `Create`/`ForceClaim`/`ClaimReleased` when the bucket transition
+    /// landed. A `ForceClaim` does *not* touch the displaced peer's
+    /// layout — its stale fork stays served until its own tick.
+    fn acquire_local(&mut self, coord: usize, name: u8, fork: Ulid) {
+        let data_dir = self.coords[coord].data_dir.clone();
+        let fork_dir = data_dir.join("by_id").join(fork.to_string());
+        std::fs::create_dir_all(&fork_dir).unwrap();
+        let by_name = data_dir.join("by_name");
+        std::fs::create_dir_all(&by_name).unwrap();
+        let link = by_name.join(name_for(name));
+        if link.exists() || link.is_symlink() {
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::os::unix::fs::symlink(format!("../by_id/{fork}"), &link).unwrap();
+        self.coords[coord].forks.push(LocalFork {
+            ulid: fork,
+            name,
+            serving: true,
+            rehomed_as: None,
+        });
+    }
+
+    /// Clear the served flag for `coord`'s fork with `ulid`. Used by a
+    /// clean `Release`, which stops serving without rehoming.
+    fn stop_serving_fork(&mut self, coord: usize, ulid: Ulid) {
+        for fork in &mut self.coords[coord].forks {
+            if fork.ulid == ulid {
+                fork.serving = false;
+            }
         }
     }
 
@@ -193,8 +291,11 @@ impl World {
         match op {
             Op::Create { name, coord } => {
                 let vol_ulid = self.mint_fork().await;
-                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
-                let _ = lifecycle::mark_initial(
+                let coord_id = self.coords[*coord as usize]
+                    .identity
+                    .coordinator_id_str()
+                    .to_owned();
+                let outcome = lifecycle::mark_initial(
                     &self.store,
                     name_for(*name),
                     &coord_id,
@@ -203,10 +304,16 @@ impl World {
                     4 * 1024 * 1024 * 1024,
                 )
                 .await;
+                if matches!(outcome, Ok(MarkInitialOutcome::Claimed)) {
+                    self.acquire_local(*coord as usize, *name, vol_ulid);
+                }
             }
 
             Op::Release { name, coord } => {
-                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
+                let coord_id = self.coords[*coord as usize]
+                    .identity
+                    .coordinator_id_str()
+                    .to_owned();
                 // Need the current vol_ulid to sign the snapshot.
                 let vol_ulid = match ns::read_name_record(&self.store, name_for(*name)).await {
                     Ok(Some((rec, _))) => rec.vol_ulid,
@@ -218,8 +325,15 @@ impl World {
                 // Tolerate every error class: wrong-state /
                 // ownership-conflict / absent are valid outcomes given
                 // the random op stream.
-                let _: Result<MarkReleasedOutcome, _> =
+                let outcome: Result<MarkReleasedOutcome, _> =
                     lifecycle::mark_released(&self.store, name_for(*name), &coord_id, snap).await;
+                // A clean release stops serving without displacement — the
+                // fork's `vol_ulid` is unchanged, so it is not rehomed. Drop
+                // the served flag so a later peer claim over this name does
+                // not read as a displacement of this coordinator.
+                if matches!(outcome, Ok(MarkReleasedOutcome::Updated { .. })) {
+                    self.stop_serving_fork(*coord as usize, vol_ulid);
+                }
             }
 
             Op::ForceClaim { name, claimant } => {
@@ -237,6 +351,7 @@ impl World {
                     _ => return,
                 };
                 let coord_id = self.coords[*claimant as usize]
+                    .identity
                     .coordinator_id_str()
                     .to_owned();
                 let parent_pin = observed
@@ -244,7 +359,7 @@ impl World {
                     .latest_snapshot
                     .map(|snap| format!("{}/{snap}", observed.record.vol_ulid));
                 let new_vol = self.mint_fork().await;
-                let _: Result<MarkClaimedForceOutcome, _> = lifecycle::mark_claimed_force(
+                let outcome: Result<MarkClaimedForceOutcome, _> = lifecycle::mark_claimed_force(
                     &self.store,
                     name_for(*name),
                     &coord_id,
@@ -254,12 +369,21 @@ impl World {
                     &observed,
                 )
                 .await;
+                // The claimant gets local state for its new fork; the
+                // displaced owner's local fork is deliberately left in
+                // place — a stale binding for its own tick to rehome.
+                if matches!(outcome, Ok(MarkClaimedForceOutcome::Claimed { .. })) {
+                    self.acquire_local(*claimant as usize, *name, new_vol);
+                }
             }
 
             Op::ClaimReleased { name, coord } => {
-                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
+                let coord_id = self.coords[*coord as usize]
+                    .identity
+                    .coordinator_id_str()
+                    .to_owned();
                 let new_vol = self.mint_fork().await;
-                let _: Result<MarkClaimedOutcome, _> = lifecycle::mark_claimed(
+                let outcome: Result<MarkClaimedOutcome, _> = lifecycle::mark_claimed(
                     &self.store,
                     name_for(*name),
                     &coord_id,
@@ -268,6 +392,9 @@ impl World {
                     NameState::Live,
                 )
                 .await;
+                if matches!(outcome, Ok(MarkClaimedOutcome::Claimed)) {
+                    self.acquire_local(*coord as usize, *name, new_vol);
+                }
             }
 
             Op::ReclaimLocal {
@@ -275,7 +402,10 @@ impl World {
                 coord,
                 as_live,
             } => {
-                let coord_id = self.coords[*coord as usize].coordinator_id_str().to_owned();
+                let coord_id = self.coords[*coord as usize]
+                    .identity
+                    .coordinator_id_str()
+                    .to_owned();
                 // Model the "we own the local fork" case: pass the
                 // record's own vol_ulid. ForkMismatch is also a real
                 // production outcome but it has no bucket-side effect
@@ -299,6 +429,65 @@ impl World {
                     target_state,
                 )
                 .await;
+            }
+
+            Op::Tick { coord } => {
+                let ci = *coord as usize;
+                // Snapshot the forks to poll up front — the rehome below
+                // borrows `self.coords[ci]` and then mutates the fork's
+                // flags, so we cannot hold an iterator over `forks`.
+                let candidates: Vec<(usize, Ulid, u8)> = self.coords[ci]
+                    .forks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.serving)
+                    .map(|(i, f)| (i, f.ulid, f.name))
+                    .collect();
+                for (fi, fork_ulid, name_idx) in candidates {
+                    let name = name_for(name_idx);
+                    let bound = match ns::read_name_record(&self.store, name).await {
+                        Ok(Some((rec, _))) => rec.vol_ulid,
+                        _ => continue,
+                    };
+                    if bound == fork_ulid {
+                        // Still ours — no displacement.
+                        continue;
+                    }
+                    let data_dir = self.coords[ci].data_dir.clone();
+                    let fork_dir = data_dir.join("by_id").join(fork_ulid.to_string());
+                    let new_name = rehome_displaced_fork(
+                        &self.coords[ci].identity,
+                        self.coords[ci].stores.as_ref(),
+                        &data_dir,
+                        &fork_dir,
+                        name,
+                        fork_ulid,
+                    )
+                    .await
+                    .expect("rehome of a displaced fork must succeed");
+                    // Re-run the primitive against the same fork — the
+                    // crash-retry / cold-restart re-observation the design
+                    // doc calls out. The ULID-suffixed name makes the
+                    // `If-None-Match` create idempotent: same name, no
+                    // divergent duplicate.
+                    let rerun = rehome_displaced_fork(
+                        &self.coords[ci].identity,
+                        self.coords[ci].stores.as_ref(),
+                        &data_dir,
+                        &fork_dir,
+                        name,
+                        fork_ulid,
+                    )
+                    .await
+                    .expect("idempotent rehome re-run must succeed");
+                    assert_eq!(
+                        rerun, new_name,
+                        "rehome re-run must resolve to the same name"
+                    );
+                    let fork = &mut self.coords[ci].forks[fi];
+                    fork.serving = false;
+                    fork.rehomed_as = Some(new_name);
+                }
             }
         }
     }
@@ -345,7 +534,7 @@ impl World {
         let coord_ids: Vec<String> = self
             .coords
             .iter()
-            .map(|c| c.coordinator_id_str().to_owned())
+            .map(|c| c.identity.coordinator_id_str().to_owned())
             .collect();
 
         for &name in &["vol-a", "vol-b", "vol-c"] {
@@ -406,6 +595,88 @@ impl World {
                 self.verify_handoff_manifest(rec.vol_ulid, snap, name).await;
             }
         }
+
+        self.check_rehome_invariants().await;
+    }
+
+    /// Invariants 6–9 of `docs/design/displaced-fork-rehome.md`, all of
+    /// which concern the previous-owner disposition after a displacement.
+    async fn check_rehome_invariants(&self) {
+        for coord in &self.coords {
+            let coord_id = coord.identity.coordinator_id_str();
+            for fork in &coord.forks {
+                let Some(rehomed) = &fork.rehomed_as else {
+                    continue;
+                };
+
+                // Invariant 6: the rehomed name is present, Stopped,
+                // self-owned, and bound to the displaced fork's ULID.
+                // Invariant 9: the name is exactly
+                // `<name>-displaced-<forkUlid>` — the deterministic,
+                // ULID-suffixed name a re-tick recomputes and the
+                // `If-None-Match` create resolves to idempotently, so a
+                // repeated observation never mints a divergent duplicate.
+                let expected = format!("{}-displaced-{}", name_for(fork.name), fork.ulid);
+                assert_eq!(
+                    rehomed, &expected,
+                    "rehomed name must be the fork's deterministic displaced name"
+                );
+                let rec = ns::read_name_record(&self.store, rehomed)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("rehomed name '{rehomed}' record must exist"))
+                    .0;
+                assert_eq!(
+                    rec.state,
+                    NameState::Stopped,
+                    "rehomed name '{rehomed}' must be Stopped"
+                );
+                assert_eq!(
+                    rec.coordinator_id.as_deref(),
+                    Some(coord_id),
+                    "rehomed name '{rehomed}' must be self-owned by the rehoming coordinator"
+                );
+                assert_eq!(
+                    rec.vol_ulid, fork.ulid,
+                    "rehomed name '{rehomed}' must bind the displaced fork's ULID"
+                );
+
+                // Invariant 8: a rehomed fork is no longer served.
+                assert!(
+                    !fork.serving,
+                    "coordinator '{coord_id}' still serves rehomed fork {}",
+                    fork.ulid
+                );
+            }
+        }
+
+        // Invariant 7: no two `Live` records anywhere in the bucket bind
+        // the same `vol_ulid` simultaneously.
+        let names_prefix = StorePath::from("names");
+        let metas = self
+            .store
+            .list(Some(&names_prefix))
+            .collect::<Vec<_>>()
+            .await;
+        let mut live_forks: HashMap<Ulid, String> = HashMap::new();
+        for meta in metas {
+            let Some(name) = meta.unwrap().location.filename().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(Some((rec, _))) = ns::read_name_record(&self.store, &name).await else {
+                continue;
+            };
+            if rec.state != NameState::Live {
+                continue;
+            }
+            if let Some(other) = live_forks.insert(rec.vol_ulid, name.clone()) {
+                panic!(
+                    "single-writer violated: Live names '{name}' and '{other}' both bind \
+                     vol_ulid {}",
+                    rec.vol_ulid
+                );
+            }
+        }
     }
 }
 
@@ -416,10 +687,10 @@ proptest! {
     })]
 
     /// After any sequence of {Create, Release, ForceClaim,
-    /// ClaimReleased, ReclaimLocal} ops on a shared bucket between two coordinators,
-    /// the bucket state remains internally consistent. Each individual
-    /// op tolerates wrong-state errors silently — the proptest is
-    /// asserting the *invariants*, not the success of any op.
+    /// ClaimReleased, ReclaimLocal, Tick} ops on a shared bucket between
+    /// two coordinators, the bucket state remains internally consistent.
+    /// Each individual op tolerates wrong-state errors silently — the
+    /// proptest is asserting the *invariants*, not the success of any op.
     #[test]
     fn portable_lifecycle_invariants_hold(
         ops in prop::collection::vec(arb_op(), 1..16)
