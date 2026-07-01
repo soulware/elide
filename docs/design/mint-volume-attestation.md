@@ -607,16 +607,18 @@ leaving the steady-state `parent = <dead's parent>` shape: the dead
 volume is correctly *not* part of the new fork's final content lineage —
 after re-own its segments are the fork's own.
 
-The field is empty on every non-recovery provenance — its emptiness is
-the "recovery complete" signal, and a `cat` of an in-flight fork's
-provenance shows exactly what it is re-owning. coord B is untouched:
+Only a transient `Recovering` lineage carries the grant — `Root`/`Fork`
+structurally cannot — so its absence is the "recovery complete" signal,
+and a `cat` of an in-flight fork's provenance shows exactly what it is
+re-owning. coord B is untouched:
 `recovery_sources` is the same volume-signed self-declaration that
 already scopes every read (§ *The read set is exactly fork ∪
 extent_index*) — a leaked `volume-ro` cred cannot widen it, because the
 grant is written under the coordinator's write authority, not the read
 credential. It expresses a transient read, not content derivation or
-ownership, which is why it is a distinct field cleared at finalize rather
-than a `ParentRef`, and why it carries no snapshot. Pinned by
+ownership, which is why it lives on a distinct, transient `Recovering`
+lineage variant — collapsed to `Root`/`Fork` at finalize — rather than a
+field every shape carries, and why it pins no snapshot. Pinned by
 `elide-attestation`'s `forced_claim_recovery_source_vouches_the_dead_fork`
 (the walk authorises the read) and `force_claim`'s
 `never_snapshotted_root_reowns_everything` (finalize clears the grant).

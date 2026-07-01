@@ -96,7 +96,7 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
         &own_pubkey,
         crate::signing::VOLUME_PROVENANCE_FILE,
     )?;
-    let Some(mut current_parent) = own_lineage.parent else {
+    let Some(mut current_parent) = own_lineage.parent().cloned() else {
         return Ok(());
     };
 
@@ -143,7 +143,7 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
             &parent_verifying,
             crate::signing::VOLUME_PROVENANCE_FILE,
         )?;
-        let Some(next) = parent_lineage.parent else {
+        let Some(next) = parent_lineage.parent().cloned() else {
             return Ok(());
         };
         current_parent = next;
@@ -154,7 +154,7 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
 /// Public so that `ls.rs` and other read-only tools can build the rebuild chain.
 pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<AncestorLayer>> {
     let lineage = load_lineage_or_empty(fork_dir)?;
-    let Some(parent) = lineage.parent else {
+    let Some(parent) = lineage.parent() else {
         return Ok(Vec::new());
     };
     let parent_fork_dir = resolve_ancestor_dir(by_id_dir, &parent.volume_ulid);
@@ -163,7 +163,7 @@ pub fn walk_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ances
     let mut ancestors = walk_ancestors(&parent_fork_dir, by_id_dir)?;
     ancestors.push(AncestorLayer {
         dir: parent_fork_dir,
-        branch_ulid: Some(parent.snapshot_ulid),
+        branch_ulid: Some(parent.snapshot_ulid.clone()),
     });
     Ok(ancestors)
 }
@@ -200,7 +200,7 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
     let mut cursor: Option<PathBuf> = Some(fork_dir.to_owned());
     while let Some(dir) = cursor {
         let lineage = load_lineage_or_empty(&dir)?;
-        for entry in &lineage.extent_index {
+        for entry in lineage.extent_index() {
             let (source, snapshot) = parse_lineage_pair(entry)?;
             let snapshot_ulid = snapshot.to_string();
             let source_dir = resolve_ancestor_dir(by_id_dir, &source.to_string());
@@ -223,7 +223,7 @@ pub fn walk_extent_ancestors(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Ve
             }
         }
         cursor = lineage
-            .parent
+            .parent()
             .map(|p| resolve_ancestor_dir(by_id_dir, &p.volume_ulid));
     }
     Ok(layers)
@@ -258,7 +258,8 @@ pub fn lineage_ulids(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ulid>>
     for layer in walk_extent_ancestors(fork_dir, by_id_dir)? {
         push(&layer.dir, &mut out, &mut seen);
     }
-    for source in load_lineage_or_empty(fork_dir)?.recovery_sources {
+    let own = load_lineage_or_empty(fork_dir)?;
+    for &source in own.recovery_sources() {
         if seen.insert(source) {
             out.push(source);
         }

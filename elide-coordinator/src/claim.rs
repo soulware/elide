@@ -1072,7 +1072,7 @@ pub(crate) async fn skip_empty_intermediates_impl(
             fetch_handoff_manifest(&store, effective_vol, effective_snap, &fork_pubkey, peer)
                 .await?;
 
-        let Some(parent) = lineage.parent else {
+        let Some(parent) = lineage.parent().cloned() else {
             // Root volume. The function's contract is "deepest non-empty
             // ancestor", so a root with zero segments is a contract
             // violation — pinning a new fork here would yield a volume
@@ -1503,7 +1503,7 @@ mod tests {
         )
         .unwrap();
         let parent = lineage
-            .parent
+            .parent()
             .expect("provisional provenance must carry a ParentRef, not be root-shape");
         assert_eq!(parent.volume_ulid, vol_x.to_string());
         assert_eq!(parent.snapshot_ulid, snap_x.to_string());
@@ -1787,7 +1787,7 @@ mod tests {
             VOLUME_PROVENANCE_FILE,
         )
         .unwrap();
-        let parent = lineage.parent.expect("provisional parent ref");
+        let parent = lineage.parent().expect("provisional parent ref");
         assert_eq!(parent.volume_ulid, released.to_string());
         assert_eq!(parent.snapshot_ulid, handoff.to_string());
         assert_eq!(parent.pubkey, released_key.verifying_key().to_bytes());

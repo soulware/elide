@@ -823,7 +823,7 @@ fn read_oci_source(dir: &Path) -> Option<OciSource> {
         signing::VOLUME_PROVENANCE_FILE,
     )
     .ok()?;
-    lineage.oci_source
+    lineage.oci_source().cloned()
 }
 
 fn fmt_size(bytes: u64) -> String {

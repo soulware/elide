@@ -731,10 +731,7 @@ mod tests {
     ) {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("volume.pub"), pub_hex(key)).unwrap();
-        let lineage = ProvenanceLineage {
-            parent,
-            ..ProvenanceLineage::root()
-        };
+        let lineage = ProvenanceLineage::from_parts(parent, Vec::new(), Vec::new());
         write_provenance(tmp.path(), key, "volume.provenance", &lineage).unwrap();
         let pub_bytes = std::fs::read(tmp.path().join("volume.pub")).unwrap();
         let prov_bytes = std::fs::read(tmp.path().join("volume.provenance")).unwrap();

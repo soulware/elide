@@ -61,7 +61,7 @@ pub async fn walk_ancestry(
 
     loop {
         let lineage = load_provenance(store, &current_ulid, &current_vk).await?;
-        let Some(parent) = lineage.parent else {
+        let Some(parent) = lineage.parent() else {
             break;
         };
 
@@ -213,10 +213,7 @@ mod tests {
         // the writer.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(VOLUME_PUB_FILE), pub_hex(key)).unwrap();
-        let lineage = ProvenanceLineage {
-            parent,
-            ..ProvenanceLineage::root()
-        };
+        let lineage = ProvenanceLineage::from_parts(parent, Vec::new(), Vec::new());
         write_provenance(tmp.path(), key, VOLUME_PROVENANCE_FILE, &lineage).unwrap();
 
         let pub_bytes = std::fs::read(tmp.path().join(VOLUME_PUB_FILE)).unwrap();

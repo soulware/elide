@@ -239,7 +239,7 @@ async fn install_basis_under_parent(
         elide_core::signing::VOLUME_PROVENANCE_FILE,
     )
     .map_err(|e| IpcError::internal(format!("verifying leaf provenance: {e}")))?;
-    let parent = lineage.parent.ok_or_else(|| {
+    let parent = lineage.parent().ok_or_else(|| {
         IpcError::not_found(format!(
             "volume '{volume_name}' has no published snapshot in the store; \
              cannot hydrate without a basis manifest"

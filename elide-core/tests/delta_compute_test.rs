@@ -130,10 +130,11 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
     }
     let child_hash = blake3::hash(&child_bytes);
 
-    let child_lineage = ProvenanceLineage {
-        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
-        ..ProvenanceLineage::root()
-    };
+    let child_lineage = ProvenanceLineage::from_parts(
+        None,
+        vec![format!("{source_ulid}/{source_seg_ulid}")],
+        Vec::new(),
+    );
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
         &child_dir,
@@ -255,10 +256,11 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
     }
     let child_hash = blake3::hash(&child_bytes);
 
-    let child_lineage = ProvenanceLineage {
-        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
-        ..ProvenanceLineage::root()
-    };
+    let child_lineage = ProvenanceLineage::from_parts(
+        None,
+        vec![format!("{source_ulid}/{source_seg_ulid}")],
+        Vec::new(),
+    );
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
         &child_dir,
@@ -356,10 +358,11 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     }
     let child_hash = blake3::hash(&child_bytes);
 
-    let child_lineage = ProvenanceLineage {
-        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
-        ..ProvenanceLineage::root()
-    };
+    let child_lineage = ProvenanceLineage::from_parts(
+        None,
+        vec![format!("{source_ulid}/{source_seg_ulid}")],
+        Vec::new(),
+    );
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
         &child_dir,
@@ -447,10 +450,11 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     }
     let child_hash = blake3::hash(&child_bytes);
 
-    let child_lineage = ProvenanceLineage {
-        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
-        ..ProvenanceLineage::root()
-    };
+    let child_lineage = ProvenanceLineage::from_parts(
+        None,
+        vec![format!("{source_ulid}/{source_seg_ulid}")],
+        Vec::new(),
+    );
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid = write_single_entry_segment(
         &child_dir,
@@ -511,10 +515,11 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
         bytes.len() as u64,
     );
 
-    let child_lineage = ProvenanceLineage {
-        extent_index: vec![format!("{source_ulid}/{source_seg_ulid}")],
-        ..ProvenanceLineage::root()
-    };
+    let child_lineage = ProvenanceLineage::from_parts(
+        None,
+        vec![format!("{source_ulid}/{source_seg_ulid}")],
+        Vec::new(),
+    );
     let (_child_ulid, child_dir, child_signer) = make_readonly_volume(&by_id_dir, &child_lineage);
     let child_seg_ulid =
         write_single_entry_segment(&child_dir, child_signer.as_ref(), hash, 0, 1, bytes.clone());
