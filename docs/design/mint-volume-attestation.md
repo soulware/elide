@@ -1022,7 +1022,7 @@ much coordinator they bring up and which read role backs the predicate:
 
    ```
    elide-attestation serve \
-     --listen 0.0.0.0:8087 \                      # or unix:<path>
+     --listen [::]:8087 \                         # or unix:<path>
      --mint-url https://mint.example \
      --identity-dir /var/lib/elide-attestation \
      --bucket elide --endpoint https://t3.storage.dev --region auto

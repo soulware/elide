@@ -23,7 +23,7 @@ fly volumes create elide_data --size 1 -a <app>
 ./deploy.sh                        # resolves the latest elide release tag
 ```
 
-The app is private (no public service); it binds `0.0.0.0:8087`, reachable
+The app is private (no public service); it binds `[::]:8087`, reachable
 over 6PN at `<app>.internal:8087`.
 
 ## Enrol (once, over `fly ssh`)

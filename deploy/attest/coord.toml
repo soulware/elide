@@ -21,9 +21,9 @@ region = "auto"
 url = "http://mint-for-elide.internal:8085"
 
 [attestation]
-# The discharge-authority listener. TCP on 6PN so a separate coord A can dial
-# it at http://<this-app>.internal:8087.
-listen = "0.0.0.0:8087"
+# The discharge-authority listener. Fly 6PN is IPv6-only, so bind `[::]` (all
+# interfaces) for a separate coord A to dial it at http://<this-app>.internal:8087.
+listen = "[::]:8087"
 # K_M-B, standard base64 of 32 bytes — identical to the value mint is deployed
 # with.
 k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="

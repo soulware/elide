@@ -37,6 +37,6 @@ primary_region = "iad"
   memory = "512mb"
 
 # No [http_service] and no tcp [checks]: the app is private. The discharge
-# route binds 0.0.0.0:8087 ([attestation].listen in coord.toml) and is reached
+# route binds [::]:8087 ([attestation].listen in coord.toml) and is reached
 # over 6PN at <app>.internal:8087 — coord A points its
 # [mint].attestation_transport there.
