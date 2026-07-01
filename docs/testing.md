@@ -27,6 +27,7 @@ elide-core/tests/
 elide-coordinator/tests/
   gc_proptest.rs          proptest: coordinator GC oracle (segment cleanup + data)
   gc_test.rs              deterministic: coordinator GC regression reproductions
+  portable_proptest.rs    proptest: two-coordinator names/<name> race + displaced-fork rehome
 
 elide-coordinator/src/ (in-module #[cfg(test)], white-box seams)
   volume_event_store.rs   proptest: event-log windowed-HEAD spine
@@ -203,6 +204,14 @@ Key additions over the volume-level proptest:
 `elide-coordinator/tests/gc_proptest.rs` calls the **real** `gc_fork()` + `apply_gc_handoffs()` + `apply_done_handoffs()` path. This closes the structural gap where `elide-core`'s simulation helper could be correct while production coordinator code had a bug (exactly what happened with the DEDUP_REF → DATA conversion bug).
 
 `GcSweep` flushes the WAL first (matching `gc_checkpoint()` in production), runs the full coordinator round-trip, then asserts every oracle LBA reads back its last-written value. A `Restart` SimOp exercises `GcSweep → Restart → GcSweep` sequences for the restart-safety path.
+
+## Coordinator ownership + displaced-fork rehome proptest
+
+`elide-coordinator/tests/portable_proptest.rs` races **two coordinators** over a shared `names/<name>` registry on one in-memory bucket, each with its own identity and `data_dir`. Ops (`Create`, `Release`, `ForceClaim`, `ClaimReleased`, `ReclaimLocal`, `Tick`) drive the real lifecycle CAS path (`mark_claimed_force`, `mark_claimed`, …); the model materializes each coordinator's local fork layout (`by_id/<ulid>` + `by_name` symlink) so a `ForceClaim` leaves the displaced coordinator holding a stale local binding.
+
+`Op::Tick` is the ownership poll: for each fork a coordinator still serves it re-reads `names/<name>`, and on a `vol_ulid` mismatch calls the real `rehome::rehome_displaced_fork` (see `docs/design/displaced-fork-rehome.md`), then re-invokes it asserting the same result — the `If-None-Match` idempotent crash-retry. Invariants checked against the real bucket after every op: a rehomed fork's `<name>-displaced-<ulid>` record is `Stopped`, self-owned, and binds the old ULID (preserve-never-orphan); no two `Live` records share a `vol_ulid` (single-writer-per-name); a displaced coordinator stops serving the lost fork; and re-observation resolves to the same deterministic name (idempotent rehome).
+
+`elide-core`'s `volume_proptest.rs` cannot model this — the `Volume` layer has no concept of a coordinator, a name, or a bucket record — so displacement/rehome lives here, beside the two-coordinator ownership race.
 
 ## Concurrent integration test
 
