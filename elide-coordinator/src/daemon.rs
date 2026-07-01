@@ -781,12 +781,13 @@ async fn poll_until_exit_or_deadline(pids: &[u32], timeout: Duration) -> Vec<u32
 ///
 /// Skips:
 ///   - entries whose name is not a valid ULID
-///   - volumes with no `pending/` or `index/` subdirectory (not yet initialised)
+///   - dirs with no `pending/`, `index/`, or `volume.key` (not a volume)
 ///   - readonly volumes that are fully indexed: `index/` is non-empty
 ///     (prefetch completed)
 ///
 /// Readonly volumes with no `index/` (or an empty one) are included for
-/// prefetch. Writable volumes with `pending/` are included for drain.
+/// prefetch. Writable volumes are included for drain and supervision —
+/// including an empty owned fork whose only marker is `volume.key`.
 fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
     let mut volumes = Vec::new();
     let root = data_dir.join("by_id");
@@ -814,7 +815,11 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
         }
         let has_pending = path.join("pending").exists();
         let has_index = path.join("index").exists();
-        if !has_pending && !has_index {
+        // A writable owned fork is identified by `volume.key`. A
+        // genuinely empty one has no `pending/`/`index/` yet but must
+        // still be supervised.
+        let has_key = path.join(elide_core::signing::VOLUME_KEY_FILE).exists();
+        if !has_pending && !has_index && !has_key {
             continue;
         }
         // Skip readonly volumes that are already fully indexed locally —
@@ -994,6 +999,38 @@ mod tests {
                 format!("by_id/{ulid7}"),
             ]
         );
+    }
+
+    #[test]
+    fn discover_volumes_includes_empty_owned_fork() {
+        // A never-written writable fork has neither `pending/` nor
+        // `index/`, only `volume.key`. It is a real volume the
+        // coordinator must supervise, so discovery must not drop it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let owned = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{owned}"));
+        std::fs::write(
+            root.join(format!(
+                "by_id/{owned}/{}",
+                elide_core::signing::VOLUME_KEY_FILE
+            )),
+            "",
+        )
+        .unwrap();
+
+        // A bare dir with no key and no working dirs is not a volume.
+        let bare = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        mk(root, &format!("by_id/{bare}"));
+
+        let volumes = discover_volumes(root);
+        let names: Vec<String> = volumes
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names, vec![format!("by_id/{owned}")]);
     }
 
     #[test]
