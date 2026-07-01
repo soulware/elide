@@ -107,6 +107,15 @@ impl VolumeConfig {
         ublk.dev_id = None;
         cfg.write(dir)
     }
+
+    /// Persist `name` into `volume.toml`, preserving unrelated config
+    /// (size, ublk, lazy). Read-modify-write. Idempotent: rewriting the
+    /// same name leaves the file content unchanged.
+    pub fn set_name(dir: &Path, name: &str) -> io::Result<()> {
+        let mut cfg = Self::read(dir)?;
+        cfg.name = Some(name.to_owned());
+        cfg.write(dir)
+    }
 }
 
 /// Details of a ublk dev-id conflict.
