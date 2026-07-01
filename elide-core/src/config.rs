@@ -116,6 +116,19 @@ impl VolumeConfig {
         cfg.name = Some(name.to_owned());
         cfg.write(dir)
     }
+
+    /// Remove the `[ublk]` transport section from `volume.toml`. After this
+    /// the volume carries no configured transport.
+    ///
+    /// No-op (no write) when there is no `[ublk]` section.
+    pub fn clear_ublk_transport(dir: &Path) -> io::Result<()> {
+        let mut cfg = Self::read(dir)?;
+        if cfg.ublk.is_none() {
+            return Ok(());
+        }
+        cfg.ublk = None;
+        cfg.write(dir)
+    }
 }
 
 /// Details of a ublk dev-id conflict.
@@ -264,6 +277,31 @@ mod tests {
         // Empty file: no [ublk] section means there's nothing to clear.
         write_config(tmp.path(), "name = \"alpha\"\n");
         VolumeConfig::clear_bound_ublk_id(tmp.path()).unwrap();
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.ublk.is_none());
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn clear_ublk_transport_drops_section_preserving_other_fields() {
+        let tmp = TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            "name = \"alpha\"\nsize = 1024\n[ublk]\ndev_id = 5\n",
+        );
+        VolumeConfig::clear_ublk_transport(tmp.path()).unwrap();
+
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.ublk.is_none(), "the whole [ublk] section must be gone");
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert_eq!(cfg.size, Some(1024));
+    }
+
+    #[test]
+    fn clear_ublk_transport_is_noop_without_section() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "name = \"alpha\"\n");
+        VolumeConfig::clear_ublk_transport(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         assert!(cfg.ublk.is_none());
         assert_eq!(cfg.name.as_deref(), Some("alpha"));

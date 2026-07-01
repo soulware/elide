@@ -70,6 +70,11 @@ fail over, instead of writing into a WAL that can never drain. This is A's
 the guest*; it stays non-load-bearing for B's safety, which the credential
 fence already covers.
 
+The stop is a teardown, not a park: A `del_dev`s V1's kernel device and
+removes the `[ublk]` transport from its config. The rehomed fork therefore
+starts transport-less until an explicit `volume update --ublk` re-exposes it
+over a freshly-allocated device.
+
 ### Rehome
 
 A no longer owns `names/<name>`, so it cannot rename it. Instead A rehomes its
@@ -151,8 +156,9 @@ Rehome is a *local* lifecycle disposition; it does not touch bucket storage.
 A rehomed fork's choices are the same as any volume's:
 
 - **Preserve (default): rehome.** The diverged fork becomes
-  `<name>-displaced-<V1>`, a first-class `stopped` volume — visible,
-  startable, no different from any other stopped volume.
+  `<name>-displaced-<V1>`, a first-class `stopped` volume — visible and
+  startable like any stopped volume, though it carries no ublk transport
+  until `volume update --ublk` re-enables it.
 - **Remove locally: `volume remove`.** A rehomed fork *is* a normal volume, so
   it is removed from the host by the ordinary local-removal path, identical to
   any other volume — there is no displaced-special verb.
