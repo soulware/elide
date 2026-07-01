@@ -1688,7 +1688,7 @@ struct VolumeRow {
     ulid: String,
     mode: VolumeMode,
     state: CliVolumeState,
-    transport: String,
+    device: String,
     pid: String,
 }
 
@@ -1793,24 +1793,24 @@ fn list_volumes(
         .max()
         .unwrap_or(5)
         .max(5);
-    let transport_w = rows
+    let device_w = rows
         .iter()
-        .map(|r| r.transport.len())
+        .map(|r| r.device.len())
         .max()
-        .unwrap_or(9)
-        .max(9);
+        .unwrap_or(6)
+        .max(6);
     println!(
-        "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<transport_w$}  PID",
-        "NAME", "ULID", "MODE", "STATE", "TRANSPORT"
+        "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  PID",
+        "NAME", "ULID", "MODE", "STATE", "DEVICE"
     );
     for r in &rows {
         println!(
-            "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<transport_w$}  {}",
+            "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  {}",
             r.name,
             r.ulid,
             r.mode.label(),
             r.state.label(),
-            r.transport,
+            r.device,
             r.pid
         );
     }
@@ -1824,7 +1824,7 @@ fn list_volumes(
     Ok(())
 }
 
-/// Gather per-volume display state: lifecycle, transport summary, and pid.
+/// Gather per-volume display state: lifecycle, ublk device, and pid.
 ///
 /// State labels mirror the coordinator's IPC `volume_status`
 /// (`elide-coordinator/src/inbound.rs`):
@@ -1841,7 +1841,7 @@ fn list_volumes(
 /// operators know auto-supervision is paused, but the visible state of each
 /// volume (live pid, manual-stop, importing) is a fact about disk regardless.
 fn volume_row(name: String, vol_dir: &Path, is_readonly: bool) -> VolumeRow {
-    let transport = transport_summary(vol_dir);
+    let device = device_summary(vol_dir);
     let ulid = vol_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -1873,24 +1873,23 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool) -> VolumeRow {
         ulid,
         mode,
         state,
-        transport,
+        device,
         pid,
     }
 }
 
-/// Summarise the configured block-device transport for display:
-/// `ublk <device>`, or `-` if no transport is configured.
-/// For ublk, the bound id (written back to `volume.toml` on a successful
-/// ADD) is shown; `auto` indicates a `[ublk]` section with no id yet.
-fn transport_summary(vol_dir: &Path) -> String {
+/// Summarise the volume's ublk block device for display: the bound
+/// `/dev/ublkb<id>` (written back to `volume.toml` on a successful ADD),
+/// `auto` for a `[ublk]` section with no id yet, or `-` when ublk is off.
+fn device_summary(vol_dir: &Path) -> String {
     let cfg = match elide_core::config::VolumeConfig::read(vol_dir) {
         Ok(c) => c,
         Err(_) => return "-".to_owned(),
     };
     if let Some(ublk) = cfg.ublk.as_ref() {
         return match ublk.dev_id {
-            Some(id) => format!("ublk /dev/ublkb{id}"),
-            None => "ublk auto".to_owned(),
+            Some(id) => format!("/dev/ublkb{id}"),
+            None => "auto".to_owned(),
         };
     }
     "-".to_owned()
