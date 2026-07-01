@@ -2254,10 +2254,11 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
                 format!(" handoff={handoff_snapshot}")
             }
             EventKind::ForceClaimed {
+                source_vol_ulid,
                 displaced_coordinator_id,
             } => match displaced_coordinator_id {
-                Some(d) => format!(" displaced={d}"),
-                None => String::new(),
+                Some(d) => format!(" source={source_vol_ulid} displaced={d}"),
+                None => format!(" source={source_vol_ulid}"),
             },
             EventKind::ForkedFrom {
                 source_name,
