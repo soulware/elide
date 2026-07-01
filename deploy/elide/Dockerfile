@@ -11,6 +11,9 @@
 #                  into coord.toml [store].bucket.
 #   MINT_APP       the mint Fly app this coordinator enrols against; baked into
 #                  coord.toml [mint].url.
+#   ATTEST_APP     the dedicated attestation authority (deploy/attest) this
+#                  coordinator fetches discharges from; baked into coord.toml
+#                  [mint].attestation_transport.
 
 FROM ubuntu:24.04
 # kmod for `modprobe ublk_drv`; ca-certificates for HTTPS to Tigris.
@@ -35,13 +38,15 @@ ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_VERSION}/elide-import-${ELIDE_TARGET}    
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY coord.toml /app/coord.toml
 
-# Bake the per-deployment bucket + mint app into coord.toml (deploy/mint's
-# Dockerfile seds its bucket the same way).
+# Bake the per-deployment bucket, mint app, and attest app into coord.toml
+# (deploy/mint's Dockerfile seds its bucket the same way).
 ARG DATA_BUCKET=elide
 ARG MINT_APP=mint-for-elide
+ARG ATTEST_APP=elide-attest
 RUN sed -i \
   -e "s|^bucket = .*|bucket = \"${DATA_BUCKET}\"|" \
   -e "s|^url = .*|url = \"http://${MINT_APP}.internal:8085\"|" \
+  -e "s|^attestation_transport = .*|attestation_transport = \"http://${ATTEST_APP}.internal:8087\"|" \
   /app/coord.toml
 
 # Every coordinator subcommand reads ELIDE_COORD_CONFIG, so the in-container

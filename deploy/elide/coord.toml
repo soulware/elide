@@ -18,17 +18,10 @@ region = "auto"
 [mint]
 # The mint Fly app's 6PN plane.
 url = "http://mint-for-elide.internal:8085"
-# Dial target for the attestation discharge: `unix:<path>` or `http(s)://`.
-# The route comes from the caveat's sealed location; this is the connection.
-attestation_transport = "unix:/data/elide_data/attest.sock"
-
-[attestation]
-# This coordinator serves the volume-attestation discharge authority (coord B);
-# `unix:<path>` keeps it off the network, reachable only in-container.
-listen = "unix:/data/elide_data/attest.sock"
-# K_M-B shared with mint — identical to the value mint is deployed with.
-# Standard base64 of 32 bytes.
-k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
+# Dial target for the attestation discharge — the dedicated coord B
+# (deploy/attest) over 6PN. The route comes from the caveat's sealed location;
+# this is the connection.
+attestation_transport = "http://elide-attest.internal:8087"
 
 [auth.demo]
 # K_M-A shared with mint — identical to deploy/mint/mint-fly.toml.
