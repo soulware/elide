@@ -1223,9 +1223,11 @@ async fn remove_volume(
     // The signing key shadow at `data_dir/keys/<vol_ulid>.key` survives
     // `remove_dir_all` (it lives outside `vol_dir`), so the released
     // name is recoverable with `volume claim`.
-    if let Some(name) = local_name.as_deref() {
-        lifecycle::release_owned_for_remove(name, &vol_dir, force, ctx).await?;
-    }
+    let released = if let Some(name) = local_name.as_deref() {
+        lifecycle::release_owned_for_remove(name, &vol_dir, force, ctx).await?
+    } else {
+        false
+    };
 
     if let Some(name) = local_name.as_deref() {
         let _ = std::fs::remove_file(data_dir.join("by_name").join(name));
@@ -1234,7 +1236,10 @@ async fn remove_volume(
     std::fs::remove_dir_all(&vol_dir)
         .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
 
-    if let Some(id) = teardown_id {
+    // The release flip (when it ran) already del_dev'd the fork's ublk
+    // device, so tear down here only when nothing was released — a second
+    // del_dev would just log a "device not found" warning.
+    if !released && let Some(id) = teardown_id {
         if let Some(pid) = prev_pid {
             elide_coordinator::ublk_sweep::wait_for_pid_exit(pid).await;
         }

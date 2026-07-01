@@ -410,6 +410,12 @@ pub(crate) async fn release_volume_op(
 /// `Released`, `Readonly`, or foreign-owned) — the caller then proceeds
 /// to tear down local state.
 ///
+/// Returns `true` when it released the name. The release flip also tears
+/// down the fork's bound ublk device, so a `true` return tells `remove`
+/// to skip its own device teardown (a second `del_dev` would just log a
+/// "device not found" warning). `false` means nothing was released and
+/// the caller still owns the teardown.
+///
 /// `--force` reuses the recorded handoff or synthesises an empty one,
 /// discarding state past the last snapshot the same way `--force`
 /// already discards unflushed local state on `remove`.
@@ -418,7 +424,7 @@ pub(crate) async fn release_owned_for_remove(
     vol_dir: &Path,
     force: bool,
     ctx: &IpcContext,
-) -> Result<(), IpcError> {
+) -> Result<bool, IpcError> {
     use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
 
     let coord_id = ctx.identity.coordinator_id_str();
@@ -428,7 +434,7 @@ pub(crate) async fn release_owned_for_remove(
         .await
         .map_err(|e| IpcError::store(format!("reading names/{volume_name}: {e}")))?;
     let OwnershipPosition::OwnedByUs { vol_ulid, .. } = position else {
-        return Ok(());
+        return Ok(false);
     };
 
     let vd = ctx.stores.volume_data(&vol_ulid);
@@ -482,7 +488,7 @@ pub(crate) async fn release_owned_for_remove(
         snap_ulid,
     )
     .await
-    .map(|_| ())
+    .map(|_| true)
 }
 
 /// The handoff snapshot to reuse for a never-started
