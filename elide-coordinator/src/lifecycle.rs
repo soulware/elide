@@ -372,7 +372,7 @@ pub async fn mark_reclaimed_local(
 #[derive(Debug)]
 pub enum MarkInitialOutcome {
     /// `names/<name>` was newly created and now points at `vol_ulid`,
-    /// owned by this coordinator, in state `Live`.
+    /// owned by this coordinator.
     Claimed,
     /// `names/<name>` already exists. The caller should refuse the
     /// create — the name is taken (possibly by us from a previous
@@ -401,6 +401,52 @@ pub async fn mark_initial(
     vol_ulid: Ulid,
     size: u64,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
+    mark_initial_with_state(
+        store,
+        name,
+        coord_id,
+        hostname,
+        vol_ulid,
+        size,
+        NameState::Live,
+    )
+    .await
+}
+
+/// Create-time claim landing the record `Stopped` rather than `Live`:
+/// the rehome of a fork displaced from another name
+/// (`docs/design/displaced-fork-rehome.md`). Same `If-None-Match`
+/// idempotency as [`mark_initial`] — a re-run after a crash resolves to
+/// its own record via `AlreadyExists`.
+pub async fn mark_rehomed(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    coord_id: &str,
+    hostname: Option<&str>,
+    vol_ulid: Ulid,
+    size: u64,
+) -> Result<MarkInitialOutcome, LifecycleError> {
+    mark_initial_with_state(
+        store,
+        name,
+        coord_id,
+        hostname,
+        vol_ulid,
+        size,
+        NameState::Stopped,
+    )
+    .await
+}
+
+async fn mark_initial_with_state(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    coord_id: &str,
+    hostname: Option<&str>,
+    vol_ulid: Ulid,
+    size: u64,
+    state: NameState,
+) -> Result<MarkInitialOutcome, LifecycleError> {
     // If a record already exists, surface its details so the caller can
     // produce a useful error. We do this read first so the common
     // success path (no record) issues exactly one PUT, but a name
@@ -418,7 +464,7 @@ pub async fn mark_initial(
         vol_ulid,
         size,
         coordinator_id: Some(coord_id.to_owned()),
-        state: NameState::Live,
+        state,
         parent: None,
         claimed_at: Some(chrono::Utc::now().to_rfc3339()),
         hostname: hostname.map(str::to_owned),

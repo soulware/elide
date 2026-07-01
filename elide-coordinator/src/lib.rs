@@ -22,6 +22,7 @@ pub mod portable;
 pub mod prefetch;
 pub mod pull;
 pub mod range_fetcher;
+pub mod rehome;
 pub mod remote_breadcrumb;
 pub mod role;
 pub mod segment_head;
