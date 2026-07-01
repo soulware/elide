@@ -2274,6 +2274,14 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
             } => {
                 format!(" from={old_name} inherits={inherits_log_from}")
             }
+            EventKind::Displaced {
+                source_name,
+                source_fork,
+                displaced_by,
+            } => match displaced_by {
+                Some(d) => format!(" source={source_name}@{source_fork} displaced-by={d}"),
+                None => format!(" source={source_name}@{source_fork}"),
+            },
         };
         println!("{sigil} {when}  {kind_label:<14} vol={vol}  by={coord}{host}{extra}");
     }
