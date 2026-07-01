@@ -396,15 +396,7 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::Remove { volume_ulid, force } => {
-            let store = ctx.stores.writer();
-            let result = remove_volume(
-                volume_ulid,
-                force,
-                &ctx.data_dir,
-                Some(&store),
-                Some(ctx.identity.coordinator_id_str()),
-            )
-            .await;
+            let result = remove_volume(volume_ulid, force, ctx).await;
             // After local removal, tear down the per-volume IAM key +
             // policy. Best-effort: any IAM error is logged inside
             // `release` and does not block the IPC reply.
@@ -1147,11 +1139,10 @@ async fn volume_events_typed(
 async fn remove_volume(
     volume_ulid: ulid::Ulid,
     force: bool,
-    data_dir: &Path,
-    store: Option<&Arc<dyn ObjectStore>>,
-    coord_id: Option<&str>,
+    ctx: &IpcContext,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
+    let data_dir: &Path = &ctx.data_dir;
     let volume_ulid_str = volume_ulid.to_string();
     let vol_dir_path = elide_coordinator::volume_state::fork_dir(data_dir, volume_ulid);
     let (vol_dir, shape) = VolumeLifecycle::resolve(&vol_dir_path)
@@ -1221,25 +1212,22 @@ async fn remove_volume(
 
     import::kill_all_for_volume(&vol_dir);
 
-    // Write the breadcrumb before tearing down local state. Best-effort:
-    // a transient bucket-read error logs and skips rather than blocking
-    // the operator's removal. A volume without a current local name
-    // claim has nothing to breadcrumb under — skip silently.
+    // Settle S3 ownership before tearing down local state: if this
+    // coordinator still owns the name, release it (flip to `Released` at
+    // the handoff snapshot). Removing without releasing is not a valid
+    // operation — a name owned in S3 with no local fork is unreachable.
+    // A name that is already released, readonly, or owned by another
+    // coordinator has nothing to release. If the release fails, abort
+    // before deleting anything so the name is never orphaned.
     //
-    // The signing key shadow at `data_dir/keys/<vol_ulid>.key` was
-    // written eagerly at volume creation time (and self-heals on every
-    // `volume start`), so `remove` does not need to touch it — the
-    // shadow already exists and survives `remove_dir_all` because it
-    // lives outside `vol_dir`.
-    if let (Some(store), Some(coord_id), Some(name)) = (store, coord_id, local_name.as_deref())
-        && let Err(e) =
-            maybe_write_remote_breadcrumb(data_dir, name, volume_ulid, store, coord_id).await
-    {
-        warn!(
-            "[inbound] remove {name} ({volume_ulid_str}): skipping remote breadcrumb ({e}); \
-             use `elide volume claim {name}` to recover the name later"
-        );
-    }
+    // The signing key shadow at `data_dir/keys/<vol_ulid>.key` survives
+    // `remove_dir_all` (it lives outside `vol_dir`), so the released
+    // name is recoverable with `volume claim`.
+    let released = if let Some(name) = local_name.as_deref() {
+        lifecycle::release_owned_for_remove(name, &vol_dir, force, ctx).await?
+    } else {
+        false
+    };
 
     if let Some(name) = local_name.as_deref() {
         let _ = std::fs::remove_file(data_dir.join("by_name").join(name));
@@ -1248,7 +1236,10 @@ async fn remove_volume(
     std::fs::remove_dir_all(&vol_dir)
         .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
 
-    if let Some(id) = teardown_id {
+    // The release flip (when it ran) already del_dev'd the fork's ublk
+    // device, so tear down here only when nothing was released — a second
+    // del_dev would just log a "device not found" warning.
+    if !released && let Some(id) = teardown_id {
         if let Some(pid) = prev_pid {
             elide_coordinator::ublk_sweep::wait_for_pid_exit(pid).await;
         }
@@ -1287,37 +1278,6 @@ fn find_local_name_for_ulid(data_dir: &Path, volume_ulid: ulid::Ulid) -> Option<
     None
 }
 
-/// Read `names/<volume_name>` and, if the bucket record exists, is in a
-/// state that retains ownership (`Live` or `Stopped`), and names this
-/// coordinator as owner, write a `data_dir/remote/<volume_name>`
-/// breadcrumb. Surfaced by `volume list` so the user can see remotely-
-/// owned volumes that have no local fork.
-async fn maybe_write_remote_breadcrumb(
-    data_dir: &Path,
-    volume_name: &str,
-    vol_ulid: ulid::Ulid,
-    store: &Arc<dyn ObjectStore>,
-    coord_id: &str,
-) -> Result<(), String> {
-    use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
-
-    let (position, _) = fetch_position(store, volume_name, coord_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let owned_state = match position {
-        OwnershipPosition::OwnedByUs { state, .. } => state,
-        _ => return Ok(()),
-    };
-
-    elide_coordinator::remote_breadcrumb::write(data_dir, volume_name, vol_ulid)
-        .map_err(|e| format!("write remote breadcrumb: {e}"))?;
-    info!(
-        "[inbound] remove {volume_name}: wrote remote breadcrumb (vol {vol_ulid}, owned_state={:?})",
-        owned_state
-    );
-    Ok(())
-}
-
 /// Returns a human-readable reason if the fork has on-disk state that
 /// has not been flushed and uploaded to S3, or `None` if the fork is
 /// fully durable. Used to gate `remove` and decide whether `--force` is
@@ -1326,19 +1286,14 @@ async fn maybe_write_remote_breadcrumb(
 /// "Fully durable" means: no segments awaiting upload (`pending/` empty)
 /// and no unflushed WAL records (`wal/` empty). Both directories are
 /// populated by writes and emptied by the drain pipeline.
-/// Post-flip best-effort housekeeping shared by `volume release` and
-/// the breadcrumb-only release path. Each successful bucket flip
-/// (`mark_released` returning `Updated`) wants to do the same three
-/// things in the same order:
+/// Post-flip best-effort housekeeping after a successful bucket flip
+/// (`mark_released` returning `Updated`):
 ///
 ///   1. If we have a local fork: write `volume.released` so
 ///      `volume list` reflects the new state without a bucket
 ///      round-trip. Failure is logged but non-fatal — the bucket
 ///      record is authoritative.
 ///   2. Emit a journal entry recording the transition. Best-effort.
-///   3. If a remote breadcrumb existed for this name, clear it.
-///      Some paths don't have a breadcrumb to clear (the standard
-///      local-fork release); a missing breadcrumb is a no-op.
 ///
 /// Allow `too_many_arguments`: every parameter here is genuine
 /// plumbing — the alternative struct-of-options just shifts the
@@ -1346,7 +1301,6 @@ async fn maybe_write_remote_breadcrumb(
 /// any caller.
 #[allow(clippy::too_many_arguments)]
 async fn emit_release_aftermath(
-    data_dir: &Path,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     volume_name: &str,
@@ -1354,7 +1308,6 @@ async fn emit_release_aftermath(
     handoff_snapshot: ulid::Ulid,
     vol_ulid: ulid::Ulid,
     event: elide_core::volume_event::EventKind,
-    clear_breadcrumb: bool,
     log_prefix: &str,
 ) {
     if let Some(vol_dir) = vol_dir_for_marker
@@ -1368,11 +1321,6 @@ async fn emit_release_aftermath(
     journal
         .emit_best_effort(identity.as_ref(), volume_name, event, vol_ulid)
         .await;
-    if clear_breadcrumb
-        && let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
-    {
-        warn!("[{log_prefix} {volume_name}] clearing breadcrumb: {e}");
-    }
 }
 
 /// Guard run early in every `volume release` variant (local fork
@@ -3165,12 +3113,41 @@ mod tests {
         assert_eq!(err.kind, IpcErrorKind::Forbidden);
     }
 
+    /// Minimal [`IpcContext`] for the `remove_volume` tests: real
+    /// in-memory-backed stores + a generated identity, empty registries.
+    /// The signing identity is minted under `data_dir` so
+    /// `release_owned_for_remove`'s ownership check runs against a real
+    /// coordinator id.
+    fn minimal_ctx(data_dir: &Path, store: Arc<dyn ObjectStore>) -> IpcContext {
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(data_dir).unwrap(),
+        );
+        IpcContext {
+            data_dir: Arc::new(data_dir.to_path_buf()),
+            registry: crate::import::new_registry(),
+            fork_registry: crate::fork::new_registry(),
+            claim_registry: crate::claim::new_registry(),
+            evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            snapshot_locks: SnapshotLockRegistry::default(),
+            prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
+            readiness_tracker: elide_coordinator::new_readiness_tracker(),
+            stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(store)),
+            identity,
+            credentialer: None,
+        }
+    }
+
+    fn empty_store() -> Arc<dyn ObjectStore> {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
     #[tokio::test]
     async fn remove_volume_without_ublk_succeeds() {
         let tmp = TempDir::new().unwrap();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        remove_volume(ulid_from(vol_ulid_str), false, &ctx)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3191,7 +3168,8 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
         let (vol_dir, link) =
             setup_removable_volume(tmp.path(), "vol", vol_ulid_str, Some(99), true);
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        remove_volume(ulid_from(vol_ulid_str), false, &ctx)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3209,7 +3187,8 @@ mod tests {
             Some(5),
             false, // no STOPPED_FILE
         );
-        let err = remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        let err = remove_volume(ulid_from(vol_ulid_str), false, &ctx)
             .await
             .expect_err("running volume should be rejected");
         assert_eq!(err.kind, IpcErrorKind::Conflict);
@@ -3223,11 +3202,13 @@ mod tests {
         // `volume.released`. `VolumeLifecycle::from_dir` returns
         // `Released { .. }` because that marker takes precedence —
         // but the daemon is provably halted, so remove must proceed.
+        // The bucket record is already Released, so nothing to release.
         let tmp = TempDir::new().unwrap();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
         write_released_marker(&vol_dir, ulid::Ulid::new()).unwrap();
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        remove_volume(ulid_from(vol_ulid_str), false, &ctx)
             .await
             .unwrap();
         assert!(!vol_dir.exists(), "by_id dir should be removed");
@@ -3241,7 +3222,8 @@ mod tests {
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAF";
         let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, false);
         std::fs::write(vol_dir.join("volume.readonly"), "").unwrap();
-        remove_volume(ulid_from(vol_ulid_str), false, tmp.path(), None, None)
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        remove_volume(ulid_from(vol_ulid_str), false, &ctx)
             .await
             .unwrap();
         assert!(!vol_dir.exists());
@@ -3252,129 +3234,46 @@ mod tests {
     async fn remove_volume_unknown_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("by_name")).unwrap();
+        let ctx = minimal_ctx(tmp.path(), empty_store());
         // ULID with no `by_id/<ulid>` directory → not_found.
-        let err = remove_volume(ulid::Ulid::new(), false, tmp.path(), None, None)
+        let err = remove_volume(ulid::Ulid::new(), false, &ctx)
             .await
             .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
     }
 
     #[tokio::test]
-    async fn remove_volume_writes_breadcrumb_when_owned() {
+    async fn remove_volume_releases_name_when_owned() {
+        use elide_coordinator::bucket_position::{OwnershipPosition, fetch_position};
         use elide_coordinator::name_store::create_name_record;
         use elide_core::name_record::{NameRecord, NameState};
         let tmp = TempDir::new().unwrap();
+        let store = empty_store();
+        let ctx = minimal_ctx(tmp.path(), store.clone());
+        let coord_id = ctx.identity.coordinator_id_str().to_owned();
         let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAA";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
+        let (vol_dir, link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
 
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        // Owned by us, Stopped, with a recorded handoff snapshot so the
+        // `--force` release reuses it — no fast-path snapshot inspection
+        // or key-shadow synthesis needed in the unit test.
         let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
         record.state = NameState::Stopped;
-        record.coordinator_id = Some("coord-A".to_owned());
+        record.coordinator_id = Some(coord_id.clone());
+        record.handoff_snapshot = Some(ulid::Ulid::new());
         create_name_record(&store, "vol", &record).await.unwrap();
 
-        remove_volume(
-            ulid_from(vol_ulid_str),
-            false,
-            tmp.path(),
-            Some(&store),
-            Some("coord-A"),
-        )
-        .await
-        .unwrap();
+        remove_volume(ulid_from(vol_ulid_str), true, &ctx)
+            .await
+            .unwrap();
 
-        let crumb = elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
-            .unwrap()
-            .expect("breadcrumb should exist");
-        assert_eq!(crumb.volume_id.to_string(), vol_ulid_str);
-    }
+        assert!(!vol_dir.exists(), "by_id dir should be removed");
+        assert!(std::fs::symlink_metadata(&link).is_err());
 
-    #[tokio::test]
-    async fn remove_volume_skips_breadcrumb_when_record_absent() {
-        let tmp = TempDir::new().unwrap();
-        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAB";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-
-        remove_volume(
-            ulid_from(vol_ulid_str),
-            false,
-            tmp.path(),
-            Some(&store),
-            Some("coord-A"),
-        )
-        .await
-        .unwrap();
-
+        let (position, _) = fetch_position(&store, "vol", &coord_id).await.unwrap();
         assert!(
-            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
-                .unwrap()
-                .is_none(),
-            "no breadcrumb when bucket has no record"
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_volume_skips_breadcrumb_when_owned_by_other() {
-        use elide_coordinator::name_store::create_name_record;
-        use elide_core::name_record::{NameRecord, NameState};
-        let tmp = TempDir::new().unwrap();
-        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAC";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
-        record.state = NameState::Stopped;
-        record.coordinator_id = Some("coord-OTHER".to_owned());
-        create_name_record(&store, "vol", &record).await.unwrap();
-
-        remove_volume(
-            ulid_from(vol_ulid_str),
-            false,
-            tmp.path(),
-            Some(&store),
-            Some("coord-A"),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
-                .unwrap()
-                .is_none(),
-            "no breadcrumb when bucket says different owner"
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_volume_skips_breadcrumb_when_released() {
-        use elide_coordinator::name_store::create_name_record;
-        use elide_core::name_record::{NameRecord, NameState};
-        let tmp = TempDir::new().unwrap();
-        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAD";
-        let (_vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
-
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let mut record = NameRecord::live_minimal(ulid_from(vol_ulid_str), SAMPLE_SIZE);
-        record.state = NameState::Released;
-        record.coordinator_id = Some("coord-A".to_owned());
-        create_name_record(&store, "vol", &record).await.unwrap();
-
-        remove_volume(
-            ulid_from(vol_ulid_str),
-            false,
-            tmp.path(),
-            Some(&store),
-            Some("coord-A"),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            elide_coordinator::remote_breadcrumb::read(tmp.path(), "vol")
-                .unwrap()
-                .is_none(),
-            "no breadcrumb when bucket state is Released"
+            matches!(position, OwnershipPosition::Released { .. }),
+            "remove must release the owned name; got {position:?}"
         );
     }
 }

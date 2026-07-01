@@ -178,7 +178,7 @@ fn mark_uploaded_from_file(sentinel: &Path, source: &Path) -> std::io::Result<()
 /// Write an `uploaded/<relative>` sentinel containing `content`,
 /// asserting that S3 already holds these bytes at the matching key.
 /// Used by code paths that *downloaded* a skeleton file from S3
-/// (notably `pull_readonly_op` and `hydrate_remote_owned`) so the
+/// (notably `pull_readonly_op` and the `claim` hydrate path) so the
 /// subsequent drain-loop pass over `upload_volume_metadata` sees a
 /// content-equal sentinel and skips a redundant PUT.
 ///

@@ -551,13 +551,14 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 );
             } else if !prev_supervised && !readonly_now {
                 // Known volume that transitioned readonly→writable since
-                // last tick. This happens when a remote-owned fork was
-                // first discovered with `volume.readonly` still stamped
-                // (partial hydrate left over from an earlier failed
-                // start) and a later successful `volume start` stripped
-                // the marker via `hydrate_remote_owned`. Per-volume
-                // tasks were spawned at first discovery; spawn the
-                // supervisor now so the daemon actually comes up.
+                // last tick. This happens when a fork was first
+                // discovered with `volume.readonly` still stamped (a
+                // readonly copy, or a partial hydrate left over from an
+                // earlier failed recovery) and a later successful
+                // `volume claim` reconciled it to writable, stripping the
+                // marker. Per-volume tasks were spawned at first
+                // discovery; spawn the supervisor now so the daemon
+                // actually comes up.
                 let label = volume_label(&vol_dir);
                 info!("[coordinator] supervising newly-writable volume: {label}");
                 let handle = tasks.spawn(supervisor::supervise(

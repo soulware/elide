@@ -356,11 +356,6 @@ async fn claim_volume_bucket_op(
                     info!(
                         "[inbound] reclaimed {volume_name} in place (vol_ulid {released_vol_ulid})"
                     );
-                    if let Err(e) =
-                        elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
-                    {
-                        warn!("[inbound] reclaim {volume_name}: clearing breadcrumb: {e}");
-                    }
                     // Best-effort: drop the display-only marker now that
                     // the bucket record is no longer Released.
                     if let Err(e) = clear_released_marker(&vol_dir) {
@@ -419,10 +414,9 @@ async fn claim_volume_bucket_op(
             // immediately. Handles the readonly-local case: `volume.key`
             // missing, `volume.readonly` present.
             //
-            // If no local fork exists at all (e.g. post-stop+remove,
-            // breadcrumb retained), `claim` doesn't hydrate — the
-            // operator should use `volume start`, which has the
-            // full hydrate-from-bucket pipeline.
+            // If no local fork exists at all, plain `claim` has nothing
+            // to reconcile — recovering a fork from S3 is `claim --force`,
+            // which re-owns from the bucket HEAD.
             use elide_coordinator::volume_state::{
                 ReconcileError, ReconcileOutcome, reconcile_owned_local_to_stopped,
             };
@@ -431,7 +425,7 @@ async fn claim_volume_bucket_op(
                 None => {
                     return Err(IpcError::conflict(format!(
                         "name '{volume_name}' is owned by this coordinator but has no \
-                         local fork; use `volume start {volume_name}` to hydrate"
+                         local fork; recover with `volume claim --force {volume_name}`"
                     )));
                 }
             };
@@ -953,12 +947,6 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
         std::fs::write(new_fork.dir.join(STOPPED_FILE), "")
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
-
-        if let Err(e) =
-            elide_coordinator::remote_breadcrumb::remove(&self.ctx.core.data_dir, &self.volume)
-        {
-            warn!("[claim {}] clearing remote breadcrumb: {e}", self.volume);
-        }
 
         register_prefetch_or_get(&self.ctx.prefetch_tracker, new_fork.vol_ulid);
         crate::rescan::trigger();

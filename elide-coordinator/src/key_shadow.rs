@@ -1,13 +1,13 @@
 //! Local backup of a volume's Ed25519 signing key. The shadow is
-//! `volume start`'s possession proof when hydrating a remote-owned
-//! volume whose local fork directory is gone: no shadow ⇒ start
-//! fails, and the key restored into the hydrated fork comes from it.
+//! `volume claim`'s possession proof when recovering a volume whose
+//! local fork directory is gone: no shadow ⇒ claim fails, and the key
+//! restored into the hydrated fork comes from it.
 //!
 //! Written whenever a keypair is minted (`volume create`, fork
 //! creation, `claim`, `claim --force`) — a write failure aborts the
-//! mint — and refreshed by `start`'s self-heal pass. Read by
-//! [`crate::start_remote::hydrate_remote_owned`] when it sees a
-//! retained name.
+//! mint — and refreshed by `start`'s self-heal pass. Read by the
+//! `claim` / `claim --force` recovery path when it hydrates a fork
+//! from the bucket.
 //!
 //! On-disk: `data_dir/keys/<vol_ulid>.key` containing 32 raw bytes
 //! (the same encoding `volume.key` uses inside a fork directory). The
@@ -17,7 +17,7 @@
 //!      lineage — the key shadow must follow the lineage, not the
 //!      name.
 //!   2. Hydrate already has the `vol_ulid` in hand (it just read it
-//!      from `names/<name>` or the breadcrumb); no extra lookup is
+//!      from `names/<name>`); no extra lookup is
 //!      needed.
 //!
 //! Security: `data_dir` is already the trust boundary for all

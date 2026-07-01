@@ -390,7 +390,7 @@ These operations give explicit control over individual volumes or all volumes wh
 Use `stop --force` when the daemon is hung, the drain cannot complete, the coordinator is dead, or a host is being torn down quickly. Routine `stop` should never need it.
 
 **`volume start <name>`** — start a previously stopped volume:
-1. If `by_name/<name>` is absent, consult `names/<name>` in the bucket. If it names this coordinator as owner (`Live`/`Stopped`), hydrate the metadata from S3 — pull the skeleton ancestor chain, fetch and verify the latest snapshot manifest under `by_id/<volume_ulid>/snapshots/`, pull its indexes, write `volume.toml`, create empty `wal/`/`pending/`, write `volume.stopped`, plant the `by_name/<name>` symlink, and clear the `remote/<name>` breadcrumb. Bodies are not warmed — they remain demand-fetched. A bucket record held by another coordinator yields a `claim --force` hint; a `Released` record yields a `claim` hint; an absent record or no manifest yields `not-found`.
+1. If `by_name/<name>` is absent, consult `names/<name>` in the bucket. If it names this coordinator as owner (`Live`/`Stopped`), hydrate the metadata from S3 — pull the skeleton ancestor chain, fetch and verify the latest snapshot manifest under `by_id/<volume_ulid>/snapshots/`, pull its indexes, write `volume.toml`, create empty `wal/`/`pending/`, write `volume.stopped`, and plant the `by_name/<name>` symlink. Bodies are not warmed — they remain demand-fetched. A bucket record held by another coordinator yields a `claim --force` hint; a `Released` record yields a `claim` hint; an absent record or no manifest yields `not-found`.
 2. Remove `<vol-dir>/volume.stopped`.
 3. Supervisor picks it up on the next scan and starts the process normally.
 
@@ -482,7 +482,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume status <name\|ulid>` | Is the volume process running? |
 | `elide volume stop <name\|ulid> [--force]` | Clean stop: drain pending, publish a stop-snapshot, flip bucket to `Stopped`, set marker, SIGTERM. `--force` skips drain/snapshot (and falls back to direct CLI mode if the coordinator is unreachable) |
 | `elide volume start <name\|ulid>` | Clear `volume.stopped`; coordinator restarts the volume. If no local fork exists but the bucket retains ownership, hydrates metadata from S3 first. Deletes the stop-snapshot after `mark_live` |
-| `elide volume remove <name\|ulid> [--force]` | Remove the local instance (by_id directory + by_name link); requires `volume.stopped` and a fully-uploaded fork unless `--force`. If the bucket retains ownership, publishes a final snapshot and writes a `remote/<name>` breadcrumb so the name can later be resurrected via `volume start` |
+| `elide volume remove <name\|ulid> [--force]` | Remove the local instance (by_id directory + by_name link); requires `volume.stopped` and a fully-uploaded fork unless `--force`. If this coordinator still owns the name, releases it first (flip to `Released` at the handoff snapshot); recover a removed volume with `volume claim` |
 | `elide volume import <name> <oci-ref>` | Ask coordinator to spawn an import; prints import job ULID |
 | `elide volume import status <job-ulid>` | Poll import state: running / done / failed |
 | `elide volume import attach <job-ulid>` | Stream import output until completion |
@@ -738,7 +738,7 @@ The volume directory is left intact — it may contain partial segment data usef
 
 ### `volume remove`
 
-`elide volume remove <name> [--force]` removes the local instance of a volume. Segments under `by_id/<volume_ulid>/` in S3 are untouched. If the bucket `names/<name>` record still names this coordinator as owner, the name is *retained* (a future `volume start <name>` resurrects it from S3 — see below). Otherwise the local instance is simply discarded and the name is available for other coordinators to claim.
+`elide volume remove <name> [--force]` removes the local instance of a volume, releasing the name first if this coordinator still owns it. `remove` always settles ownership: a name owned in S3 with no local fork is an unusable limbo state — invisible to the LIST-free `volume list` — so there is no remove-without-release. Segments under `by_id/<volume_ulid>/` in S3 are untouched (bucket-level deletion is out of scope). If the name is already released or owned by another coordinator, there is nothing to release and the local instance is simply discarded.
 
 Preconditions:
 
@@ -749,21 +749,15 @@ Preconditions:
 Once the preconditions hold, the coordinator:
 
 1. Sends SIGTERM to any running import process (via `import.pid`) and removes a stale `import.lock`.
-2. Reads `names/<name>` from the bucket. If the record is in state `Live` or `Stopped` and `coordinator_id` is ours, the name is *retained*: write a `data_dir/remote/<name>` breadcrumb capturing the `volume_ulid`. The breadcrumb makes the retained name visible in `volume list` even though the local fork is gone. The basis snapshot needed for future `start` already exists in S3 from the preceding clean `stop` (the stop-snapshot at `by_id/<volume_ulid>/snapshots/<S>-stop.manifest`) — `remove` does not produce a snapshot itself.
+2. Reads `names/<name>` from the bucket. If the record is `Live` or `Stopped` and owned by this coordinator, **releases** the name: promote the covering stop-snapshot to a stable manifest and flip `names/<name>` to `Released` at that handoff — identical to `volume release`. Under `--force` with local state past the last snapshot, the release reuses the latest available snapshot (or synthesises an empty owner handoff if none exists), discarding the uncovered writes. A missing record, an already-`Released`/`Readonly` record, or one owned by another coordinator has nothing to release, so this step is skipped.
 3. Capture the bound ublk `dev_id` (if any) and tear down the kernel device after step 5, so the device's stamped `target_data.elide.volume_dir` no longer points at a deleted path.
 4. Remove the `by_name/<name>` symlink.
 5. Remove the `by_id/<volume_ulid>/` directory tree.
 6. Respond `ok`.
 
-If the bucket read fails or the record does not retain ownership (no record, or state `Released`/`Readonly`, or owned by another coordinator), step 2 is skipped (breadcrumb omitted). The local instance is still removed — `remove` always tears down the local fork; the retention path is best-effort on top.
+The local instance is always removed: the release settles the name, then steps 4–5 tear down the local fork.
 
-**Resurrection prerequisite.** Retained-name resurrection on this host requires a basis snapshot in S3 — usually the stop-snapshot from the preceding clean `stop`. Two cases produce a retained name *without* a basis: (a) `stop --force` (skipped the snapshot) followed by `remove`, and (b) a volume that was never started, never wrote anything, and was removed. In both cases the breadcrumb is written but `start` will fail with "no published snapshot in the store" — recovery from this host is no longer possible; the name must be reclaimed via `volume claim --force` from another host (or `claim --force` then a normal `release` to give it up).
-
-**The key shadow is the possession proof.** S3 never holds the volume's private signing key, so the hydrate anchors on the local *signing-key shadow* under `data_dir/keys/<vol_ulid>.key`. The shadow is written at every key-generation site (`volume create`, fork creation, cross-coordinator claim, `claim --force`) — a shadow-write failure aborts the mint — and refreshed best-effort on every `volume start` for self-heal on pre-existing volumes. `remove` does not delete the shadow — it lives outside `vol_dir` and survives `remove_dir_all`. On hydrate, `hydrate_remote_owned` reads the shadow and checks it against the leaf's published `volume.pub` *before* its `by_id` basis reads; if no shadow exists (host moved, key never minted on this host) or the key doesn't match, the start fails — recovery from another host is `volume claim --force`, a claim, not a start. After the basis reads, the proven shadow bytes are copied into `vol_dir/volume.key` and the `volume.readonly` marker that `pull_readonly_op` stamps onto every skeleton-pulled fork is stripped.
-
-After `volume remove` with retained ownership, a valid basis, and a key shadow on this host, the next `volume start <name>` on this coordinator proves possession from the shadow, hydrates the metadata from S3 (skeleton ancestor chain → basis manifest → indexes → `volume.toml` → `by_name` symlink → `volume.stopped`), restores the signing key from the shadow, strips `volume.readonly` from the leaf, then runs the normal start flow. Bodies remain demand-fetched — body warm is not part of resurrection. The breadcrumb is removed once hydration succeeds.
-
-Without retained ownership (or after `volume release <name>`), the name is free to be reused (e.g. `volume import <name> <oci-ref>` starts fresh, or `volume claim <name>` re-binds a Released bucket-side record on this host).
+**Recovery is `volume claim`.** A removed volume leaves no local trace and its name is `Released`, so `volume start <name>` no longer applies (a `Released` record yields a `claim` hint). `volume claim <name>` re-binds the released record on this host, hydrating the metadata from S3 and proving possession from the *signing-key shadow* under `data_dir/keys/<vol_ulid>.key`. The shadow is written at every key-generation site (`volume create`, fork creation, cross-coordinator claim, `claim --force`) — a shadow-write failure aborts the mint — and `remove` leaves it intact, since it lives outside `vol_dir` and survives `remove_dir_all`. If the shadow is gone (host moved, key never minted here) or does not match the leaf's published `volume.pub`, recovery is `volume claim --force` from a host that holds the key. The name is equally free for reuse — `volume import <name> <oci-ref>` or `volume claim <name>` against a fresh lineage.
 
 ### Stop-snapshot lifecycle
 
@@ -784,7 +778,7 @@ The per-volume Ed25519 signing key (`volume.key`) is never uploaded to S3 — it
 - **Self-healed** on every `volume start`: a fork that has `volume.key` but no shadow gets one written. This is the migration path for volumes that pre-date this mechanism.
 - **Untouched** by `remove`: the shadow lives outside `vol_dir` and survives `remove_dir_all`.
 - **Proven and restored** by `start`'s hydrate path: `hydrate_remote_owned` checks the shadow against the leaf's published `volume.pub` before its `by_id` basis reads, then copies it into `vol_dir/volume.key` and removes `volume.readonly` from the leaf. No shadow, or a mismatched key, fails the start — recovery from another host is `volume claim --force`.
-- **Keyed by `vol_ulid`, not name.** A name can be released and re-claimed against a different lineage — the shadow must follow the lineage. Lookups during hydrate already have the `vol_ulid` in hand (from `names/<name>` or the breadcrumb), so this costs nothing.
+- **Keyed by `vol_ulid`, not name.** A name can be released and re-claimed against a different lineage — the shadow must follow the lineage. Lookups during hydrate already have the `vol_ulid` in hand (from `names/<name>`), so this costs nothing.
 - **Not deleted on start.** A shadow is a permanent backup of an immutable artefact (volume keys never rotate — rotation = fork). Keeping it means a future accidental `rm -rf vol_dir` is also recoverable. Cleanup is a future operator concern (`volume purge`-style verb) when the lineage is permanently abandoned.
 
 ### Output retention

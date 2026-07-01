@@ -302,8 +302,8 @@ pub async fn run_volume_tasks(
     // first tick would assume `volume-rw` for the volume, burning a
     // mint round-trip + IAM key on a credential that's never used.
     // Re-check the marker each tick so a readonly→writable transition
-    // (`hydrate_remote_owned` strips the marker on a successful
-    // `volume start`) starts producing ticks on the next interval
+    // (`volume claim` strips the marker when it reconciles a readonly
+    // copy to writable) starts producing ticks on the next interval
     // without needing to respawn this task.
     //
     // Exception: a fresh import is born readonly but its post-import
