@@ -154,6 +154,11 @@ pub async fn rehome_displaced_fork(
     }
     std::os::unix::fs::symlink(format!("../by_id/{fork_ulid}"), &link)?;
     std::fs::write(fork_dir.join(STOPPED_FILE), "")?;
+    // Rebind the fork's own name to match: `read_volume_name` anchors the
+    // attestation discharge for any `by_id/<fork_ulid>/` write, and a stale
+    // `old_name` points coord B's liveness lookup at the displacer's record
+    // — which no longer binds this fork — so the discharge is denied.
+    elide_core::config::VolumeConfig::set_name(fork_dir, &new_name)?;
 
     stores
         .event_journal()
@@ -241,6 +246,15 @@ mod tests {
         let their_fork = Ulid::from_string("01J0000000000000000000000W").unwrap();
         let fork_dir = data_dir.join("by_id").join(our_fork.to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
+        // The fork self-identifies as "prod" and carries a bound ublk id.
+        elide_core::config::VolumeConfig {
+            name: Some("prod".to_owned()),
+            size: None,
+            ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),
+            lazy: None,
+        }
+        .write(&fork_dir)
+        .unwrap();
 
         // names/prod is held by the displacer.
         stores
@@ -290,6 +304,18 @@ mod tests {
             Path::new(&format!("../by_id/{our_fork}"))
         );
         assert!(fork_dir.join(STOPPED_FILE).exists());
+
+        // The fork's own name is rebound to the rehomed name (so an
+        // attestation discharge for its `by_id/` writes anchors on a
+        // record that still binds it), and the bound ublk id survives.
+        assert_eq!(
+            crate::tasks::read_volume_name(&fork_dir).as_deref(),
+            Some(new_name.as_str())
+        );
+        assert_eq!(
+            elide_core::config::VolumeConfig::bound_ublk_id(&fork_dir).unwrap(),
+            Some(7)
+        );
 
         // names/prod is untouched — it is alive under the displacer.
         let prod = stores.name_claims().read("prod").await.unwrap().unwrap();
