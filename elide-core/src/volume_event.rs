@@ -14,7 +14,7 @@
 //! document.
 //!
 //! ```toml
-//! version = 1
+//! version = 2
 //! event_ulid = "01HHHHHHHH0000000000000000"
 //! kind = "claimed"
 //! at = "2024-01-19T22:35:43.328Z"
@@ -105,10 +105,12 @@ pub enum EventKind {
     /// `names/<name>` was force-claimed: a coordinator displaced an
     /// unreachable owner with a forced CAS straight to a fresh fork
     /// (`volume claim --force`). The event's `vol_ulid` is the new
-    /// fork; `displaced_coordinator_id` is the dead owner recorded
-    /// just before the rewrite (`None` if the stale record carried no
-    /// owner identity).
+    /// fork; `source_vol_ulid` is the dead fork it re-owned;
+    /// `displaced_coordinator_id` is the dead owner recorded just
+    /// before the rewrite (`None` if the stale record carried no owner
+    /// identity).
     ForceClaimed {
+        source_vol_ulid: Ulid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced_coordinator_id: Option<String>,
     },
@@ -230,7 +232,7 @@ pub struct VolumeEvent {
 }
 
 impl VolumeEvent {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Construct a new unsigned event. `at` is derived from
     /// `event_ulid` so writers cannot desync the two fields.
@@ -301,6 +303,7 @@ impl VolumeEvent {
                 push_field(&mut buf, "handoff_snapshot", &handoff_snapshot.to_string());
             }
             EventKind::ForceClaimed {
+                source_vol_ulid,
                 displaced_coordinator_id,
             } => {
                 push_field(
@@ -308,6 +311,7 @@ impl VolumeEvent {
                     "displaced_coordinator_id",
                     displaced_coordinator_id.as_deref().unwrap_or(""),
                 );
+                push_field(&mut buf, "source_vol_ulid", &source_vol_ulid.to_string());
             }
             EventKind::ForkedFrom {
                 source_name,
@@ -447,9 +451,11 @@ mod tests {
                 handoff_snapshot: snap_ulid(),
             },
             EventKind::ForceClaimed {
+                source_vol_ulid: snap_ulid(),
                 displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
             },
             EventKind::ForceClaimed {
+                source_vol_ulid: snap_ulid(),
                 displaced_coordinator_id: None,
             },
             EventKind::ForkedFrom {
@@ -656,6 +662,7 @@ mod tests {
     #[test]
     fn lowercase_kind_serialisation() {
         let ev = sample_event(EventKind::ForceClaimed {
+            source_vol_ulid: snap_ulid(),
             displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
         });
         let toml = ev.to_toml().unwrap();

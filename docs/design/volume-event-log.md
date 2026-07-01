@@ -71,7 +71,7 @@ provides:
 ## Event schema
 
 ```toml
-version = 1
+version = 2
 event_ulid = "<ulid>"
 kind = "claimed"                          # see catalogue below
 at = "2026-04-30T12:34:56Z"               # rfc3339, advisory
@@ -143,7 +143,7 @@ readable.
 | `created` | first creator | initial `names/<name>` write (writable or readonly) |
 | `claimed` | acquiring coordinator | after `released → stopped/live` CAS succeeds |
 | `released` | releasing coordinator | after `live/stopped → released` CAS succeeds |
-| `force_claimed` | claiming coordinator | after `claim --force`'s conditioned CAS displaces a dead owner; carries `displaced_coordinator_id`. Doubles as the crash-resume source index: a later claimant resolves the name's prior bindings from these entries (and the rest of the log) to re-own a head delta a crashed intermediate never finished copying |
+| `force_claimed` | claiming coordinator | after `claim --force`'s conditioned CAS displaces a dead owner; carries `source_vol_ulid` (the re-owned dead fork) and `displaced_coordinator_id`. Doubles as the crash-resume source index: a later claimant resolves the name's prior bindings from these entries (and the rest of the log) to re-own a head delta a crashed intermediate never finished copying |
 | `forked_from` | new fork's coordinator | when this name was created via `volume create --from` (emitted on the *new* name's log only — see open question 1) |
 | `renamed_to` | owner | terminal event when this name is renamed away (see Rename) |
 | `renamed_from` | owner | opening event when this name was just renamed in (see Rename) |

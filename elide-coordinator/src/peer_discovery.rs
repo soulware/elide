@@ -415,6 +415,7 @@ mod tests {
                 &ident,
                 "vol",
                 EventKind::ForceClaimed {
+                    source_vol_ulid: vol_ulid,
                     displaced_coordinator_id: Some("old-coord".to_owned()),
                 },
                 vol_ulid,

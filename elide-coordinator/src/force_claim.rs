@@ -428,6 +428,7 @@ impl ForceClaimOrchestrator {
                 self.ctx.core.identity.as_ref(),
                 &self.volume,
                 elide_core::volume_event::EventKind::ForceClaimed {
+                    source_vol_ulid: source,
                     displaced_coordinator_id: displaced,
                 },
                 new_vol_ulid,
@@ -1115,6 +1116,14 @@ mod tests {
             })
             .expect("force_claimed event present");
         assert_eq!(fc.vol_ulid, fork);
+        assert!(
+            matches!(
+                fc.kind,
+                elide_core::volume_event::EventKind::ForceClaimed { source_vol_ulid, .. }
+                    if source_vol_ulid == dead.vol
+            ),
+            "the force-claim event records the re-owned dead fork as its source"
+        );
     }
 
     #[tokio::test]
@@ -1357,6 +1366,7 @@ mod tests {
                 host_a.as_ref(),
                 "vol",
                 elide_core::volume_event::EventKind::ForceClaimed {
+                    source_vol_ulid: dead.vol,
                     displaced_coordinator_id: Some(dead_owner_id()),
                 },
                 f1.vol,

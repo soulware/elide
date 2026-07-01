@@ -937,6 +937,7 @@ mod tests {
                                     &id_b,
                                     name,
                                     EventKind::ForceClaimed {
+                                        source_vol_ulid: v,
                                         displaced_coordinator_id: Some(
                                             id_a.coordinator_id_str().to_owned(),
                                         ),
