@@ -84,6 +84,7 @@ impl StartupBackoff {
 }
 
 pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Result<()> {
+    config.reject_discharge_authority()?;
     let drain_interval = config.supervisor.drain_interval;
     let scan_interval = config.supervisor.scan_interval;
     let gc_config = config.gc.clone();
@@ -212,33 +213,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         peer_fetch_server = Some((addr, ctx));
     }
 
-    // Discharge authority (coord B): its own listener — TCP or UDS — wholly
-    // independent of peer fetch (`docs/design/mint-volume-attestation.md`
-    // § *Proposed: per-endpoint transport*). A pure verifier serves only
-    // this and may keep it off the network on a unix socket. The predicate
-    // reads meta/*.pub + names/* through the coord-ro store.
-    let mut discharge_server: Option<(
-        elide_coordinator::config::ListenAddr,
-        elide_attestation::DischargeState,
-    )> = None;
-    if let Some(att) = &config.attestation {
-        match att.listen_addr()? {
-            Some(listen) => {
-                let k_m_b = att.load_discharge_key()?;
-                let state =
-                    elide_attestation::DischargeState::new(k_m_b, stores.base_object_store());
-                info!(
-                    "[coordinator] volume-attestation discharge authority enabled \
-                     (coord B): {listen:?}"
-                );
-                discharge_server = Some((listen, state));
-            }
-            None => warn!(
-                "[coordinator] [attestation] configured without `listen`; \
-                 discharge authority not served"
-            ),
-        }
-    }
     // Install the peer-fetch handle as a process-global so per-volume
     // tasks, the claim orchestrator, and the IPC `Register` handler
     // can read it without us threading the value through. `None` when
@@ -399,25 +373,6 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             let router = elide_peer_fetch::server::peer_fetch_router(ctx);
             if let Err(e) = elide_peer_fetch::server::serve_tcp(addr, router).await {
                 warn!("[coordinator] peer-fetch server exited: {e}");
-            }
-        });
-    }
-
-    // Discharge authority HTTP server: its own listener, TCP or UDS,
-    // serving only `POST /v1/discharge`.
-    if let Some((listen, state)) = discharge_server.take() {
-        tasks.spawn(async move {
-            let router = elide_attestation::discharge_router(state);
-            let res = match listen {
-                elide_coordinator::config::ListenAddr::Tcp(addr) => {
-                    elide_attestation::serve::serve_tcp(addr, router).await
-                }
-                elide_coordinator::config::ListenAddr::Uds(path) => {
-                    elide_attestation::serve::serve_uds(path, router).await
-                }
-            };
-            if let Err(e) = res {
-                warn!("[coordinator] discharge server exited: {e}");
             }
         });
     }
