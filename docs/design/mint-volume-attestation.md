@@ -24,7 +24,7 @@ MAC-verified template namespace, `caveat.volume` (§ *Every template
 value is MAC-verified or mint-computed*) — without teaching mint anything
 about volumes. The self-asserted `req.*` namespace is removed entirely.
 
-## The mechanism: a third-party caveat discharged by a co-located coordinator
+## The mechanism: a third-party caveat discharged by the attestation coordinator
 
 mint embeds a third-party caveat (TPC) in the credential: "valid only if
 discharged by the *attestation coordinator*, attesting the volume named
@@ -847,25 +847,29 @@ routes. The trust-critical per-link step stays single-sourced in
 is a thin async driver over it, differing only by prefix (`by_id/` vs
 `meta/`) and whether `extent_index` sources are unioned.
 
-They run as **two separate, non-overlapping modes** — a coordinator runs as
-a peer-fetch server, a discharge verifier, both, or neither — each its own
-optional listener. **Each takes its own scheme-discriminated `listen`**
-(`unix:<path>` | `<host>:<port>`, the `[mint] url` convention); presence of
-`listen` enables that mode, binding a dedicated listener that serves only
-that mode's routes.
+They run in **separate processes** — the volume-serving coordinator
+(`serve`) exposes peer fetch; the dedicated authority (`attest`) exposes
+discharge. Neither serves the other's routes, and a `serve` config that
+declares `[attestation]` is rejected. **Each takes its own
+scheme-discriminated `listen`** (`unix:<path>` | `<host>:<port>`, the
+`[mint] url` convention), binding a dedicated listener that serves only that
+mode's routes.
 
 ```toml
+# serve — the volume coordinator advertises peer fetch
 [peer_fetch]
 listen = "0.0.0.0:8086"                      # TCP — advertised to remote peers
 
+# attest — the dedicated discharge authority
 [attestation]
-listen = "unix:/run/elide/discharge.sock"    # UDS — discharge stays off the network
+listen = "[::]:8087"                          # 6PN TCP, or unix:<path> when same-host
 discharge_key_file = "…"                     # K_M-B
 ```
 
-This lets a verifier run discharge-only and enables the hardened shape:
-discharge served only to a co-located coord A over UDS while peer-fetch is
-the sole network surface. Two couplings remain: peer-fetch's advertised
+Discharge stays off the public network either way: bind a `unix:` socket
+when coord A shares the host, or a 6PN TCP address when the authority is its
+own instance (the shipped `deploy/attest` shape). Two couplings remain:
+peer-fetch's advertised
 host must stay network-reachable (its `listen` is TCP-only — a `unix:`
 value is rejected), and coord A must be able to reach the discharge
 `listen`. The sealed location is the authority's
@@ -940,19 +944,7 @@ comes from the caveat. Absent, the location's host is dialled directly.
 **`K_M-B` enters by holder.** mint holds it to *seal* the `cid`; coord B
 holds it to *open* the `cid`. In the production shape the key never leaves
 mint and coord B unwraps over the wire (§ *Proposed: `K_M-B` stays at
-mint*); in the single-host shape both hold it directly.
-
-### Co-located shape: one coordinator, both hats
-
-In the bundled single-host deployment the coordinator *is* coord B for its
-own requests, so the two surfaces collapse onto one process:
-
-- `[attestation] listen` binds the authority — a `unix:<path>` keeps it off
-  the network, reachable only in-container;
-- `[mint] attestation_transport` points back at that same `listen`, so
-  coord A's discharge POST loops back to the in-process authority;
-- the sealed `location` in the caveat stays coord B's identity — never
-  dialled, only routed-by-path and matched by mint at verify.
+mint*); in the demo shape both hold it directly.
 
 ### Distributed demo — shared `K_M-B`
 
@@ -964,17 +956,17 @@ more machinery than a demo needs, so the trust anchor is shared directly:
 rather than one mint generates.
 
 ```toml
-# mint-fly.toml — colocated demo attestation
+# mint-fly.toml — mint's demo attestation seal key
 [attestation.demo]
 k_m_b = "<base64 32-byte AEAD key>"
 
-# coord.toml — the coordinator as coord B
+# deploy/attest/coord.toml — the dedicated coord B
 [attestation]
 k_m_b = "<base64 32-byte AEAD key>"   # identical value
 ```
 
 The deploy renders one generated value into both files, so they cannot
-drift. mint seals attestation `cid`s under it; the co-located coordinator
+drift. mint seals attestation `cid`s under it; the attestation instance
 opens them locally to discharge — no unwrap round-trip, no out-of-band key
 delivery. The `cid` construction and the discharge MAC are unchanged; only
 the holder of the key differs, exactly as shared-`K_M-A` leaves mint's
@@ -985,7 +977,8 @@ discharge verifier untouched.
 generating it at first start — the `K_M-B` analog of the `k_m_a` field
 `[auth.demo]` already carries. The colocated `[attestation.demo].socket`
 that stands up mint's *own* discharge authority is unused in this shape: the
-coordinator is coord B, so mint seals `cid`s but serves no discharge.
+dedicated attestation instance is coord B, so mint seals `cid`s but serves
+no discharge.
 
 Demo-tier only: a shared forgeable `K_M-B` is offline discharge-forgery
 capability for every attested credential (§ *Proposed: `K_M-B` stays at
@@ -995,20 +988,15 @@ mint*), which is exactly why production keeps it at mint.
 
 Splitting coord B off the volume-serving coordinator gives the discharge
 authority its own deployable, so its custody of `K_M-B` and its
-availability are independent of the data plane. coord B runs in one of
-three shapes, in increasing separation. All hold their own identity
-keypair, read possession / lineage / liveness through ordinary `assume-role`
-(half-TTL refresh, like every coordinator credential), serve only
-`POST /v1/discharge`, and drive the same `DischargeState` — differing in how
-much coordinator they bring up and which read role backs the predicate:
+availability are independent of the data plane. coord B is always its own
+instance — the volume-serving coordinator is never also the authority. It
+runs in one of two shapes, differing only in where `K_M-B` lives. Both hold
+their own identity keypair, read possession / lineage / liveness through
+ordinary `assume-role` (half-TTL refresh, like every coordinator
+credential), serve only `POST /v1/discharge`, and drive the same
+`DischargeState`:
 
-1. **Co-located** — `elide-coordinator serve` with `[attestation]`. One
-   process is both coord A (requester) and coord B (authority), looping
-   its own discharge POST back over a UDS. A full coordinator (the
-   `coordinator` profile), so the discharge half reuses its own `coord-ro`.
-   The single-host bundle; brings up the whole coordinator (supervisor, GC,
-   IPC socket, volume scan) alongside the one POST route.
-2. **Dedicated instance, shared binary** — `elide-coordinator attest`.
+1. **Dedicated instance, shared binary** — `elide-coordinator attest`.
    coord B in its own process and its own app, serving only the discharge
    route: it enrolls as the `attestation` profile (§ *Attestation-profile
    enrollment*), assumes `attest-ro`, builds the `DischargeState`, and
@@ -1017,7 +1005,7 @@ much coordinator they bring up and which read role backs the predicate:
    `K_M-A` for the enroll gate) locally as the shared literals (§
    *Distributed demo — shared `K_M-B`*), which live in a key file, not a
    flag. The multi-coord shape with the demo's local `K_M-B`.
-3. **Dedicated flags-only binary** — `elide-attestation serve`, no config
+2. **Dedicated flags-only binary** — `elide-attestation serve`, no config
    file:
 
    ```

@@ -145,6 +145,21 @@ impl CoordinatorConfig {
         })?;
         Ok(Some(key))
     }
+
+    /// A volume-serving coordinator is not a discharge authority. The
+    /// discharge authority (coord B) runs as its own `attest` instance
+    /// (`docs/design/mint-volume-attestation.md` § *A dedicated attestation
+    /// instance*), so an `[attestation]` block in a `serve` config is a
+    /// misconfiguration, not a co-located mode.
+    pub fn reject_discharge_authority(&self) -> Result<()> {
+        if self.attestation.is_some() {
+            bail!(
+                "[attestation] is only served by the `attest` subcommand; a \
+                 volume-serving coordinator is not a discharge authority"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[auth]` — the operator-auth source for enrollment.
@@ -863,7 +878,7 @@ pub struct AttestationConfig {
 
     /// Listen address for `POST /v1/discharge`: `<host>:<port>` (TCP) or
     /// `unix:<path>` (UDS — keeps the discharge endpoint off the network,
-    /// reachable only by a co-located coord A). Absent → the authority is
+    /// reachable only by a same-host coord A). Absent → the authority is
     /// configured but not served. Independent of `[peer_fetch]`: a pure
     /// verifier sets only this.
     #[serde(default)]
@@ -1006,6 +1021,38 @@ mod tests {
             cfg.attestation.is_none(),
             "coord A must not run a co-located [attestation] authority"
         );
+    }
+
+    #[test]
+    fn serve_config_rejects_discharge_authority() {
+        // A volume-serving coordinator that also declares [attestation] is a
+        // misconfiguration: the discharge authority is the `attest` subcommand,
+        // never a co-located mode of `serve`.
+        let with_attestation = r#"
+            data_dir = "elide_data"
+
+            [store]
+            bucket = "elide-test"
+
+            [attestation]
+            k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
+            listen = "[::]:8087"
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(with_attestation).unwrap();
+        assert!(
+            cfg.reject_discharge_authority().is_err(),
+            "[attestation] in a serve config must be rejected"
+        );
+
+        let without = r#"
+            data_dir = "elide_data"
+
+            [store]
+            bucket = "elide-test"
+        "#;
+        let cfg: CoordinatorConfig = toml::from_str(without).unwrap();
+        cfg.reject_discharge_authority()
+            .expect("no [attestation] is a valid serve config");
     }
 
     #[test]
