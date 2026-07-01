@@ -1,7 +1,7 @@
 # mint-for-elide config for the Fly.io deployment (see README.md § Fly.io
 # deployment). Self-contained: mint-elide.toml plus the Fly data_dir, listener,
-# and colocated demo auth/attestation. The role + profile catalog is the shared
-# catalog.toml.
+# colocated demo auth, and the shared attestation key. The role + profile
+# catalog is the shared catalog.toml.
 
 audience = "mint"
 
@@ -22,22 +22,22 @@ bind = "[::]:8085"
 location = "https://auth.elide.internal/v1/discharge"
 
 [attestation]
-# Attestation coordinator (coord B) identity for the attested volume roles.
-location = "https://coord-b.elide.internal/v1/discharge"
+# Attestation authority (the dedicated attest instance) identity for the
+# attested volume roles; the holder fetches the discharge from here.
+location = "http://elide-attest.internal:8087/v1/discharge"
+# K_M-B, the shared attestation-CID wrapping key — the identical value the
+# attest instance holds. Demo-tier: standard base64 of 32 bytes, known and
+# forgeable.
+k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
 
 [store]
 # mint's own administrative bucket (holds its _mint/* state). The Fly build
 # overrides this from the DATA_BUCKET / STORE_BUCKET build arg.
 bucket = "mint-admin"
 
-# Colocated demo auth + attestation, both binding a container-internal UDS.
-# `k_m_a` and `k_m_b` are demo-tier shared-key secrets — standard base64 of 32
-# bytes, known and forgeable — each identical to the coordinator's value
-# (docs/design/auth-service.md; docs/mint-shared-k-m-b-spec.md).
+# Colocated demo auth issuer, binding a container-internal UDS. `k_m_a` is a
+# demo-tier shared-key secret — standard base64 of 32 bytes, known and
+# forgeable — identical to the coordinator's value (docs/design/auth-service.md).
 [auth.demo]
 socket = "/data/mint_data/auth.sock"
 k_m_a = "XXdf8FWWdPwfx2RePVaoQzxA7zLjbC+zEnkAWiVA/2M="
-
-[attestation.demo]
-socket = "/data/mint_data/attest.sock"
-k_m_b = "8K0oyDybI3jBHjtUYxtrfLKHeniWHK8JmxxpCS/e3IU="
