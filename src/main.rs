@@ -173,7 +173,7 @@ enum CoordCommand {
         /// Re-exchange and overwrite every role credential, not just missing ones
         #[arg(long)]
         force: bool,
-        /// Enrol as a read-only attestation authority (coord-ro role only)
+        /// Enrol as a read-only attestation authority (attest-ro role only)
         #[arg(long)]
         attestation: bool,
     },
