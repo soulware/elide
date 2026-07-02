@@ -194,8 +194,10 @@ tombstoned:
 - Empty sections present-but-empty regardless of state (canonical form).
 - `anchor:` names the manifest this HEAD is a delta of (`nil` on a
   fresh volume). Self-describing for operators and lets the proptest
-  assert anchor equality; not load-bearing for correctness — the
-  manifest set is the arbiter regardless.
+  assert anchor equality. Force-claim follows it to discover a
+  stop-snapshot seal (which `LATEST` does not name) — as a hint,
+  verified by fetching the signed manifest it names; the manifest
+  set remains the arbiter regardless.
 - `since` is RFC3339, matching the manifest's `recovered_at`. Replaces
   the role the retention marker's filename ULID plays today.
 - **No `sig:`** — derived, unsigned state (see *Derived state*).
@@ -314,15 +316,20 @@ no intra-host ordering between writers to reason about.
 
 ## Truncation
 
-Truncation is trivial because the writer is also the sealer. When the
-tick loop seals a new snapshot it writes the manifest, bumps `LATEST`
-(P2), and — in the same sequential tick — **overwrites HEAD
-to empty**. The new manifest's `segment_ulids` already absorbs every
-live segment (the post-previous-snapshot drain and all completed GC),
-so the emptied HEAD plus the new anchor still computes the identical
-`live` set. No lazy reclamation, no compaction heuristic, no
-cross-task coordination: a single writer resets a single object as
-part of the seal it is already performing.
+Truncation is trivial because the writer is also the sealer. When a
+seal lands — a user snapshot or a stop-snapshot, whether from the
+tick-loop drain or the inbound snapshot/stop verbs — the sealer
+writes the manifest, bumps `LATEST` (user seals only, P2), and
+**overwrites HEAD to empty, anchored at the seal**. The new
+manifest's `segment_ulids` already absorbs every live segment (the
+post-previous-snapshot drain and all completed GC), so the emptied
+HEAD plus the new anchor still computes the identical `live` set.
+For a stop-snapshot the anchor is the only bucket-side pointer to
+the seal: `LATEST` does not name it, and force-claim's claim-set
+resolution follows the anchor to the stop manifest. No lazy
+reclamation, no compaction heuristic, no cross-task coordination: a
+single writer resets a single object as part of the seal it is
+already performing.
 
 A reader that races the seal (reads old `LATEST` + new empty HEAD, or
 new `LATEST` + old HEAD) still computes correct `live`: the manifest
