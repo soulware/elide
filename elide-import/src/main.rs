@@ -37,36 +37,27 @@ struct Args {
     /// Path to the volume directory to create (e.g. volumes/ubuntu-22.04)
     vol_dir: String,
 
-    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag).
-    /// Mutually exclusive with --from-file.
+    /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
     #[arg(long, conflicts_with = "from_file")]
     image: Option<String>,
 
-    /// Import a raw ext4 image directly, skipping OCI pull.
-    /// Mutually exclusive with --image.
+    /// Import a raw ext4 image directly, skipping OCI pull
     #[arg(long, value_name = "PATH", conflicts_with = "image")]
     from_file: Option<PathBuf>,
 
-    /// Disk image size (e.g. 4G, 2048M). Auto-sized from unpacked rootfs if omitted.
-    /// Ignored when using --from-file (size is read from the image).
+    /// Disk image size (e.g. 4G, 2048M); auto-sized from the rootfs if omitted
     #[arg(long)]
     size: Option<String>,
 
-    /// Target CPU architecture (e.g. amd64, arm64). Defaults to host architecture.
-    /// Ignored when using --from-file.
+    /// Target CPU architecture (e.g. amd64, arm64); defaults to host architecture
     #[arg(long)]
     arch: Option<String>,
 
-    /// Save the intermediate flat ext4 image to this path (for boot-trace analysis).
-    /// Only valid with --image; ignored with --from-file (the file is already flat).
+    /// Save the intermediate flat ext4 image to this path (--image only)
     #[arg(long, value_name = "PATH")]
     save_flat: Option<PathBuf>,
 
-    /// Extent-index source entry, in the canonical `<source-ulid>/<snapshot-ulid>`
-    /// form. Repeat for each source. The coordinator is the normal producer of
-    /// this list; it resolves `--extents-from <name>` flags to source
-    /// directories, flattens the union, applies the eviction cap, and passes
-    /// the resolved entries here.
+    /// Extent-index source, `<source-ulid>/<snapshot-ulid>` (repeatable)
     #[arg(long = "extent-source", value_name = "ULID/ULID")]
     extent_sources: Vec<String>,
 }
