@@ -64,7 +64,7 @@ The WAL flushes to `pending/` once it exceeds 32 MiB; 80 MiB produces two or thr
 The coordinator uploads `pending/` segments to the store on each drain tick (default: every 5 seconds). No manual step required. Check progress:
 
 ```sh
-./target/debug/elide volume info data-vol
+./target/debug/elide volume status data-vol
 ```
 
 After drain, segments are uploaded to `elide_store/` and promoted: the volume writes `index/<ulid>.idx` (permanent LBA index) and `cache/<ulid>.body` (evictable body), then removes the `pending/` file.

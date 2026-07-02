@@ -197,8 +197,8 @@ enum VolumeCommand {
         all: bool,
     },
 
-    /// Show a human-readable summary of a volume
-    Info {
+    /// Deep on-disk inspection: WAL, pending and cached segments, ancestry
+    Inspect {
         /// Volume name
         name: String,
     },
@@ -457,7 +457,7 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Info { name } => {
+            VolumeCommand::Inspect { name } => {
                 let vol_dir = resolve_volume_dir(&data_dir, &name);
                 if let Err(e) = inspect::run(&vol_dir, &by_id_dir) {
                     eprintln!("error: {e}");
@@ -577,14 +577,9 @@ fn main() {
                             std::process::exit(1);
                         }
                     }
-                } else {
-                    match coord.status(&name) {
-                        Ok(reply) => println!("{name}: {}", reply.lifecycle.wire_body()),
-                        Err(e) => {
-                            eprintln!("{name}: {e}");
-                            std::process::exit(1);
-                        }
-                    }
+                } else if let Err(e) = print_local_status(&name, &data_dir, &coord) {
+                    eprintln!("{name}: {e}");
+                    std::process::exit(1);
                 }
             }
 
@@ -1536,6 +1531,7 @@ struct VolumeRow {
     mode: VolumeMode,
     state: CliVolumeState,
     device: String,
+    pending: String,
     pid: String,
 }
 
@@ -1646,18 +1642,25 @@ fn list_volumes(
         .max()
         .unwrap_or(6)
         .max(6);
+    let pending_w = rows
+        .iter()
+        .map(|r| r.pending.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
     println!(
-        "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  PID",
-        "NAME", "ULID", "MODE", "STATE", "DEVICE"
+        "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  {:<pending_w$}  PID",
+        "NAME", "ULID", "MODE", "STATE", "DEVICE", "PENDING"
     );
     for r in &rows {
         println!(
-            "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  {}",
+            "{:<name_w$}  {:<ulid_w$}  {:<mode_w$}  {:<state_w$}  {:<device_w$}  {:<pending_w$}  {}",
             r.name,
             r.ulid,
             r.mode.label(),
             r.state.label(),
             r.device,
+            r.pending,
             r.pid
         );
     }
@@ -1721,8 +1724,83 @@ fn volume_row(name: String, vol_dir: &Path, is_readonly: bool) -> VolumeRow {
         mode,
         state,
         device,
+        pending: pending_cell(vol_dir),
         pid,
     }
+}
+
+/// Render the bytes not yet uploaded to S3 (pending segments + WAL payload)
+/// as a table cell: a size when non-zero, `-` when clean or unreadable.
+fn pending_cell(vol_dir: &Path) -> String {
+    match inspect::pending_summary(vol_dir) {
+        Ok(p) if p.total_bytes() > 0 => inspect::fmt_size(p.total_bytes()),
+        _ => "-".to_owned(),
+    }
+}
+
+/// Operational summary for one volume, derived from on-disk markers so it
+/// renders whether or not the coordinator is up; a footer flags paused
+/// supervision, mirroring `volume list`.
+fn print_local_status(
+    name: &str,
+    data_dir: &Path,
+    coord: &coordinator_client::Client,
+) -> std::io::Result<()> {
+    let link = resolve_volume_dir(data_dir, name);
+    let vol_dir = std::fs::canonicalize(&link).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no local volume named '{name}'"),
+            )
+        } else {
+            e
+        }
+    })?;
+    let lifecycle = VolumeLifecycle::from_dir(&vol_dir);
+    println!("{name}: {}", lifecycle.wire_body());
+    let ulid = vol_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| ulid::Ulid::from_string(s).ok())
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let mode = if vol_dir.join("volume.readonly").exists() {
+        VolumeMode::Ro
+    } else {
+        VolumeMode::Rw
+    };
+    println!("  ulid:     {ulid}");
+    println!("  mode:     {}", mode.label());
+    if let Some(pid) = lifecycle.pid() {
+        println!("  pid:      {pid}");
+    }
+    println!("  device:   {}", device_summary(&vol_dir));
+    let p = inspect::pending_summary(&vol_dir)?;
+    if p.total_bytes() == 0 {
+        println!("  pending:  none");
+    } else {
+        println!(
+            "  pending:  {} ({} segment{} {}, wal {})",
+            inspect::fmt_size(p.total_bytes()),
+            p.pending_files,
+            if p.pending_files == 1 { "" } else { "s" },
+            inspect::fmt_size(p.pending_bytes),
+            inspect::fmt_size(p.wal_bytes),
+        );
+    }
+    match volume::latest_snapshot(&vol_dir).ok().flatten() {
+        Some(s) => println!("  snapshot: {s}"),
+        None => println!("  snapshot: -"),
+    }
+    if !coord.is_reachable() {
+        println!();
+        println!(
+            "coordinator is not running ({})",
+            coord.socket_path().display()
+        );
+    }
+    Ok(())
 }
 
 /// Summarise the volume's ublk block device for display: the bound

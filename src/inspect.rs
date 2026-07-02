@@ -74,9 +74,51 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     print_ancestor_nodes(&ancestors);
 
     let t = totals(&node, &ancestors);
-    print_totals(&t);
+    print_totals(&t, &pending_summary(dir)?);
 
     Ok(())
+}
+
+/// Local bytes not yet uploaded to S3: segment files in `pending/` plus
+/// WAL record payload (file size net of the WAL header, so an idle open
+/// WAL counts as zero).
+pub struct PendingSummary {
+    pub pending_files: usize,
+    pub pending_bytes: u64,
+    pub wal_bytes: u64,
+}
+
+impl PendingSummary {
+    pub fn total_bytes(&self) -> u64 {
+        self.pending_bytes + self.wal_bytes
+    }
+}
+
+pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
+    let pending_paths = segment::collect_segment_files(&vol_dir.join("pending"))?;
+    let pending_files = pending_paths.len();
+    let mut pending_bytes = 0u64;
+    for p in &pending_paths {
+        match fs::metadata(p) {
+            Ok(m) => pending_bytes += m.len(),
+            // A drain tick can promote (delete) the file between listing and stat.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut wal_bytes = 0u64;
+    for p in &segment::collect_segment_files(&vol_dir.join("wal"))? {
+        match fs::metadata(p) {
+            Ok(m) => wal_bytes += m.len().saturating_sub(writelog::HEADER_LEN),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(PendingSummary {
+        pending_files,
+        pending_bytes,
+        wal_bytes,
+    })
 }
 
 // --- node collection ---
@@ -239,7 +281,7 @@ fn read_origin(fork_dir: &Path) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-fn print_totals(t: &Totals) {
+fn print_totals(t: &Totals, p: &PendingSummary) {
     println!();
     if t.cache_files > 0 {
         let pct = if t.cache_data > 0 {
@@ -288,6 +330,16 @@ fn print_totals(t: &Totals) {
             if t.wal_files == 1 { "" } else { "s" },
             fmt_commas(t.seg_entries as u64),
             fmt_size(t.body_bytes),
+        );
+    }
+    if p.total_bytes() > 0 {
+        println!(
+            "  not in S3: {} ({} pending segment{} {}, wal {})",
+            fmt_size(p.total_bytes()),
+            p.pending_files,
+            if p.pending_files == 1 { "" } else { "s" },
+            fmt_size(p.pending_bytes),
+            fmt_size(p.wal_bytes),
         );
     }
 }
@@ -592,7 +644,7 @@ fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
 // --- display ---
 
 fn print_node(node: &NodeInfo, latest_snap: Option<&str>) {
-    let state = if node.is_live { "live" } else { "frozen" };
+    let state = if node.is_live { "writable" } else { "readonly" };
     println!("[{state} root]");
 
     let prefix = "  ";
@@ -826,7 +878,7 @@ fn read_oci_source(dir: &Path) -> Option<OciSource> {
     lineage.oci_source().cloned()
 }
 
-fn fmt_size(bytes: u64) -> String {
+pub fn fmt_size(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
@@ -866,6 +918,49 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("elide-inspect-test-{}-{}", std::process::id(), n));
         p
+    }
+
+    #[test]
+    fn pending_summary_counts_pending_files_and_wal_payload() {
+        let tmp = temp_vol_dir();
+        fs::create_dir_all(tmp.join("pending")).unwrap();
+        fs::create_dir_all(tmp.join("wal")).unwrap();
+        fs::write(tmp.join("pending/01AAAAAAAAAAAAAAAAAAAAAAAA"), [0u8; 100]).unwrap();
+        fs::write(
+            tmp.join("pending/01AAAAAAAAAAAAAAAAAAAAAAAB.tmp"),
+            [0u8; 999],
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("wal/01AAAAAAAAAAAAAAAAAAAAAAAC"),
+            vec![0u8; (writelog::HEADER_LEN + 50) as usize],
+        )
+        .unwrap();
+
+        let p = pending_summary(&tmp).unwrap();
+        assert_eq!(p.pending_files, 1);
+        assert_eq!(p.pending_bytes, 100);
+        assert_eq!(p.wal_bytes, 50);
+        assert_eq!(p.total_bytes(), 150);
+
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn pending_summary_clean_volume_is_zero() {
+        let tmp = temp_vol_dir();
+        fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(pending_summary(&tmp).unwrap().total_bytes(), 0);
+
+        fs::create_dir_all(tmp.join("wal")).unwrap();
+        fs::write(
+            tmp.join("wal/01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            vec![0u8; writelog::HEADER_LEN as usize],
+        )
+        .unwrap();
+        assert_eq!(pending_summary(&tmp).unwrap().total_bytes(), 0);
+
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
