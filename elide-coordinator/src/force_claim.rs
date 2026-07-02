@@ -455,7 +455,8 @@ impl ForceClaimOrchestrator {
         elide_core::config::VolumeConfig {
             name: Some(self.volume.clone()),
             size: Some(self.observed.record.size),
-            ublk: None,
+            ublk: elide_coordinator::ublk_sweep::ublk_capable()
+                .then(elide_core::config::UblkConfig::default),
             lazy: None,
         }
         .write(dir)

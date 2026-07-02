@@ -6,11 +6,12 @@
 // keeps serving if the coordinator is restarted or upgraded.
 //
 // Transport binding:
-//   By default no block-device transport is started (IPC-only mode). To expose
-//   a fork, add a `[ublk]` section to `volume.toml`. The supervisor passes
-//   `--ublk` when that section is present; the bound dev_id is read by
-//   serve-volume from volume.toml itself, and the kernel auto-allocates on
-//   first serve.
+//   The supervisor passes `--ublk` when `volume.toml` has a `[ublk]` section;
+//   without one the volume is IPC-only. Create/claim write the section by
+//   default when the host can serve ublk (root with /dev/ublk-control
+//   present), and `volume update --ublk/--no-ublk` flips it. The bound
+//   dev_id is read by serve-volume from volume.toml itself, and the kernel
+//   auto-allocates on first serve.
 //
 // State files written to the fork directory:
 //   volume.pid  — PID of the running volume process, for display; absent when
@@ -104,7 +105,7 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, child_env: ChildEnv
             error!(
                 "[supervisor {label}] volume requires --ublk but coordinator is not running as root. \
                  Rerun the coordinator under sudo (or grant it CAP_SYS_ADMIN), \
-                 or remove the [ublk] section from volume.toml. Marking volume.stopped."
+                 or run `elide volume update <name> --no-ublk`. Marking volume.stopped."
             );
             let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
             continue;

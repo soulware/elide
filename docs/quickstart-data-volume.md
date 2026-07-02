@@ -16,20 +16,26 @@ limactl start elide-dev                            # subsequent boots
 
 ```sh
 cargo build -p elide -p elide-coordinator
-./target/debug/elide-coordinator serve   # leave running in a separate terminal
+sudo ./target/debug/elide-coordinator serve   # leave running in a separate terminal
 ```
+
+Root matters here: ublk needs CAP_SYS_ADMIN, and a root coordinator serves
+new volumes over ublk by default.
 
 With no config file: volume state in `elide_data/`, local store in `elide_store/`.
 
 ## Create the volume
 
 ```sh
-./target/debug/elide volume create --size 1G --ublk data-vol
+./target/debug/elide volume create --size 1G data-vol
 ```
 
-`--ublk` writes a `[ublk]` section into `volume.toml` so the coordinator's
-supervisor will attach a kernel block device on first start. The kernel
-auto-allocates a device id; the chosen id is sticky across restarts.
+When the coordinator can serve ublk — running as root with the `ublk_drv`
+module loaded — create writes a `[ublk]` section into `volume.toml` and the
+supervisor attaches a kernel block device on first start. The kernel
+auto-allocates a device id; the chosen id is sticky across restarts. Pass
+`--no-ublk` to keep the volume IPC-only, or `--ublk` to force the transport
+on a host that can't serve it yet (the volume stays parked until it can).
 
 ## Mount from the VM
 
