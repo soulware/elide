@@ -2,9 +2,13 @@
 # Deploy the Elide attestation authority (coord B) to Fly.io at a resolved
 # elide release version.
 #
-#   ./deploy.sh            deploy the latest release
+#   ./deploy.sh            deploy the newest version tag's release
 #   ./deploy.sh latest     same, stated explicitly
 #   ./deploy.sh v0.1.2     deploy a specific tag
+#
+# `latest` is the highest v* tag on the remote (hyphenated prerelease tags
+# excluded), so a tag whose release is still building fails the asset check
+# below instead of silently deploying the previous release.
 #
 # Resolves the version to a concrete tag, checks the release assets exist, and
 # passes the tag as the ELIDE_VERSION build-arg the Dockerfile requires. Any
@@ -26,9 +30,9 @@ case "${1:-}" in
 esac
 
 if [ -z "$version" ]; then
-  version="$(curl -fsIL -o /dev/null -w '%{url_effective}' \
-    "https://github.com/${repo}/releases/latest" | sed 's#.*/tag/##')"
-  [ -n "$version" ] || { echo "could not resolve latest release of ${repo}" >&2; exit 1; }
+  version="$(git ls-remote --tags --refs "https://github.com/${repo}.git" 'v*' \
+    | awk -F/ '$NF !~ /-/ {print $NF}' | sort -V | tail -n 1)"
+  [ -n "$version" ] || { echo "could not resolve latest tag of ${repo}" >&2; exit 1; }
 fi
 
 for asset in "${assets[@]}"; do
