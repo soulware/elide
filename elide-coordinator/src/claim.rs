@@ -732,7 +732,8 @@ impl ClaimOrchestrator {
                     ulid: Some(new_vol_ulid),
                     name: Some(self.volume.clone()),
                     size: Some(size),
-                    ublk: None,
+                    ublk: elide_coordinator::ublk_sweep::ublk_capable()
+                        .then(elide_core::config::UblkConfig::default),
                     lazy: None,
                 }
                 .write(&new_fork_dir)

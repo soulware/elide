@@ -1387,17 +1387,26 @@ fn unflushed_state_reason(vol_dir: &Path) -> Option<String> {
 // ── Volume create / update ────────────────────────────────────────────────────
 
 /// Parsed transport flags from the `create`/`update` IPC argument string.
-/// Each `Some` field is an explicit set request; the corresponding `no_*`
-/// boolean is an explicit clear. Mutually-exclusive flags are validated by
-/// the consumer (different rules for create vs update).
+/// At most one field is set; neither set means "no explicit request"
+/// (create then defaults by host capability, update leaves the transport
+/// unchanged).
 #[derive(Default)]
 pub(crate) struct TransportPatch {
     pub(crate) ublk: bool,
     pub(crate) no_ublk: bool,
 }
 
+impl TransportPatch {
+    /// The `[ublk]` section for a freshly-written `volume.toml`: an
+    /// explicit flag wins; otherwise serve over ublk iff this host can.
+    pub(crate) fn ublk_cfg_or_default(&self) -> Option<elide_core::config::UblkConfig> {
+        let ublk = self.ublk || (!self.no_ublk && elide_coordinator::ublk_sweep::ublk_capable());
+        ublk.then(elide_core::config::UblkConfig::default)
+    }
+}
+
 /// Parse a flat space-separated flag list. Recognised tokens: `ublk`,
-/// `no-ublk`.
+/// `no-ublk` — mutually exclusive.
 ///
 /// Unknown tokens produce an error so silent typos don't get accepted.
 /// There is no `ublk-id=<n>` token: the kernel auto-allocates the device
@@ -1416,6 +1425,9 @@ pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String
             ("no-ublk", None) => patch.no_ublk = true,
             _ => return Err(format!("unknown flag: {tok}")),
         }
+    }
+    if patch.ublk && patch.no_ublk {
+        return Err(format!("conflicting transport flags: {args}"));
     }
     Ok(patch)
 }
@@ -1459,17 +1471,7 @@ async fn create_volume_op(
     }
 
     let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
-    if patch.no_ublk {
-        return Err(IpcError::bad_request(
-            "no-ublk is not valid on create (volume starts without transport)",
-        ));
-    }
-
-    let ublk_cfg = if patch.ublk {
-        Some(elide_core::config::UblkConfig::default())
-    } else {
-        None
-    };
+    let ublk_cfg = patch.ublk_cfg_or_default();
 
     let by_name_dir = data_dir.join("by_name");
     if by_name_dir.join(name).exists() {
@@ -2556,6 +2558,32 @@ mod tests {
     #[test]
     fn parse_flags_bad_value() {
         assert!(parse_transport_flags("ublk-id=").is_err());
+    }
+
+    #[test]
+    fn parse_flags_conflicting_rejected() {
+        let err = match parse_transport_flags("ublk no-ublk") {
+            Ok(_) => panic!("ublk + no-ublk should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("conflicting"), "got {err:?}");
+    }
+
+    #[test]
+    fn ublk_cfg_explicit_flags_win() {
+        let on = parse_transport_flags("ublk").unwrap();
+        assert!(on.ublk_cfg_or_default().is_some());
+        let off = parse_transport_flags("no-ublk").unwrap();
+        assert!(off.ublk_cfg_or_default().is_none());
+    }
+
+    #[test]
+    fn ublk_cfg_default_follows_host_capability() {
+        let p = parse_transport_flags("").unwrap();
+        assert_eq!(
+            p.ublk_cfg_or_default().is_some(),
+            elide_coordinator::ublk_sweep::ublk_capable()
+        );
     }
 
     #[test]

@@ -569,14 +569,7 @@ async fn fork_create_op(
     let source_ulid_str = source_vol_ulid.to_string();
 
     let patch = parse_transport_flags(&flags.join(" ")).map_err(IpcError::bad_request)?;
-    if patch.no_ublk {
-        return Err(IpcError::bad_request("no-ublk is not valid on fork-create"));
-    }
-    let ublk_cfg = if patch.ublk {
-        Some(elide_core::config::UblkConfig::default())
-    } else {
-        None
-    };
+    let ublk_cfg = patch.ublk_cfg_or_default();
 
     let by_name_dir = data_dir.join("by_name");
     let symlink_path = by_name_dir.join(new_name);

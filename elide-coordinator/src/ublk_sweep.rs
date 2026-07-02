@@ -183,6 +183,17 @@ fn scan_sysfs() -> std::io::Result<HashSet<i32>> {
     Ok(ids)
 }
 
+/// Whether this coordinator can serve ublk right now: effective root with
+/// the kernel control device present (ublk_drv loaded). Decides the
+/// transport default when a volume is created or claimed.
+pub fn ublk_capable() -> bool {
+    #[cfg(unix)]
+    let root = nix::unistd::Uid::effective().is_root();
+    #[cfg(not(unix))]
+    let root = false;
+    root && Path::new("/dev/ublk-control").exists()
+}
+
 /// Walk `<data_dir>/by_id/*/volume.toml`, returning a map from volume
 /// directory to the bound dev_id. Volumes without a `[ublk]` section or
 /// without a `dev_id` are skipped (no binding to reconcile). Unreadable

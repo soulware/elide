@@ -235,9 +235,13 @@ enum VolumeCommand {
         /// Fork source: <name>, <name>/<snap_ulid>, or <vol_ulid>/<snap_ulid>
         #[arg(long)]
         from: Option<String>,
-        /// Serve this volume over ublk on first start
-        #[arg(long)]
+        /// Serve over ublk even if this host can't right now
+        /// (default: ublk when the coordinator is root with ublk_drv loaded)
+        #[arg(long, conflicts_with = "no_ublk")]
         ublk: bool,
+        /// Never serve this volume over ublk (IPC only)
+        #[arg(long)]
+        no_ublk: bool,
     },
 
     /// Update configuration for a running volume
@@ -315,6 +319,10 @@ enum VolumeCommand {
         /// Claim a released name first, then start
         #[arg(long)]
         claim: bool,
+        /// Disable ublk before starting (persists, like `update --no-ublk`;
+        /// revert with `update --ublk`)
+        #[arg(long)]
+        no_ublk: bool,
     },
 
     /// Claim a released volume name into local ownership without starting it
@@ -493,13 +501,14 @@ fn main() {
                 size,
                 from,
                 ublk,
+                no_ublk,
             } => {
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    let flags = encode_transport_flags(ublk, false);
+                    let flags = encode_transport_flags(ublk, no_ublk);
                     if let Err(e) = create_fork(&data_dir, &name, from, &coord, &by_id_dir, &flags)
                     {
                         eprintln!("error: {e}");
@@ -524,7 +533,7 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let flags = encode_transport_flags(ublk, false);
+                    let flags = encode_transport_flags(ublk, no_ublk);
                     let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
@@ -776,7 +785,11 @@ fn main() {
                 }
             }
 
-            VolumeCommand::Start { name, claim } => {
+            VolumeCommand::Start {
+                name,
+                claim,
+                no_ublk,
+            } => {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
                     // already; no second await needed here.
@@ -805,6 +818,15 @@ fn main() {
                                  coordinator continues in background"
                             ),
                         }
+                    }
+                }
+                if no_ublk {
+                    // Drop the transport before the first spawn so the
+                    // volume never attempts a ublk start.
+                    let flags = encode_transport_flags(false, true);
+                    if let Err(e) = coord.update_volume(&name, &flags) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
                     }
                 }
                 if let Err(e) = coord.start_volume(&name) {
