@@ -112,7 +112,7 @@ enum Command {
         command: UblkCommand,
     },
 
-    /// Manage the coordinator daemon (start, stop)
+    /// Manage the coordinator daemon (start, stop, run, enroll)
     Coord {
         #[command(subcommand)]
         command: CoordCommand,
@@ -136,79 +136,44 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CoordCommand {
-    /// Start the coordinator as a detached background process.
-    ///
-    /// Spawns `elide-coordinator serve` in a new session (setsid),
-    /// redirects its stdout/stderr to `<data_dir>/elide.log`, and
-    /// waits for the control socket to come up before returning.
+    /// Start the coordinator as a detached background process
     Start {
-        /// Path to the coordinator config file (forwarded to the
-        /// daemon). Defaults to `coordinator.toml` in the daemon's
-        /// working directory.
+        /// Coordinator config file (default: coordinator.toml)
         #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
-    /// Stop the coordinator. By default, volume children continue running
-    /// detached — volumes are expensive state (mounted devices, in-flight
-    /// I/O, populated caches) and bouncing the coordinator (rolling
-    /// upgrade, panic, `systemctl restart`) should not drag the data
-    /// plane with it. With `--stop-volumes`, managed volume processes are
-    /// terminated as well; use `elide volume stop <name>` to stop a
-    /// single volume.
+    /// Stop the coordinator; volumes keep running unless --stop-volumes
     Stop {
-        /// Also terminate managed volume processes.
+        /// Also terminate managed volume processes
         #[arg(long)]
         stop_volumes: bool,
-        /// Path to the coordinator config file. Used to resolve the
-        /// data_dir (and thus the control socket) when `--data-dir`
-        /// is not given. Falls back to `elide_data` if neither is set.
+        /// Coordinator config file (default: coordinator.toml)
         #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
-    /// Run the coordinator in the foreground.
-    ///
-    /// Thin wrapper that execs the sibling `elide-coordinator serve`
-    /// binary with stdio inherited. Use this as the `ExecStart` for a
-    /// `Type=simple` systemd unit, or for interactive debugging.
-    /// Signals reach the coordinator directly; both SIGINT and SIGTERM
-    /// trigger the defensive shutdown (volumes left running).
+    /// Run the coordinator in the foreground
     Run {
-        /// Path to the coordinator config file. Defaults to
-        /// `coordinator.toml` in the working directory.
+        /// Coordinator config file (default: coordinator.toml)
         #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
     },
 
-    /// Enrol this coordinator with the configured mint and provision
-    /// its per-role credentials.
-    ///
-    /// Thin wrapper that execs the sibling `elide-coordinator enroll`
-    /// binary with stdio inherited. One blocking step: it POSTs to
-    /// `/v1/enroll`, waits while the operator runs `mint enroll approve
-    /// <coordinator-id>` on the mint host, then exchanges the ticket
-    /// for every role under `<data_dir>/credentials/`. Requires a
-    /// `[mint]` section in the config; `coord run`/`start` refuse to
-    /// start until this has completed.
+    /// Enrol with the configured mint and provision per-role credentials
     Enroll {
-        /// Path to the coordinator config file. Defaults to
-        /// `coordinator.toml` in the working directory.
+        /// Coordinator config file (default: coordinator.toml)
         #[arg(long, env = "ELIDE_COORD_CONFIG")]
         config: Option<PathBuf>,
-        /// Invite macaroon: the macaroon text inline, a file path,
-        /// or `-` for stdin. Distributed out of band by the operator.
+        /// Invite macaroon: inline text, a file path, or `-` for stdin
         invite: String,
-        /// Overall bound on waiting for operator approval (humantime,
-        /// e.g. `30m`). Defaults to the daemon's own default.
+        /// Bound on waiting for operator approval (humantime, e.g. "30m")
         #[arg(long)]
         timeout: Option<String>,
-        /// Re-exchange and overwrite every role credential, not just
-        /// the missing ones.
+        /// Re-exchange and overwrite every role credential, not just missing ones
         #[arg(long)]
         force: bool,
-        /// Enrol as a read-only attestation authority (coord B): request
-        /// `coord-ro` only, not the full coordinator role set.
+        /// Enrol as a read-only attestation authority (attest-ro role only)
         #[arg(long)]
         attestation: bool,
     },
