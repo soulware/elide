@@ -372,11 +372,14 @@ Re-adoption means the supervisor task polls the existing process until it exits 
 
 These operations give explicit control over individual volumes or all volumes while the coordinator keeps running. They are the right tool for planned maintenance, controlled shutdown of a single VM, or draining a host before an upgrade.
 
-**`volume stop <name>`** — stop a single volume (clean stop):
-1. (writable only) Flush the WAL, drain `pending/` to S3, and publish an *stop-snapshot* manifest at `by_id/<volume_ulid>/snapshots/<S>-stop.manifest` where `S = max(index/)` after the drain (or a freshly minted ULID if `index/` is empty). The manifest is signed identically to a user snapshot — only the filename differs. The stop-snapshot exists for exactly one purpose: to give a future `start` (this host, or another host via `claim`) a basis to hydrate from without requiring synthesis.
-2. (writable only) Flip `names/<name>` in the bucket to `Stopped`.
-3. Write `<vol-dir>/volume.stopped`.
-4. Send SIGTERM to the volume process (via `volume.pid`). Supervisor sees the marker and does not restart.
+**`volume stop <name>`** — stop a single volume (clean stop). The whole verb runs under the per-volume snapshot lock, which the drain/GC tick loop try-locks and skips — so from the first step to the seal, no background pass (GC, repack, reclaim) can add durable state behind the seal's back:
+1. (writable only) Flush the WAL and drain `pending/` to S3 with the daemon up (the volume's promote IPC writes the `index/`/`cache/` form), settling outstanding GC handoffs.
+2. Write `<vol-dir>/volume.stopped` and shut the daemon down. The daemon's shutdown handler flushes any WAL tail into `pending/` before exiting; the supervisor sees the marker and does not restart.
+3. (writable only) Post-halt sweep, coordinator-side — the daemon is gone: upload any `pending/` segments the shutdown flush minted and write their `index/`/`cache/` form; drop staged-but-unapplied `gc/` scratch (its inputs are still live in `index/`; an already-uploaded output becomes a pre-seal orphan).
+4. (writable only) Seal: sign a *stop-snapshot* manifest over `index/`'s final contents with the volume's key at `by_id/<volume_ulid>/snapshots/<S>-stop.manifest`, `S = max(index/)` (or a freshly minted ULID if `index/` is empty), and upload it — truncating the per-volume HEAD to empty anchored at `S`. The manifest is signed identically to a user snapshot — only the filename differs. The stop-snapshot exists for exactly one purpose: to give a future `start` (this host, or another host via `claim`) a basis to hydrate from without requiring synthesis. With the daemon down and the tick loop fenced, the seal covers the volume's final durable state by construction.
+5. (writable only) Flip `names/<name>` in the bucket to `Stopped` (best-effort).
+
+`stop` on an already-stopped volume re-checks the seal: durable state past the last stop-snapshot (the crash window between halt and seal) is repaired in place by re-running the sweep + seal. A WAL tail needs the daemon to replay it — that case errors with a `start`-then-`stop` hint.
 
 **`volume stop --force <name>`** — emergency local halt. Skips the drain/snapshot work entirely. Two execution modes:
 

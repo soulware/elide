@@ -24,8 +24,8 @@ use elide_coordinator::ipc::{IpcError, ReleaseReply};
 use elide_coordinator::volume_state::{STOPPED_FILE, write_released_marker};
 
 use super::{
-    CoordinatorCore, IpcContext, emit_release_aftermath, ensure_release_eligible,
-    snapshot_take_new, snapshot_volume_kind,
+    CoordinatorCore, IpcContext, covering_local_snapshot, drain_volume_for_seal,
+    emit_release_aftermath, ensure_release_eligible, snapshot_take_new,
 };
 
 /// True if `<data_dir>/by_name/<name>` resolves to a fork with a live
@@ -62,15 +62,23 @@ pub(crate) async fn stop_volume_op(
     let vol_dir =
         vol_dir.ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_name}")))?;
 
-    // Idempotent shapes: already stopped, or terminal-released
-    // locally. Importing has its own active subprocess to drain —
-    // refuse with a hint rather than proceeding into the snapshot
-    // path (which would error mid-flow). All other shapes proceed
-    // with drain+halt; the `readonly` flag controls whether the
-    // bucket-flip + drain steps run.
+    // Importing has its own active subprocess to drain — refuse with a
+    // hint rather than proceeding into the drain path (which would
+    // error mid-flow). A stopped volume re-runs the seal check: a
+    // crash between halt and seal leaves durable state past the last
+    // stop-snapshot, and re-running `stop` is the recovery verb for
+    // it. All other shapes proceed with drain+halt+seal; the
+    // `readonly` flag controls whether the bucket-flip + drain + seal
+    // steps run.
     match &shape {
-        VolumeLifecycle::StoppedManual | VolumeLifecycle::Released { .. } => {
+        VolumeLifecycle::Released { .. } => {
             return Ok(());
+        }
+        VolumeLifecycle::StoppedManual => {
+            if force {
+                return Ok(());
+            }
+            return ensure_stopped_sealed(volume_name, &vol_dir, core, snapshot_locks).await;
         }
         VolumeLifecycle::Importing { import_ulid } => {
             return Err(IpcError::conflict(format!(
@@ -94,27 +102,61 @@ pub(crate) async fn stop_volume_op(
         ));
     }
 
-    // Clean stop on a writable volume: drain pending and publish an
-    // stop-snapshot before any state change. The stop-snapshot is what
-    // gives a future `start` (this host, or another host via `claim`)
-    // a basis to hydrate from. Skipped under `--force`.
-    if !readonly && !force {
-        match snapshot_volume_kind(
-            volume_name,
-            core,
-            snapshot_locks,
-            elide_core::signing::SnapshotKind::Stop,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(IpcError::internal(format!(
-                    "stop {volume_name}: drain/stop-snapshot failed: {e:#}; \
-                     retry, or use `stop --force` to halt without a checkpoint"
-                )));
-            }
+    // Clean stop on a writable volume: drain, halt, then seal — in
+    // that order, under the per-volume snapshot lock for the whole
+    // verb. The tick loop try-locks and skips while the lock is held,
+    // and the daemon is down before the seal is taken, so nothing —
+    // guest writes, GC outputs, repack/reclaim rewrites — can add
+    // durable state after the stop-snapshot that is supposed to cover
+    // it. The stop-snapshot is what gives a future `start` (this
+    // host, or another host via `claim`) a basis to hydrate from.
+    // Skipped under `--force`.
+    let seal = if !readonly && !force {
+        let vol_ulid = elide_coordinator::upload::derive_names(&vol_dir)
+            .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
+        // Drain/seal write under `by_id/<vol>/` — `volume-rw` scope
+        // (`coord-rw` would 403), as in `snapshot_volume`.
+        let store = core.stores.volume_rw(&vol_ulid);
+        let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &vol_dir);
+        let guard = lock.lock_owned().await;
+
+        if let Err(e) = drain_volume_for_seal(&vol_dir, vol_ulid, &store, &core.stores).await {
+            return Err(IpcError::internal(format!(
+                "stop {volume_name}: drain failed: {e}; \
+                 retry, or use `stop --force` to halt without a checkpoint"
+            )));
         }
+        Some((vol_ulid, store, guard))
+    } else {
+        None
+    };
+
+    // Write the marker before sending shutdown so the supervisor won't
+    // restart. The daemon's shutdown handler flushes its WAL into
+    // `pending/` before exiting; the sweep below picks that up.
+    std::fs::write(vol_dir.join(STOPPED_FILE), "")
+        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
+
+    use elide_coordinator::control::ShutdownOutcome;
+    match elide_coordinator::control::shutdown(&vol_dir).await {
+        ShutdownOutcome::Acknowledged => {}
+        ShutdownOutcome::Failed(msg) => {
+            // Roll back the marker so the supervisor doesn't strand a
+            // still-running volume. No seal has been taken and the
+            // bucket record is untouched; the volume simply keeps
+            // running.
+            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
+            return Err(IpcError::internal(format!("shutdown failed: {msg}")));
+        }
+        ShutdownOutcome::NotRunning => {
+            info!("[inbound] stop {volume_name}: process was not running");
+        }
+    }
+
+    // Seal over the final durable state, now that the daemon is down
+    // and the lock still fences the tick loop.
+    if let Some((vol_ulid, store, _guard)) = &seal {
+        sweep_and_seal_stopped(volume_name, &vol_dir, *vol_ulid, store).await?;
     }
 
     // `stop` is a local-lifecycle verb: its job is to halt the daemon
@@ -126,12 +168,12 @@ pub(crate) async fn stop_volume_op(
     // For writable volumes, the bucket update only succeeds for the
     // canonical case (record owned by us, Live → Stopped); every other
     // case (no record, already stopped, foreign-owned, Released,
-    // transient store error) becomes a warning and we proceed with
-    // the local halt. The daemon may legitimately still be running
-    // while the bucket says Released — e.g. after a partial release
-    // that flipped the bucket but failed to halt the process — and
-    // `stop` must be able to recover from that. Halting our local
-    // daemon never affects other hosts.
+    // transient store error) becomes a warning and the local halt
+    // stands. The daemon may legitimately still be running while the
+    // bucket says Released — e.g. after a partial release that flipped
+    // the bucket but failed to halt the process — and `stop` must be
+    // able to recover from that. Halting our local daemon never
+    // affects other hosts.
     if !readonly {
         use elide_coordinator::lifecycle::LifecycleError;
         match core
@@ -159,30 +201,211 @@ pub(crate) async fn stop_volume_op(
         }
     }
 
-    // Write the marker before sending shutdown so the supervisor won't restart.
-    std::fs::write(vol_dir.join(STOPPED_FILE), "")
-        .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
+    info!("[inbound] stopped volume {volume_name}");
+    Ok(())
+}
 
-    use elide_coordinator::control::ShutdownOutcome;
-    match elide_coordinator::control::shutdown(&vol_dir).await {
-        ShutdownOutcome::Acknowledged => {
-            info!("[inbound] stopped volume {volume_name}");
+/// Re-check a halted volume's seal and repair it in place. `Cover` and
+/// `NeverRan` need nothing; `NeedsDrain` means durable state exists
+/// past the last stop-snapshot — a crash window, or a stop taken
+/// before the halt-first ordering. A WAL tail needs the daemon to
+/// replay it (`start`, then `stop`); anything else the post-halt sweep
+/// seals directly.
+async fn ensure_stopped_sealed(
+    volume_name: &str,
+    vol_dir: &Path,
+    core: &CoordinatorCore,
+    snapshot_locks: &SnapshotLockRegistry,
+) -> Result<(), IpcError> {
+    // Lock first: the tick loop's drain also uploads pending/ for
+    // stopped volumes, and the sweep must not race it.
+    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, vol_dir);
+    let _guard = lock.lock_owned().await;
+
+    match release_fast_path_handoff(vol_dir) {
+        Ok(FastPathDisposition::Cover(_)) | Ok(FastPathDisposition::NeverRan) => Ok(()),
+        Ok(FastPathDisposition::NeedsDrain) => {
+            if !dir_is_empty_or_absent(&vol_dir.join("wal"))
+                .map_err(|e| IpcError::internal(format!("inspecting wal/: {e}")))?
+            {
+                return Err(IpcError::conflict(format!(
+                    "volume '{volume_name}' is stopped with unflushed WAL records; \
+                     recover with: elide volume start {volume_name}, \
+                     then elide volume stop {volume_name}"
+                )));
+            }
+            let vol_ulid = elide_coordinator::upload::derive_names(vol_dir)
+                .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
+            let store = core.stores.volume_rw(&vol_ulid);
+            let snap = sweep_and_seal_stopped(volume_name, vol_dir, vol_ulid, &store).await?;
+            info!("[stop {volume_name}] sealed previously-unsealed stop at {snap}");
             Ok(())
         }
-        ShutdownOutcome::Failed(msg) => {
-            // Roll back the marker so the supervisor doesn't strand a still-
-            // running volume. (Note: the S3 state has already flipped to
-            // Stopped; that's a soft inconsistency the operator can resolve
-            // by issuing `volume start` once the underlying issue is fixed.)
-            let _ = std::fs::remove_file(vol_dir.join(STOPPED_FILE));
-            Err(IpcError::internal(format!("shutdown failed: {msg}")))
+        Err(e) => Err(IpcError::internal(format!(
+            "inspecting stopped volume: {e}"
+        ))),
+    }
+}
+
+/// Post-halt sweep and seal. Requires the daemon down and the
+/// per-volume snapshot lock held: nothing can extend the fork's
+/// durable state while this runs, so the published stop-snapshot
+/// covers the volume's final contents.
+///
+/// 1. `wal/` must be empty — the daemon's shutdown flush promotes it;
+///    content here means the halt did not complete cleanly.
+/// 2. Upload any `pending/` segments the shutdown flush minted and
+///    write their local `index/` + `cache/` form (coordinator-side
+///    promote; there is no daemon to IPC).
+/// 3. Drop staged-but-unapplied `gc/` scratch: the inputs are still
+///    live in `index/`, so the rewrite is redundant; an
+///    already-uploaded output becomes a pre-seal orphan
+///    (`docs/design/segment-index.md` *Rebuild defines correctness*).
+/// 4. Sign the stop manifest over `index/` with the volume's key and
+///    publish it — `upload_snapshot_metadata` also truncates HEAD to
+///    empty anchored at the seal.
+async fn sweep_and_seal_stopped(
+    volume_name: &str,
+    vol_dir: &Path,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<ulid::Ulid, IpcError> {
+    if !dir_is_empty_or_absent(&vol_dir.join("wal"))
+        .map_err(|e| IpcError::internal(format!("inspecting wal/: {e}")))?
+    {
+        return Err(IpcError::internal(format!(
+            "volume '{volume_name}' halted with unflushed WAL records; \
+             recover with: elide volume start {volume_name}, \
+             then elide volume stop {volume_name}"
+        )));
+    }
+
+    let pending_dir = vol_dir.join("pending");
+    match std::fs::read_dir(&pending_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(IpcError::internal(format!("reading pending/: {e}")));
         }
-        ShutdownOutcome::NotRunning => {
-            // Volume process wasn't running — marker is correct as-is.
-            info!("[inbound] stopped volume {volume_name} (process was not running)");
-            Ok(())
+        Ok(entries) => {
+            let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| IpcError::internal(format!("reading pending/: {e}")))?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Ok(seg_ulid) = ulid::Ulid::from_string(name) else {
+                    warn!(
+                        "[stop {volume_name}] skipping non-segment file pending/{name} \
+                         during post-halt sweep"
+                    );
+                    continue;
+                };
+                let path = entry.path();
+                vd.segments()
+                    .put_from_file(seg_ulid, &path)
+                    .await
+                    .map_err(|e| {
+                        IpcError::store(format!("uploading post-halt segment {seg_ulid}: {e}"))
+                    })?;
+                elide_coordinator::upload::promote_segment_local_form(vol_dir, seg_ulid, &path)
+                    .map_err(|e| {
+                        IpcError::internal(format!("promoting post-halt segment {seg_ulid}: {e}"))
+                    })?;
+                std::fs::remove_file(&path)
+                    .map_err(|e| IpcError::internal(format!("removing pending/{seg_ulid}: {e}")))?;
+                info!("[stop {volume_name}] post-halt sweep: drained segment {seg_ulid}");
+            }
         }
     }
+
+    let gc_dir = vol_dir.join("gc");
+    match std::fs::read_dir(&gc_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(IpcError::internal(format!("reading gc/: {e}")));
+        }
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| IpcError::internal(format!("reading gc/: {e}")))?;
+                let path = entry.path();
+                let removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                removed.map_err(|e| {
+                    IpcError::internal(format!("removing gc scratch {}: {e}", path.display()))
+                })?;
+                warn!(
+                    "[stop {volume_name}] dropped staged gc scratch {} — its inputs \
+                     remain live in index/",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let segs = index_segment_ulids(&vol_dir.join("index"))
+        .map_err(|e| IpcError::internal(format!("reading index/: {e}")))?;
+    let snap_ulid = segs.iter().max().copied().unwrap_or_else(ulid::Ulid::new);
+
+    if covering_local_snapshot(vol_dir, snap_ulid).is_none() {
+        std::fs::create_dir_all(vol_dir.join("snapshots"))
+            .map_err(|e| IpcError::internal(format!("creating snapshots/: {e}")))?;
+        let signer = load_volume_signer(vol_dir)?;
+        elide_core::signing::write_stop_snapshot_manifest(
+            vol_dir,
+            signer.as_ref(),
+            &snap_ulid,
+            &segs,
+        )
+        .map_err(|e| IpcError::internal(format!("writing stop manifest {snap_ulid}: {e}")))?;
+    }
+    elide_coordinator::upload::upload_snapshot_metadata(vol_dir, vol_ulid, store)
+        .await
+        .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
+    info!("[stop-snapshot {vol_ulid}] committed {snap_ulid}");
+    Ok(snap_ulid)
+}
+
+/// Every segment ULID with an `index/<ulid>.idx` entry — the volume's
+/// committed live set, which is what a seal must enumerate.
+fn index_segment_ulids(index_dir: &Path) -> std::io::Result<Vec<ulid::Ulid>> {
+    let entries = match std::fs::read_dir(index_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(stem) = s.strip_suffix(".idx") else {
+            continue;
+        };
+        if let Ok(u) = ulid::Ulid::from_string(stem) {
+            out.push(u);
+        }
+    }
+    Ok(out)
+}
+
+/// The volume's segment signer, from `<vol_dir>/volume.key`.
+fn load_volume_signer(
+    vol_dir: &Path,
+) -> Result<Arc<dyn elide_core::segment::SegmentSigner>, IpcError> {
+    let key_path = vol_dir.join(elide_core::signing::VOLUME_KEY_FILE);
+    let bytes = std::fs::read(&key_path)
+        .map_err(|e| IpcError::internal(format!("reading volume.key: {e}")))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| IpcError::internal("volume.key is not a 32-byte Ed25519 key"))?;
+    let (signer, _) = elide_core::signing::signer_from_bytes(&arr)
+        .map_err(|e| IpcError::internal(format!("deriving segment signer: {e}")))?;
+    Ok(signer)
 }
 
 /// Relinquish ownership of `<volume_name>` so any other coordinator can
@@ -350,11 +573,9 @@ pub(crate) async fn release_volume_op(
         }
         Ok(FastPathDisposition::NeedsDrain) => {
             return Err(IpcError::conflict(format!(
-                "volume '{volume_name}' has durable state past the last snapshot \
-                 (WAL/pending uploads not yet drained); the previous stop did not \
-                 complete a clean drain. Recover with: \
-                 `elide volume start {volume_name}` then \
-                 `elide volume stop {volume_name}`, then re-run release"
+                "volume '{volume_name}' has durable state past the last stop-snapshot. \
+                 Recover with: `elide volume stop {volume_name}` (re-running stop \
+                 seals it), then re-run release"
             )));
         }
         Err(e) => {
@@ -1845,6 +2066,188 @@ mod tests {
         let (still, _) = ns::read_name_record(&store, "vol").await.unwrap().unwrap();
         assert_eq!(still.state, NameState::Live);
         assert_eq!(still.coordinator_id.as_deref(), Some("coord-other"));
+    }
+
+    // ── post-halt sweep + seal ─────────────────────────────────────────
+
+    fn write_test_segment(path: &Path, signer: &dyn elide_core::segment::SegmentSigner, fill: u8) {
+        let body = vec![fill; 4096];
+        let hash = blake3::hash(&body);
+        let mut entries = vec![elide_core::segment::SegmentEntry::new_data(
+            hash,
+            0,
+            1,
+            elide_core::segment::SegmentFlags::empty(),
+            body,
+        )];
+        elide_core::segment::write_segment(path, &mut entries, signer).unwrap();
+    }
+
+    fn volume_keypair(vol_dir: &Path) -> Arc<dyn elide_core::segment::SegmentSigner> {
+        let key = elide_core::signing::generate_keypair(
+            vol_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let (signer, _) = elide_core::signing::signer_from_bytes(&key.to_bytes()).unwrap();
+        signer
+    }
+
+    #[tokio::test]
+    async fn sweep_and_seal_drains_post_halt_pending_and_seals() {
+        let store = mem_store();
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(vol_dir.join("pending")).unwrap();
+        std::fs::create_dir_all(vol_dir.join("wal")).unwrap();
+        std::fs::create_dir_all(vol_dir.join("gc")).unwrap();
+        let signer = volume_keypair(&vol_dir);
+
+        // One segment the shutdown flush minted after the daemon-up
+        // drain, plus staged gc scratch from an interrupted pass.
+        let seg = ulid::Ulid::new();
+        write_test_segment(
+            &vol_dir.join("pending").join(seg.to_string()),
+            signer.as_ref(),
+            7,
+        );
+        std::fs::write(
+            vol_dir.join("gc").join("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            b"plan",
+        )
+        .unwrap();
+
+        let sealed = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(sealed, seg, "seal anchors at the swept segment");
+        assert!(!vol_dir.join("pending").join(seg.to_string()).exists());
+        assert!(vol_dir.join("index").join(format!("{seg}.idx")).is_file());
+        assert!(vol_dir.join("cache").join(format!("{seg}.body")).is_file());
+        assert!(
+            std::fs::read_dir(vol_dir.join("gc"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "gc scratch dropped"
+        );
+        assert!(
+            vol_dir
+                .join("snapshots")
+                .join(elide_core::signing::stop_snapshot_manifest_filename(
+                    &sealed
+                ))
+                .is_file()
+        );
+
+        // S3: segment uploaded, manifest signed over exactly the index
+        // set, HEAD truncated to empty anchored at the seal.
+        let vd = elide_coordinator::volume_data::VolumeData::new(store.clone(), vol_ulid);
+        assert!(vd.segments().get_bytes(seg).await.is_ok());
+        let pubkey =
+            elide_core::signing::load_verifying_key(&vol_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+        let manifest_bytes = vd
+            .snapshots()
+            .get_stop_manifest_bytes(sealed)
+            .await
+            .unwrap();
+        let manifest = elide_core::signing::read_snapshot_manifest_from_bytes(
+            &manifest_bytes,
+            &pubkey,
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(manifest.segment_ulids, vec![seg]);
+        let head = vd.head().read().await.unwrap();
+        assert_eq!(
+            head,
+            elide_coordinator::segment_head::SegmentHead::empty(Some(sealed))
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_and_seal_refuses_unflushed_wal() {
+        let store = mem_store();
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let vol_dir = tmp.path().join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(vol_dir.join("wal")).unwrap();
+        std::fs::write(
+            vol_dir.join("wal").join("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            b"rec",
+        )
+        .unwrap();
+
+        let err = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unflushed WAL"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn stop_on_stopped_volume_seals_uncovered_segments() {
+        // The crash window between halt and seal (and any stop taken
+        // before the halt-first ordering) leaves a halted volume whose
+        // index/ outruns its last stop-snapshot. Re-running `stop`
+        // must seal it in place — no daemon restart.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let (vol_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), false);
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        let _signer = volume_keypair(&vol_dir);
+        let seg = ulid::Ulid::new();
+        std::fs::create_dir_all(vol_dir.join("index")).unwrap();
+        std::fs::write(vol_dir.join("index").join(format!("{seg}.idx")), b"idx").unwrap();
+
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+            .await
+            .expect("re-running stop seals the halted volume");
+
+        assert!(
+            vol_dir
+                .join("snapshots")
+                .join(elide_core::signing::stop_snapshot_manifest_filename(&seg))
+                .is_file(),
+            "the uncovered segment is now sealed"
+        );
+        assert!(matches!(
+            release_fast_path_handoff(&vol_dir).unwrap(),
+            FastPathDisposition::Cover(_)
+        ));
+
+        // Sealed volume: a further stop is a no-op.
+        stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+            .await
+            .expect("stop on a sealed stopped volume is idempotent");
+    }
+
+    #[tokio::test]
+    async fn stop_on_stopped_volume_with_wal_tail_refuses() {
+        // WAL records need the daemon to replay them; the heal path
+        // must point at start-then-stop rather than sealing past them.
+        let store = mem_store();
+        let data_dir = TempDir::new().unwrap();
+        let (vol_ulid, _lock) = make_volume_with_marker(data_dir.path(), Some(STOPPED_FILE), false);
+        let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(vol_dir.join("wal")).unwrap();
+        std::fs::write(
+            vol_dir.join("wal").join("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            b"rec",
+        )
+        .unwrap();
+
+        let core = test_core(data_dir.path(), &store);
+        let snapshot_locks = SnapshotLockRegistry::default();
+        let err = stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unflushed WAL"), "got: {err}");
     }
 
     // ── release fast-path predicate ────────────────────────────────────
