@@ -50,8 +50,9 @@ Any CLI operation that mutates a live volume's directory must go through coordin
 | `volume update` | Direct fs + IPC restart | Safe (config only read at `Volume::open`) |
 | `volume snapshot` | IPC (primary) / offline fallback | Offline fallback races with coordinator drain — proposed: always route through coordinator |
 | `volume evict` (hidden dev tool) | Direct fs | **Unsafe** — proposed: route through coordinator IPC; concurrent GC can read a body between `collect_stats` and `compact_segments` |
-| `volume import`/`delete`/`status` | Coordinator IPC | Safe |
-| `volume info` | Direct fs (read-only) | Safe |
+| `volume import`/`delete` | Coordinator IPC | Safe |
+| `volume status` | Direct fs (read-only); `--remote` via coordinator IPC | Safe |
+| `volume inspect` | Direct fs (read-only) | Safe |
 
 ## S3 upload
 

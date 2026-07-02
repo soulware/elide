@@ -466,7 +466,8 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | Command | What it does |
 |---|---|
 | `elide volume list` | Scan `data_dir` for ULID dirs; show name, ULID, state |
-| `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
+| `elide volume inspect <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
+| `elide volume status <name>` | Lifecycle, device, bytes not yet uploaded to S3, latest snapshot — all from on-disk markers |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
 | `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` or `<name>/<snap_ulid>` (explicit pin), or `<name>` (local or remote lookup; a remote basis comes from the `names/<name>` record's `latest_snapshot`). A bare `<vol_ulid>` is rejected — raw ULIDs always carry an explicit pin; the name is the discovery surface. Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design/replica-model.md](design/replica-model.md) for the direction of travel |
 | `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.toml`); rescan |

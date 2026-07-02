@@ -56,7 +56,7 @@ On Apple Silicon, `elide-import` auto-selects `arm64`.
 ```
 
 ```sh
-./target/debug/elide volume info ubuntu-22.04
+./target/debug/elide volume inspect ubuntu-22.04
 ```
 
 ## Branch a writable replica for a VM

@@ -59,6 +59,9 @@ bitflags! {
 
 const MAGIC: &[u8; 8] = b"ELIDWAL\x01";
 
+/// Byte length of the file header; everything past it is record payload.
+pub const HEADER_LEN: u64 = MAGIC.len() as u64;
+
 // ---
 
 /// A recovered record from the write log.
