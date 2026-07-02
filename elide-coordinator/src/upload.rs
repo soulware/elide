@@ -538,6 +538,7 @@ pub async fn upload_snapshot_metadata(
     };
 
     let mut published_user_snapshot: Option<Ulid> = None;
+    let mut sealed: Option<Ulid> = None;
     for entry in entries {
         let entry = entry.context("reading snapshots dir entry")?;
         let file_name = entry.file_name();
@@ -585,33 +586,38 @@ pub async fn upload_snapshot_metadata(
                 if let Err(e) = mark_uploaded(&sentinel, &[]) {
                     warn!("failed to mark snapshot {snap_ulid} sentinel: {e}");
                 }
-                // Best-effort perf hint for the clean data-axis
-                // consumers — `User` snapshots only. `Stop` checkpoints
-                // are not pointed at: their recovery role is served by
-                // the `Stopped` event on the spine. A failure here must
-                // not fail the upload (self-heals on the next publish).
+                // `snapshots/LATEST` tracks stable user manifests only;
+                // stop-snapshots are ephemeral and reachable via the
+                // HEAD anchor written below. Failures here must not
+                // fail the upload (self-heal on the next publish).
                 if kind == elide_core::signing::SnapshotKind::User {
                     published_user_snapshot = published_user_snapshot.max(Some(snap_ulid));
                     if let Err(e) = snapshots.bump_latest_if_newer(snap_ulid).await {
                         warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
                     }
-                    // Truncate the post-snapshot HEAD: the new manifest
-                    // absorbs every live segment, so the delta over it
-                    // starts empty. Single writer (the seal is the same
-                    // tick loop / inbound handler that authors HEAD), so
-                    // a plain unconditional PUT — same pattern as
-                    // `snapshots/LATEST`. See `docs/design/segment-index.md`
-                    // *Truncation*.
-                    let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
-                    if let Err(e) = vd.head().put(&empty).await {
-                        warn!(
-                            "[upload] truncating HEAD for {snap_ulid}: {e}; \
-                             self-heals on next active tick"
-                        );
-                    }
                 }
+                sealed = sealed.max(Some(snap_ulid));
             }
             Err(e) => warn!("snapshot manifest upload failed for {key}: {e:#}"),
+        }
+    }
+
+    // Truncate the post-snapshot HEAD: the newest manifest uploaded
+    // here (either kind) absorbs every live segment, so the delta over
+    // it starts empty and the anchor names the seal. For a
+    // stop-snapshot the anchor is the only bucket-side pointer to it.
+    // Single writer (the seal is the same tick loop / inbound handler
+    // that authors HEAD), so a plain unconditional PUT — same pattern
+    // as `snapshots/LATEST`. See `docs/design/segment-index.md`
+    // *Truncation*.
+    if let Some(snap_ulid) = sealed {
+        let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
+        let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
+        if let Err(e) = vd.head().put(&empty).await {
+            warn!(
+                "[upload] truncating HEAD for {snap_ulid}: {e}; \
+                 self-heals on next active tick"
+            );
         }
     }
 
@@ -990,6 +996,91 @@ mod tests {
         assert!(
             store.head(&fm_key).await.is_err(),
             "filemap must not be uploaded to S3",
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_seal_truncates_head_without_bumping_latest() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        std::fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
+        let vol: Ulid = VOL_ULID.parse().unwrap();
+        let snap = Ulid::from_parts(1743120000000, 78);
+        std::fs::write(
+            vol_dir
+                .join("snapshots")
+                .join(elide_core::signing::stop_snapshot_manifest_filename(&snap)),
+            b"signed-manifest-bytes",
+        )
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let vd = crate::volume_data::VolumeData::new(Arc::clone(&store), vol);
+        let mut stale = crate::segment_head::SegmentHead::empty(None);
+        stale.added.insert(Ulid::from_parts(1743110000000, 9));
+        vd.head().put(&stale).await.unwrap();
+
+        let published = upload_snapshot_metadata(&vol_dir, vol, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(published, None, "stop seals never publish a user snapshot");
+        let head = vd.head().read().await.unwrap();
+        assert_eq!(
+            head,
+            crate::segment_head::SegmentHead::empty(Some(snap)),
+            "stop seal truncates HEAD anchored at the stop-snapshot"
+        );
+        assert!(
+            vd.snapshots().read_latest().await.unwrap().is_none(),
+            "snapshots/LATEST tracks user manifests only"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_truncation_anchors_at_the_newest_manifest() {
+        use elide_core::ulid_mint::UlidMint;
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        std::fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
+        let vol: Ulid = VOL_ULID.parse().unwrap();
+        let mut mint = UlidMint::new(Ulid::nil());
+        let user_snap = mint.next();
+        let stop_snap = mint.next();
+        std::fs::write(
+            vol_dir
+                .join("snapshots")
+                .join(elide_core::signing::snapshot_manifest_filename(&user_snap)),
+            b"user-manifest-bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            vol_dir
+                .join("snapshots")
+                .join(elide_core::signing::stop_snapshot_manifest_filename(
+                    &stop_snap,
+                )),
+            b"stop-manifest-bytes",
+        )
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        let published = upload_snapshot_metadata(&vol_dir, vol, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(published, Some(user_snap));
+        let vd = crate::volume_data::VolumeData::new(Arc::clone(&store), vol);
+        let head = vd.head().read().await.unwrap();
+        assert_eq!(
+            head.anchor,
+            Some(stop_snap),
+            "HEAD anchors at the newest seal regardless of dir order"
+        );
+        assert!(head.is_empty());
+        assert_eq!(
+            vd.snapshots().read_latest().await.unwrap().map(|(u, _)| u),
+            Some(user_snap),
+            "LATEST still points at the user manifest"
         );
     }
 }
