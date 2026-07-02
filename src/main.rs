@@ -15,11 +15,7 @@ use elide::{
 #[derive(Parser)]
 #[command(version = elide_core::VERSION)]
 struct Args {
-    /// Directory containing volumes and the coordinator socket.
-    /// When unset, defaults to `elide_data` for non-coord commands;
-    /// `coord run`/`start`/`stop` instead consult `--config` (if given)
-    /// and fall back to `elide_data` only when neither is provided, so
-    /// the value in `coordinator.toml` is honoured.
+    /// Data directory (default: elide_data)
     #[arg(long, env = "ELIDE_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
 
@@ -253,12 +249,7 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Verify every extent's stored body hashes to its declared hash.
-    ///
-    /// Walks `index/*.idx`, reads each Data/Inline body from its local
-    /// location (wal, pending, gc, or cache), and reports any extent whose
-    /// body does not match. Evicted bodies are skipped (reported as
-    /// skipped). Exit code: 0 clean, 1 if any mismatches, 2 on scan errors.
+    /// Verify extent bodies against their declared hashes; exit 1 on mismatch
     #[command(hide = true)]
     Verify {
         /// Volume name
@@ -271,18 +262,7 @@ enum VolumeCommand {
         name: String,
     },
 
-    /// Generate the snapshot filemap for a volume.
-    ///
-    /// Walks the ext4 layout of the named snapshot (defaulting to the
-    /// latest local one) and writes `snapshots/<ulid>.filemap`. Demand-
-    /// fetches segment bytes from S3 if needed, so this works on
-    /// freshly-pulled volumes whose segments haven't been hydrated.
-    ///
-    /// The filemap is consumed by `volume import --extents-from <name>`
-    /// for file-aware delta compression. Run this against the source
-    /// volume before importing if you want delta savings — without it,
-    /// the import path skips delta opportunities for that source and
-    /// falls back to plain DATA entries.
+    /// Generate a snapshot's filemap (consumed by `volume import --extents-from`)
     GenerateFilemap {
         /// Volume name
         name: String,
@@ -291,39 +271,17 @@ enum VolumeCommand {
         snapshot: Option<String>,
     },
 
-    /// Create a new volume.
-    ///
-    /// With `--from`, creates a writable replica branched from an existing
-    /// volume.  `--from` accepts three forms:
-    ///   - `<name>` — branches from the volume's latest published snapshot
-    ///   - `<name>/<snap_ulid>` — pins to a specific snapshot by name
-    ///   - `<vol_ulid>/<snap_ulid>` — pins to a specific snapshot by ULID
-    ///
-    /// A bare `<vol_ulid>` is rejected: raw ULIDs always carry an
-    /// explicit snapshot pin; the name is the discovery surface.
-    ///
-    /// If the source is not found locally, the volume and its ancestor
-    /// chain are auto-pulled from the remote store.
-    ///
-    /// ULID-wins: if the part before `/` parses as a valid ULID it is
-    /// always treated as a volume ID, never as a volume name.
-    ///
-    /// Without `--from`, creates a fresh empty volume and `--size` is
-    /// required.
+    /// Create a new volume, fresh or forked from an existing one
     Create {
         /// Volume name
         name: String,
-        /// Volume size (e.g. "4G", "512M"). Required for fresh volumes;
-        /// conflicts with `--from` (size is inherited from the source).
+        /// Volume size (e.g. "4G", "512M"); required without --from
         #[arg(long, conflicts_with = "from")]
         size: Option<String>,
-        /// Fork from an existing volume: `<name>`, `<name>/<snap_ulid>`,
-        /// or `<vol_ulid>/<snap_ulid>`
+        /// Fork source: <name>, <name>/<snap_ulid>, or <vol_ulid>/<snap_ulid>
         #[arg(long)]
         from: Option<String>,
-        /// Serve this volume over ublk on first start. The kernel
-        /// auto-allocates a device id; the chosen id is then sticky
-        /// across restarts (recorded in volume.toml).
+        /// Serve this volume over ublk on first start
         #[arg(long)]
         ublk: bool,
     },
@@ -332,11 +290,10 @@ enum VolumeCommand {
     Update {
         /// Volume name
         name: String,
-        /// Switch this volume to ublk transport (writes [ublk] section;
-        /// restarts the volume process).
+        /// Switch this volume to ublk transport (restarts the volume process)
         #[arg(long, conflicts_with_all = ["no_ublk"])]
         ublk: bool,
-        /// Disable ublk serving (removes the [ublk] section; restarts the volume process)
+        /// Disable ublk serving (restarts the volume process)
         #[arg(long, conflicts_with_all = ["ublk"])]
         no_ublk: bool,
     },
@@ -345,33 +302,19 @@ enum VolumeCommand {
     Status {
         /// Volume name
         name: String,
-        /// Fetch `names/<name>` from the bucket and print the
-        /// authoritative cross-coordinator record (vol_ulid, state,
-        /// coordinator_id, hostname, claimed_at, parent,
-        /// handoff_snapshot) plus this coordinator's eligibility
-        /// (owned, foreign, released-claimable, …). Without this,
-        /// `volume status` is local-only and never reaches S3.
+        /// Fetch the authoritative names/<name> record from the bucket
         #[arg(long)]
         remote: bool,
     },
 
-    /// Show the per-name event log for a volume.
-    ///
-    /// Prints the most-recent events, one per line, in chronological
-    /// order (oldest first). The default count is the coordinator's
-    /// HEAD window; pass `--num <n>` for a different number of recent
-    /// events. Each event's signature is verified against the emitting
-    /// coordinator's published pubkey; events whose signature is
-    /// invalid or whose pubkey can't be fetched are flagged with a
-    /// sigil rather than hidden.
+    /// Show the per-name event log for a volume, oldest first
     Events {
         /// Volume name
         name: String,
-        /// Number of most-recent events to show. Defaults to the
-        /// coordinator's HEAD window when omitted.
+        /// Number of recent events to show (default: coordinator HEAD window)
         #[arg(long)]
         num: Option<usize>,
-        /// Emit one JSON object per event instead of the human form.
+        /// Emit one JSON object per event
         #[arg(long)]
         json: bool,
     },
@@ -379,121 +322,57 @@ enum VolumeCommand {
     /// Import an OCI image into a new readonly volume (sync by default)
     Import(ImportArgs),
 
-    /// Evict locally cached data so it is demand-fetched on next read
-    ///
-    /// Deletes cache/<ulid>.body and cache/<ulid>.present for segments where
-    /// index/<ulid>.idx confirms S3 upload. The LBA map (index/) is untouched;
-    /// evicted bodies are re-fetched from S3 on next access. Only safe on
-    /// volumes with S3 backing.
-    ///
-    /// --segment <ulid>: evict one specific body by ULID.
+    /// Evict cached segment bodies; they are demand-fetched from S3 on next read
     #[command(hide = true)]
     Evict {
         /// Evict a single segment body by ULID
-        #[arg(long)]
+        #[arg(long, value_name = "ULID")]
         segment: Option<String>,
 
         /// Volume name
         name: String,
     },
 
-    /// Remove the local instance of a volume.
-    ///
-    /// Removes the on-disk fork (`by_id/<ulid>/`) and its `by_name/<name>`
-    /// symlink. Does not delete bucket-side records or segments — this is
-    /// a local-instance verb, not a `purge`.
-    ///
-    /// The volume must be stopped first. Without `--force`, the local
-    /// state must be fully flushed and uploaded to S3 (no segments in
-    /// `pending/`, no records in `wal/`); otherwise `--force` is required
-    /// to discard the unflushed local state.
+    /// Remove the local instance of a volume (bucket-side state is kept)
     Remove {
         /// Volume name
         name: String,
-        /// Skip the "all writes flushed and uploaded" check and discard
-        /// any local segments still pending upload or WAL records still
-        /// unflushed. Use only if you don't need the local-only state.
+        /// Discard local state not yet flushed and uploaded to S3
         #[arg(long)]
         force: bool,
     },
 
-    /// Stop a running volume (flushes WAL, drains pending, publishes an
-    /// stop-snapshot, then halts the daemon and ublk device).
+    /// Stop a running volume, draining and publishing a stop-snapshot
     Stop {
         /// Volume name
         name: String,
-        /// Release ownership in the same operation. Drains the WAL,
-        /// publishes a handoff snapshot, and flips the bucket-side
-        /// state to `released` so any coordinator can claim the name
-        /// via `volume claim`. Equivalent to running `volume release`
-        /// after `volume stop`.
+        /// Also release the name so any coordinator can claim it
         #[arg(long)]
         release: bool,
-        /// Skip the drain/stop-snapshot step. The local daemon is
-        /// halted but `pending/` and `wal/` may be left dirty, and no
-        /// fresh basis manifest is published to S3. Use only when the
-        /// drain is stuck or the host is being torn down quickly.
+        /// Halt without draining; may leave pending/ and wal/ dirty
         #[arg(long)]
         force: bool,
     },
 
-    /// Start a previously stopped volume.
-    ///
-    /// Resumes from local state when present. When the local fork is
-    /// missing but the bucket-side `names/<name>` record names this
-    /// coordinator as owner, transparently hydrates the metadata
-    /// (skeleton + indexes + signed basis manifest) from S3 and brings
-    /// the daemon up; segment bodies remain demand-fetched.
-    ///
-    /// Refuses if the bucket record is `Released` (use `volume claim`
-    /// or pass `--claim` here to compose claim + start) or owned by
-    /// another coordinator.
+    /// Start a previously stopped volume
     Start {
         /// Volume name
         name: String,
-        /// Compose with `volume claim`: claim the bucket-side record
-        /// first (in-place reclaim if the local fork matches the
-        /// released ULID, otherwise pull + mint a fresh fork), then
-        /// start the daemon.
+        /// Claim a released name first, then start
         #[arg(long)]
         claim: bool,
     },
 
-    /// Claim a `Released` volume name into local ownership without
-    /// starting the daemon. Result is a `Stopped` volume bound to
-    /// this coordinator; use `volume start` to bring up the daemon.
-    ///
-    /// In-place reclaim if the local fork's ULID matches the released
-    /// ULID. Otherwise pulls only the delta since the last local
-    /// ancestor, mints a fresh local fork descending from the
-    /// released snapshot, and atomically rebinds `names/<name>`.
-    ///
-    /// Refuses if the bucket record is `Live` or `Stopped` and owned
-    /// by another coordinator. To recover a volume whose owner is
-    /// unreachable (machine gone, key lost), run
-    /// `volume claim --force <name>`: ownership transfers first via a
-    /// forced CAS on the record, then the dead fork's head delta
-    /// (live segments above its last snapshot) is re-owned as the new
-    /// fork's first segments. The forced CAS is still conditioned on
-    /// the record observed at start, so concurrent forced claims
-    /// arbitrate cleanly.
+    /// Claim a released volume name into local ownership without starting it
     Claim {
         /// Volume name
         name: String,
-        /// Override an unreachable owner's `live`/`stopped` record.
-        /// Never run this against a healthy owner: its undrained
-        /// local writes are lost (drained state is recovered in
-        /// full).
+        /// Force-claim from an unreachable owner; its undrained writes are lost
         #[arg(long)]
         force: bool,
     },
 
-    /// Release a volume's name back to the pool. Drains the WAL, publishes
-    /// a handoff snapshot, halts the daemon, and flips the bucket-side
-    /// `names/<name>` record to `released` so any coordinator (this host
-    /// or another) may claim it via `volume claim`. Use this to relocate
-    /// a named volume between hosts; use `volume stop` for a temporary
-    /// halt that retains ownership.
+    /// Stop a volume and release its name so any coordinator may claim it
     Release {
         /// Volume name
         name: String,
@@ -512,20 +391,12 @@ struct ImportArgs {
     /// OCI image reference (e.g. ubuntu:22.04, ghcr.io/org/image:tag)
     oci_ref: Option<String>,
 
-    /// Create a fork with this name immediately after the import completes
-    #[arg(long, conflicts_with = "detach")]
+    /// Create a fork with this name after the import completes
+    #[arg(long, conflicts_with = "detach", value_name = "NAME")]
     fork: Option<String>,
 
-    /// Name of an existing volume whose extent index contributes to the new
-    /// volume's hash pool. Repeat the flag to union multiple sources.
-    ///
-    /// The new volume is written as a fresh import but any 4 KiB block whose
-    /// content hash matches a block in any listed source is recorded as a
-    /// `DedupRef` pointing back at that source's segment. Sources must exist
-    /// locally (with their index files materialised). Source data is never
-    /// merged into the new volume's read path — only its extent index is
-    /// consulted for dedup.
-    #[arg(long = "extents-from")]
+    /// Dedup against this local volume's extent index (repeatable)
+    #[arg(long = "extents-from", value_name = "NAME")]
     extents_from: Vec<String>,
 
     /// Start the import in the background and return immediately
