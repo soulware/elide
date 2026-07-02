@@ -289,13 +289,13 @@ pub async fn wait_for_pid_exit(pid: u32) {
     }
 }
 
-/// Tear down a previously-bound kernel ublk device for this volume.
+/// Retire a previously-bound kernel ublk device for this volume: remove
+/// the kernel device (`del_dev`) and drop the `[ublk]` transport from
+/// `volume.toml`, leaving no stale binding once the device is gone.
 ///
-/// `bound_id` is the dev_id captured from `volume.toml` *before* the
-/// caller wrote the new config (which may have removed the `[ublk]`
-/// section entirely). On a `update --no-ublk` flow the new cfg has
-/// already had its dev_id dropped along with the section, so there's
-/// nothing left to clear here — only the kernel device to remove.
+/// `bound_id` is the dev_id captured from `volume.toml` before the caller
+/// mutated config. The config drop is idempotent (no write when `[ublk]`
+/// is already absent) and runs regardless of the `del_dev` result.
 ///
 /// Caller must have already shut the volume daemon down so the kernel's
 /// queue io_uring fds are released. `kill_dev` itself is safe-from-
@@ -307,6 +307,12 @@ pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
     );
     if let Err(e) = delete_device(bound_id).await {
         warn!("[ublk-teardown] del_dev ublk{bound_id}: {e}");
+    }
+    if let Err(e) = elide_core::config::VolumeConfig::clear_ublk_transport(vol_dir) {
+        warn!(
+            "[ublk-teardown] clearing [ublk] from {}: {e}",
+            vol_dir.display()
+        );
     }
 }
 
@@ -532,5 +538,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_cfg(tmp.path(), Some(7));
         assert_eq!(bound_ublk_id(tmp.path()), Some(7));
+    }
+
+    #[tokio::test]
+    async fn teardown_drops_ublk_transport_section() {
+        // The kernel del_dev is best-effort (no real device here), but the
+        // config drop must still run: a torn-down device leaves no [ublk]
+        // binding, so the fork re-serves over ublk only on an explicit
+        // update --ublk.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cfg(tmp.path(), Some(4));
+        teardown_bound_device(tmp.path(), 4).await;
+        let cfg = elide_core::config::VolumeConfig::read(tmp.path()).unwrap();
+        assert!(
+            cfg.ublk.is_none(),
+            "teardown must drop the [ublk] section, not just the dev_id"
+        );
     }
 }
