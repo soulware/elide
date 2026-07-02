@@ -467,12 +467,17 @@ impl ForceClaimOrchestrator {
 
     /// Stage 4. Re-own the dead fork's head delta.
     ///
-    /// Resolves the effective basis from the dead fork's data plane
+    /// Resolves the pin basis from the dead fork's data plane
     /// (`snapshots/LATEST` → manifest), then reads the dead fork's
     /// HEAD **once**: the forced CAS is the cut, and this single read
-    /// defines the claim set — `delta = live(manifest, HEAD) −
-    /// manifest`. Anything the displaced owner publishes after the
-    /// cut is a post-displacement write and is excluded, the same
+    /// defines the claim set — `delta = live(frontier, HEAD) −
+    /// basis`, where the frontier is the newest seal of either kind
+    /// (HEAD's anchor names the stop-snapshot a clean `stop` leaves
+    /// behind, which `LATEST` — user manifests only — does not).
+    /// The pin stays on the stable user manifest: stop-snapshots are
+    /// ephemeral, so segments they cover are copied, not referenced
+    /// through lineage. Anything the displaced owner publishes after
+    /// the cut is a post-displacement write and is excluded, the same
     /// policy as its undrained WAL. Writes the new fork's HEAD
     /// *first* (the durable intent a resumer reads), then copies each
     /// segment: GET, verify under the source's key, re-sign the
@@ -532,7 +537,28 @@ impl ForceClaimOrchestrator {
             .read()
             .await
             .map_err(|e| IpcError::store(format!("reading HEAD for {source}: {e}")))?;
-        let head_delta: BTreeSet<Ulid> = live_set(&manifest_segments, &source_head)
+
+        // Frontier: the newest seal of either kind. A clean `stop`
+        // truncates HEAD to empty anchored at its stop-snapshot;
+        // computing the claim set over the basis manifest alone would
+        // drop everything that seal covered.
+        let frontier_segments: BTreeSet<Ulid> = match source_head.anchor {
+            Some(anchor) if basis.is_none_or(|b| anchor > b) => {
+                match fetch_manifest_any_kind(&source_vd, anchor, &source_pubkey).await? {
+                    Some(m) => m.segment_ulids.into_iter().collect(),
+                    None => {
+                        warn!(
+                            "[force-claim {}] HEAD anchor {anchor} has no manifest \
+                             under {source}; claim set falls back to the basis",
+                            self.volume
+                        );
+                        manifest_segments.clone()
+                    }
+                }
+            }
+            _ => manifest_segments.clone(),
+        };
+        let head_delta: BTreeSet<Ulid> = live_set(&frontier_segments, &source_head)
             .into_iter()
             .filter(|u| !manifest_segments.contains(u))
             .collect();
@@ -891,6 +917,42 @@ impl ForceClaimOrchestrator {
         let _ = await_prefetch_op(fork_vol, &self.ctx.prefetch_tracker).await;
         self.job.append(ClaimAttachEvent::PrefetchDone);
     }
+}
+
+/// Fetch and verify `<vol>/snapshots/<snap>` in either form — the
+/// stable user manifest first, the ephemeral stop-snapshot second.
+/// `Ok(None)` when neither key exists.
+async fn fetch_manifest_any_kind(
+    vd: &elide_coordinator::volume_data::VolumeData,
+    snap_ulid: Ulid,
+    pubkey: &VerifyingKey,
+) -> Result<Option<elide_core::signing::SnapshotManifest>, IpcError> {
+    use elide_coordinator::volume_data::SnapshotsError;
+    let vol = vd.vol_ulid();
+    let bytes = match vd.snapshots().get_manifest_bytes(snap_ulid).await {
+        Ok(b) => b,
+        Err(SnapshotsError::Get(object_store::Error::NotFound { .. })) => {
+            match vd.snapshots().get_stop_manifest_bytes(snap_ulid).await {
+                Ok(b) => b,
+                Err(SnapshotsError::Get(object_store::Error::NotFound { .. })) => {
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(IpcError::store(format!(
+                        "fetching stop manifest {vol}/{snap_ulid}: {e}"
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            return Err(IpcError::store(format!(
+                "fetching manifest {vol}/{snap_ulid}: {e}"
+            )));
+        }
+    };
+    elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, pubkey, &snap_ulid)
+        .map(Some)
+        .map_err(|e| IpcError::internal(format!("verifying manifest {vol}/{snap_ulid}: {e}")))
 }
 
 /// Write the local read-state form for a re-owned segment from its
@@ -1287,6 +1349,165 @@ mod tests {
             .unwrap();
         assert_eq!(head.anchor, None);
         assert_eq!(head.added, [s1, s2].into_iter().collect());
+    }
+
+    /// A clean `stop` on a never-user-snapshotted fork truncates HEAD
+    /// to empty anchored at the stop-snapshot. The claim set must come
+    /// from that manifest (the frontier), not the absent `LATEST` —
+    /// otherwise the claim would compute an empty live set and re-own
+    /// nothing.
+    #[tokio::test]
+    async fn clean_stop_frontier_reowns_stop_covered_segments() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let s2 = mint.next();
+        let stop_snap = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+        for (seg, fill) in [(s1, 1u8), (s2, 2)] {
+            put_segment(
+                &store,
+                dead.vol,
+                seg,
+                build_segment_bytes(dead.signer.as_ref(), fill),
+            )
+            .await;
+        }
+        let manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1, s2]);
+        elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol)
+            .snapshots()
+            .put_stop_manifest(stop_snap, bytes::Bytes::from(manifest))
+            .await
+            .unwrap();
+        put_head(&store, dead.vol, Some(stop_snap), &[]).await;
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        assert_reowned(&store, data_dir.path(), fork, s1).await;
+        assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s1);
+        assert_materialised(data_dir.path(), fork, s2);
+
+        // No user manifest to pin at: root continuation, data carried
+        // by the copies.
+        let lineage = read_lineage_verifying_signature(
+            &data_dir.path().join("by_id").join(fork.to_string()),
+            VOLUME_PUB_FILE,
+            VOLUME_PROVENANCE_FILE,
+        )
+        .unwrap();
+        assert!(lineage.parent().is_none());
+    }
+
+    /// User snapshot at `basis` covering s1, then further writes and a
+    /// clean stop sealing {s1, s2}. The pin lands on the stable user
+    /// basis; only the stop-covered delta above it is copied.
+    #[tokio::test]
+    async fn stop_frontier_above_user_basis_copies_only_the_delta() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let basis = mint.next();
+        let s2 = mint.next();
+        let stop_snap = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+        for (seg, fill) in [(s1, 1u8), (s2, 2)] {
+            put_segment(
+                &store,
+                dead.vol,
+                seg,
+                build_segment_bytes(dead.signer.as_ref(), fill),
+            )
+            .await;
+        }
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
+        let user_manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1]);
+        vd.snapshots()
+            .put_manifest(basis, bytes::Bytes::from(user_manifest))
+            .await
+            .unwrap();
+        vd.snapshots().bump_latest_if_newer(basis).await.unwrap();
+        let stop_manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1, s2]);
+        vd.snapshots()
+            .put_stop_manifest(stop_snap, bytes::Bytes::from(stop_manifest))
+            .await
+            .unwrap();
+        put_head(&store, dead.vol, Some(stop_snap), &[]).await;
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        rec.latest_snapshot = Some(basis);
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s2);
+        let fork_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork);
+        assert!(
+            fork_vd.segments().get_bytes(s1).await.is_err(),
+            "basis-covered segment is served through the pin, not copied"
+        );
+
+        let (rec, _) = elide_coordinator::name_store::read_name_record(&store, "vol")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.parent.as_deref(),
+            Some(format!("{}/{basis}", dead.vol).as_str())
+        );
+        let head = fork_vd.head().read().await.unwrap();
+        assert_eq!(head.anchor, Some(basis));
+        assert_eq!(head.added, [s2].into_iter().collect());
+    }
+
+    /// HEAD anchored at a manifest that no longer exists (e.g. a
+    /// reaped stop-snapshot): the claim set falls back to the basis
+    /// manifest plus HEAD's own delta.
+    #[tokio::test]
+    async fn missing_frontier_manifest_falls_back_to_basis() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let s2 = mint.next();
+        let gone_snap = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+        for (seg, fill) in [(s1, 1u8), (s2, 2)] {
+            put_segment(
+                &store,
+                dead.vol,
+                seg,
+                build_segment_bytes(dead.signer.as_ref(), fill),
+            )
+            .await;
+        }
+        put_head(&store, dead.vol, Some(gone_snap), &[s1, s2]).await;
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        assert_reowned(&store, data_dir.path(), fork, s1).await;
+        assert_reowned(&store, data_dir.path(), fork, s2).await;
     }
 
     /// A claim that crashed after `early_rebind` leaves a partial fork

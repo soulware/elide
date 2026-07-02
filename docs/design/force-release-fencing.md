@@ -64,11 +64,17 @@ prompt local errors; it is hygiene, not load-bearing.
 
 **The forced CAS is the cut.** B reads V1's HEAD exactly once,
 immediately after the CAS; that single read defines the claim set —
-`live(S's manifest, HEAD) − manifest`. Anything A publishes after
-the cut is a post-displacement write and is excluded by the same
-policy that loses A's undrained WAL. B never re-reads V1's HEAD to
-pick up new entries: doing so would fold an arbitrary, racy subset
-of a displaced owner's writes into V2.
+`live(frontier manifest, HEAD) − basis manifest`. The basis is the
+latest *user* manifest (`snapshots/LATEST`), which is where V2's
+provenance pins; the frontier is the newest seal of either kind,
+discovered via HEAD's anchor — a clean `stop` truncates HEAD to
+empty anchored at its stop-snapshot, which `LATEST` never names.
+Stop-snapshots are ephemeral, so segments only they cover are
+copied into V2 rather than referenced through lineage. Anything A
+publishes after the cut is a post-displacement write and is
+excluded by the same policy that loses A's undrained WAL. B never
+re-reads V1's HEAD to pick up new entries: doing so would fold an
+arbitrary, racy subset of a displaced owner's writes into V2.
 
 The only transient exposure: A physically deleting a cut-set member
 before B's copy reaches it. Two layers cover it:
