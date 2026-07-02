@@ -261,6 +261,9 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // exists, add missing symlinks for volumes that have a volume.name file.
     reconcile_by_name(&data_dir);
 
+    // Stamp the volume ULID into any volume.toml that predates the field.
+    backfill_volume_toml_ulids(&data_dir);
+
     // Clean up any stale import locks left by a previous coordinator
     // run, then CAS-delete the bucket-side `Importing` records of the
     // imports those locks belonged to.
@@ -863,6 +866,35 @@ fn reconcile_by_name(data_dir: &Path) {
     }
 }
 
+/// Stamp each volume's ULID (its `by_id/` directory name) into its
+/// `volume.toml`, for files written before the `ulid` field existed.
+/// Volumes without a `volume.toml` (pulled ancestors) and files that
+/// already carry a `ulid` are left untouched.
+fn backfill_volume_toml_ulids(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("by_id")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let vol_dir = entry.path();
+        if !vol_dir.is_dir() {
+            continue;
+        }
+        let Some(ulid) = vol_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        else {
+            continue;
+        };
+        if let Err(e) = elide_core::config::VolumeConfig::backfill_ulid(&vol_dir, ulid) {
+            warn!(
+                "[coordinator] failed to backfill ulid into {}/volume.toml: {e}",
+                vol_dir.display()
+            );
+        }
+    }
+}
+
 /// Human-readable label for log messages: "name (ulid)" if the volume has a
 /// name, otherwise just the path.
 fn volume_label(fork_dir: &Path) -> String {
@@ -886,6 +918,33 @@ mod tests {
 
     fn mk(root: &Path, rel: &str) {
         std::fs::create_dir_all(root.join(rel)).unwrap();
+    }
+
+    #[test]
+    fn backfill_stamps_ulid_only_into_existing_volume_toml() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Volume whose volume.toml predates the ulid field.
+        let ulid1 = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{ulid1}"));
+        std::fs::write(
+            root.join(format!("by_id/{ulid1}/volume.toml")),
+            "name = \"alpha\"\n",
+        )
+        .unwrap();
+
+        // Pulled ancestor: no volume.toml, and none must be created.
+        let ulid2 = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        mk(root, &format!("by_id/{ulid2}/index"));
+
+        backfill_volume_toml_ulids(root);
+
+        let cfg =
+            elide_core::config::VolumeConfig::read(&root.join(format!("by_id/{ulid1}"))).unwrap();
+        assert_eq!(cfg.ulid.map(|u| u.to_string()).as_deref(), Some(ulid1));
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert!(!root.join(format!("by_id/{ulid2}/volume.toml")).exists());
     }
 
     #[test]

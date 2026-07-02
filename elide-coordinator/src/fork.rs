@@ -719,6 +719,7 @@ async fn fork_create_op(
     // creation below. Doing it here keeps the cleanup semantics
     // symmetric with the upload failures above.
     if let Err(e) = (elide_core::config::VolumeConfig {
+        ulid: Some(new_vol_ulid_value),
         name: Some(new_name.to_owned()),
         size: Some(size),
         ublk: ublk_cfg,

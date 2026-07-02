@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 pub const CONFIG_FILE: &str = "volume.toml";
 
@@ -14,6 +15,10 @@ pub const CONFIG_FILE: &str = "volume.toml";
 /// - `control.sock` — runtime Unix socket
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct VolumeConfig {
+    /// The volume's ULID. Advisory self-description: the `by_id/<ulid>`
+    /// directory name is authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ulid: Option<Ulid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +110,22 @@ impl VolumeConfig {
             return Ok(());
         }
         ublk.dev_id = None;
+        cfg.write(dir)
+    }
+
+    /// Stamp `ulid` into an existing `volume.toml` that predates the field.
+    ///
+    /// No-op when the file is absent (pulled ancestors carry no
+    /// `volume.toml`) or the field is already set.
+    pub fn backfill_ulid(dir: &Path, ulid: Ulid) -> io::Result<()> {
+        if !dir.join(CONFIG_FILE).exists() {
+            return Ok(());
+        }
+        let mut cfg = Self::read(dir)?;
+        if cfg.ulid.is_some() {
+            return Ok(());
+        }
+        cfg.ulid = Some(ulid);
         cfg.write(dir)
     }
 
@@ -236,6 +257,55 @@ mod tests {
         // [ublk] enabled but no id bound yet.
         write_config(tmp.path(), "[ublk]\n");
         assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn ulid_roundtrips_as_canonical_string() {
+        let tmp = TempDir::new().unwrap();
+        let ulid = Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        VolumeConfig {
+            ulid: Some(ulid),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join(CONFIG_FILE)).unwrap();
+        assert!(raw.contains("ulid = \"01JQAAAAAAAAAAAAAAAAAAAAAA\""));
+        assert_eq!(VolumeConfig::read(tmp.path()).unwrap().ulid, Some(ulid));
+    }
+
+    #[test]
+    fn backfill_ulid_stamps_missing_field_and_preserves_config() {
+        let tmp = TempDir::new().unwrap();
+        let ulid = Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        write_config(tmp.path(), "name = \"alpha\"\nsize = 1024\n[ublk]\n");
+        VolumeConfig::backfill_ulid(tmp.path(), ulid).unwrap();
+
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.ulid, Some(ulid));
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert_eq!(cfg.size, Some(1024));
+        assert!(cfg.ublk.is_some());
+    }
+
+    #[test]
+    fn backfill_ulid_noop_when_file_absent_or_field_set() {
+        let tmp = TempDir::new().unwrap();
+        let existing = Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let other = Ulid::from_string("01JQBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+
+        // Absent file: no volume.toml is created.
+        VolumeConfig::backfill_ulid(tmp.path(), other).unwrap();
+        assert!(!tmp.path().join(CONFIG_FILE).exists());
+
+        // Field already set: left untouched.
+        write_config(
+            tmp.path(),
+            "ulid = \"01JQAAAAAAAAAAAAAAAAAAAAAA\"\nname = \"alpha\"\n",
+        );
+        VolumeConfig::backfill_ulid(tmp.path(), other).unwrap();
+        assert_eq!(VolumeConfig::read(tmp.path()).unwrap().ulid, Some(existing));
     }
 
     #[test]
