@@ -707,7 +707,8 @@ impl ForceClaimOrchestrator {
                 })?;
         }
 
-        let materialised = materialise_re_owned(&fork.dir, seg_ulid, &staged);
+        let materialised =
+            elide_coordinator::upload::promote_segment_local_form(&fork.dir, seg_ulid, &staged);
         let _ = std::fs::remove_file(&staged);
         materialised.map_err(|e| {
             IpcError::internal(format!(
@@ -953,23 +954,6 @@ async fn fetch_manifest_any_kind(
     elide_core::signing::read_snapshot_manifest_from_bytes(&bytes, pubkey, &snap_ulid)
         .map(Some)
         .map_err(|e| IpcError::internal(format!("verifying manifest {vol}/{snap_ulid}: {e}")))
-}
-
-/// Write the local read-state form for a re-owned segment from its
-/// staged full-segment bytes: `index/<u>.idx` plus
-/// `cache/<u>.{body,present}` (and `.delta` when the segment carries a
-/// delta section).
-fn materialise_re_owned(fork_dir: &Path, seg_ulid: Ulid, staged: &Path) -> std::io::Result<()> {
-    let index_dir = fork_dir.join("index");
-    let cache_dir = fork_dir.join("cache");
-    std::fs::create_dir_all(&index_dir)?;
-    std::fs::create_dir_all(&cache_dir)?;
-    elide_core::segment::extract_idx(staged, &index_dir.join(format!("{seg_ulid}.idx")))?;
-    elide_core::segment::promote_to_cache(
-        staged,
-        &cache_dir.join(format!("{seg_ulid}.body")),
-        &cache_dir.join(format!("{seg_ulid}.present")),
-    )
 }
 
 #[cfg(test)]

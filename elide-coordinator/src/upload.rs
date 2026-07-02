@@ -516,6 +516,31 @@ async fn upload_small_bytes(
     Ok(())
 }
 
+/// Write a segment's post-upload local form — `index/<u>.idx` plus
+/// `cache/<u>.{body,present}` (and `.delta` when the segment carries a
+/// delta section) — from a full segment file at `segment_file`.
+///
+/// This is the daemon's promote step done coordinator-side, for
+/// callers with no running daemon to IPC. Run only after the segment
+/// is durable in S3, preserving the idx-presence ↔ segment-in-S3
+/// invariant.
+pub fn promote_segment_local_form(
+    fork_dir: &Path,
+    seg_ulid: Ulid,
+    segment_file: &Path,
+) -> std::io::Result<()> {
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    std::fs::create_dir_all(&index_dir)?;
+    std::fs::create_dir_all(&cache_dir)?;
+    elide_core::segment::extract_idx(segment_file, &index_dir.join(format!("{seg_ulid}.idx")))?;
+    elide_core::segment::promote_to_cache(
+        segment_file,
+        &cache_dir.join(format!("{seg_ulid}.body")),
+        &cache_dir.join(format!("{seg_ulid}.present")),
+    )
+}
+
 /// Upload signed snapshot manifests from `vol_dir/snapshots/` to S3.
 ///
 /// Snapshots are recorded as `<ulid>.manifest`; the manifest's

@@ -730,6 +730,62 @@ async fn evict_volume(
 ///
 /// Lock is released when this function returns (via the `Drop` guard on
 /// the returned `MutexGuard`).
+/// Daemon-up drain phase shared by the seal paths: flush the WAL into
+/// `pending/`, upload `pending/` to S3 (volume promote IPC writes the
+/// local `index/`/`cache/` form), and settle outstanding GC handoffs.
+/// Returns the highest `User` snapshot ULID the drain published, for
+/// the caller's `names/<name>.latest_snapshot` bump.
+///
+/// Callers must hold the per-volume snapshot lock: the tick loop
+/// try-locks it and skips, so the lock is what keeps this drain's view
+/// of `index/` from being extended concurrently.
+pub(crate) async fn drain_volume_for_seal(
+    fork_dir: &Path,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn object_store::ObjectStore>,
+    stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+) -> Result<Option<ulid::Ulid>, IpcError> {
+    if !elide_coordinator::control::promote_wal(fork_dir).await {
+        return Err(IpcError::internal(
+            "promote_wal failed or volume unreachable",
+        ));
+    }
+
+    // Minted only once the daemon has answered promote_wal — a dead
+    // daemon fails the verb before any credential beyond `volume-rw`
+    // is requested.
+    let meta_store = stores.writer();
+    let drained_user_snapshot = match elide_coordinator::upload::drain_pending(
+        fork_dir,
+        vol_ulid,
+        store,
+        &meta_store,
+    )
+    .await
+    {
+        Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
+            return Err(IpcError::store(format!(
+                "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
+                r.upload_failed, r.promote_failed
+            )));
+        }
+        Ok(r) => r.published_user_snapshot,
+        Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
+    };
+
+    let _ = elide_coordinator::control::apply_gc_handoffs(fork_dir).await;
+    // Outcomes from handoffs draining during a snapshot seal are folded
+    // into the manifest itself (the consumed inputs are excluded from
+    // the manifest's segment_ulids) and HEAD is truncated to empty
+    // post-seal, so the orchestrator doesn't need them — drop on the
+    // floor here. See `docs/design/segment-index.md` *Truncation*.
+    elide_coordinator::gc::apply_done_handoffs(fork_dir, vol_ulid, store)
+        .await
+        .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
+
+    Ok(drained_user_snapshot)
+}
+
 pub(crate) async fn snapshot_volume(
     vol_name: &str,
     core: &CoordinatorCore,
@@ -785,36 +841,8 @@ pub(crate) async fn snapshot_volume_kind(
     let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
     let _guard = lock.lock_owned().await;
 
-    if !elide_coordinator::control::promote_wal(&fork_dir).await {
-        return Err(IpcError::internal(
-            "promote_wal failed or volume unreachable",
-        ));
-    }
-
-    let meta_store = core.stores.writer();
     let drained_user_snapshot =
-        match elide_coordinator::upload::drain_pending(&fork_dir, vol_ulid, &store, &meta_store)
-            .await
-        {
-            Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
-                return Err(IpcError::store(format!(
-                    "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
-                    r.upload_failed, r.promote_failed
-                )));
-            }
-            Ok(r) => r.published_user_snapshot,
-            Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
-        };
-
-    let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
-    // Outcomes from handoffs draining during a snapshot seal are folded
-    // into the manifest itself (the consumed inputs are excluded from
-    // the manifest's segment_ulids) and HEAD is truncated to empty
-    // post-seal, so the orchestrator doesn't need them — drop on the
-    // floor here. See `docs/design/segment-index.md` *Truncation*.
-    elide_coordinator::gc::apply_done_handoffs(&fork_dir, vol_ulid, &store)
-        .await
-        .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
+        drain_volume_for_seal(&fork_dir, vol_ulid, &store, &core.stores).await?;
 
     let snap_ulid = pick_snapshot_ulid(&fork_dir)
         .map_err(|e| IpcError::internal(format!("picking snap_ulid: {e}")))?;
@@ -890,7 +918,7 @@ pub(crate) async fn snapshot_volume_kind(
 /// or `None` if neither exists. Used by stop's stop-snapshot publish path
 /// to skip the redundant sign+upload when a covering manifest is already
 /// present.
-fn covering_local_snapshot(
+pub(super) fn covering_local_snapshot(
     vol_dir: &Path,
     snap_ulid: ulid::Ulid,
 ) -> Option<elide_core::signing::SnapshotKind> {
