@@ -33,7 +33,7 @@ use crate::inbound::{CoordinatorCore, await_prefetch_op, local_daemon_running, p
 use elide_coordinator::ipc::{ClaimAttachEvent, ClaimReply, ClaimStartReply, IpcError};
 use elide_coordinator::prefetch::PeerFetchContext;
 use elide_coordinator::register_prefetch_or_get;
-use elide_coordinator::volume_state::STOPPED_FILE;
+use elide_coordinator::volume_state::{CLAIMING_FILE, STOPPED_FILE};
 
 // ── Per-domain context ───────────────────────────────────────────────────────
 
@@ -552,10 +552,10 @@ impl ClaimOrchestrator {
     /// provenance}` to S3, and `mark_claimed` to rebind `names/<volume>` to
     /// this coordinator. After this returns the bucket says we own the name,
     /// peer-fetch auth accepts our coord_id for the chain walk that follows,
-    /// and the local fork dir holds `volume.{key,pub,provenance}` only —
-    /// crucially **no `wal/`, no `pending/`, no `index/`**, so the daemon's
-    /// discovery loop won't pick the partial fork up and try to open it
-    /// before [`Self::finalize`] materialises those dirs.
+    /// and the local fork dir holds `volume.{claiming,key,pub,provenance}`
+    /// only — the `volume.claiming` marker keeps the daemon's discovery loop
+    /// away from the partial fork until [`Self::finalize`] completes it and
+    /// removes the marker (`docs/design/claim-supervision-gate.md`).
     ///
     /// The provenance written here is provisional: its `ParentRef` points at
     /// the immediate released volume, not yet the effective ancestor that
@@ -585,11 +585,14 @@ impl ClaimOrchestrator {
         let new_fork_dir =
             elide_coordinator::volume_state::fork_dir(&self.ctx.core.data_dir, new_vol_ulid);
 
-        // Bare dir + keypair only. No wal/, no pending/, no index/ — daemon
-        // discovery requires one of those to consider a dir a volume, so this
-        // skeleton stays invisible to the supervisor until `finalize` adds them.
+        // Marker before keypair: discovery admits any dir carrying
+        // `volume.key`, and `volume.claiming` is what keeps this
+        // half-built skeleton out of supervision until `finalize`
+        // removes it — so no discoverable instant exists without it.
         std::fs::create_dir_all(&new_fork_dir)
             .map_err(|e| IpcError::internal(format!("creating fork dir: {e}")))?;
+        std::fs::write(new_fork_dir.join(CLAIMING_FILE), "")
+            .map_err(|e| IpcError::internal(format!("writing volume.claiming: {e}")))?;
         let signing_key = generate_keypair(&new_fork_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
 
@@ -949,6 +952,11 @@ impl ClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating by_name symlink: {e}")))?;
         std::fs::write(new_fork.dir.join(STOPPED_FILE), "")
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
+
+        // Park marker down first, claiming marker off second: no
+        // instant where the dir is discoverable without one of them.
+        elide_coordinator::volume_state::clear_claiming_marker(&new_fork.dir)
+            .map_err(|e| IpcError::internal(format!("removing volume.claiming: {e}")))?;
 
         register_prefetch_or_get(&self.ctx.prefetch_tracker, new_fork.vol_ulid);
         crate::rescan::trigger();
@@ -1488,6 +1496,14 @@ mod tests {
             .expect("provisional provenance must carry a ParentRef, not be root-shape");
         assert_eq!(parent.volume_ulid, vol_x.to_string());
         assert_eq!(parent.snapshot_ulid, snap_x.to_string());
+
+        // The partial fork carries the claim-in-progress marker, so
+        // discovery skips it until a resumed/superseding claim's
+        // finalize (docs/design/claim-supervision-gate.md).
+        assert!(
+            partial_dir.join(CLAIMING_FILE).exists(),
+            "mid-claim fork must carry volume.claiming"
+        );
     }
 
     #[tokio::test]

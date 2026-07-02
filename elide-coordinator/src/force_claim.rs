@@ -37,7 +37,7 @@ use elide_coordinator::ipc::{ClaimAttachEvent, ClaimStartReply, IpcError};
 use elide_coordinator::lifecycle::ObservedRecord;
 use elide_coordinator::register_prefetch_or_get;
 use elide_coordinator::segment_head::{SegmentHead, live_set};
-use elide_coordinator::volume_state::STOPPED_FILE;
+use elide_coordinator::volume_state::{CLAIMING_FILE, STOPPED_FILE};
 use elide_core::name_record::{Lifecycle, TransitionCheck};
 use elide_core::signing::{
     ParentRef, ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
@@ -304,6 +304,8 @@ impl ForceClaimOrchestrator {
                 "[force-claim {}] resuming partial fork {vol_ulid}",
                 self.volume
             );
+            std::fs::write(dir.join(CLAIMING_FILE), "")
+                .map_err(|e| IpcError::internal(format!("writing volume.claiming: {e}")))?;
             self.write_volume_toml(&dir, vol_ulid)?;
             self.fork = Some(ForkSkeleton {
                 vol_ulid,
@@ -324,8 +326,14 @@ impl ForceClaimOrchestrator {
 
         let new_vol_ulid = Ulid::new();
         let new_dir = self.by_id_dir.join(new_vol_ulid.to_string());
+        // Marker before keypair: discovery admits any dir carrying
+        // `volume.key`, and `volume.claiming` is what keeps this
+        // half-built skeleton out of supervision until `finalize`
+        // removes it — so no discoverable instant exists without it.
         std::fs::create_dir_all(&new_dir)
             .map_err(|e| IpcError::internal(format!("creating fork dir: {e}")))?;
+        std::fs::write(new_dir.join(CLAIMING_FILE), "")
+            .map_err(|e| IpcError::internal(format!("writing volume.claiming: {e}")))?;
         let signing_key = generate_keypair(&new_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE)
             .map_err(|e| IpcError::internal(format!("generating keypair: {e}")))?;
         elide_coordinator::key_shadow::write(
@@ -897,6 +905,11 @@ impl ForceClaimOrchestrator {
         std::fs::write(fork.dir.join(STOPPED_FILE), "")
             .map_err(|e| IpcError::internal(format!("writing volume.stopped: {e}")))?;
 
+        // Park marker down first, claiming marker off second: no
+        // instant where the dir is discoverable without one of them.
+        elide_coordinator::volume_state::clear_claiming_marker(&fork.dir)
+            .map_err(|e| IpcError::internal(format!("removing volume.claiming: {e}")))?;
+
         register_prefetch_or_get(&self.ctx.prefetch_tracker, fork.vol_ulid);
         crate::rescan::trigger();
         self.job.append(ClaimAttachEvent::ForkCreated {
@@ -1248,10 +1261,14 @@ mod tests {
         assert_eq!(parent.snapshot_ulid, basis.to_string());
         assert_eq!(parent.pubkey, dead.vk.to_bytes());
 
-        // Local fork is finalized.
+        // Local fork is finalized: parked, discovery unblocked.
         let fork_dir = data_dir.path().join("by_id").join(fork.to_string());
         assert!(fork_dir.join("wal").is_dir());
         assert!(fork_dir.join(STOPPED_FILE).exists());
+        assert!(
+            !fork_dir.join(CLAIMING_FILE).exists(),
+            "finalize removes the claim-in-progress marker"
+        );
 
         // The journal records the forced claim against the new fork.
         let events = ctx

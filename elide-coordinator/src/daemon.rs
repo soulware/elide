@@ -44,7 +44,7 @@ use crate::import;
 use crate::inbound;
 use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
-use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE};
+use elide_coordinator::volume_state::{CLAIMING_FILE, IMPORTING_FILE, PID_FILE};
 use elide_coordinator::{
     EvictRegistry, PrefetchTracker, ReadinessTracker, SnapshotLockRegistry, new_prefetch_tracker,
     new_readiness_tracker, new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
@@ -738,6 +738,7 @@ async fn poll_until_exit_or_deadline(pids: &[u32], timeout: Duration) -> Vec<u32
 ///
 /// Skips:
 ///   - entries whose name is not a valid ULID
+///   - dirs bearing `volume.claiming` (a claim in flight — not a volume yet)
 ///   - dirs with no `pending/`, `index/`, or `volume.key` (not a volume)
 ///   - readonly volumes that are fully indexed: `index/` is non-empty
 ///     (prefetch completed)
@@ -768,6 +769,12 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         if ulid::Ulid::from_string(name).is_err() {
+            continue;
+        }
+        // A claim in flight: the fork is half-built (the claim job
+        // owns the marker lifecycle) and must not be supervised,
+        // drained, or GC'd until its finalize removes the marker.
+        if path.join(CLAIMING_FILE).exists() {
             continue;
         }
         let has_pending = path.join("pending").exists();
@@ -891,6 +898,12 @@ fn reconcile_volume_metadata(data_dir: &Path) {
             continue;
         };
         if !vol_dir.join(elide_core::config::CONFIG_FILE).exists() {
+            continue;
+        }
+        // A claim in flight names itself in volume.toml before its
+        // by_name symlink exists; creating the symlink here would
+        // hand the name to a half-built fork.
+        if vol_dir.join(CLAIMING_FILE).exists() {
             continue;
         }
         let mut cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
@@ -1137,6 +1150,79 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec![format!("by_id/{owned}")]);
+    }
+
+    #[test]
+    fn discover_volumes_skips_claiming_fork() {
+        // A mid-claim skeleton carries volume.claiming alongside its
+        // key (and, later in the claim, index/ from the head-delta
+        // re-own). Discovery must not admit it in either shape — a
+        // supervised daemon opening it pre-finalize serves a stale
+        // basis (docs/design/claim-supervision-gate.md).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let skeleton = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{skeleton}"));
+        std::fs::write(
+            root.join(format!(
+                "by_id/{skeleton}/{}",
+                elide_core::signing::VOLUME_KEY_FILE
+            )),
+            "",
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("by_id/{skeleton}/{CLAIMING_FILE}")), "").unwrap();
+
+        let mid_reown = "01JQBBBBBBBBBBBBBBBBBBBBBB";
+        mk(root, &format!("by_id/{mid_reown}/index"));
+        std::fs::write(
+            root.join(format!(
+                "by_id/{mid_reown}/index/01JQAAAAAAAAAAAAAAAAAAAAA1.idx"
+            )),
+            "",
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("by_id/{mid_reown}/{CLAIMING_FILE}")), "").unwrap();
+
+        assert!(discover_volumes(root).is_empty());
+
+        // Finalize removes the marker; the same dirs become volumes.
+        elide_coordinator::volume_state::clear_claiming_marker(
+            &root.join(format!("by_id/{skeleton}")),
+        )
+        .unwrap();
+        elide_coordinator::volume_state::clear_claiming_marker(
+            &root.join(format!("by_id/{mid_reown}")),
+        )
+        .unwrap();
+        assert_eq!(discover_volumes(root).len(), 2);
+    }
+
+    #[test]
+    fn reconcile_skips_claiming_fork_symlink() {
+        // A mid-claim fork names itself in volume.toml before its
+        // by_name symlink exists; reconcile must not mint the link.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mk(root, "by_name");
+
+        let ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{ulid}"));
+        std::fs::write(
+            root.join(format!("by_id/{ulid}/volume.toml")),
+            format!("ulid = \"{ulid}\"\nname = \"alpha\"\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("by_id/{ulid}/{CLAIMING_FILE}")), "").unwrap();
+
+        reconcile_volume_metadata(root);
+        assert!(!root.join("by_name/alpha").is_symlink());
+
+        elide_coordinator::volume_state::clear_claiming_marker(&root.join(format!("by_id/{ulid}")))
+            .unwrap();
+        reconcile_volume_metadata(root);
+        assert!(root.join("by_name/alpha").is_symlink());
     }
 
     #[test]

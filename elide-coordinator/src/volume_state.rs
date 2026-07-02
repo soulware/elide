@@ -44,6 +44,17 @@ pub const RELEASED_FILE: &str = "volume.released";
 /// aligned with the other `volume.<state>` lifecycle markers.
 pub const IMPORTING_FILE: &str = "volume.importing";
 
+/// Claim-in-progress marker. Written by the claim orchestrators
+/// (`claim`, `claim --force`) before the fork's keypair lands,
+/// removed by their finalize once the fork is complete and parked.
+/// Presence means "not a volume yet": the daemon's discovery loop
+/// skips the directory entirely, so no supervisor, drain/GC task,
+/// or `by_name` symlink can attach to a half-built fork
+/// (`docs/design/claim-supervision-gate.md`). A leftover marker is
+/// a claim that died in flight; `volume claim --force` resumes or
+/// supersedes it.
+pub const CLAIMING_FILE: &str = "volume.claiming";
+
 /// Read/write mode for a volume. Readonly is set on imported OCI
 /// volumes; everything else is read/write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +269,18 @@ pub fn write_released_marker(vol_dir: &Path, handoff: ulid::Ulid) -> std::io::Re
 /// to a non-`Released` state succeeds.
 pub fn clear_released_marker(vol_dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(vol_dir.join(RELEASED_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove `volume.claiming` if present; missing-file is not an error.
+///
+/// Called from the claim orchestrators' finalize, after the
+/// `volume.stopped` park marker lands.
+pub fn clear_claiming_marker(vol_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(vol_dir.join(CLAIMING_FILE)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
