@@ -36,19 +36,13 @@ enum Command {
     ServeVolume {
         /// Path to the volume directory (by_id/<ulid>/)
         fork_dir: PathBuf,
-        /// Volume size (e.g. "4G", "512M"). Required on first use;
-        /// ignored on subsequent opens (size is stored in <vol-dir>/size).
+        /// Volume size (e.g. "4G", "512M"); required on first use only
         #[arg(long)]
         size: Option<String>,
-        /// Serve as a read-only block device (auto-detected for imported bases;
-        /// use this flag to explicitly serve a writable volume read-only)
+        /// Serve as a read-only block device
         #[arg(long)]
         readonly: bool,
-        /// Serve over ublk. Without this flag the volume runs for coordinator
-        /// IPC only (no block device). Requires Linux with CONFIG_BLK_DEV_UBLK
-        /// and the 'ublk' cargo feature enabled. The kernel device id is read
-        /// from (and recorded into) volume.toml; the kernel auto-allocates on
-        /// first serve.
+        /// Serve over ublk (default is coordinator IPC only, no block device)
         #[arg(long)]
         ublk: bool,
     },
@@ -118,19 +112,14 @@ enum Command {
         command: CoordCommand,
     },
 
-    /// Log in as an operator (records the subject for `coord enroll`).
-    ///
-    /// In the shared-key demo this stamps the operator identity into
-    /// `~/.config/elide`; `coord enroll` then self-issues the operator
-    /// discharges under that `sub`. A standalone auth service will later
-    /// make this an interactive device-code flow.
+    /// Log in as an operator (records the subject for `coord enroll`)
     Login {
-        /// The operator subject to record.
+        /// The operator subject to record
         #[arg(long)]
         subject: String,
     },
 
-    /// Clear the stored operator login (`~/.config/elide`).
+    /// Clear the stored operator login (`~/.config/elide`)
     Logout,
 }
 
