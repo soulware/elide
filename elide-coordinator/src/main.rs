@@ -49,76 +49,49 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the coordinator daemon.
-    ///
-    /// Watches the configured data directory, discovers forks automatically,
-    /// supervises volume processes, and continuously drains pending segments to
-    /// the object store. Configuration is read from coordinator.toml.
+    /// Start the coordinator daemon
     Serve {
         #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
-        /// Override the data_dir from the config file.
+        /// Override the data_dir from the config file
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
 
-    /// Write a default coordinator.toml (commented template) to the given path.
-    ///
-    /// Every field in the template is commented out — the values shown are
-    /// the defaults the daemon would use if the file were absent. Edit the
-    /// fields you want to override.
+    /// Write a default coordinator.toml template (all fields commented out)
     Init {
         #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
-        /// Overwrite the file if it already exists.
+        /// Overwrite the file if it already exists
         #[arg(long)]
         force: bool,
     },
 
-    /// Enrol this coordinator with the configured mint and provision
-    /// its per-role credentials.
-    ///
-    /// One blocking step: POST /v1/enroll, wait while the operator runs
-    /// `mint enroll approve <coordinator-id>` on the mint host, then
-    /// exchange the ticket for every role, writing
-    /// `<data_dir>/credentials/<role>`. Requires `[mint]` in the
-    /// config. Idempotent: re-running only fills missing roles (use
-    /// `--force` to re-exchange all). `coord serve` refuses to start
-    /// until this has completed.
+    /// Enrol with the configured mint and provision per-role credentials
     Enroll {
         #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
-        /// Override the data_dir from the config file.
+        /// Override the data_dir from the config file
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Invite macaroon: the macaroon text inline, a file path,
-        /// or `-` for stdin. Distributed out of band by the operator.
+        /// Invite macaroon: inline text, a file path, or `-` for stdin
         invite: String,
-        /// Overall bound on waiting for operator approval (humantime).
+        /// Bound on waiting for operator approval (humantime)
         #[arg(long, default_value = "30m", value_parser = parse_humantime)]
         timeout: std::time::Duration,
-        /// Re-exchange and overwrite every role credential, not just
-        /// the missing ones.
+        /// Re-exchange and overwrite every role credential, not just missing ones
         #[arg(long)]
         force: bool,
-        /// Enrol as a read-only attestation authority (coord B): request
-        /// `attest-ro` only, not the full coordinator role set.
+        /// Enrol as a read-only attestation authority (coord-ro role only)
         #[arg(long)]
         attestation: bool,
     },
 
-    /// Serve the volume-attestation discharge authority (coord B) only.
-    ///
-    /// A dedicated attestation instance: it assumes `coord-ro`, opens
-    /// attested CIDs under `K_M-B`, and serves `POST /v1/discharge` on the
-    /// `[attestation] listen` address — none of the supervisor, GC, IPC,
-    /// or volume scan that `serve` runs. Requires `[mint]` and
-    /// `[attestation]`; enrol first with `enroll --attestation`. Waits for
-    /// that enrollment to complete, mirroring `serve`.
+    /// Serve only the volume-attestation discharge authority (coord B)
     Attest {
         #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
         config: PathBuf,
-        /// Override the data_dir from the config file.
+        /// Override the data_dir from the config file
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },

@@ -118,19 +118,14 @@ enum Command {
         command: CoordCommand,
     },
 
-    /// Log in as an operator (records the subject for `coord enroll`).
-    ///
-    /// In the shared-key demo this stamps the operator identity into
-    /// `~/.config/elide`; `coord enroll` then self-issues the operator
-    /// discharges under that `sub`. A standalone auth service will later
-    /// make this an interactive device-code flow.
+    /// Log in as an operator (records the subject for `coord enroll`)
     Login {
-        /// The operator subject to record.
+        /// The operator subject to record
         #[arg(long)]
         subject: String,
     },
 
-    /// Clear the stored operator login (`~/.config/elide`).
+    /// Clear the stored operator login (`~/.config/elide`)
     Logout,
 }
 
