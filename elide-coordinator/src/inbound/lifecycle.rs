@@ -1120,8 +1120,8 @@ pub(crate) async fn start_volume_op(
         }
         Err(LifecycleError::OwnershipConflict { held_by }) => {
             // Our local fork lost this name to `held_by`. Rehome it under
-            // <name>-displaced-<ulid> so the diverged fork survives as a
-            // first-class stopped volume rather than a dead-end local
+            // <name>-<suffix> so the fork survives as a
+            // first-class released volume rather than a dead-end local
             // binding (docs/design/displaced-fork-rehome.md).
             if let Some(new_name) = elide_coordinator::rehome::rehome_existing_local_fork(
                 core.identity.as_ref(),
@@ -1136,8 +1136,8 @@ pub(crate) async fn start_volume_op(
                 let _ = std::fs::remove_file(data_dir.join("by_name").join(volume_name));
                 return Err(IpcError::conflict(format!(
                     "name '{volume_name}' is owned by coordinator {held_by}; \
-                     your displaced fork was rehomed as '{new_name}' (stopped) \
-                     — start it to recover, or run \
+                     your fork was rehomed as '{new_name}' (released) \
+                     — reclaim it with `volume claim {new_name}`, or run \
                      `volume claim --force {volume_name}` to take the name"
                 )));
             }

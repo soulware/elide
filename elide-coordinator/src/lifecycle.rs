@@ -413,29 +413,33 @@ pub async fn mark_initial(
     .await
 }
 
-/// Create-time claim landing the record `Stopped` rather than `Live`:
-/// the rehome of a fork displaced from another name
-/// (`docs/design/displaced-fork-rehome.md`). Same `If-None-Match`
-/// idempotency as [`mark_initial`] — a re-run after a crash resolves to
-/// its own record via `AlreadyExists`.
+/// Create-time claim landing the record in release shape: the rehome of
+/// a fork that lost its name (`docs/design/displaced-fork-rehome.md`).
+/// The record is `Released` with no owner — mirroring [`mark_released`]
+/// — and carries the best-available handoff snapshot, so the rehomed
+/// name recovers like any released volume (reclaim, then start). Same
+/// `If-None-Match` idempotency as [`mark_initial`] — a re-run after a
+/// crash resolves to its own record via `AlreadyExists`.
 pub async fn mark_rehomed(
     store: &Arc<dyn ObjectStore>,
     name: &str,
-    coord_id: &str,
-    hostname: Option<&str>,
     vol_ulid: Ulid,
     size: u64,
+    handoff_snapshot: Option<Ulid>,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
-    mark_initial_with_state(
-        store,
-        name,
-        coord_id,
-        hostname,
+    let record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
         vol_ulid,
         size,
-        NameState::Stopped,
-    )
-    .await
+        coordinator_id: None,
+        state: NameState::Released,
+        parent: None,
+        claimed_at: None,
+        hostname: None,
+        handoff_snapshot,
+        latest_snapshot: handoff_snapshot,
+    };
+    create_initial_record(store, name, &record).await
 }
 
 async fn mark_initial_with_state(
@@ -446,6 +450,26 @@ async fn mark_initial_with_state(
     vol_ulid: Ulid,
     size: u64,
     state: NameState,
+) -> Result<MarkInitialOutcome, LifecycleError> {
+    let record = elide_core::name_record::NameRecord {
+        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
+        vol_ulid,
+        size,
+        coordinator_id: Some(coord_id.to_owned()),
+        state,
+        parent: None,
+        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+        hostname: hostname.map(str::to_owned),
+        handoff_snapshot: None,
+        latest_snapshot: None,
+    };
+    create_initial_record(store, name, &record).await
+}
+
+async fn create_initial_record(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    record: &elide_core::name_record::NameRecord,
 ) -> Result<MarkInitialOutcome, LifecycleError> {
     // If a record already exists, surface its details so the caller can
     // produce a useful error. We do this read first so the common
@@ -459,20 +483,7 @@ async fn mark_initial_with_state(
         });
     }
 
-    let record = elide_core::name_record::NameRecord {
-        version: elide_core::name_record::NameRecord::CURRENT_VERSION,
-        vol_ulid,
-        size,
-        coordinator_id: Some(coord_id.to_owned()),
-        state,
-        parent: None,
-        claimed_at: Some(chrono::Utc::now().to_rfc3339()),
-        hostname: hostname.map(str::to_owned),
-        handoff_snapshot: None,
-        latest_snapshot: None,
-    };
-
-    match name_store::create_name_record(store, name, &record).await {
+    match name_store::create_name_record(store, name, record).await {
         Ok(_) => Ok(MarkInitialOutcome::Claimed),
         // Lost a race against another coordinator that created the
         // same name between our read and our conditional create.

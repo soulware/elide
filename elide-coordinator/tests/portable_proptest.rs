@@ -10,20 +10,21 @@
 // `ClaimReleased` op since its bucket-side effect is identical;
 // `start --claim` and `claim` against a locally-owned released fork are
 // both modelled by `ReclaimLocal`, differing only in `target_state`.
-// `Tick` is the per-running-volume ownership poll of
+// `Tick` is the per-volume ownership poll of
 // `docs/design/displaced-fork-rehome.md`: for each fork a coordinator
-// serves locally it re-reads `names/<name>` and, on a `vol_ulid`
-// mismatch (a peer force-claimed the name out from under it), rehomes
-// the displaced fork under `<name>-displaced-<forkUlid>` via
-// `rehome::rehome_displaced_fork`.
+// holds locally it re-reads `names/<name>` and, on a `vol_ulid`
+// mismatch, rehomes the fork under `<name>-<suffix>` via
+// `rehome::rehome_displaced_fork` — a displacement when the fork was
+// force-claimed out from under it, a supersession when it was cleanly
+// released (`volume.released` present) and a peer claimed the name.
 //
 // The proptest enforces the invariants the design doc requires after
 // any sequence of ops:
 //
 //   1. Every `names/<name>` parses cleanly.
 //   2. Every `Live`/`Stopped` record names a coordinator we know about.
-//   3. Every `Released` record clears `coordinator_id` and carries a
-//      `handoff_snapshot`.
+//   3. Every `Released` record on a base name clears `coordinator_id`
+//      and carries a `handoff_snapshot`.
 //   4. Every name's `vol_ulid` has `volume.pub` in the bucket.
 //   5. Every `handoff_snapshot`, regardless of record state, references
 //      a manifest that exists in the bucket under
@@ -34,15 +35,17 @@
 //      remains the valid basis until the new owner writes and
 //      `mark_released` overwrites it).
 //   6. Preserve-never-orphan: every fork a coordinator rehomed on a
-//      tick has its `<name>-displaced-<forkUlid>` record present,
-//      `Stopped`, self-owned by that coordinator, and bound to the
-//      displaced fork's ULID.
+//      tick has its `<name>-<suffix>` record present, `Released`,
+//      ownerless (release shape), and bound to the rehomed fork's
+//      ULID; a supersession's record carries the release handoff, and
+//      it verifies like any other handoff.
 //   7. Single-writer: no two `Live` records anywhere in the bucket bind
 //      the same `vol_ulid` simultaneously.
 //   8. A ticked coordinator no longer serves any fork whose name it
 //      lost (its local `serving` flag is cleared).
 //   9. Rehome is idempotent: a re-tick resolves to the same
-//      `<name>-displaced-<forkUlid>` — no divergent duplicate.
+//      `<name>-<suffix>` — the candidate sequence is derived from the
+//      episode, so no divergent duplicate is minted.
 //
 // Cases run in a single tokio runtime per test case; ops are
 // interleaved sequentially. The interesting non-trivial races
@@ -115,12 +118,12 @@ enum Op {
         coord: u8,
         as_live: bool,
     },
-    /// The per-running-volume ownership poll
+    /// The per-volume ownership poll
     /// (`docs/design/displaced-fork-rehome.md`). For each fork `coord`
-    /// serves locally, re-reads `names/<name>`; a `vol_ulid` mismatch
-    /// means a peer force-claimed the name, so the displaced fork is
-    /// rehomed via `rehome::rehome_displaced_fork` and `coord` stops
-    /// serving it.
+    /// holds locally, re-reads `names/<name>`; a `vol_ulid` mismatch
+    /// means a peer took the name (force-claim, or a normal claim of a
+    /// released one), so the fork is rehomed via
+    /// `rehome::rehome_displaced_fork` and `coord` stops serving it.
     Tick {
         coord: u8,
     },
@@ -154,8 +157,8 @@ struct LocalFork {
     ulid: Ulid,
     name: u8,
     serving: bool,
-    /// The `<name>-displaced-<ulid>` this fork resolved to once a tick
-    /// rehomed it. `None` until then.
+    /// The `<name>-<suffix>` this fork resolved to once a tick rehomed
+    /// it. `None` until then.
     rehomed_as: Option<String>,
 }
 
@@ -327,12 +330,21 @@ impl World {
                 // the random op stream.
                 let outcome: Result<MarkReleasedOutcome, _> =
                     lifecycle::mark_released(&self.store, name_for(*name), &coord_id, snap).await;
-                // A clean release stops serving without displacement — the
-                // fork's `vol_ulid` is unchanged, so it is not rehomed. Drop
-                // the served flag so a later peer claim over this name does
-                // not read as a displacement of this coordinator.
+                // A clean release stops serving; the fork stays bound to
+                // the (now Released) record, so it is not rehomed until a
+                // peer actually claims the name. Stamp `volume.released`
+                // on the local fork — the marker the release IPC handler
+                // writes, and the discriminator a later tick reads to
+                // classify the rehome as a supersession.
                 if matches!(outcome, Ok(MarkReleasedOutcome::Updated { .. })) {
                     self.stop_serving_fork(*coord as usize, vol_ulid);
+                    let fork_dir = self.coords[*coord as usize]
+                        .data_dir
+                        .join("by_id")
+                        .join(vol_ulid.to_string());
+                    if fork_dir.is_dir() {
+                        std::fs::write(fork_dir.join("volume.released"), snap.to_string()).unwrap();
+                    }
                 }
             }
 
@@ -420,15 +432,33 @@ impl World {
                 } else {
                     NameState::Stopped
                 };
-                let _: Result<MarkReclaimedLocalOutcome, _> = lifecycle::mark_reclaimed_local(
-                    &self.store,
-                    name_for(*name),
-                    &coord_id,
-                    None,
-                    local_vol,
-                    target_state,
-                )
-                .await;
+                let outcome: Result<MarkReclaimedLocalOutcome, _> =
+                    lifecycle::mark_reclaimed_local(
+                        &self.store,
+                        name_for(*name),
+                        &coord_id,
+                        None,
+                        local_vol,
+                        target_state,
+                    )
+                    .await;
+                // A successful in-place reclaim clears the local
+                // `volume.released` marker (the production path does this
+                // at `claim.rs`) and resumes serving when the reclaim
+                // landed `Live`.
+                if matches!(outcome, Ok(MarkReclaimedLocalOutcome::Reclaimed)) {
+                    let data_dir = self.coords[*coord as usize].data_dir.clone();
+                    for fork in &mut self.coords[*coord as usize].forks {
+                        if fork.ulid == local_vol && fork.rehomed_as.is_none() {
+                            let marker = data_dir
+                                .join("by_id")
+                                .join(local_vol.to_string())
+                                .join("volume.released");
+                            let _ = std::fs::remove_file(marker);
+                            fork.serving = *as_live;
+                        }
+                    }
+                }
             }
 
             Op::Tick { coord } => {
@@ -436,11 +466,15 @@ impl World {
                 // Snapshot the forks to poll up front — the rehome below
                 // borrows `self.coords[ci]` and then mutates the fork's
                 // flags, so we cannot hold an iterator over `forks`.
+                // Every not-yet-rehomed fork is polled, serving or not —
+                // the production poll runs for every fork with a task,
+                // which is how a released fork gets superseded-rehomed
+                // once a peer claims its name.
                 let candidates: Vec<(usize, Ulid, u8)> = self.coords[ci]
                     .forks
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| f.serving)
+                    .filter(|(_, f)| f.rehomed_as.is_none())
                     .map(|(i, f)| (i, f.ulid, f.name))
                     .collect();
                 for (fi, fork_ulid, name_idx) in candidates {
@@ -467,9 +501,10 @@ impl World {
                     .expect("rehome of a displaced fork must succeed");
                     // Re-run the primitive against the same fork — the
                     // crash-retry / cold-restart re-observation the design
-                    // doc calls out. The ULID-suffixed name makes the
-                    // `If-None-Match` create idempotent: same name, no
-                    // divergent duplicate.
+                    // doc calls out. The episode-derived candidate sequence
+                    // makes the `If-None-Match` create idempotent: the
+                    // re-run walks the same candidates and lands on its
+                    // own record, no divergent duplicate.
                     let rerun = rehome_displaced_fork(
                         &self.coords[ci].identity,
                         self.coords[ci].stores.as_ref(),
@@ -600,7 +635,7 @@ impl World {
     }
 
     /// Invariants 6–9 of `docs/design/displaced-fork-rehome.md`, all of
-    /// which concern the previous-owner disposition after a displacement.
+    /// which concern the previous-owner disposition after a rehome.
     async fn check_rehome_invariants(&self) {
         for coord in &self.coords {
             let coord_id = coord.identity.coordinator_id_str();
@@ -609,17 +644,17 @@ impl World {
                     continue;
                 };
 
-                // Invariant 6: the rehomed name is present, Stopped,
-                // self-owned, and bound to the displaced fork's ULID.
-                // Invariant 9: the name is exactly
-                // `<name>-displaced-<forkUlid>` — the deterministic,
-                // ULID-suffixed name a re-tick recomputes and the
-                // `If-None-Match` create resolves to idempotently, so a
-                // repeated observation never mints a divergent duplicate.
-                let expected = format!("{}-displaced-{}", name_for(fork.name), fork.ulid);
-                assert_eq!(
-                    rehomed, &expected,
-                    "rehomed name must be the fork's deterministic displaced name"
+                // Invariant 6: the rehomed name is `<base>-<suffix>`
+                // (six hex chars), present, in release shape (Released,
+                // ownerless), and bound to the rehomed fork's ULID.
+                let suffix = rehomed
+                    .strip_prefix(&format!("{}-", name_for(fork.name)))
+                    .unwrap_or_else(|| {
+                        panic!("rehomed name '{rehomed}' must extend the lost name")
+                    });
+                assert!(
+                    suffix.len() == 6 && suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                    "rehomed name '{rehomed}' must carry a six-hex-char suffix"
                 );
                 let rec = ns::read_name_record(&self.store, rehomed)
                     .await
@@ -628,18 +663,24 @@ impl World {
                     .0;
                 assert_eq!(
                     rec.state,
-                    NameState::Stopped,
-                    "rehomed name '{rehomed}' must be Stopped"
+                    NameState::Released,
+                    "rehomed name '{rehomed}' must be Released"
                 );
                 assert_eq!(
-                    rec.coordinator_id.as_deref(),
-                    Some(coord_id),
-                    "rehomed name '{rehomed}' must be self-owned by the rehoming coordinator"
+                    rec.coordinator_id, None,
+                    "rehomed name '{rehomed}' must be ownerless (release shape)"
                 );
                 assert_eq!(
                     rec.vol_ulid, fork.ulid,
-                    "rehomed name '{rehomed}' must bind the displaced fork's ULID"
+                    "rehomed name '{rehomed}' must bind the rehomed fork's ULID"
                 );
+                // A supersession's record carries the release handoff;
+                // whenever a handoff is present it must verify like any
+                // other (invariant 5's rule applied to rehomed names).
+                if let Some(snap) = rec.handoff_snapshot {
+                    self.verify_handoff_manifest(rec.vol_ulid, snap, rehomed)
+                        .await;
+                }
 
                 // Invariant 8: a rehomed fork is no longer served.
                 assert!(

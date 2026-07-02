@@ -136,18 +136,32 @@ pub enum EventKind {
         inherits_log_from: String,
     },
     /// Rehomes a fork displaced from another name. A peer force-claimed
-    /// `source_name`; this coordinator re-homed its now-orphaned fork
-    /// under a fresh name rather than discard it. The event's `vol_ulid`
-    /// is the rehomed fork; `source_name` is the name it was displaced
-    /// from; `source_fork` is the fork now bound to `source_name`;
-    /// `displaced_by` is the coordinator that force-claimed it (`None`
-    /// if that record carried no owner identity). Emitted only on this
-    /// (new) name's log.
+    /// `source_name` while this fork still held it; this coordinator
+    /// re-homed its now-orphaned fork under a fresh name rather than
+    /// discard it. The event's `vol_ulid` is the rehomed fork;
+    /// `source_name` is the name it was displaced from; `source_fork`
+    /// is the fork now bound to `source_name`; `displaced_by` is the
+    /// coordinator that force-claimed it (`None` if that record carried
+    /// no owner identity). Emitted only on this (new) name's log.
     Displaced {
         source_name: String,
         source_fork: Ulid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced_by: Option<String>,
+    },
+    /// Rehomes a fork superseded at another name. This coordinator
+    /// cleanly released `source_name` and a peer claimed it; the
+    /// released local fork was re-homed under a fresh name. The event's
+    /// `vol_ulid` is the rehomed fork; `source_name` is the name it
+    /// lost; `source_fork` is the fork now bound to `source_name`;
+    /// `superseded_by` is the coordinator that claimed it (`None` if
+    /// that record carried no owner identity). Emitted only on this
+    /// (new) name's log.
+    Superseded {
+        source_name: String,
+        source_fork: Ulid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        superseded_by: Option<String>,
     },
     /// An event whose `kind` payload did not parse under this binary's
     /// schema — a field a different version wrote or omitted. Produced
@@ -175,6 +189,7 @@ impl EventKind {
             Self::RenamedTo { .. } => "renamed_to",
             Self::RenamedFrom { .. } => "renamed_from",
             Self::Displaced { .. } => "displaced",
+            Self::Superseded { .. } => "superseded",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -371,6 +386,19 @@ impl VolumeEvent {
                 push_field(&mut buf, "source_name", source_name);
                 push_field(&mut buf, "source_fork", &source_fork.to_string());
             }
+            EventKind::Superseded {
+                source_name,
+                source_fork,
+                superseded_by,
+            } => {
+                push_field(&mut buf, "source_name", source_name);
+                push_field(&mut buf, "source_fork", &source_fork.to_string());
+                push_field(
+                    &mut buf,
+                    "superseded_by",
+                    superseded_by.as_deref().unwrap_or(""),
+                );
+            }
             // Never signed or verified: an Unknown event is a read-time
             // stand-in whose original payload lives only in the raw bytes.
             EventKind::Unknown { .. } => {}
@@ -521,6 +549,16 @@ mod tests {
                 source_name: "prod".to_string(),
                 source_fork: vol_ulid(),
                 displaced_by: None,
+            },
+            EventKind::Superseded {
+                source_name: "prod".to_string(),
+                source_fork: vol_ulid(),
+                superseded_by: Some("01NEWCOORDXXXXXXXXXXXXXXXX".to_string()),
+            },
+            EventKind::Superseded {
+                source_name: "prod".to_string(),
+                source_fork: vol_ulid(),
+                superseded_by: None,
             },
         ];
         for kind in kinds {
