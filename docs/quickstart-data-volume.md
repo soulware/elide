@@ -74,7 +74,7 @@ elide_data/by_id/<ulid>/
     <ulid>.idx      — LBA index section; written at flush; permanent (survives eviction)
   cache/
     <ulid>.body     — segment body; evictable once committed to store
-  volume.toml       — name, size, [ublk] dev_id binding
+  volume.toml       — ulid, name, size, [ublk] dev_id binding
   volume.key        — Ed25519 signing key (never uploaded)
   volume.pub        — Ed25519 public key
   volume.provenance — signed lineage (parent + extent_index); uploaded to S3

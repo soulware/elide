@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 pub const CONFIG_FILE: &str = "volume.toml";
 
@@ -14,6 +15,10 @@ pub const CONFIG_FILE: &str = "volume.toml";
 /// - `control.sock` — runtime Unix socket
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct VolumeConfig {
+    /// The volume's ULID. Advisory self-description: the `by_id/<ulid>`
+    /// directory name is authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ulid: Option<Ulid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,6 +241,22 @@ mod tests {
         // [ublk] enabled but no id bound yet.
         write_config(tmp.path(), "[ublk]\n");
         assert_eq!(VolumeConfig::bound_ublk_id(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn ulid_roundtrips_as_canonical_string() {
+        let tmp = TempDir::new().unwrap();
+        let ulid = Ulid::from_string("01JQAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        VolumeConfig {
+            ulid: Some(ulid),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join(CONFIG_FILE)).unwrap();
+        assert!(raw.contains("ulid = \"01JQAAAAAAAAAAAAAAAAAAAAAA\""));
+        assert_eq!(VolumeConfig::read(tmp.path()).unwrap().ulid, Some(ulid));
     }
 
     #[test]

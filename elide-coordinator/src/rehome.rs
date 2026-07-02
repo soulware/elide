@@ -351,6 +351,7 @@ mod tests {
         std::fs::create_dir_all(&fork_dir).unwrap();
         // The fork self-identifies as "prod" and carries a bound ublk id.
         elide_core::config::VolumeConfig {
+            ulid: Some(our_fork),
             name: Some("prod".to_owned()),
             size: None,
             ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),

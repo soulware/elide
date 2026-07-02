@@ -303,7 +303,7 @@ impl ForceClaimOrchestrator {
                 "[force-claim {}] resuming partial fork {vol_ulid}",
                 self.volume
             );
-            self.write_volume_toml(&dir)?;
+            self.write_volume_toml(&dir, vol_ulid)?;
             self.fork = Some(ForkSkeleton {
                 vol_ulid,
                 dir,
@@ -439,7 +439,7 @@ impl ForceClaimOrchestrator {
         // follow; the discharge possession proof loads the anchor's
         // name and key from its dir, so volume.toml lands before the
         // first anchored read.
-        self.write_volume_toml(&new_dir)?;
+        self.write_volume_toml(&new_dir, new_vol_ulid)?;
         self.fork = Some(ForkSkeleton {
             vol_ulid: new_vol_ulid,
             dir: new_dir,
@@ -451,8 +451,9 @@ impl ForceClaimOrchestrator {
     /// Write the fork's `volume.toml` (name + size from the observed
     /// record — a forced claim continues the same logical volume
     /// identity).
-    fn write_volume_toml(&self, dir: &Path) -> Result<(), IpcError> {
+    fn write_volume_toml(&self, dir: &Path, vol_ulid: Ulid) -> Result<(), IpcError> {
         elide_core::config::VolumeConfig {
+            ulid: Some(vol_ulid),
             name: Some(self.volume.clone()),
             size: Some(self.observed.record.size),
             ublk: None,

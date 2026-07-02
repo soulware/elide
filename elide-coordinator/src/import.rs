@@ -309,6 +309,7 @@ pub async fn spawn_import(req: ImportRequest<'_>, ctx: &ImportContext) -> std::i
         // Write the name into volume.toml (size is added later by elide-core once
         // the import completes).
         elide_core::config::VolumeConfig {
+            ulid: Some(vol_ulid_value),
             name: Some(vol_name.to_owned()),
             ..Default::default()
         }

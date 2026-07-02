@@ -1607,6 +1607,7 @@ async fn create_volume_op(
     // uploaded in Phase 2 ahead of the names/<name> claim.
     let result: std::io::Result<()> = (|| {
         elide_core::config::VolumeConfig {
+            ulid: Some(vol_ulid),
             name: Some(name.to_owned()),
             size: Some(size_bytes),
             ublk: ublk_cfg,
@@ -3069,6 +3070,7 @@ mod tests {
         let vol_dir = data_dir.join("by_id").join(vol_ulid);
         std::fs::create_dir_all(&vol_dir).unwrap();
         elide_core::config::VolumeConfig {
+            ulid: ulid::Ulid::from_string(vol_ulid).ok(),
             name: Some(name.to_owned()),
             size: Some(SAMPLE_SIZE),
             ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig { dev_id: Some(id) }),
