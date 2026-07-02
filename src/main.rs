@@ -2202,6 +2202,7 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
             SignatureStatus::Invalid { .. } => '!',
             SignatureStatus::KeyUnavailable { .. } => '?',
             SignatureStatus::Missing => '-',
+            SignatureStatus::Unparseable => '~',
         };
         let when = ev.at.format("%Y-%m-%d %H:%M:%SZ");
         let kind_label = ev.kind.as_str();
@@ -2248,6 +2249,10 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
                 Some(d) => format!(" source={source_name}@{source_fork} displaced-by={d}"),
                 None => format!(" source={source_name}@{source_fork}"),
             },
+            EventKind::Unknown { original_kind } => match original_kind {
+                Some(k) => format!(" unparseable was={k}"),
+                None => " unparseable".to_owned(),
+            },
         };
         println!("{sigil} {when}  {kind_label:<14} vol={vol}  by={coord}{host}{extra}");
     }
@@ -2263,6 +2268,7 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
                 format!("key unavailable: {reason}")
             }
             SignatureStatus::Missing => "no signature on event".to_string(),
+            SignatureStatus::Unparseable => "unparseable kind — signature not checked".to_string(),
         };
         if !had_explanation {
             println!();
