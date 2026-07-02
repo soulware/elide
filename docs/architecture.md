@@ -110,9 +110,8 @@ elide_data/                           — single root (default --data-dir)
   coordinator.toml                    — coordinator configuration
   by_id/
     01JQAAAAAAA/                      — imported base (ULID = stable S3 prefix)
-      volume.name                     — "ubuntu-22.04"
+      volume.toml                     — ulid, name = "ubuntu-22.04", size
       volume.readonly                 — present = permanently readonly (imported/frozen)
-      volume.size                     — volume size in bytes (plain text)
       volume.pub                      — Ed25519 public key (uploaded to S3)
       volume.provenance               — signed lineage (parent + extent_index + oci_source); uploaded to S3
       pending/                        — segments awaiting S3 upload (volume-written)
@@ -122,8 +121,7 @@ elide_data/                           — single root (default --data-dir)
         01JQXXXXX                     — branch point marker for derived volumes
       import.lock                     — present while import is running or interrupted
     01JQBBBBBBB/                      — writable replica of ubuntu-22.04
-      volume.name                     — "server-1"
-      volume.size
+      volume.toml                     — ulid, name = "server-1", size, optional [ublk] dev_id
       volume.key                      — Ed25519 signing key (never uploaded; absent on readonly volumes)
       volume.pub
       volume.provenance               — signed: parent="01JQAAAAAAA/01JQXXXXX" + empty extent_index
@@ -135,15 +133,15 @@ elide_data/                           — single root (default --data-dir)
       snapshots/
       control.sock                    — volume process IPC socket (coordinator connects here)
     01JQCCCCCCC/
-      volume.name                     — "server-2"
+      volume.toml                     — ulid, name = "server-2", size
       volume.provenance               — signed: parent="01JQAAAAAAA/01JQXXXXX", extent_index empty
       ...
     01JQDDDDDDD/
-      volume.name                     — "server-2-experiment"
+      volume.toml                     — ulid, name = "server-2-experiment", size
       volume.provenance               — signed: parent="01JQCCCCCCC/<ulid>", extent_index empty
       ...
     01JQEEEEEEE/                      — readonly import layered on ubuntu-22.04
-      volume.name                     — "ubuntu-22.04.1"
+      volume.toml                     — ulid, name = "ubuntu-22.04.1", size
       volume.readonly
       volume.provenance               — signed: parent="", extent_index=["01JQAAAAAAA/01JQXXXXX"]
       ...
@@ -156,9 +154,9 @@ elide_data/                           — single root (default --data-dir)
 
 `by_id/<ulid>/` holds three roles, distinguishable by file shape:
 
-1. **Writable volume** — has `volume.key`, `volume.name`, `wal/`, `by_name/` symlink.
-2. **Imported readonly base** — has `volume.readonly`, `volume.name`, `by_name/` symlink. OCI source label (`image`, `digest`, `arch`) lives inside the signed `volume.provenance` as an `oci_source` block.
-3. **Ancestor pulled from S3** — has `volume.readonly`, *no* `volume.name`, *no* `by_name/` symlink. `index/` is populated incrementally by prefetch; `cache/` is populated incrementally by demand-fetches issued by children that read through this ancestor.
+1. **Writable volume** — has `volume.key`, `volume.toml`, `wal/`, `by_name/` symlink.
+2. **Imported readonly base** — has `volume.readonly`, `volume.toml`, `by_name/` symlink. OCI source label (`image`, `digest`, `arch`) lives inside the signed `volume.provenance` as an `oci_source` block.
+3. **Ancestor pulled from S3** — has `volume.readonly`, *no* `volume.toml`, *no* `by_name/` symlink. `index/` is populated incrementally by prefetch; `cache/` is populated incrementally by demand-fetches issued by children that read through this ancestor.
 
 Lineage lives inside `volume.provenance`, **not** in standalone `volume.parent` / `volume.extent_index` files. Provenance is a single signed document recording both lineage relationships under one Ed25519 signature. Tampering with lineage is detectable with the volume's own public key, and the file format is extensible — adding new lineage fields in the future means extending the signed payload rather than dropping more unsigned files into the directory. `volume.provenance` is uploaded to S3 alongside `volume.pub` so that `remote pull` can materialise a signed, verifiable skeleton on another host.
 
@@ -190,7 +188,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 **Invariants:**
 - `by_id/` entries are valid ULIDs — the coordinator skips anything else
 - `by_name/` entries are symlinks only — no real directories
-- `volume.name` is present in every user-managed volume; *absent* on ancestors pulled from S3 to satisfy a child's lineage. The missing name (and the matching absence of a `by_name/` symlink) is the on-disk indicator that a `by_id/` entry exists only as a fork source, not as a user-managed volume.
+- `volume.toml` is present in every user-managed volume; *absent* on ancestors pulled from S3 to satisfy a child's lineage. The missing config (and the matching absence of a `by_name/` symlink) is the on-disk indicator that a `by_id/` entry exists only as a fork source, not as a user-managed volume.
 - `volume.readonly` present → volume is permanently readonly; coordinator skips supervision; volume process refuses writable open
 - `volume.pub` present in every volume — readonly volumes have only `volume.pub` (no `volume.key`); `serve-volume` verifies provenance against it on every open, writable or not
 - `volume.key` present only on writable volumes; absent on readonly/imported volumes — `serve-volume` fails hard if it is missing and the volume is not readonly
@@ -204,7 +202,7 @@ Walker integrity: `walk_ancestors` and `walk_extent_ancestors` both verify the s
 - **`index/<ulid>.idx` present** means the volume has flushed segment `<ulid>` to `pending/` (or applied a GC handoff producing it). The volume writes `index/<ulid>.idx` at two points: (1) when flushing the WAL to `pending/<ulid>`; (2) when applying a GC handoff — writing `index/<new>.idx` from `gc/<new>` and deleting `index/<old>.idx` for each consumed input. `index/` is never written by the coordinator. `index/<ulid>.idx` files are never evicted — they are the permanent LBA index for all segments the volume has ever created or compacted.
 - **`pending/<ulid>` absent ↔ segment `<ulid>` is confirmed in S3.** The volume deletes `pending/<ulid>` as part of responding to the coordinator's `promote` IPC, which the coordinator issues only after a confirmed S3 upload. If `pending/<ulid>` exists, the segment has not yet been confirmed in S3. `cache/<ulid>.body` and `cache/<ulid>.present` are volume-owned: written by the volume on `promote` response and on demand-fetch; may be evicted by the volume at any time; their absence means body bytes must be fetched from S3.
 
-**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have a `pending/` subdirectory (segments awaiting upload) or an `index/` subdirectory (already-uploaded segments). Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `index/` is absent or empty (just pulled from the store, no segments indexed yet). Readonly volumes with a non-empty `index/` are already indexed and are skipped. Pulled ancestors (no `volume.name`, no `by_name/` symlink) are picked up by the same scan: they have `volume.readonly` and an empty/missing `index/` until prefetch fills it.
+**Finding live volumes:** the coordinator scans `by_id/` for ULID-named subdirectories that have a `pending/` subdirectory (segments awaiting upload) or an `index/` subdirectory (already-uploaded segments). Readonly volumes (with `volume.readonly`) are included for drain if they have pending segments (import just completed), and for prefetch if `index/` is absent or empty (just pulled from the store, no segments indexed yet). Readonly volumes with a non-empty `index/` are already indexed and are skipped. Pulled ancestors (no `volume.toml`, no `by_name/` symlink) are picked up by the same scan: they have `volume.readonly` and an empty/missing `index/` until prefetch fills it.
 
 **Exclusive access:** a live volume holds an exclusive `flock` on `<vol-dir>/volume.lock` for the lifetime of its volume process. Attempting to open an already-locked volume fails immediately.
 
@@ -468,7 +466,7 @@ All user-facing commands accept a **volume name** (resolved via `by_name/<name>`
 | `elide volume info <name\|ulid>` | Segment counts, WAL size, snapshot history, ancestry chain |
 | `elide volume snapshot <name\|ulid>` | Write a snapshot marker file |
 | `elide volume create <name> --from <source>` | Create a new writable replica of an existing volume. `<source>` is one of: `<vol_ulid>/<snap_ulid>` or `<name>/<snap_ulid>` (explicit pin), or `<name>` (local or remote lookup; a remote basis comes from the `names/<name>` record's `latest_snapshot`). A bare `<vol_ulid>` is rejected — raw ULIDs always carry an explicit pin; the name is the discovery surface. Refuses if `<name>` already exists. Reads traverse the upstream's S3 prefix via the ancestor chain (cheap-reference shape). See [design/replica-model.md](design/replica-model.md) for the direction of travel |
-| `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.name`); rescan |
+| `elide volume create <name> --size N` | Create a new empty root volume (generates ULID dir, writes `volume.toml`); rescan |
 | `elide volume status --remote <name>` | `GET names/<name>` against the store; print the authoritative record (state, vol_ulid, coordinator_id, hostname, claimed_at, parent, handoff_snapshot) plus this coordinator's eligibility |
 | `elide volume claim <name>` | Claim a `Released` name from the store: pull the released ancestor's chain, mint a fresh local fork, and conditionally rebind `names/<name>` to the new fork (state ends `Stopped`). Always CAS-protected. To override an unreachable owner of a `Live`/`Stopped` record, use `volume claim --force <name>` |
 | `elide volume start --claim <name>` | Compose `volume claim` + `volume start` |
@@ -1003,7 +1001,7 @@ Delta compression is compelling for point-release image updates; not worth the c
 
 | Term | Definition |
 |------|------------|
-| **Volume** | A ULID-named directory directly under `data_dir`. Every volume is a peer. Its stable global identity is its ULID (the directory name and S3 prefix); its human-readable name is stored in `volume.name`. |
+| **Volume** | A ULID-named directory directly under `data_dir`. Every volume is a peer. Its stable global identity is its ULID (the directory name and S3 prefix); its human-readable name is stored in `volume.toml`. |
 | **Replica** | A volume that references an upstream (a cheap-reference replica created via `volume create --from`) or was copied from one (a self-contained replica created via `volume materialize`). Every non-root volume is a replica of some upstream. |
 | **Fork** | Historical synonym for "replica" describing lineage. No longer a CLI command — see `volume create --from` and `volume materialize`. The parent relationship is recorded in an `origin` file using ULID paths. |
 | **Snapshot** | A marker file (`snapshots/<ulid>`) recording a point in a volume's committed segment sequence. The ULID gives the position: all segments with ULID ≤ the snapshot ULID are part of that snapshot. The latest snapshot ULID also serves as the **compaction floor** — segments at or below it are frozen and will never be compacted. The file content is empty or an optional human-readable label. |

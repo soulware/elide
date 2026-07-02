@@ -257,12 +257,9 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
         elide_coordinator::bins::elide_bin().display(),
     );
 
-    // Reconcile by_name/ against by_id/: remove symlinks whose target no longer
-    // exists, add missing symlinks for volumes that have a volume.name file.
-    reconcile_by_name(&data_dir);
-
-    // Stamp the volume ULID into any volume.toml that predates the field.
-    backfill_volume_toml_ulids(&data_dir);
+    // Reconcile by_name/ symlinks against by_id/, backfill volume.toml
+    // ulid/name fields that predate them, and flag mismatches.
+    reconcile_volume_metadata(&data_dir);
 
     // Clean up any stale import locks left by a previous coordinator
     // run, then CAS-delete the bucket-side `Importing` records of the
@@ -800,26 +797,31 @@ fn discover_volumes(data_dir: &Path) -> Vec<PathBuf> {
     volumes
 }
 
-/// Reconcile `<data_dir>/by_name/` against `<data_dir>/by_id/`.
+/// Reconcile `<data_dir>/by_name/`, `<data_dir>/by_id/`, and each
+/// volume's `volume.toml` self-description.
 ///
 /// - Removes stale symlinks whose target ULID no longer exists in `by_id/`.
-/// - Adds missing symlinks for volumes that have a `volume.name` file but no
-///   corresponding `by_name/` entry.
-fn reconcile_by_name(data_dir: &Path) {
+/// - Adds missing symlinks for volumes whose `volume.toml` carries a name.
+/// - Stamps the `ulid` field (the `by_id/` directory name) and the `name`
+///   field (the `by_name/` symlink) into `volume.toml` files that predate
+///   them. Existing values are never rewritten — the fields are advisory —
+///   but a value that disagrees with the directory name or symlink is
+///   flagged with a warning. Volumes without a `volume.toml` (pulled
+///   ancestors) are left untouched: no file is created.
+fn reconcile_volume_metadata(data_dir: &Path) {
     let by_id_dir = data_dir.join("by_id");
     let by_name_dir = data_dir.join("by_name");
 
-    // Remove stale symlinks: entries that are symlinks but whose target no
-    // longer exists.  Non-symlink entries (real directories, files) are left
-    // alone and warned about — they indicate unexpected manual changes.
+    // by_name/ pass: remove stale symlinks, and check each live symlink
+    // against its target's volume.toml name. Non-symlink entries (real
+    // directories, files) are left alone and warned about — they indicate
+    // unexpected manual changes.
     if let Ok(entries) = std::fs::read_dir(&by_name_dir) {
         for entry in entries.flatten() {
             let link = entry.path();
+            let link_name = entry.file_name().to_string_lossy().into_owned();
             if !link.is_symlink() {
-                warn!(
-                    "[coordinator] by_name/{} is not a symlink; skipping",
-                    entry.file_name().to_string_lossy()
-                );
+                warn!("[coordinator] by_name/{link_name} is not a symlink; skipping");
                 continue;
             }
             // Broken symlink: target no longer exists.
@@ -829,49 +831,51 @@ fn reconcile_by_name(data_dir: &Path) {
                     "[coordinator] removed stale by_name symlink: {}",
                     link.display()
                 );
+                continue;
+            }
+            let Ok(vol_dir) = std::fs::canonicalize(&link) else {
+                continue;
+            };
+            if !vol_dir.join(elide_core::config::CONFIG_FILE).exists() {
+                continue;
+            }
+            let mut cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    warn!(
+                        "[coordinator] cannot read {}/volume.toml: {e}",
+                        vol_dir.display()
+                    );
+                    continue;
+                }
+            };
+            match cfg.name.as_deref() {
+                None => {
+                    cfg.name = Some(link_name.clone());
+                    match cfg.write(&vol_dir) {
+                        Ok(()) => info!(
+                            "[coordinator] backfilled name \"{link_name}\" into {}/volume.toml",
+                            vol_dir.display()
+                        ),
+                        Err(e) => warn!(
+                            "[coordinator] failed to backfill name into {}/volume.toml: {e}",
+                            vol_dir.display()
+                        ),
+                    }
+                }
+                Some(name) if name != link_name => warn!(
+                    "[coordinator] by_name/{link_name} points at {} but its \
+                     volume.toml names \"{name}\"",
+                    vol_dir.display()
+                ),
+                Some(_) => {}
             }
         }
     }
 
-    // Add missing symlinks.
+    // by_id/ pass: check each volume.toml's ulid against its directory
+    // name, and create missing by_name/ symlinks.
     let Ok(entries) = std::fs::read_dir(&by_id_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let vol_dir = entry.path();
-        if !vol_dir.is_dir() {
-            continue;
-        }
-        let Some(ulid_str) = vol_dir.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if ulid::Ulid::from_string(ulid_str).is_err() {
-            continue;
-        }
-        let Some(name) = elide_coordinator::tasks::read_volume_name(&vol_dir) else {
-            continue;
-        };
-        let name = name.as_str();
-        let link = by_name_dir.join(name);
-        if link.is_symlink() || link.exists() {
-            // Already present (symlink or unexpected non-symlink); leave it.
-            continue;
-        }
-        let target = format!("../by_id/{ulid_str}");
-        if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
-            warn!("[coordinator] failed to create by_name/{name} -> {target}: {e}");
-        } else {
-            info!("[coordinator] created by_name/{name} -> {target}");
-        }
-    }
-}
-
-/// Stamp each volume's ULID (its `by_id/` directory name) into its
-/// `volume.toml`, for files written before the `ulid` field existed.
-/// Volumes without a `volume.toml` (pulled ancestors) and files that
-/// already carry a `ulid` are left untouched.
-fn backfill_volume_toml_ulids(data_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(data_dir.join("by_id")) else {
         return;
     };
     for entry in entries.flatten() {
@@ -886,11 +890,61 @@ fn backfill_volume_toml_ulids(data_dir: &Path) {
         else {
             continue;
         };
-        if let Err(e) = elide_core::config::VolumeConfig::backfill_ulid(&vol_dir, ulid) {
-            warn!(
-                "[coordinator] failed to backfill ulid into {}/volume.toml: {e}",
+        if !vol_dir.join(elide_core::config::CONFIG_FILE).exists() {
+            continue;
+        }
+        let mut cfg = match elide_core::config::VolumeConfig::read(&vol_dir) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(
+                    "[coordinator] cannot read {}/volume.toml: {e}",
+                    vol_dir.display()
+                );
+                continue;
+            }
+        };
+        match cfg.ulid {
+            None => {
+                cfg.ulid = Some(ulid);
+                match cfg.write(&vol_dir) {
+                    Ok(()) => info!(
+                        "[coordinator] backfilled ulid into {}/volume.toml",
+                        vol_dir.display()
+                    ),
+                    Err(e) => warn!(
+                        "[coordinator] failed to backfill ulid into {}/volume.toml: {e}",
+                        vol_dir.display()
+                    ),
+                }
+            }
+            Some(stored) if stored != ulid => warn!(
+                "[coordinator] {}/volume.toml carries ulid {stored}, which \
+                 disagrees with the directory name",
                 vol_dir.display()
-            );
+            ),
+            Some(_) => {}
+        }
+
+        // Create the by_name/ symlink if the volume names itself and no
+        // entry exists yet; flag an existing entry that resolves elsewhere.
+        let Some(name) = cfg.name.filter(|n| !n.trim().is_empty()) else {
+            continue;
+        };
+        let link = by_name_dir.join(&name);
+        if link.is_symlink() || link.exists() {
+            if std::fs::canonicalize(&link).ok() != std::fs::canonicalize(&vol_dir).ok() {
+                warn!(
+                    "[coordinator] volume {ulid} names itself \"{name}\" but \
+                     by_name/{name} points elsewhere"
+                );
+            }
+            continue;
+        }
+        let target = format!("../by_id/{ulid}");
+        if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+            warn!("[coordinator] failed to create by_name/{name} -> {target}: {e}");
+        } else {
+            info!("[coordinator] created by_name/{name} -> {target}");
         }
     }
 }
@@ -921,9 +975,10 @@ mod tests {
     }
 
     #[test]
-    fn backfill_stamps_ulid_only_into_existing_volume_toml() {
+    fn reconcile_backfills_ulid_and_name_into_existing_volume_toml() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
+        mk(root, "by_name");
 
         // Volume whose volume.toml predates the ulid field.
         let ulid1 = "01JQAAAAAAAAAAAAAAAAAAAAAA";
@@ -934,17 +989,52 @@ mod tests {
         )
         .unwrap();
 
-        // Pulled ancestor: no volume.toml, and none must be created.
+        // Volume with a by_name symlink but no name in volume.toml.
         let ulid2 = "01JQBBBBBBBBBBBBBBBBBBBBBB";
-        mk(root, &format!("by_id/{ulid2}/index"));
+        mk(root, &format!("by_id/{ulid2}"));
+        std::fs::write(root.join(format!("by_id/{ulid2}/volume.toml")), "").unwrap();
+        std::os::unix::fs::symlink(format!("../by_id/{ulid2}"), root.join("by_name/beta")).unwrap();
 
-        backfill_volume_toml_ulids(root);
+        // Pulled ancestor: no volume.toml, and none must be created.
+        let ulid3 = "01JQCCCCCCCCCCCCCCCCCCCCCC";
+        mk(root, &format!("by_id/{ulid3}/index"));
 
-        let cfg =
+        reconcile_volume_metadata(root);
+
+        let cfg1 =
             elide_core::config::VolumeConfig::read(&root.join(format!("by_id/{ulid1}"))).unwrap();
-        assert_eq!(cfg.ulid.map(|u| u.to_string()).as_deref(), Some(ulid1));
-        assert_eq!(cfg.name.as_deref(), Some("alpha"));
-        assert!(!root.join(format!("by_id/{ulid2}/volume.toml")).exists());
+        assert_eq!(cfg1.ulid.map(|u| u.to_string()).as_deref(), Some(ulid1));
+        assert_eq!(cfg1.name.as_deref(), Some("alpha"));
+        // alpha's symlink was created from its backfilled name.
+        assert!(root.join("by_name/alpha").is_symlink());
+
+        let cfg2 =
+            elide_core::config::VolumeConfig::read(&root.join(format!("by_id/{ulid2}"))).unwrap();
+        assert_eq!(cfg2.ulid.map(|u| u.to_string()).as_deref(), Some(ulid2));
+        assert_eq!(cfg2.name.as_deref(), Some("beta"));
+
+        assert!(!root.join(format!("by_id/{ulid3}/volume.toml")).exists());
+    }
+
+    #[test]
+    fn reconcile_never_rewrites_mismatched_ulid_or_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        mk(root, "by_name");
+
+        // volume.toml disagrees with both the directory name and the
+        // by_name symlink; reconcile flags but must not rewrite.
+        let dir_ulid = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        mk(root, &format!("by_id/{dir_ulid}"));
+        let contents = "ulid = \"01JQBBBBBBBBBBBBBBBBBBBBBB\"\nname = \"alpha\"\n";
+        let toml_path = root.join(format!("by_id/{dir_ulid}/volume.toml"));
+        std::fs::write(&toml_path, contents).unwrap();
+        std::os::unix::fs::symlink(format!("../by_id/{dir_ulid}"), root.join("by_name/renamed"))
+            .unwrap();
+
+        reconcile_volume_metadata(root);
+
+        assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), contents);
     }
 
     #[test]
