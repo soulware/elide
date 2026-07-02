@@ -801,7 +801,7 @@ impl ForceClaimOrchestrator {
             .map_err(|e| IpcError::internal(format!("creating by_name dir: {e}")))?;
         if symlink_path.exists() || symlink_path.is_symlink() {
             // Preserve the fork we're displacing: rehome it under
-            // <name>-displaced-<old_ulid> instead of orphaning it
+            // <name>-<suffix> instead of orphaning it
             // (docs/design/displaced-fork-rehome.md). Best-effort — a
             // rehome failure must not fail the force-claim itself.
             elide_coordinator::rehome::rehome_existing_local_fork(

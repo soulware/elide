@@ -75,7 +75,7 @@ pub struct GcCycleOrchestrator {
     /// rehomed name record when a displaced fork is fenced
     /// (`fence_if_displaced`).
     identity: Arc<crate::identity::CoordinatorIdentity>,
-    /// Scoped stores — the rehome mints `names/<name>-displaced-<ulid>`
+    /// Scoped stores — the rehome mints `names/<name>-<suffix>`
     /// and emits its `Displaced` event through these.
     stores: Arc<dyn crate::stores::ScopedStores>,
 }
@@ -148,10 +148,11 @@ impl GcCycleOrchestrator {
     /// alone and lets the credential fence backstop.
     ///
     /// Halts the device, then rehomes the fork under
-    /// `<name>-displaced-<ulid>` (a first-class stopped volume) and drops
-    /// the stale local name binding. Returns `Some(Stop)` once halted (the
-    /// per-volume task then exits), `Some(Continue)` to retry a failed halt
-    /// next tick, or `None` when the fork is still the bound owner.
+    /// `<name>-<suffix>` (a first-class released volume,
+    /// recovered by reclaim-then-start) and drops the stale local name
+    /// binding. Returns `Some(Stop)` once halted (the per-volume task then
+    /// exits), `Some(Continue)` to retry a failed halt next tick, or `None`
+    /// when the fork is still the bound owner.
     async fn fence_if_displaced(&self) -> Option<TickOutcome> {
         let name = self.volume_name.as_ref()?;
         let rec = match self.name_claims.read(name).await {
@@ -206,8 +207,8 @@ impl GcCycleOrchestrator {
             crate::ublk_sweep::teardown_bound_device(&self.fork_dir, id).await;
         }
 
-        // Rehome the fork under <name>-displaced-<ulid> so it survives as a
-        // first-class stopped volume, then drop our stale local binding.
+        // Rehome the fork under <name>-<suffix> so it survives
+        // as a first-class released volume, then drop our stale local binding.
         let data_dir = self.by_id_dir.parent().unwrap_or(&self.by_id_dir);
         match crate::rehome::rehome_displaced_fork(
             self.identity.as_ref(),
@@ -1129,9 +1130,10 @@ mod tests {
             Some(TickOutcome::Stop)
         ));
 
-        // The displaced fork is rehomed as a Stopped, named volume.
+        // The displaced fork is rehomed as a Released volume under its
+        // episode's derived name.
         let our = vol_ulid();
-        let new_name = format!("vol2-displaced-{our}");
+        let new_name = format!("vol2-{}", crate::rehome::rehome_suffix("vol2", our, 0));
         let rehomed = orch
             .name_claims
             .read(&new_name)
@@ -1139,9 +1141,9 @@ mod tests {
             .unwrap()
             .expect("displaced fork must be rehomed");
         assert_eq!(rehomed.vol_ulid, our);
-        assert_eq!(rehomed.state, elide_core::name_record::NameState::Stopped);
+        assert_eq!(rehomed.state, elide_core::name_record::NameState::Released);
         let fork_dir = tmp.path().join("by_id").join(our.to_string());
-        assert!(fork_dir.join(STOPPED_FILE).exists());
+        assert!(fork_dir.join(crate::volume_state::RELEASED_FILE).exists());
         assert!(tmp.path().join("by_name").join(&new_name).exists());
     }
 

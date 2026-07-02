@@ -2120,6 +2120,14 @@ fn print_volume_events(reply: &coordinator_client::VolumeEventsReply) {
                 Some(d) => format!(" source={source_name}@{source_fork} displaced-by={d}"),
                 None => format!(" source={source_name}@{source_fork}"),
             },
+            EventKind::Superseded {
+                source_name,
+                source_fork,
+                superseded_by,
+            } => match superseded_by {
+                Some(d) => format!(" source={source_name}@{source_fork} superseded-by={d}"),
+                None => format!(" source={source_name}@{source_fork}"),
+            },
             EventKind::Unknown { original_kind } => match original_kind {
                 Some(k) => format!(" unparseable was={k}"),
                 None => " unparseable".to_owned(),

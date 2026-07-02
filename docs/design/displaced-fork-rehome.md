@@ -1,13 +1,34 @@
-# Displaced-fork rehome
+# Fork rehome: supersession and displacement
 
-**Status:** Proposed (2026-07-01). Companion to
-[`force-release-fencing.md`](force-release-fencing.md) (the claimant-side
-safety fence) and [`volume-event-log.md`](volume-event-log.md) (whose rename
-boundary this deliberately does *not* reuse). Covers the **previous owner's
-local disposition**: what coordinator A does with its own live fork V1 once a
-peer B has force-claimed `names/<name>` out from under it — the piece
+**Status:** Proposed (2026-07-01; supersession/displacement split 2026-07-02).
+Companion to [`force-release-fencing.md`](force-release-fencing.md) (the
+claimant-side safety fence) and [`volume-event-log.md`](volume-event-log.md)
+(whose rename boundary this deliberately does *not* reuse). Covers the
+**previous owner's local disposition**: what coordinator A does with its own
+fork V1 once `names/<name>` binds a different fork — the piece
 `force-release-fencing.md` scopes out as "teardown, hygiene" and defers as
 "cleanup of garbage under V1."
+
+V1 stops being the name's owner two ways, and A's disposition differs by which:
+
+- **Supersession** — A **cleanly released** and a peer picked the name up
+  with a normal `claim`, minting fork V2. The claim hydrates from A's handoff
+  snapshot, so V2 *descends from* V1 — and release refuses a fork with
+  durable state past its last snapshot (`NeedsDrain`), so V1 is provably a
+  drained predecessor: nothing undrained, nothing divergent. The rehome
+  records a `superseded` event.
+- **Displacement** — a peer **force-claimed** the name while A still held it,
+  minting fork V2. V1 may carry writes past the force-claimer's head-delta
+  cut — a divergent branch. The rehome records a `displaced` event.
+
+A tells them apart by the `volume.released` marker on V1. Both dispositions
+rehome to the same name shape — `<name>-<suffix>`, six hex chars derived
+from the episode — and land V1 **released** under it: the rehome mints the
+new record in `Released` state and the fork carries the `volume.released`
+marker. Recovery is uniform — reclaim first (`volume claim <rehome-name>`,
+the ordinary in-place reclaim), then `start` — and the name carries no
+information: what happened, and who took the name, live in the event on the
+new name's log.
 
 ## Problem
 
@@ -40,12 +61,39 @@ That leaves A's **own** side unspecified, and today it is handled badly:
 - **Orphaned forks accumulate.** Nothing reclaims a superseded local fork; its
   WAL / pending / index / cache / keys sit on disk indefinitely.
 
-## Proposed: fence-to-stopped, then rehome
+The clean-release handoff hits the same tail. After A releases and a peer
+claims — a fully happy-path handoff, no force anywhere — A is left with a
+stale `by_name/<name>` binding that now disagrees with the bucket, and the
+next `claim` for the name silently removes that symlink (`claim.rs`) and
+orphans A's fork exactly as the force-claim case does. Local names are
+single-valued (`by_name/<name>` is one symlink), so A cannot keep the fork
+under `<name>` and stay consistent with the bucket; it must relinquish the
+name. That makes rehome the disposition for *both* events — the only
+difference is whether A's fork is a diverged branch or a drained predecessor.
 
-On detecting displacement, an alive A does two things — **fence** its local
-device to a stop, and **rehome** its fork under a new name — so the diverged
-volume survives as a first-class, inspectable object rather than silent
-garbage.
+## Proposed: fence, then rehome to released
+
+On detecting that V1 is no longer `names/<name>`'s owner, an alive A does two
+things — **fence** its local device to a stop (when one is still serving) and
+**rehome** its fork under a new name — so the fork survives as a first-class,
+inspectable object rather than silent garbage. The `volume.released` marker on
+V1 selects the disposition:
+
+- **Supersession** (marker present) — the device is already parked from
+  release, so there is no guest to fence. A rehomes V1 and emits a
+  `superseded` event naming the claimant.
+- **Displacement** (marker absent) — V1 may still be serving. A halts its
+  device (an honest `EIO` to the guest instead of writes into an un-drainable
+  WAL), rehomes it, and emits a `displaced` event cross-linking the
+  force-claimer.
+
+The marker is a sound discriminator, not a heuristic — the lifecycle
+transition table enforces the split: a normal `claim` only proceeds from
+`Released`, and `ForceClaim` on a `Released` record is *rerouted* ("no owner
+to override; claim it normally"), so a fork carrying `volume.released` is
+never a displacement target. `write_released_marker` is best-effort, so a
+failed marker write mislabels a clean handoff as a displacement — a wrong
+event kind only; the end state and recovery path are identical.
 
 ### Detection
 
@@ -53,7 +101,10 @@ Promote the reap-step ownership check into an unconditional per-tick poll:
 each tick A reads `names/<name>` and compares `record.vol_ulid` against the
 fork it is serving, *before* the drain/GC early-exit, so idle running forks
 are checked too. This is the same read that already exists; the change is
-running it unconditionally and acting on the result.
+running it unconditionally and acting on the result. The mismatch read itself
+supplies the claimant for the event — the record's `vol_ulid` is V2 — and A
+reads V1's `volume.released` marker (already on disk, no extra bucket
+round-trip) to pick the event kind.
 
 The poll rides the existing per-running-volume tick (`gc_interval`, ~10 s),
 which bounds the window between B's CAS and A's fence — far tighter than the
@@ -64,39 +115,87 @@ already detects the ownership conflict (today it only errors).
 
 ### Fence
 
-On mismatch, A stops the ublk device. The guest gets an honest `EIO` and can
-fail over, instead of writing into a WAL that can never drain. This is A's
+The fence is the *displacement* path: V1 may still be serving, so A stops the
+ublk device. The guest gets an honest `EIO` and can fail over, instead of
+writing into a WAL that can never drain. This is A's
 `force-release-fencing.md` "name-record poll → halt" made load-bearing *for
 the guest*; it stays non-load-bearing for B's safety, which the credential
-fence already covers.
+fence already covers. In a *supersession* A already released, so the device is
+parked and there is no guest to fence — the rehome involves no device work.
 
-The stop is a teardown, not a park: A `del_dev`s V1's kernel device and
-removes the `[ublk]` transport from its config. The rehomed fork therefore
-starts transport-less until an explicit `volume update --ublk` re-exposes it
-over a freshly-allocated device.
+Where a device is still bound, the stop is a teardown, not a park: A `del_dev`s
+V1's kernel device and removes the `[ublk]` transport from its config. The
+rehomed fork therefore starts transport-less until an explicit
+`volume update --ublk` re-exposes it over a freshly-allocated device.
 
 ### Rehome
 
 A no longer owns `names/<name>`, so it cannot rename it. Instead A rehomes its
-*fork* under a name it creates:
+*fork* under a name it creates — `<name>-<suffix>`:
 
-1. Conditional-create (`If-None-Match: *`) `names/<name>-displaced-<V1>` with
-   `vol_ulid = V1`, `coordinator_id = A`, `state = stopped`. A writes this
-   with its still-live *coordinator-level* creds; only its *volume-level*
-   creds for V1 lapsed.
-2. Rebind the local `by_name` symlink from `<name>` to
-   `<name>-displaced-<V1>`.
-3. Emit a `displaced` event into `events/<name>-displaced-<V1>/` recording the
-   source name, the displacing coordinator B, and B's fork V2.
+1. Probe the derived candidate names (see *Suffix derivation* below) with
+   the conditional create itself: for each candidate, attempt an
+   `If-None-Match: *` create of `names/<candidate>` with `vol_ulid = V1` in
+   release shape — `state = released`, no owner (the same field-clearing
+   `mark_released` performs) — carrying a handoff snapshot: the release
+   handoff from the marker body (supersession), or the fork's latest
+   published stable snapshot — none if it was never snapshotted —
+   (displacement). A conflict on a record that already binds V1 is a
+   resumed attempt, treated as settled; a conflict on any other binding
+   advances to the next candidate. A writes this with its still-live
+   *coordinator-level* creds; only its *volume-level* creds for V1 lapsed.
+2. Rebind the local `by_name` symlink from `<name>` to `<rehome-name>`.
+3. Emit the disposition event into `events/<rehome-name>/` — `superseded`
+   or `displaced` by the marker — recording the source name, the fork now
+   bound to it (V2), and its coordinator (B).
+4. **Displacement only:** stamp `volume.released` (body = the handoff, when
+   one exists) — the explicit release step a displacement never had; a
+   supersession's marker is already present and is left untouched. The
+   bucket record is the authority regardless: `start` on a `Released` name
+   refuses and points at `claim`, and the discovery-time marker
+   reconciliation (S3 wins) restamps a missing marker.
+5. Rebind the fork's own `volume.toml` name to `<rehome-name>`. This is
+   both the ownership poll's re-fire signal and the rehome's completion
+   signal — a fork whose `volume.toml` names a record that binds it is
+   settled, and a re-invocation returns that name without re-running the
+   steps above.
 
-The result is a normal `stopped` volume. Because the fork is *renamed on
-disk*, `volume list` shows `<name>-displaced-<V1>` with no new state variant —
-the name itself carries the signal, so surfacing costs nothing.
+The result is a normal `released` volume: `volume list` shows
+`<rehome-name>` as `released` with no new state variant, and
+`volume events <rehome-name>` shows how it got here.
 
-**Suffix = the fork's own ULID**, not a wall-clock timestamp: an A that
-restarts mid-displacement re-derives the identical name and the
-`If-None-Match` create is idempotent, rather than minting a second
-`-displaced-<t2>` name.
+### Suffix derivation
+
+The suffix is **six hex chars of a domain-tagged hash over the episode**
+(`old_name`, V1, attempt counter) — attempt 0 first, incrementing only past
+a collision. Deterministic, so the scheme is crash-idempotent with no
+persisted state: the candidate sequence is a pure function of the episode
+(a fork loses a given name at most once — reacquiring it mints a fresh
+fork), and name records are effectively never deleted, so a retry walks the
+identical sequence and reaches its own record before any free slot.
+Random-looking, so the name encodes nothing and mints no per-name counter —
+who took the name, and how, live in the event.
+
+Collisions are handled by the probe itself and racing coordinators resolve
+by the CAS (the loser observes the winner's record and advances), so
+bucket-global uniqueness needs no coordination. Two caveats, both accepted:
+suffixes are never reused (a rehomed record persists like any released
+name's), and the one record-deleting path — a failed import's cleanup —
+can, if it races the narrow window between a crashed attempt's create and
+its retry, leave one orphan `Released` record binding V1; litter, never a
+duplicate `Live` binding, since a claim of either name mints a fresh fork.
+
+### One event per disposition
+
+Both events carry the same fields — the source name, the fork now bound to
+it, and its coordinator — but they are distinct kinds because they record
+different facts. `displaced` is an *adversarial cross-link*: it pairs with
+the `force_claimed` event B emits on `<name>`'s log to give both-sided
+provenance of a divergence. `superseded` is a *lineage note*: the new owner
+descends from V1 and there is no divergence, so the event simply records
+what ended this fork's tenure and where the name went. Keeping them as
+separate kinds makes `displaced` an honest signal — it fires only when the
+name was taken out from under a still-holding owner.
 
 ### Why not the rename two-event boundary
 
@@ -104,26 +203,31 @@ restarts mid-displacement re-derives the identical name and the
 `renamed_from` and tombstones the old pointer as a forward link. That shape is
 wrong here because the rebinding is **asymmetric**: `<name>` is not being
 vacated — it is *alive under B*. A `renamed_to` on `events/<name>/` would
-falsely tombstone a live name and forward it to the diverged fork. Rehome is
-fork-rehoming, not name-renaming: a single `displaced` event on the *new*
-name's log, mirroring `created` / `forked_from` provenance, with no write to
-`<name>`'s log or pointer (both owned by B). It pairs with the `force_claimed`
-event B emits on `<name>`'s log — carrying `displaced_coordinator_id` and
-source `vol_ulid` — to give both-sided provenance.
+falsely tombstone a live name and forward it to the superseded fork. Rehome is
+fork-rehoming, not name-renaming: no write to `<name>`'s log or pointer (both
+owned by B), and a single `superseded` / `displaced` event on the *new*
+name's log, mirroring `created` / `forked_from` provenance. The `displaced`
+kind pairs with the `force_claimed` event B emits on `<name>`'s log —
+carrying `displaced_coordinator_id` and source `vol_ulid` — to give
+both-sided provenance.
 
 ### Three triggers, one primitive
 
 Rehome is the single disposition for *"my local fork is no longer this name's
-owner,"* and it fires wherever that condition is first noticed:
+owner,"* and it fires wherever that condition is first noticed. Each site
+reads the `volume.released` marker to pick supersession vs. displacement:
 
-1. **The running poll** (above) — the common case; fences the guest and
-   rehomes in one step.
+1. **The running poll** (above) — the common case; rehomes in one step
+   (fencing the guest first if the displacement path).
 2. **The start-refusal** — a stopped stale fork, or a coordinator that just
    restarted and polls cold: `mark_live`'s existing `OwnershipConflict`
    becomes a rehome instead of a bare error.
 3. **`force_claim` finalize** — when A itself force-claims the same name, its
    about-to-be-replaced local fork is rehomed *before* the `by_name` swap,
-   replacing the silent symlink drop at `force_claim.rs`.
+   replacing the silent symlink drop at `force_claim.rs`. The marker
+   discriminates here too: an owned stale fork takes the displacement path,
+   while a released one (its supersession unobserved while A was down) takes
+   the bare path.
 
 A prompt poll usually rehomes a displaced *running* fork before a later
 self-force-claim would meet it, so (3) is mostly a residual for the
@@ -133,17 +237,26 @@ name-loss was noticed.
 
 ## Undrained writes survive rehome
 
+This is the displacement case: a supersession fork was drained at release, so
+it has no undrained tail to recover and this section is vacuous for it.
+
 `force-release-fencing.md` states A's "accepted-but-undrained writes are
 lost." That is the contract under *halt-and-discard*. Rehome changes it: V1's
-local WAL / pending is preserved under the new name. Starting
-`<name>-displaced-<V1>` is a normal claim/start — it re-attests volume creds
-under the *new* name (A holds V1's `volume.key`; the new name is live → V1),
-and the ordinary drain then flushes the preserved WAL to `by_id/<V1>/` under
-fresh creds. Rehome is therefore the only disposition that can recover a
-displaced fork's undrained tail. The flush happens only as a side effect of
-that deliberate `start`: the rehome itself never drains (A's V1 creds are dead
-until re-attest), and a local `volume remove` never starts, so it never
+local WAL / pending is preserved under the new name. Recovery is the ordinary
+released-volume path — `volume claim <rehome-name>` reclaims in place
+(CAS `Released` → `Stopped`, marker cleared), and `start` then re-attests
+volume creds under the *new* name (A holds V1's `volume.key`; the new name is
+live → V1) and the ordinary drain flushes the preserved WAL to `by_id/<V1>/`
+under fresh creds. Rehome is therefore the only disposition that can recover
+a displaced fork's undrained tail. The flush happens only after that
+deliberate reclaim + start: the rehome itself never drains (A's V1 creds are
+dead until re-attest), and a local `volume remove` never starts, so it never
 pays the flush.
+
+The rehomed record's handoff is the fork's last *published* snapshot, so it
+excludes the tail: a fresh claim of the rehomed name from any other host
+hydrates that basis alone. The tail exists only in A's WAL — the in-place
+reclaim on A is the sole recovery that carries it.
 
 This does not weaken B. A's V1 writes, drained or not, are a *divergent
 branch* — never folded into V2, because the head-delta cut in
@@ -155,10 +268,10 @@ read. Rehome gives that branch a home instead of a grave.
 Rehome is a *local* lifecycle disposition; it does not touch bucket storage.
 A rehomed fork's choices are the same as any volume's:
 
-- **Preserve (default): rehome.** The diverged fork becomes
-  `<name>-displaced-<V1>`, a first-class `stopped` volume — visible and
-  startable like any stopped volume, though it carries no ublk transport
-  until `volume update --ublk` re-enables it.
+- **Preserve (default): rehome.** The fork becomes `<name>-<suffix>`, a
+  first-class `released` volume — visible like any released volume and
+  revived by the ordinary reclaim-then-start, though it carries no ublk
+  transport until `volume update --ublk` re-enables it.
 - **Remove locally: `volume remove`.** A rehomed fork *is* a normal volume, so
   it is removed from the host by the ordinary local-removal path, identical to
   any other volume — there is no displaced-special verb.
@@ -187,17 +300,51 @@ Settled 2026-07-01:
   per-running-volume `gc_interval` (~10 s) — a promptness bound, not a
   correctness one (the credential fence is the safety). No dedicated interval;
   stopped forks rehome at start-refusal.
-- **The `displaced` event carries `source_name` + `displaced_by` (B) +
-  `source_fork` (V2), and does *not* inherit `<name>`'s log.**
-  Log-inheritance would bleed `<name>`'s post-divergence timeline (which
-  continues under B) into the rehomed fork's backward walk; the cross-link is
-  a point reference to the divergence, already mirrored by B's `force_claimed`
-  event, and the pre-divergence lineage comes from V1's fork chain.
-- **No special first-start handling.** `start` = use it (drains normally); the
-  rehome never drains and `delete` never starts, so the preserved WAL flushes
-  only on a deliberate start.
+- **The rehome event carries `source_name` + the claimant (B, V2), and does
+  *not* inherit `<name>`'s log.** Log-inheritance would bleed `<name>`'s
+  post-handoff timeline (which continues under B) into the rehomed fork's
+  backward walk; the cross-link is a point reference to the handoff, and the
+  pre-handoff lineage comes from V1's fork chain.
+- **No special recovery handling.** Recovery is the ordinary released-volume
+  path (`claim` → `start`); the rehome never drains and `remove` never
+  starts, so a preserved WAL flushes only after a deliberate reclaim + start.
 - **One `rehome(fork)` primitive, three triggers** (poll, start-refusal,
   `force_claim` finalize) — preserve-never-orphan as an invariant.
 - **Removal is the ordinary local `volume remove`, identical to any volume.**
   No displaced-special verb; bucket-level deletion is unsupported for *any*
   volume and out of scope, so the S3 prefix persists like every volume's.
+
+Settled 2026-07-02:
+
+- **Two dispositions, discriminated by the `volume.released` marker.**
+  Supersession (marker present) and displacement (marker absent). The marker
+  is sound because a released name is taken by a normal `claim` and an owned
+  name by a force-claim — the two never overlap — and a mislabel costs only
+  the event kind; the end state and recovery are identical.
+- **The name carries no information; events carry the context.** Both
+  dispositions rehome to `<name>-<suffix>` — six hex chars of a
+  domain-tagged hash over the episode (`old_name`, V1, attempt) — probed via
+  the `If-None-Match` create itself. Derived-not-random keeps the rehome
+  crash-idempotent with no persisted state (a retry walks the identical
+  candidate sequence to its own record); hash-not-ordinal keeps the probe
+  O(1) regardless of how many husks a name has accumulated. A claimant-ULID
+  suffix was rejected as bucket-globally collision-prone (two stale hosts
+  observing the same holder derive the same name); an ordinal as an O(husks)
+  probe that leaks a counter into the name; ULID and compound suffixes as
+  too verbose.
+- **One event per disposition, same fields.** `superseded` (source name,
+  claimant fork, claimant coordinator) is the lineage note for a clean
+  handoff; `displaced` is the adversarial cross-link pairing with B's
+  `force_claimed`. Distinct kinds keep `displaced` an honest signal.
+- **Both dispositions land in `released`.** The rehome mints the new record
+  `Released` (handoff: the marker body for a supersession; the last published
+  snapshot, or none, for a displacement) and the fork carries
+  `volume.released` — the explicit release step a displacement never had.
+  Recovery is uniform: a rehomed fork must be reclaimed before it serves
+  again, exactly like any released volume, so reviving a superseded or
+  displaced husk is claim-gated — divergence is a deliberate act, not a side
+  effect of `start`.
+- **A displaced fork's handoff excludes its undrained tail.** The tail exists
+  only in A's WAL; the in-place reclaim on A is the only recovery that
+  carries it — a fresh claim of the rehomed name from another host hydrates
+  the published-snapshot basis alone.
