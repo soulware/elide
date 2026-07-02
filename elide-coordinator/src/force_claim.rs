@@ -8,8 +8,9 @@
 //! the now-live new fork. The dead fork's prefix is never written:
 //! the head delta (live segments above the basis manifest) is
 //! *re-owned* — each segment's index verified under the dead fork's
-//! key, re-signed with the new fork's key, and copied under the new
-//! fork's prefix with its ULID retained.
+//! key, re-signed with the new fork's key, copied under the new
+//! fork's prefix with its ULID retained, and written into the fork's
+//! local read state (`index/<u>.idx` + `cache/<u>.{body,present}`).
 //!
 //! Mirrors the structure of [`crate::claim`]: a [`ClaimJob`] in the
 //! shared registry, a staged orchestrator, progress via
@@ -478,7 +479,9 @@ impl ForceClaimOrchestrator {
     /// header with the new fork's key, PUT under the new prefix with
     /// the ULID retained. A final advisory re-read of the dead HEAD
     /// detects an owner that was alive all along — logged loudly; the
-    /// claim proceeds, since the fence has already landed.
+    /// claim proceeds, since the fence has already landed. Each copied
+    /// segment is also written into the fork's local read state
+    /// (`index/`, `cache/`) so the daemon's lbamap rebuild sees it.
     async fn re_own(&mut self) -> Result<(), IpcError> {
         let source = self.source_vol.expect("resolve_source ran");
         let fork_vol = self.fork.as_ref().expect("rebind ran").vol_ulid;
@@ -585,11 +588,18 @@ impl ForceClaimOrchestrator {
         Ok(())
     }
 
-    /// Copy one head-delta segment under the new fork's prefix. Sources the
-    /// bytes from the dead fork, falling back to the name's prior
-    /// bindings (journal) for chains of crashed claimants. Verifies
-    /// under the source's key before re-signing — re-signing
-    /// unverified bytes would launder them under the new key.
+    /// Copy one head-delta segment under the new fork's prefix and
+    /// materialise its local read-state form. Sources the bytes from
+    /// the dead fork, falling back to the name's prior bindings
+    /// (journal) for chains of crashed claimants. Verifies under the
+    /// source's key before re-signing — re-signing unverified bytes
+    /// would launder them under the new key.
+    ///
+    /// The local form (`index/<u>.idx` + `cache/<u>.{body,present}`) is
+    /// what `open_read_state` builds the fork's lbamap from: without it
+    /// a re-owned segment is durable but invisible to reads. It is
+    /// written only after the segment is durable under the fork's
+    /// prefix, preserving the idx-presence ↔ segment-in-S3 invariant.
     async fn re_own_segment(
         &self,
         seg_ulid: Ulid,
@@ -597,48 +607,87 @@ impl ForceClaimOrchestrator {
         primary_pubkey: &VerifyingKey,
     ) -> Result<(), IpcError> {
         let fork = self.fork.as_ref().expect("rebind ran");
+        let idx_path = fork.dir.join("index").join(format!("{seg_ulid}.idx"));
 
-        // Resume skip: already copied by a previous run.
+        // Resume skips are per-artefact: the S3 copy and the local form
+        // are checked independently so a crash between them heals here.
         let fork_ro = self
             .ctx
             .core
             .stores
             .read_volume(&fork.vol_ulid, &fork.vol_ulid);
         let fork_ro_vd = elide_coordinator::volume_data::VolumeData::new(fork_ro, fork.vol_ulid);
-        if fork_ro_vd
+        let copied = fork_ro_vd
             .segments()
             .get_range(seg_ulid, 0..1)
             .await
-            .is_ok()
-        {
+            .is_ok();
+        if copied && idx_path.exists() {
             return Ok(());
         }
 
-        let mut bytes = match self
-            .fetch_delta_segment(seg_ulid, primary_source, primary_pubkey)
-            .await?
-        {
-            Some(b) => b,
-            None => {
-                return Err(IpcError::not_found(format!(
-                    "segment {seg_ulid} not found under {primary_source} \
-                     or any prior binding of '{}' — originals may have been \
-                     reaped; manual recovery required",
-                    self.volume
-                )));
-            }
-        };
+        let staged = fork.dir.join(format!("{seg_ulid}.re-own"));
+        if copied {
+            // A prior run copied the segment but crashed before writing
+            // the local form: fetch our copy back, verified under the
+            // fork's own key.
+            let bytes = fork_ro_vd
+                .segments()
+                .get_bytes(seg_ulid)
+                .await
+                .map_err(|e| {
+                    IpcError::store(format!(
+                        "fetching re-owned segment {seg_ulid} from {}: {e}",
+                        fork.vol_ulid
+                    ))
+                })?;
+            elide_core::segment::verify_segment_bytes(
+                &bytes,
+                &seg_ulid.to_string(),
+                &fork.signing_key.verifying_key(),
+            )
+            .map_err(|e| IpcError::internal(format!("verifying {seg_ulid}: {e}")))?;
+            std::fs::write(&staged, &bytes)
+                .map_err(|e| IpcError::internal(format!("staging segment {seg_ulid}: {e}")))?;
+        } else {
+            let mut bytes = match self
+                .fetch_delta_segment(seg_ulid, primary_source, primary_pubkey)
+                .await?
+            {
+                Some(b) => b,
+                None => {
+                    return Err(IpcError::not_found(format!(
+                        "segment {seg_ulid} not found under {primary_source} \
+                         or any prior binding of '{}' — originals may have been \
+                         reaped; manual recovery required",
+                        self.volume
+                    )));
+                }
+            };
 
-        let signer = fork.signer()?;
-        let _body_start = elide_core::segment::resign_segment_head(&mut bytes, signer.as_ref())
-            .map_err(|e| IpcError::internal(format!("re-signing segment {seg_ulid}: {e}")))?;
+            let signer = fork.signer()?;
+            elide_core::segment::resign_segment_head(&mut bytes, signer.as_ref())
+                .map_err(|e| IpcError::internal(format!("re-signing segment {seg_ulid}: {e}")))?;
+            std::fs::write(&staged, &bytes)
+                .map_err(|e| IpcError::internal(format!("staging segment {seg_ulid}: {e}")))?;
 
-        let fork_vd = self.ctx.core.stores.volume_data(&fork.vol_ulid);
-        fork_vd
-            .segments()
-            .put_bytes(seg_ulid, bytes::Bytes::from(bytes))
-            .await
-            .map_err(|e| IpcError::store(format!("uploading re-owned segment {seg_ulid}: {e}")))?;
+            let fork_vd = self.ctx.core.stores.volume_data(&fork.vol_ulid);
+            fork_vd
+                .segments()
+                .put_bytes(seg_ulid, bytes::Bytes::from(bytes))
+                .await
+                .map_err(|e| {
+                    IpcError::store(format!("uploading re-owned segment {seg_ulid}: {e}"))
+                })?;
+        }
+
+        let materialised = materialise_re_owned(&fork.dir, seg_ulid, &staged);
+        let _ = std::fs::remove_file(&staged);
+        materialised.map_err(|e| {
+            IpcError::internal(format!(
+                "materialising re-owned segment {seg_ulid} locally: {e}"
+            ))
+        })?;
         info!(
             "[force-claim {}] re-owned segment {seg_ulid} from {primary_source}",
             self.volume
@@ -844,6 +893,23 @@ impl ForceClaimOrchestrator {
     }
 }
 
+/// Write the local read-state form for a re-owned segment from its
+/// staged full-segment bytes: `index/<u>.idx` plus
+/// `cache/<u>.{body,present}` (and `.delta` when the segment carries a
+/// delta section).
+fn materialise_re_owned(fork_dir: &Path, seg_ulid: Ulid, staged: &Path) -> std::io::Result<()> {
+    let index_dir = fork_dir.join("index");
+    let cache_dir = fork_dir.join("cache");
+    std::fs::create_dir_all(&index_dir)?;
+    std::fs::create_dir_all(&cache_dir)?;
+    elide_core::segment::extract_idx(staged, &index_dir.join(format!("{seg_ulid}.idx")))?;
+    elide_core::segment::promote_to_cache(
+        staged,
+        &cache_dir.join(format!("{seg_ulid}.body")),
+        &cache_dir.join(format!("{seg_ulid}.present")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1079,33 @@ mod tests {
             .expect("re-owned segment verifies under the new fork's key");
     }
 
+    /// The re-owned segment's local read-state form is in place and the
+    /// fork's own lbamap layer rebuilds over it (signature-verifying, so
+    /// this also proves the idx carries the fork's re-signed header).
+    fn assert_materialised(data_dir: &std::path::Path, fork: Ulid, seg: Ulid) {
+        let fork_dir = data_dir.join("by_id").join(fork.to_string());
+        for rel in [
+            format!("index/{seg}.idx"),
+            format!("cache/{seg}.body"),
+            format!("cache/{seg}.present"),
+        ] {
+            assert!(
+                fork_dir.join(&rel).is_file(),
+                "re-owned segment {seg} missing local form: {rel}"
+            );
+        }
+        assert!(
+            !fork_dir.join(format!("{seg}.re-own")).exists(),
+            "staging file for {seg} must not outlive the re-own"
+        );
+        let map = elide_core::lbamap::rebuild_segments(&[(fork_dir, None)])
+            .expect("fork's own lbamap layer rebuilds over the re-owned idx");
+        assert!(
+            map.lookup(0).is_some(),
+            "re-owned segment {seg} claims its LBAs in the rebuilt lbamap"
+        );
+    }
+
     fn dead_owner_id() -> String {
         elide_coordinator::portable::format_coordinator_id(
             &elide_coordinator::portable::coordinator_id(&[0xEEu8; 32]),
@@ -1078,8 +1171,19 @@ mod tests {
         // the basis-covered segment is not copied.
         assert_reowned(&store, data_dir.path(), fork, s2).await;
         assert_reowned(&store, data_dir.path(), fork, s3).await;
+        assert_materialised(data_dir.path(), fork, s2);
+        assert_materialised(data_dir.path(), fork, s3);
         let fork_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork);
         assert!(fork_vd.segments().get_bytes(s1).await.is_err());
+        assert!(
+            !data_dir
+                .path()
+                .join("by_id")
+                .join(fork.to_string())
+                .join(format!("index/{s1}.idx"))
+                .exists(),
+            "basis-covered segment gets no local idx"
+        );
 
         // New fork's HEAD: anchored at the basis, listing the delta.
         let head = fork_vd.head().read().await.unwrap();
@@ -1160,6 +1264,8 @@ mod tests {
 
         assert_reowned(&store, data_dir.path(), fork, s1).await;
         assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s1);
+        assert_materialised(data_dir.path(), fork, s2);
 
         // The dead fork was a root with no manifest: the new fork
         // takes over its (empty) ParentRef — a root itself.
@@ -1294,10 +1400,15 @@ mod tests {
         let fork = run_force_claim(&ctx, &store).await;
 
         // Simulate a crash between the forced CAS and completion:
-        // local materialisation gone, one re-owned object missing.
+        // local materialisation gone (both segments), one re-owned
+        // object missing from S3. Resume must re-copy s2 and
+        // re-materialise both — s1 through the copied-but-unmaterialised
+        // branch, s2 through the full copy path.
         let fork_dir = data_dir.path().join("by_id").join(fork.to_string());
         std::fs::remove_dir_all(fork_dir.join("wal")).unwrap();
         std::fs::remove_dir_all(fork_dir.join("pending")).unwrap();
+        std::fs::remove_dir_all(fork_dir.join("index")).unwrap();
+        std::fs::remove_dir_all(fork_dir.join("cache")).unwrap();
         std::fs::remove_file(data_dir.path().join("by_name").join("vol")).unwrap();
         store
             .delete(&elide_coordinator::upload::segment_key(fork, s2))
@@ -1307,6 +1418,8 @@ mod tests {
         let resumed = run_force_claim(&ctx, &store).await;
         assert_eq!(resumed, fork, "resume continues the same fork");
         assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s1);
+        assert_materialised(data_dir.path(), fork, s2);
         assert!(fork_dir.join("wal").is_dir(), "finalize re-ran");
     }
 
@@ -1392,5 +1505,7 @@ mod tests {
         // via the journal fallback.
         assert_reowned(&store, data_dir.path(), fork, s1).await;
         assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s1);
+        assert_materialised(data_dir.path(), fork, s2);
     }
 }
