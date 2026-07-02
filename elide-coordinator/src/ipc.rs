@@ -546,6 +546,11 @@ pub enum SignatureStatus {
     /// written by this codebase — surfaced rather than hidden so a
     /// hand-edited or pre-signing-era record is obvious.
     Missing,
+    /// The event's `kind` payload did not parse under this binary's
+    /// schema, so its signing payload cannot be reconstructed and the
+    /// signature is not checked. Distinct from `Invalid`: the event is
+    /// unreadable here, not proven tampered.
+    Unparseable,
 }
 
 /// One entry in [`VolumeEventsReply`] — the parsed event paired with

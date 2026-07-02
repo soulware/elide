@@ -149,6 +149,16 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced_by: Option<String>,
     },
+    /// An event whose `kind` payload did not parse under this binary's
+    /// schema — a field a different version wrote or omitted. Produced
+    /// only when *reading* a log, so a single such entry does not brick
+    /// the whole HEAD; `original_kind` is the on-disk `kind` tag, kept
+    /// for display. Never emitted, and never signature-verified (the
+    /// original signing payload cannot be reconstructed here).
+    Unknown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_kind: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -165,6 +175,7 @@ impl EventKind {
             Self::RenamedTo { .. } => "renamed_to",
             Self::RenamedFrom { .. } => "renamed_from",
             Self::Displaced { .. } => "displaced",
+            Self::Unknown { .. } => "unknown",
         }
     }
 }
@@ -360,6 +371,9 @@ impl VolumeEvent {
                 push_field(&mut buf, "source_name", source_name);
                 push_field(&mut buf, "source_fork", &source_fork.to_string());
             }
+            // Never signed or verified: an Unknown event is a read-time
+            // stand-in whose original payload lives only in the raw bytes.
+            EventKind::Unknown { .. } => {}
         }
         buf
     }
@@ -515,6 +529,47 @@ mod tests {
             let parsed = VolumeEvent::from_toml(&toml).expect("parse");
             assert_eq!(parsed, ev, "round-trip mismatch for kind {:?}", kind);
         }
+    }
+
+    /// Events serialise as a `[[events]]` array-of-tables inside the
+    /// journal HEAD; a flattened, internally-tagged `kind` with required
+    /// fields (`source_vol_ulid`) must survive that nesting, not just a
+    /// standalone single-event document.
+    #[test]
+    fn round_trip_vec_of_events_with_fielded_kinds() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            events: Vec<VolumeEvent>,
+        }
+        let with_prev = |kind: EventKind| {
+            VolumeEvent::new(
+                event_ulid(),
+                "vol".to_string(),
+                "01ABCDEFGHJKMNPQRSTVWXYZ23".to_string(),
+                Some("test-host".to_string()),
+                vol_ulid(),
+                Some(event_ulid()),
+                kind,
+            )
+            .expect("event")
+        };
+        let w = Wrapper {
+            events: vec![
+                with_prev(EventKind::Claimed),
+                with_prev(EventKind::ForceClaimed {
+                    source_vol_ulid: snap_ulid(),
+                    displaced_coordinator_id: Some("01OLDCOORDXXXXXXXXXXXXXXXX".to_string()),
+                }),
+                with_prev(EventKind::Displaced {
+                    source_name: "prod".to_string(),
+                    source_fork: vol_ulid(),
+                    displaced_by: Some("01NEWCOORDXXXXXXXXXXXXXXXX".to_string()),
+                }),
+            ],
+        };
+        let toml = toml::to_string(&w).expect("serialise vec");
+        let parsed: Wrapper = toml::from_str(&toml).expect("parse vec");
+        assert_eq!(parsed.events, w.events);
     }
 
     #[test]

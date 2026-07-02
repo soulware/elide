@@ -29,7 +29,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, UpdateVersion};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -78,33 +77,141 @@ fn name_emit_lock(name: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+/// One entry in the HEAD window: either a fully-parsed event, or one
+/// whose `kind` payload did not parse under this binary's schema.
+///
+/// Opaque entries keep their raw TOML table so a HEAD rewrite re-emits
+/// them verbatim — a single event a different version wrote can never
+/// brick the log or be silently dropped/rewritten. The common fields
+/// (always plain scalars) are extracted so the ordering spine and
+/// `recent`'s consumers still work.
+#[derive(Debug, Clone)]
+enum HeadEvent {
+    Parsed(Box<VolumeEvent>),
+    Opaque(Box<OpaqueEvent>),
+}
+
+/// An event whose `kind` payload did not deserialize. The `raw` table is
+/// the verbatim on-disk form (re-emitted unchanged on rewrite); the
+/// extracted fields drive ordering and a lossy [`VolumeEvent`] stand-in.
+#[derive(Debug, Clone)]
+struct OpaqueEvent {
+    event_ulid: Option<Ulid>,
+    prev_event_ulid: Option<Ulid>,
+    vol_ulid: Option<Ulid>,
+    name: Option<String>,
+    coordinator_id: Option<String>,
+    hostname: Option<String>,
+    signature: Option<String>,
+    original_kind: Option<String>,
+    raw: toml::Table,
+}
+
+impl OpaqueEvent {
+    fn from_table(raw: toml::Table) -> Self {
+        let str_at = |k: &str| raw.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+        let ulid_at = |k: &str| str_at(k).and_then(|s| Ulid::from_string(&s).ok());
+        OpaqueEvent {
+            event_ulid: ulid_at("event_ulid"),
+            prev_event_ulid: ulid_at("prev_event_ulid"),
+            vol_ulid: ulid_at("vol_ulid"),
+            name: str_at("name"),
+            coordinator_id: str_at("coordinator_id"),
+            hostname: str_at("hostname"),
+            signature: str_at("signature"),
+            original_kind: str_at("kind"),
+            raw,
+        }
+    }
+
+    /// Lossy `VolumeEvent` stand-in with an [`EventKind::Unknown`] kind.
+    /// `at` is re-derived from `event_ulid` (the two are the same fact).
+    /// `None` when a required common field is missing/unparseable — a
+    /// genuinely malformed record, not just an unknown kind.
+    fn as_volume_event(&self) -> Option<VolumeEvent> {
+        let mut ev = VolumeEvent::new(
+            self.event_ulid?,
+            self.name.clone()?,
+            self.coordinator_id.clone()?,
+            self.hostname.clone(),
+            self.vol_ulid?,
+            self.prev_event_ulid,
+            EventKind::Unknown {
+                original_kind: self.original_kind.clone(),
+            },
+        )?;
+        ev.signature = self.signature.clone();
+        Some(ev)
+    }
+}
+
+impl HeadEvent {
+    /// Try the typed event; fall back to opaque on a kind-payload parse
+    /// failure so one bad entry never fails the whole window.
+    fn from_value(v: toml::Value) -> HeadEvent {
+        match v.clone().try_into::<VolumeEvent>() {
+            Ok(ev) => HeadEvent::Parsed(Box::new(ev)),
+            Err(_) => {
+                let raw = match v {
+                    toml::Value::Table(t) => t,
+                    _ => toml::Table::new(),
+                };
+                HeadEvent::Opaque(Box::new(OpaqueEvent::from_table(raw)))
+            }
+        }
+    }
+
+    /// The event's ordering key, present for any well-formed entry
+    /// (`event_ulid` is a common field even on opaque entries).
+    fn event_ulid(&self) -> Option<Ulid> {
+        match self {
+            HeadEvent::Parsed(e) => Some(e.event_ulid),
+            HeadEvent::Opaque(o) => o.event_ulid,
+        }
+    }
+
+    /// Lossy `VolumeEvent` view for `recent`'s consumers; `None` drops a
+    /// malformed entry that cannot be reconstructed.
+    fn into_volume_event(self) -> Option<VolumeEvent> {
+        match self {
+            HeadEvent::Parsed(e) => Some(*e),
+            HeadEvent::Opaque(o) => o.as_volume_event(),
+        }
+    }
+
+    /// The verbatim TOML for a rewrite: the raw table for opaque
+    /// entries, re-serialised typed form for parsed ones.
+    fn to_value(&self) -> Result<toml::Value, EventError> {
+        match self {
+            HeadEvent::Parsed(e) => {
+                toml::Value::try_from(e.as_ref()).map_err(EventError::Serialise)
+            }
+            HeadEvent::Opaque(o) => Ok(toml::Value::Table(o.raw.clone())),
+        }
+    }
+}
+
 /// The `events/<name>/HEAD` window: the last [`HEAD_WINDOW`] signed
 /// events, newest-first (`events[0]` is the latest). HEAD is the
 /// ordering authority for `emit` (so no LIST is needed) but **not**
 /// the integrity authority — each entry is the same individually
 /// signed `VolumeEvent` stored standalone, so a tampered entry still
 /// fails the per-event signature check.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct EventHead {
-    #[serde(default)]
-    events: Vec<VolumeEvent>,
+    events: Vec<HeadEvent>,
 }
 
 impl EventHead {
     /// Newest event, or `None` for an empty/just-created log.
-    pub fn latest(&self) -> Option<&VolumeEvent> {
+    fn latest(&self) -> Option<&HeadEvent> {
         self.events.first()
-    }
-
-    /// All events currently in the window, newest-first.
-    pub fn events(&self) -> &[VolumeEvent] {
-        &self.events
     }
 
     /// `[new] ++ self.events`, truncated to [`HEAD_WINDOW`].
     fn pushed(&self, new: VolumeEvent) -> EventHead {
         let mut events = Vec::with_capacity((self.events.len() + 1).min(HEAD_WINDOW));
-        events.push(new);
+        events.push(HeadEvent::Parsed(Box::new(new)));
         events.extend(self.events.iter().take(HEAD_WINDOW - 1).cloned());
         EventHead { events }
     }
@@ -305,6 +412,38 @@ fn sign_event(event: &mut VolumeEvent, identity: &CoordinatorIdentity) {
     event.signature = Some(signing::encode_hex(&sig));
 }
 
+/// Serialise a HEAD to TOML. Parsed entries go through the typed
+/// serializer; opaque entries are re-emitted from their raw table
+/// verbatim, so an event a different version wrote survives a rewrite
+/// unchanged.
+fn serialise_head(head: &EventHead) -> Result<String, EventError> {
+    let mut events = Vec::with_capacity(head.events.len());
+    for e in &head.events {
+        events.push(e.to_value()?);
+    }
+    let mut root = toml::Table::new();
+    root.insert("events".to_owned(), toml::Value::Array(events));
+    toml::to_string(&toml::Value::Table(root)).map_err(EventError::Serialise)
+}
+
+/// Parse a HEAD, tolerating any single event whose `kind` payload does
+/// not deserialize under this binary's schema (kept as opaque). A
+/// wholly malformed document (not valid TOML, or `events` not an array)
+/// is still a hard [`EventError::ParseHead`].
+fn parse_head(text: &str) -> Result<EventHead, EventError> {
+    let root: toml::Table = toml::from_str(text).map_err(EventError::ParseHead)?;
+    let events = match root.get("events") {
+        None => Vec::new(),
+        // `events` must be an array; a non-array is a corrupt HEAD, so
+        // let the typed conversion surface a real parse error.
+        Some(v) => {
+            let arr: Vec<toml::Value> = v.clone().try_into().map_err(EventError::ParseHead)?;
+            arr.into_iter().map(HeadEvent::from_value).collect()
+        }
+    };
+    Ok(EventHead { events })
+}
+
 async fn write_head(
     store: &dyn ObjectStore,
     name: &str,
@@ -312,11 +451,7 @@ async fn write_head(
     expected: Option<UpdateVersion>,
     is_force: bool,
 ) -> Result<(), EventError> {
-    let body = Bytes::from(
-        toml::to_string(head)
-            .map_err(EventError::Serialise)?
-            .into_bytes(),
-    );
+    let body = Bytes::from(serialise_head(head)?.into_bytes());
     let key = head_key(name);
     if is_force {
         return store
@@ -383,7 +518,7 @@ async fn read_head_via(
             source: format!("HEAD not utf-8: {e}").into(),
         })
     })?;
-    let head: EventHead = toml::from_str(text).map_err(EventError::ParseHead)?;
+    let head = parse_head(text)?;
     Ok(Some((head, EventHeadToken { version })))
 }
 
@@ -398,12 +533,21 @@ async fn recent_via(
     let Some((head, _tok)) = read_head_via(store, name).await? else {
         return Ok(Vec::new());
     };
-    let mut events = head.events;
+    let head_len = head.events.len();
+    let mut events: Vec<VolumeEvent> = head
+        .events
+        .into_iter()
+        .filter_map(HeadEvent::into_volume_event)
+        .collect();
     if events.len() >= limit {
         events.truncate(limit);
         return Ok(events);
     }
-    if events.len() < HEAD_WINDOW {
+    // Only walk back beyond the window if the window was full — a short
+    // window is the whole log. Base this on the raw head length, not the
+    // post-filter count, so a dropped malformed entry can't spuriously
+    // trigger a walk.
+    if head_len < HEAD_WINDOW {
         return Ok(events);
     }
     let mut prev = events.last().and_then(|e| e.prev_event_ulid);
@@ -419,15 +563,17 @@ async fn recent_via(
             Err(e) => return Err(EventError::Store(e)),
         };
         let bytes = got.bytes().await.map_err(EventError::Store)?;
-        let event = match std::str::from_utf8(&bytes)
+        // Tolerate an unparseable-kind archival record the same way the
+        // HEAD does: read it as an opaque event so the walk continues,
+        // rather than stopping the whole history at one bad entry.
+        let event = std::str::from_utf8(&bytes)
             .ok()
-            .and_then(|t| VolumeEvent::from_toml(t).ok())
-        {
-            Some(ev) => ev,
-            None => {
-                debug!("[event-journal] {key} unreadable/corrupt; stop walk");
-                break;
-            }
+            .and_then(|t| toml::from_str::<toml::Value>(t).ok())
+            .map(HeadEvent::from_value)
+            .and_then(HeadEvent::into_volume_event);
+        let Some(event) = event else {
+            debug!("[event-journal] {key} unreadable/corrupt; stop walk");
+            break;
         };
         prev = event.prev_event_ulid;
         events.push(event);
@@ -448,6 +594,16 @@ async fn list_and_verify_via(
 
     let mut entries = Vec::with_capacity(events.len());
     for event in events {
+        // An unparseable-kind event has no reconstructable signing
+        // payload, so verification is impossible — report it as such
+        // rather than fetching a key and reporting a spurious Invalid.
+        if matches!(event.kind, EventKind::Unknown { .. }) {
+            entries.push(VolumeEventEntry {
+                event,
+                signature_status: SignatureStatus::Unparseable,
+            });
+            continue;
+        }
         let coord_id = event.coordinator_id.clone();
         if !keys.contains_key(&coord_id) {
             match identity::fetch_coordinator_pub(store, &coord_id).await {
@@ -544,7 +700,7 @@ impl EventJournal for BucketEventJournal {
         let prev_event_ulid = prev_head
             .as_ref()
             .and_then(|h| h.latest())
-            .map(|e| e.event_ulid);
+            .and_then(|e| e.event_ulid());
 
         let event_ulid = match prev_event_ulid {
             Some(prev) => elide_core::ulid_mint::UlidMint::new(prev).next(),
@@ -865,9 +1021,9 @@ mod tests {
         let mut tampered = original.clone();
         tampered.kind = EventKind::Claimed;
         let head = EventHead {
-            events: vec![tampered],
+            events: vec![HeadEvent::Parsed(Box::new(tampered))],
         };
-        let body = toml::to_string(&head).expect("serialise head");
+        let body = serialise_head(&head).expect("serialise head");
         s.put(&head_key("vol"), Bytes::from(body.into_bytes()).into())
             .await
             .expect("overwrite head");
@@ -881,6 +1037,70 @@ mod tests {
             entries[0].signature_status,
             SignatureStatus::Invalid { .. }
         ));
+    }
+
+    /// A `force_claimed` event written before `source_vol_ulid` became a
+    /// required field: the whole HEAD used to fail to parse, freezing
+    /// every future emit for the name. The read path now tolerates it.
+    #[tokio::test]
+    async fn head_with_unparseable_event_is_tolerated() {
+        let (s, j) = journal();
+        let (_tmp, id) = fresh_identity();
+        id.publish_pub(s.as_ref()).await.expect("publish pub");
+
+        let legacy_head = r#"
+[[events]]
+version = 3
+event_ulid = "01J0000000000000000000000E"
+at = "2026-06-15T00:00:00.000Z"
+name = "vol"
+coordinator_id = "01ABCDEFGHJKMNPQRSTVWXYZ23"
+vol_ulid = "01J0000000000000000000000V"
+kind = "force_claimed"
+displaced_coordinator_id = "01OLDCOORDXXXXXXXXXXXXXXXX"
+signature = "00"
+"#;
+        s.put(
+            &head_key("vol"),
+            Bytes::from(legacy_head.as_bytes().to_vec()).into(),
+        )
+        .await
+        .expect("seed head");
+
+        // recent tolerates it: surfaced as Unknown, common fields intact.
+        let recent = j.recent("vol", DEFAULT_EVENTS_LIMIT).await.expect("recent");
+        assert_eq!(recent.len(), 1);
+        assert!(matches!(recent[0].kind, EventKind::Unknown { .. }));
+        assert_eq!(recent[0].vol_ulid, vol_ulid());
+
+        // emit is no longer frozen — a new event appends.
+        let new = j
+            .emit(&id, "vol", EventKind::Claimed, vol_ulid())
+            .await
+            .expect("emit unfreezes");
+
+        // The opaque event survives the HEAD rewrite verbatim, newest-first.
+        let after = j
+            .recent("vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("recent after");
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].event_ulid, new.event_ulid);
+        assert!(matches!(
+            &after[1].kind,
+            EventKind::Unknown { original_kind } if original_kind.as_deref() == Some("force_claimed")
+        ));
+
+        // list_and_verify reports it Unparseable, not a spurious Invalid.
+        let entries = j
+            .list_and_verify("vol", DEFAULT_EVENTS_LIMIT)
+            .await
+            .expect("verify");
+        let unknown = entries
+            .iter()
+            .find(|e| matches!(e.event.kind, EventKind::Unknown { .. }))
+            .expect("unknown entry present");
+        assert_eq!(unknown.signature_status, SignatureStatus::Unparseable);
     }
 
     /// Property: under any interleaving of normal emits, force-release
@@ -956,7 +1176,7 @@ mod tests {
                                 let prev_ulid = prev_head
                                     .as_ref()
                                     .and_then(|h| h.latest())
-                                    .map(|e| e.event_ulid);
+                                    .and_then(|e| e.event_ulid());
                                 let event_ulid = match prev_ulid {
                                     Some(p) => {
                                         elide_core::ulid_mint::UlidMint::new(p).next()
