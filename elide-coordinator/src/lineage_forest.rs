@@ -75,6 +75,9 @@ pub struct ForestNode {
 pub struct LineageForest {
     /// All nodes, sorted by ULID (which sorts by mint time).
     pub nodes: Vec<ForestNode>,
+    /// Each anchor's full lineage walk, kept so per-target questions
+    /// ("who references this?") don't re-walk the disk.
+    anchor_chains: Vec<(Ulid, HashSet<Ulid>)>,
 }
 
 impl LineageForest {
@@ -83,6 +86,17 @@ impl LineageForest {
             .binary_search_by_key(&ulid, |n| n.ulid)
             .ok()
             .map(|i| &self.nodes[i])
+    }
+
+    /// Anchors whose lineage walk reaches `target`, excluding `target`
+    /// itself. Non-empty means the target's directory is load-bearing:
+    /// `remove` demotes it to a skeleton instead of deleting it.
+    pub fn referencing_anchors(&self, target: Ulid) -> Vec<Ulid> {
+        self.anchor_chains
+            .iter()
+            .filter(|(anchor, chain)| *anchor != target && chain.contains(&target))
+            .map(|(anchor, _)| *anchor)
+            .collect()
     }
 }
 
@@ -228,9 +242,13 @@ pub fn build_forest(data_dir: &Path) -> io::Result<LineageForest> {
     // its reachable ancestors then go uncounted, which errs toward
     // showing skeletons as unreferenced rather than hiding the fault.
     let mut reachable: HashSet<Ulid> = HashSet::new();
+    let mut anchor_chains: Vec<(Ulid, HashSet<Ulid>)> = Vec::new();
     for (ulid, dir) in &anchor_dirs {
         match elide_core::volume::lineage_ulids(dir, &by_id) {
-            Ok(chain) => reachable.extend(chain),
+            Ok(chain) => {
+                reachable.extend(chain.iter().copied());
+                anchor_chains.push((*ulid, chain.into_iter().collect()));
+            }
             Err(e) => {
                 if let Some(node) = nodes.get_mut(ulid)
                     && node.lineage_error.is_none()
@@ -271,6 +289,7 @@ pub fn build_forest(data_dir: &Path) -> io::Result<LineageForest> {
 
     Ok(LineageForest {
         nodes: nodes.into_values().collect(),
+        anchor_chains,
     })
 }
 
@@ -441,6 +460,20 @@ mod tests {
         assert_eq!(a.class, NodeClass::Anchor);
         assert!(a.lineage_error.is_some());
         assert!(a.parent.is_none());
+    }
+
+    #[test]
+    fn referencing_anchors_excludes_self_and_finds_dependents() {
+        // A (anchor) ← B (anchor fork of A): A is referenced by B
+        // only; B by nobody. A's own chain never counts as a
+        // self-reference.
+        let data_dir = temp_data_dir();
+        let a_pub = mint_volume(&data_dir, A, &ProvenanceLineage::root());
+        mint_volume(&data_dir, B, &ProvenanceLineage::fork(parent_ref(A, a_pub)));
+
+        let forest = build_forest(&data_dir).unwrap();
+        assert_eq!(forest.referencing_anchors(ulid(A)), vec![ulid(B)]);
+        assert!(forest.referencing_anchors(ulid(B)).is_empty());
     }
 
     #[test]

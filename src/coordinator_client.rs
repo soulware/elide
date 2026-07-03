@@ -19,7 +19,7 @@ use serde::Deserialize;
 pub use elide_coordinator::ipc::{
     ClaimAttachEvent, ClaimStartReply, CreateReply, EvictReply, ForkAttachEvent, ForkSource,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcErrorKind, PeerClaimerTokenReply, RegisterReply, ReleaseReply, SignatureStatus,
+    IpcErrorKind, PeerClaimerTokenReply, RegisterReply, ReleaseReply, RemoveReply, SignatureStatus,
     SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
     VolumeEventEntry, VolumeEventsReply,
 };
@@ -562,9 +562,11 @@ impl Client {
     /// `force = false`, the coordinator additionally requires that all
     /// local writes have been flushed and uploaded to S3 (`pending/`
     /// and `wal/` empty). Bucket-side records and segments are
-    /// untouched.
-    pub fn remove_volume(&self, volume_ulid: ulid::Ulid, force: bool) -> io::Result<()> {
-        self.call_typed::<()>(&Request::Remove { volume_ulid, force })?
+    /// untouched. When another local volume's lineage walks through
+    /// the directory, it is demoted to a readonly ancestor skeleton
+    /// instead of deleted — the reply says which happened.
+    pub fn remove_volume(&self, volume_ulid: ulid::Ulid, force: bool) -> io::Result<RemoveReply> {
+        self.call_typed::<RemoveReply>(&Request::Remove { volume_ulid, force })?
             .map_err(io::Error::other)
     }
 
