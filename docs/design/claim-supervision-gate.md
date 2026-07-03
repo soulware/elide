@@ -151,9 +151,9 @@ reconcile skip keeps it that way).
   today; is an automatic sweep worth it?
 - The incident's durable outcome shows a second-order gap: nothing
   detects a daemon serving a segment set narrower than the fork's
-  on-disk `index/`. The gate removes the known cause; an invariant
-  check at GC time (daemon lbamap segment set ⊇ GC input set) would
-  catch any future recurrence of the shape.
+  on-disk `index/`. The gate removes the known cause; the GC-commit
+  enforcement of the single-writer rule is designed in
+  `read-state-divergence-check.md`.
 - `volume fork` and ancestor pulls also materialise directories over
   several steps, but with content complete-by-reference throughout —
   no openable-but-incomplete window. They keep their existing
