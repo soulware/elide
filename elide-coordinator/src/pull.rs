@@ -37,9 +37,13 @@ use ulid::Ulid;
 use crate::prefetch::PeerFetchContext;
 
 /// Pull a readonly ancestor for `volume_id` from the object store into
-/// `<data_dir>/by_id/<volume_id>/`. If the directory already exists,
-/// returns its path without re-pulling (idempotent — safe to call on every
-/// prefetch tick).
+/// `<data_dir>/by_id/<volume_id>/`. If the skeleton's identity files
+/// (`volume.pub` + `volume.provenance`) are already on disk, returns the
+/// path without re-pulling (idempotent — safe to call on every prefetch
+/// tick). A directory that exists but lacks them — a pull that crashed
+/// between the marker and the provenance write — is repaired by
+/// re-running the writes, which are plain overwrites. A directory
+/// holding `volume.key` is a writable fork and is never touched.
 ///
 /// Fetches:
 ///   - `by_id/<volume_id>/volume.pub`
@@ -67,7 +71,12 @@ pub async fn pull_volume_skeleton(
     peer: Option<&PeerFetchContext>,
 ) -> Result<PathBuf> {
     let vol_dir = crate::volume_state::fork_dir(data_dir, vol_ulid);
-    if vol_dir.exists() {
+    if vol_dir.join(elide_core::signing::VOLUME_KEY_FILE).exists()
+        || (vol_dir.join("volume.pub").exists()
+            && vol_dir
+                .join(elide_core::signing::VOLUME_PROVENANCE_FILE)
+                .exists())
+    {
         return Ok(vol_dir);
     }
 

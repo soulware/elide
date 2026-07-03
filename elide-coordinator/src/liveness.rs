@@ -45,9 +45,9 @@ pub struct LivenessOutcome {
 ///   readable yet;
 /// - no lineage-walk errors — an anchor whose walk failed contributes
 ///   nothing to reachability, so "unreferenced" is unreliable;
-/// - no live missing ancestors — a lineage walk stops at a missing
-///   hop, so skeletons *above* the break look unreferenced until heal
-///   re-pulls it.
+/// - no heal-pending anchors — a lineage walk stops at a missing or
+///   unreadable hop, so skeletons *above* the break look unreferenced
+///   until heal re-pulls it.
 ///
 /// Heal has no such gate: re-pulling a reachable ancestor is safe
 /// regardless of what else is in flight (`pull_volume_skeleton` is a
@@ -62,26 +62,43 @@ pub async fn liveness_pass(
     let mut outcome = LivenessOutcome::default();
 
     // ── Heal ────────────────────────────────────────────────────────
+    // Two triggers, unioned. Missing-node reachability covers
+    // extent-index sources, which the fork-chain verify doesn't walk;
+    // `verify_ancestor_manifests` — the open path's own check — covers
+    // present-but-partial ancestors (missing manifest, missing `.idx`
+    // section, gutted identity files), so the heal trigger and the
+    // open requirement cannot drift.
     let missing_live: Vec<Ulid> = forest
         .nodes
         .iter()
         .filter(|n| n.class == NodeClass::Missing && n.live)
         .map(|n| n.ulid)
         .collect();
-    let mut heal_anchors: Vec<Ulid> = missing_live
+    let anchors_with_missing: HashSet<Ulid> = missing_live
         .iter()
         .flat_map(|m| forest.referencing_anchors(*m))
         .collect();
-    heal_anchors.sort_unstable();
-    heal_anchors.dedup();
-    for anchor in heal_anchors {
+    let mut heal_pending = false;
+    for node in forest.nodes.iter().filter(|n| n.class == NodeClass::Anchor) {
+        let anchor = node.ulid;
         let anchor_dir = by_id.join(anchor.to_string());
         // A claim or import job hydrates its own fork; healing under it
         // would race the job's pulls.
         if anchor_dir.join(CLAIMING_FILE).exists() || anchor_dir.join(IMPORTING_FILE).exists() {
             continue;
         }
-        info!("[heal {anchor}] lineage incomplete; re-pulling missing ancestors");
+        let reason: Option<String> = if anchors_with_missing.contains(&anchor) {
+            Some("missing ancestor directories".to_owned())
+        } else {
+            elide_core::volume::verify_ancestor_manifests(&anchor_dir, &by_id)
+                .err()
+                .map(|e| format!("ancestor verify failed: {e}"))
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
+        heal_pending = true;
+        info!("[heal {anchor}] {reason}; re-pulling ancestors");
         match crate::prefetch::prefetch_indexes(&anchor_dir, stores, None).await {
             Ok(r) => {
                 outcome.healed_anchors += 1;
@@ -103,8 +120,8 @@ pub async fn liveness_pass(
         Some("claim or import in flight")
     } else if forest.nodes.iter().any(|n| n.lineage_error.is_some()) {
         Some("a lineage walk failed; reachability incomplete")
-    } else if !missing_live.is_empty() {
-        Some("missing ancestors pending heal")
+    } else if heal_pending {
+        Some("ancestors incomplete; heal pending")
     } else {
         None
     };
@@ -295,25 +312,28 @@ mod tests {
             assert_eq!(outcome.swept, 0);
             assert_eq!(
                 outcome.sweep_skipped,
-                Some("missing ancestors pending heal")
+                Some("ancestors incomplete; heal pending")
             );
         }
         assert!(data_dir.join("by_id").join(A).exists());
     }
 
-    #[tokio::test]
-    async fn heal_repulls_missing_ancestor_from_store() {
+    const SEG: &str = "01AAAAAAAAAAAAAAAAAAAAAAA1";
+
+    /// Stage parent volume `A` fully in the store — meta pub +
+    /// provenance, one sealed segment, and the `SNAP` manifest — the
+    /// shape a drained-and-removed volume leaves. Signed identity
+    /// files land in a scratch dir under `data_dir` (NOT `by_id/A`);
+    /// returns the parent's verifying-key bytes for children's
+    /// `ParentRef`s and the scratch path for tests that pre-seed a
+    /// partial local dir.
+    async fn stage_parent_in_store(
+        data_dir: &Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+    ) -> ([u8; 32], PathBuf) {
         use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
         use elide_core::signing::{build_snapshot_manifest_bytes, load_signer};
-        use object_store::ObjectStore;
 
-        let data_dir = temp_data_dir();
-        let by_id = data_dir.join("by_id");
-
-        // Mint the parent in a scratch dir (its by_id/ dir must NOT
-        // exist locally — that's the point), publish its meta pub +
-        // provenance, one sealed segment, and the snapshot manifest to
-        // the store — the shape a drained-and-removed volume leaves.
         let scratch = data_dir.join("scratch-parent");
         std::fs::create_dir_all(&scratch).unwrap();
         let parent_key = generate_keypair(&scratch, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
@@ -326,7 +346,6 @@ mod tests {
         .unwrap();
         let parent_signer = load_signer(&scratch, VOLUME_KEY_FILE).unwrap();
 
-        let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAA1";
         let data = vec![0x5Au8; 4096];
         let mut entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
@@ -338,7 +357,6 @@ mod tests {
         let staging = data_dir.join("seg-staging");
         write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
 
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         store
             .put(
                 &object_store::path::Path::from(elide_core::store_keys::meta_pub_key(ulid(A))),
@@ -359,28 +377,42 @@ mod tests {
             .unwrap();
         store
             .put(
-                &crate::upload::segment_key(ulid(A), ulid(seg_ulid)),
+                &crate::upload::segment_key(ulid(A), ulid(SEG)),
                 std::fs::read(&staging).unwrap().into(),
             )
             .await
             .unwrap();
-        let manifest = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[ulid(seg_ulid)]);
-        crate::volume_data::VolumeData::new(Arc::clone(&store), ulid(A))
+        let manifest = build_snapshot_manifest_bytes(parent_signer.as_ref(), &[ulid(SEG)]);
+        crate::volume_data::VolumeData::new(Arc::clone(store), ulid(A))
             .snapshots()
             .put_manifest(ulid(SNAP), manifest.into())
             .await
             .unwrap();
 
-        // The dependent anchor, forked from the vanished parent.
+        (parent_key.verifying_key().to_bytes(), scratch)
+    }
+
+    /// The dependent anchor `B`, forked from parent `A` at `SNAP`.
+    fn mint_dependent(data_dir: &Path, parent_pub: [u8; 32]) {
         mint_volume(
-            &data_dir,
+            data_dir,
             B,
             &ProvenanceLineage::fork(ParentRef {
                 volume_ulid: A.to_owned(),
                 snapshot_ulid: SNAP.to_owned(),
-                pubkey: parent_key.verifying_key().to_bytes(),
+                pubkey: parent_pub,
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn heal_repulls_missing_ancestor_from_store() {
+        use object_store::ObjectStore;
+        let data_dir = temp_data_dir();
+        let by_id = data_dir.join("by_id");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (parent_pub, _scratch) = stage_parent_in_store(&data_dir, &store).await;
+        mint_dependent(&data_dir, parent_pub);
         assert!(!by_id.join(A).exists());
 
         let stores: Arc<dyn ScopedStores> = Arc::new(crate::stores::PassthroughStores::new(store));
@@ -395,12 +427,137 @@ mod tests {
         assert!(parent_dir.join("volume.readonly").exists());
         assert!(parent_dir.join(VOLUME_PUB_FILE).exists());
         assert!(parent_dir.join(VOLUME_PROVENANCE_FILE).exists());
+        let seg_ulid = SEG;
         assert!(
             parent_dir
                 .join("index")
                 .join(format!("{seg_ulid}.idx"))
                 .exists(),
             "index section pulled"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_completes_partial_skeleton_missing_manifest() {
+        // Parent dir present with valid identity files but no
+        // manifest and no .idx — the shape that used to pass the
+        // missing-dir trigger and still fail at open. The verify
+        // trigger catches it; the next pass is clean.
+        use object_store::ObjectStore;
+        let data_dir = temp_data_dir();
+        let by_id = data_dir.join("by_id");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (parent_pub, scratch) = stage_parent_in_store(&data_dir, &store).await;
+        mint_dependent(&data_dir, parent_pub);
+
+        let parent_dir = by_id.join(A);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(parent_dir.join("volume.readonly"), "").unwrap();
+        std::fs::copy(
+            scratch.join(VOLUME_PUB_FILE),
+            parent_dir.join(VOLUME_PUB_FILE),
+        )
+        .unwrap();
+        std::fs::copy(
+            scratch.join(VOLUME_PROVENANCE_FILE),
+            parent_dir.join(VOLUME_PROVENANCE_FILE),
+        )
+        .unwrap();
+
+        let stores: Arc<dyn ScopedStores> = Arc::new(crate::stores::PassthroughStores::new(store));
+        let mut condemned = HashSet::new();
+        let outcome = liveness_pass(&data_dir, &stores, &mut condemned)
+            .await
+            .unwrap();
+        assert_eq!(outcome.healed_anchors, 1);
+        assert_eq!(
+            outcome.sweep_skipped,
+            Some("ancestors incomplete; heal pending")
+        );
+        let seg_ulid = SEG;
+        assert!(
+            parent_dir
+                .join("index")
+                .join(format!("{seg_ulid}.idx"))
+                .exists(),
+            "missing index section fetched"
+        );
+
+        let clean = liveness_pass(&data_dir, &stores, &mut condemned)
+            .await
+            .unwrap();
+        assert_eq!(clean.healed_anchors, 0, "verify passes after heal");
+        assert_eq!(clean.sweep_skipped, None);
+    }
+
+    #[tokio::test]
+    async fn heal_repairs_gutted_skeleton_dir() {
+        // A pull that crashed right after the marker write leaves a
+        // dir with only volume.readonly — present, so the old
+        // missing-dir trigger never fired, and the old
+        // pull_volume_skeleton early-return made it unrepairable.
+        use object_store::ObjectStore;
+        let data_dir = temp_data_dir();
+        let by_id = data_dir.join("by_id");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (parent_pub, _scratch) = stage_parent_in_store(&data_dir, &store).await;
+        mint_dependent(&data_dir, parent_pub);
+
+        let parent_dir = by_id.join(A);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(parent_dir.join("volume.readonly"), "").unwrap();
+
+        let stores: Arc<dyn ScopedStores> = Arc::new(crate::stores::PassthroughStores::new(store));
+        let mut condemned = HashSet::new();
+        let outcome = liveness_pass(&data_dir, &stores, &mut condemned)
+            .await
+            .unwrap();
+        assert_eq!(outcome.healed_anchors, 1);
+        assert!(parent_dir.join(VOLUME_PUB_FILE).exists());
+        assert!(parent_dir.join(VOLUME_PROVENANCE_FILE).exists());
+        let seg_ulid = SEG;
+        assert!(
+            parent_dir
+                .join("index")
+                .join(format!("{seg_ulid}.idx"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_never_overwrites_a_keyed_dir() {
+        // The parent dir holds a volume.key (a writable fork in some
+        // broken intermediate state) — pull must not stomp its
+        // identity files, and the sweep stays gated on the unhealable
+        // anchor.
+        use object_store::ObjectStore;
+        let data_dir = temp_data_dir();
+        let by_id = data_dir.join("by_id");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (parent_pub, _scratch) = stage_parent_in_store(&data_dir, &store).await;
+        mint_dependent(&data_dir, parent_pub);
+
+        let parent_dir = by_id.join(A);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(parent_dir.join(VOLUME_KEY_FILE), "local key material").unwrap();
+
+        let stores: Arc<dyn ScopedStores> = Arc::new(crate::stores::PassthroughStores::new(store));
+        let mut condemned = HashSet::new();
+        let outcome = liveness_pass(&data_dir, &stores, &mut condemned)
+            .await
+            .unwrap();
+        assert_eq!(outcome.healed_anchors, 0, "prefetch fails, never repairs");
+        assert_eq!(
+            outcome.sweep_skipped,
+            Some("ancestors incomplete; heal pending")
+        );
+        assert!(
+            !parent_dir.join(VOLUME_PUB_FILE).exists(),
+            "keyed dir untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent_dir.join(VOLUME_KEY_FILE)).unwrap(),
+            "local key material"
         );
     }
 }
