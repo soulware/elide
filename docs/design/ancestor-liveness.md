@@ -1,16 +1,16 @@
 # Local ancestor liveness
 
-Status: proposed.
+Status: implemented (#670, #672, #673, #674).
 
 A `by_id/<ulid>/` directory is shared state: it can be a named volume's
 home *and* an ancestor layer that other local volumes' read paths walk
-through. `volume remove` decides from the target's own lifecycle state
-alone (stopped, released, readonly), so it can delete a directory that a
+through. Deciding `volume remove` from the target's own lifecycle state
+alone (stopped, released, readonly) would delete a directory that a
 sibling volume's fork chain still requires — after which that sibling's
 daemon cannot open and crash-loops under supervision.
 
-This doc proposes making local ancestor presence a *liveness* property
-with a single reachability definition, enforced in both directions:
+Local ancestor presence is therefore a *liveness* property with a
+single reachability definition, enforced in both directions:
 
 - **remove** unbinds the name and demotes the directory to the readonly
   ancestor-skeleton shape instead of deleting it;
