@@ -403,8 +403,9 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
     loop {
         // Prune volumes that have been deleted since we last saw them so that
-        // if the same ULID directory is recreated (e.g. by `volume remote pull`
-        // after a `volume delete`), it will be discovered and processed again.
+        // if the same ULID directory is recreated (e.g. by a claim's ancestor
+        // pull after a `volume remove`), it will be discovered and processed
+        // again.
         // Prune volumes whose path no longer exists OR whose directory inode
         // changed (deleted and recreated at the same path with the same ULID).
         known.retain(|p, k| {
