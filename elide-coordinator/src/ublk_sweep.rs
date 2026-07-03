@@ -327,6 +327,24 @@ pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
     }
 }
 
+/// Rewrite `vol_dir/volume.toml`'s `[ublk]` section to the host-capability
+/// default: present iff this host can serve ublk right now. An existing
+/// section is kept as-is (a sticky `dev_id` survives); enabling writes an
+/// empty section so the kernel auto-allocates the dev id on first ADD.
+pub fn rederive_transport_default(vol_dir: &Path) -> std::io::Result<()> {
+    apply_transport(vol_dir, ublk_capable())
+}
+
+fn apply_transport(vol_dir: &Path, want_ublk: bool) -> std::io::Result<()> {
+    let mut cfg = elide_core::config::VolumeConfig::read(vol_dir)?;
+    match (want_ublk, &cfg.ublk) {
+        (true, Some(_)) | (false, None) => return Ok(()),
+        (true, None) => cfg.ublk = Some(elide_core::config::UblkConfig::default()),
+        (false, Some(_)) => cfg.ublk = None,
+    }
+    cfg.write(vol_dir)
+}
+
 /// Open a fresh `new_simple` control device and issue `kill_dev` + `del_dev`
 /// against it, on a `spawn_blocking` thread (libublk's control ioctls are
 /// synchronous). Bounded by `PER_DEV_DELETE_TIMEOUT`. On timeout the blocking
@@ -555,8 +573,7 @@ mod tests {
     async fn teardown_drops_ublk_transport_section() {
         // The kernel del_dev is best-effort (no real device here), but the
         // config drop must still run: a torn-down device leaves no [ublk]
-        // binding, so the fork re-serves over ublk only on an explicit
-        // update --ublk.
+        // binding behind.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_cfg(tmp.path(), Some(4));
         teardown_bound_device(tmp.path(), 4).await;
@@ -565,5 +582,64 @@ mod tests {
             cfg.ublk.is_none(),
             "teardown must drop the [ublk] section, not just the dev_id"
         );
+    }
+
+    #[test]
+    fn apply_transport_enables_ublk_with_auto_dev_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        elide_core::config::VolumeConfig {
+            name: Some("alpha".into()),
+            size: Some(1 << 30),
+            ..Default::default()
+        }
+        .write(tmp.path())
+        .unwrap();
+
+        apply_transport(tmp.path(), true).unwrap();
+
+        let cfg = elide_core::config::VolumeConfig::read(tmp.path()).unwrap();
+        let ublk = cfg.ublk.expect("[ublk] section written");
+        assert_eq!(ublk.dev_id, None, "dev id is kernel-allocated on first ADD");
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert_eq!(cfg.size, Some(1 << 30));
+    }
+
+    #[test]
+    fn apply_transport_enable_keeps_existing_sticky_dev_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cfg(tmp.path(), Some(7));
+        apply_transport(tmp.path(), true).unwrap();
+        assert_eq!(bound_ublk_id(tmp.path()), Some(7));
+    }
+
+    #[test]
+    fn apply_transport_disable_drops_section() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cfg(tmp.path(), Some(7));
+        apply_transport(tmp.path(), false).unwrap();
+        let cfg = elide_core::config::VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.ublk.is_none());
+    }
+
+    #[test]
+    fn apply_transport_disable_is_noop_without_section() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        elide_core::config::VolumeConfig::default()
+            .write(tmp.path())
+            .unwrap();
+        apply_transport(tmp.path(), false).unwrap();
+        let cfg = elide_core::config::VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.ublk.is_none());
+    }
+
+    #[test]
+    fn rederive_transport_default_follows_host_capability() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        elide_core::config::VolumeConfig::default()
+            .write(tmp.path())
+            .unwrap();
+        rederive_transport_default(tmp.path()).unwrap();
+        let cfg = elide_core::config::VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.ublk.is_some(), ublk_capable());
     }
 }

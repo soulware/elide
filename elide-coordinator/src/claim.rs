@@ -364,6 +364,16 @@ async fn claim_volume_bucket_op(
                              volume.released marker: {e}"
                         );
                     }
+                    // Best-effort: the volume serves over IPC either way,
+                    // and `volume update ublk` recovers a failed write.
+                    if let Err(e) =
+                        elide_coordinator::ublk_sweep::rederive_transport_default(&vol_dir)
+                    {
+                        warn!(
+                            "[inbound] reclaim {volume_name}: re-deriving \
+                             ublk transport: {e}"
+                        );
+                    }
                     journal
                         .emit_best_effort(
                             identity.as_ref(),
@@ -1679,6 +1689,76 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn reclaim_in_place_rederives_ublk_transport() {
+        // Same-coord release → claim: the local fork's volume.toml is
+        // reused, so the reclaim branch must land it with `[ublk]`
+        // present iff this host can serve ublk — the same default a
+        // fresh claim writes.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut mint = UlidMint::new(Ulid::nil());
+        let vol = mint.next();
+        let snap = mint.next();
+        let _fork = build_fork(data_dir, vol, snap, None);
+        let vol_dir = data_dir.join("by_id").join(vol.to_string());
+        elide_core::config::VolumeConfig {
+            ulid: Some(vol),
+            name: Some("vol".into()),
+            size: Some(1 << 30),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
+        std::fs::create_dir_all(data_dir.join("by_name")).unwrap();
+        std::os::unix::fs::symlink(&vol_dir, data_dir.join("by_name").join("vol")).unwrap();
+
+        let mut rec = elide_core::name_record::NameRecord::live_minimal(vol, 1 << 30);
+        rec.state = elide_core::name_record::NameState::Released;
+        rec.coordinator_id = None;
+        rec.handoff_snapshot = Some(snap);
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let coord_dir = TempDir::new().unwrap();
+        let identity = Arc::new(
+            elide_coordinator::identity::CoordinatorIdentity::load_or_generate(coord_dir.path())
+                .unwrap(),
+        );
+        let stores = passthrough(Arc::clone(&store));
+        let writer = stores.writer();
+        let journal = stores.event_journal();
+        let claims = stores.name_claims();
+
+        let reply = claim_volume_bucket_op(
+            "vol",
+            data_dir,
+            &writer,
+            journal.as_ref(),
+            claims.as_ref(),
+            &identity,
+        )
+        .await
+        .expect("matching local fork must reclaim in place");
+        assert!(
+            matches!(reply, ClaimReply::Reclaimed),
+            "expected Reclaimed, got {reply:?}"
+        );
+
+        let cfg = elide_core::config::VolumeConfig::read(&vol_dir).unwrap();
+        assert_eq!(
+            cfg.ublk.is_some(),
+            elide_coordinator::ublk_sweep::ublk_capable(),
+            "reclaim must re-derive [ublk] by host capability"
+        );
+        if let Some(ublk) = cfg.ublk {
+            assert_eq!(ublk.dev_id, None, "no device bound yet — id auto-allocates");
+        }
+    }
+
     #[tokio::test]
     async fn early_rebind_is_control_plane_only() {
         // Claim-first ordering: everything `early_rebind` does before
