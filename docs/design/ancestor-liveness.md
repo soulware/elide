@@ -115,23 +115,30 @@ hydrate-then-verify shape the claim path already has.
 
 Partition `by_id/` directories:
 
-- **Roots** — directories the operator or a job explicitly owns: any
+- **Anchors** — directories the operator or a job explicitly owns: any
   dir holding `volume.key`, a `by_name` binding, or an in-flight
   marker (`volume.claiming`, `volume.importing`). Never swept; removed
   only by verb.
 - **Skeletons** — `volume.readonly`-marked dirs with none of the
   above: pulled ancestors and demoted removals.
 
-A skeleton is **live** iff some root's `lineage_ulids`
+A skeleton is **live** iff some anchor's `lineage_ulids`
 (`elide-core/src/volume/ancestry.rs`: fork-parent chain + extent-index
 sources + recovery sources) contains its ULID. There is no reverse
-index; liveness is a scan over roots walking each lineage — fine at
+index; liveness is a scan over anchors walking each lineage — fine at
 coordinator scale.
 
-The root-set definition resolves the imported-base trap: an imported
-base with no forks yet is a root via its name binding, so it is never
-swept as garbage; removing its name demotes it into the skeleton pool,
-where it survives exactly as long as forks reference it.
+"Anchor" deliberately makes no topological claim. In the lineage tree
+the anchors are usually the tips and the skeletons the interior and
+root nodes — but not always: an anchored volume that was itself forked
+from sits interior. Ownership and tree position are orthogonal axes,
+and "root" stays reserved for lineage topology
+(`ProvenanceLineage::Root`, the parentless head of a fork tree).
+
+The anchor-set definition resolves the imported-base trap: an imported
+base with no forks yet is an anchor via its name binding, so it is
+never swept as garbage; removing its name demotes it into the skeleton
+pool, where it survives exactly as long as forks reference it.
 
 ### Remove: unbind + demote
 
@@ -163,7 +170,7 @@ One pass, folded into the coordinator's existing tick loop, computes
 the reachable set once and acts in both directions:
 
 - **sweep**: delete skeletons outside the reachable set;
-- **heal**: for each root, if any lineage hop is missing its dir or its
+- **heal**: for each anchor, if any lineage hop is missing its dir or its
   read form is incomplete (missing `.idx` for a manifest segment,
   missing manifest), run the existing `prefetch_indexes` chain walk to
   re-materialise it — the same code the claim path uses, with a new
@@ -176,12 +183,40 @@ skeleton and sections from the bucket, the next spawn succeeds. It also
 covers any other cause of a missing ancestor (partial pull, operator
 surgery, disk restore).
 
+### Operator surface: `volume tree`
+
+The same lineage forest, rendered. Local-only by construction: it walks
+`by_id/` provenance on disk, no bucket reads.
+
+```
+01KWHFHKKY…006X                       skeleton
+└─ 01KWHK77…0FN0                      skeleton   2 dependents
+   ├─ vol2         01KWHVM5…M6S0      rw  running
+   └─ vol2-2595e8  01KWKE2W…NVQY      rw  stopped
+```
+
+- Primary edges are fork parents, labelled with the snapshot pin.
+  Extent-index and recovery-source references are cross-edges (the
+  structure is a DAG), so they annotate the row (`+2 extent sources`)
+  rather than draw.
+- Anchors and skeletons render distinctly: a leaf skeleton is visibly
+  sweepable, an interior one visibly load-bearing — the dependency
+  structure `remove` acts on, shown before the verb runs rather than
+  enforced by a refusal ("eligibility shown, not filtered").
+- A reachable-but-missing ancestor renders as a broken node
+  (`… MISSING`) — a heal candidate.
+
+Liveness, heal, and tree are three consumers of the one
+lineage-forest computation, so the tree is also the low-risk first
+consumer: it can land and be eyeballed before the same computation is
+wired to deletion.
+
 ### Races
 
 The sweep must not eat a skeleton pulled for a claim that has not yet
 finalized: mid-claim, the new fork's provenance may not be readable, so
 nothing on disk references the just-pulled ancestors. `volume.claiming`
-and `volume.importing` dirs are roots, but their lineages may be
+and `volume.importing` dirs are anchors, but their lineages may be
 unreadable; options, to be settled at implementation time:
 
 - skip the sweep entirely while any claiming/importing marker exists
@@ -231,4 +266,4 @@ subsystem (#650). It should name the actual recovery
 - Exact wording of the remove reply for the demoted case.
 - Whether `heal` should also verify skeleton *completeness* against the
   manifest on every tick or only on open-failure signal from the
-  supervisor (cost: one chain walk per root per tick).
+  supervisor (cost: one chain walk per anchor per tick).
