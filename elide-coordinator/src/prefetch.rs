@@ -175,7 +175,14 @@ pub async fn prefetch_indexes(
             )
         })?;
         let parent_dir = resolve_ancestor_dir(by_id_dir.as_path(), &parent.volume_ulid);
-        let parent_dir = if parent_dir.exists() {
+        // Pull when the skeleton's identity files are incomplete, not
+        // just when the dir is absent — a pull that crashed between the
+        // marker and the provenance write leaves a dir the walk below
+        // cannot read. `pull_volume_skeleton` never touches a dir
+        // holding `volume.key`.
+        let skeleton_complete = parent_dir.join(signing::VOLUME_PUB_FILE).exists()
+            && parent_dir.join(signing::VOLUME_PROVENANCE_FILE).exists();
+        let parent_dir = if skeleton_complete {
             parent_dir
         } else {
             info!(

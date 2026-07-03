@@ -177,13 +177,22 @@ One pass (`liveness::liveness_pass`, its own coordinator-wide tick —
 `[supervisor].liveness_interval`, default 30s, first tick at boot)
 computes the forest once and acts in both directions:
 
-- **heal**: for every anchor whose lineage reaches a `Missing` node,
-  run the existing `prefetch_indexes` chain walk — the same code the
-  claim path uses, triggered by *lineage incompleteness* instead of
-  *fork looks freshly pulled*. Anchors carrying a claiming/importing
-  marker are skipped (their own job hydrates them); healing is
-  otherwise ungated, since re-pulling a reachable ancestor is safe
-  regardless of what else is in flight.
+- **heal**: two triggers, unioned, per anchor per tick. An anchor
+  whose lineage reaches a `Missing` node (covers extent-index sources,
+  which the fork-chain verify doesn't walk), or an anchor whose
+  `verify_ancestor_manifests` — the open path's own check — fails
+  (covers present-but-partial ancestors: missing manifest, missing
+  `.idx` section, gutted identity files). Using the open path's check
+  as the trigger means trigger and requirement cannot drift; the cost
+  is a few file reads and signature verifies per anchor per tick.
+  Either trigger runs the existing `prefetch_indexes` chain walk — the
+  same code the claim path uses. `pull_volume_skeleton` repairs a dir
+  whose identity files are incomplete (a pull that crashed between the
+  marker and the provenance write) by re-running its overwriting
+  writes, and never touches a dir holding `volume.key`. Anchors
+  carrying a claiming/importing marker are skipped (their own job
+  hydrates them); healing is otherwise ungated, since re-pulling a
+  reachable ancestor is safe regardless of what else is in flight.
 - **sweep**: delete skeletons outside the reachable set, under
   **two-tick condemnation** — a skeleton dies only when two
   consecutive clean passes agree it is unreferenced, so a fork or
@@ -198,9 +207,9 @@ resets all condemnation:
   readable yet;
 - no lineage-walk errors — a failed walk contributes nothing to
   reachability, so "unreferenced" is unreliable;
-- no live missing ancestors — a lineage walk stops at a missing hop,
-  so skeletons *above* the break look unreferenced until heal
-  re-pulls it.
+- no heal-pending anchors — a lineage walk stops at a missing or
+  unreadable hop, so skeletons *above* the break look unreferenced
+  until heal re-pulls it.
 
 Heal turns the incident's terminal crash-loop into a self-repairing
 blip: the supervisor's open fails, the next tick re-pulls the parent
@@ -286,8 +295,4 @@ subsystem (#650). It should name the actual recovery
 
 ## Open questions
 
-- Whether `heal` should also verify skeleton *completeness* against the
-  manifest on every tick or only on open-failure signal from the
-  supervisor (cost: one chain walk per anchor per tick). Today heal
-  triggers on a missing *directory*; a present-but-partial skeleton
-  (manifest without its `.idx` sections) still fails at open.
+None.
