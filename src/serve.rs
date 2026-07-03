@@ -158,7 +158,11 @@ pub fn run_volume_ipc_only(dir: &Path, fetch_inputs: crate::VolumeFetchInputs) -
         peer_counters = build.peer_counters;
     }
 
-    let (actor, handle) = elide_core::actor::spawn(volume);
+    let (mut actor, handle) = elide_core::actor::spawn(volume);
+    // Fail-stop on read-state divergence: exit so the supervisor
+    // respawns us and the fresh open rebuilds from disk. All accepted
+    // writes are already durable in the WAL, so `_exit` loses nothing.
+    actor.set_divergence_exit(|| unsafe { libc::_exit(70) });
     let _actor_thread = std::thread::Builder::new()
         .name("volume-actor".into())
         .spawn(move || actor.run())

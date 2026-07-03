@@ -169,6 +169,13 @@ pub enum StagedApply {
     /// The apply was cancelled (e.g. stale-liveness check) and the staged
     /// file was removed. Extent index is unchanged.
     Cancelled,
+    /// The plan consumes an input segment this daemon's read state has
+    /// never loaded — the served view is a strict subset of the on-disk
+    /// own layer (`docs/design/read-state-divergence-check.md`). The
+    /// plan file is retained: a fresh open loads the missing segments
+    /// and can apply it. The daemon must fail-stop rather than keep
+    /// serving.
+    Diverged,
 }
 
 /// A fork ancestry layer used when rebuilding the LBA map and extent index.
@@ -267,6 +274,14 @@ pub struct Volume {
     /// and the worker thread hit the same cache. See
     /// `segment_cache::SegmentIndexCache`.
     pub(in crate::volume) segment_cache: Arc<segment_cache::SegmentIndexCache>,
+    /// Committed-tier (`gc/` ∪ `index/`) own-layer segments this process
+    /// has loaded or created — the daemon's view of its own committed
+    /// segment set, against which every GC plan's inputs are checked
+    /// (`docs/design/read-state-divergence-check.md`). Populated from
+    /// the open-time scan; segments enter at `promote_segment` and at
+    /// GC-handoff commit, and leave when their `index/<ulid>.idx` is
+    /// deleted by a GC output's promote.
+    pub(in crate::volume) own_segments: std::collections::BTreeSet<Ulid>,
 }
 
 /// Counters for the no-op write skip path. Reset to zero on `Volume::open`.
@@ -374,14 +389,20 @@ impl Volume {
             }
         }
         // Collect index/*.idx ULIDs (uploaded segments; file stem is the ULID).
+        // These and the bare gc/ outputs below form the committed-tier
+        // `own_segments` set the divergence check compares GC plan inputs
+        // against.
+        let mut own_segments = std::collections::BTreeSet::new();
         for p in segment::collect_idx_files(&base_dir.join("index"))? {
             if let Some(ulid) = p
                 .file_stem()
                 .and_then(|n| n.to_str())
                 .and_then(|s| Ulid::from_string(s).ok())
-                && last_segment_ulid < Some(ulid)
             {
-                last_segment_ulid = Some(ulid);
+                own_segments.insert(ulid);
+                if last_segment_ulid < Some(ulid) {
+                    last_segment_ulid = Some(ulid);
+                }
             }
         }
         // A volume-applied GC output (bare `gc/<ulid>`) carries a ULID
@@ -392,9 +413,11 @@ impl Volume {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|s| Ulid::from_string(s).ok())
-                && last_segment_ulid < Some(ulid)
             {
-                last_segment_ulid = Some(ulid);
+                own_segments.insert(ulid);
+                if last_segment_ulid < Some(ulid) {
+                    last_segment_ulid = Some(ulid);
+                }
             }
         }
 
@@ -572,6 +595,7 @@ impl Volume {
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
+            own_segments,
         };
         ret.assert_volume_invariants("Volume::open");
         Ok(ret)
@@ -1036,6 +1060,9 @@ impl Volume {
                 StagedApply::Cancelled => {
                     // Cancel removes the handoff input file inside.
                 }
+                // The read state is provably incomplete; every remaining
+                // plan is suspect for the same reason. Stop here.
+                StagedApply::Diverged => break,
             }
         }
 
@@ -1131,6 +1158,32 @@ impl Volume {
             Some(p) => p,
             None => return Ok(StagedApply::Cancelled),
         };
+
+        // Divergence check: the stale-liveness loop below only examines
+        // hashes the extent index locates *at* an input, so an input
+        // this daemon never loaded would sail through it unchecked.
+        // The plan file stays on disk — unlike a cancel, the plan is
+        // valid against the on-disk layer; it is this daemon that is
+        // wrong (`docs/design/read-state-divergence-check.md`).
+        let unknown: Vec<Ulid> = inputs
+            .iter()
+            .filter(|u| !self.own_segments.contains(u))
+            .copied()
+            .collect();
+        if !unknown.is_empty() {
+            log::error!(
+                "plan {new_ulid}: read-state divergence — {} input segment(s) \
+                 unknown to this daemon's read state: [{}]; refusing to fold",
+                unknown.len(),
+                unknown
+                    .iter()
+                    .map(Ulid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let _ = fs::remove_file(&tmp_path);
+            return Ok(StagedApply::Diverged);
+        }
 
         let live = self.lbamap.lba_referenced_hashes();
         let carried_hashes: std::collections::HashSet<blake3::Hash> = entries
@@ -1246,6 +1299,7 @@ impl Volume {
         let bare_path = gc_dir.join(new_ulid.to_string());
         fs::rename(&tmp_path, &bare_path)?;
         let _ = fs::remove_file(&plan_path);
+        self.own_segments.insert(new_ulid);
 
         // Merge the GC output into self.lbamap by per-entry conditional
         // insert. `insert_consuming_inputs` skips any sub-range whose
@@ -1802,10 +1856,12 @@ impl Volume {
             tombstone,
         } = result;
         let index_dir = self.base_dir.join("index");
+        self.own_segments.insert(ulid);
 
         if tombstone {
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+                self.own_segments.remove(old_ulid);
             }
             self.assert_volume_invariants("apply_promote_segment_result_tombstone");
             return Ok(());
@@ -1890,6 +1946,7 @@ impl Volume {
             // GC carried path: delete each consumed input's idx.
             for old_ulid in &inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+                self.own_segments.remove(old_ulid);
             }
 
             // GC carried entries already reference `BodySource::Cached(idx)`

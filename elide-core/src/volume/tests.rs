@@ -2269,6 +2269,156 @@ fn gc_staged_handoff_applies_and_commits_bare() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Write a `gc/<new>.plan` keeping every entry of each input, like
+/// `simulate_coord_gc_staged` but over multiple inputs — the shape the
+/// coordinator emits when a bucket folds several segments.
+fn write_multi_input_plan(vol: &mut Volume, fork_dir: &Path, inputs: &[Ulid]) -> Ulid {
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+    use crate::segment;
+
+    let mut outputs = Vec::new();
+    for input in inputs {
+        let idx_path = fork_dir.join("index").join(format!("{input}.idx"));
+        let (_bss, entries, _) =
+            segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+        outputs.extend((0..entries.len() as u32).map(|entry_idx| PlanOutput::Keep {
+            input: *input,
+            entry_idx,
+        }));
+    }
+    let new_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let gc_dir = fork_dir.join("gc");
+    fs::create_dir_all(&gc_dir).unwrap();
+    let plan = RewritePlan { new_ulid, outputs };
+    plan.write_atomic(&gc_dir.join(format!("{new_ulid}.plan")))
+        .unwrap();
+    new_ulid
+}
+
+#[test]
+fn gc_plan_with_unknown_input_diverges_and_reopen_recovers() {
+    // Re-enacts the 2026-07-02 incident shape: a committed segment lands
+    // in index/ + cache/ behind a running daemon's back (there: force-claim
+    // re-own; here: idx moved aside across a reopen and restored after).
+    // A GC plan folding that segment must be refused as Diverged — with
+    // the plan retained — and a fresh open must then apply it cleanly.
+    // See docs/design/read-state-divergence-check.md.
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data_a: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(0, &data_a).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+
+    let data_b: Vec<u8> = (0..8192).map(|i| (i * 11 + 5) as u8).collect();
+    vol.write(16, &data_b).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+
+    let mut committed: Vec<Ulid> = vol.own_segments.iter().copied().collect();
+    committed.sort();
+    let [s1, s2] = committed[..] else {
+        panic!("expected exactly two committed segments, got {committed:?}");
+    };
+
+    // Reopen with s2's idx hidden: this daemon's read state never loads s2.
+    drop(vol);
+    let index_dir = base.join("index");
+    let s2_idx = index_dir.join(format!("{s2}.idx"));
+    let hidden = base.join(format!("{s2}.idx.hidden"));
+    fs::rename(&s2_idx, &hidden).unwrap();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.own_segments.iter().copied().collect::<Vec<_>>(),
+        vec![s1]
+    );
+    fs::rename(&hidden, &s2_idx).unwrap();
+
+    let new_ulid = write_multi_input_plan(&mut vol, &base, &[s1, s2]);
+    let gc_dir = base.join("gc");
+
+    let count = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(count, 0, "diverged plan must not be counted as applied");
+    assert!(
+        gc_dir.join(format!("{new_ulid}.plan")).exists(),
+        "diverged plan must be retained for the post-rebuild retry"
+    );
+    assert!(
+        !gc_dir.join(new_ulid.to_string()).exists(),
+        "no bare output may be committed on divergence"
+    );
+    assert!(
+        !gc_dir.join(format!("{new_ulid}.tmp")).exists(),
+        "worker scratch must not outlive the divergence rejection"
+    );
+
+    // The fail-stop's recovery: a fresh open loads s2 and the retained
+    // plan applies cleanly.
+    drop(vol);
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert!(vol.own_segments.contains(&s2));
+    let count = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(count, 1);
+    assert!(gc_dir.join(new_ulid.to_string()).exists());
+    assert_eq!(vol.read(0, 2).unwrap(), data_a);
+    assert_eq!(vol.read(16, 2).unwrap(), data_b);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn own_segments_mirrors_committed_lifecycle() {
+    // own_segments tracks the committed tier (gc/ ∪ index/) through the
+    // full segment lifecycle: pending segments are excluded, promote adds,
+    // GC apply adds the output, the output's promote removes the consumed
+    // inputs, and a fresh open rebuilds the same set from disk.
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert!(vol.own_segments.is_empty());
+
+    let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    assert!(
+        vol.own_segments.is_empty(),
+        "pending segments are not committed-tier"
+    );
+
+    simulate_upload(&mut vol);
+    assert_eq!(vol.own_segments.len(), 1);
+    let old_ulid = *vol.own_segments.iter().next().unwrap();
+
+    let new_ulid_str = simulate_coord_gc_staged(&mut vol, &base, &old_ulid.to_string());
+    let new_ulid = Ulid::from_string(&new_ulid_str).unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    assert!(vol.own_segments.contains(&old_ulid));
+    assert!(
+        vol.own_segments.contains(&new_ulid),
+        "GC apply commits the bare output into the committed tier"
+    );
+
+    vol.promote_segment(new_ulid).unwrap();
+    assert!(
+        !vol.own_segments.contains(&old_ulid),
+        "the output's promote deletes the consumed input's idx"
+    );
+    assert!(vol.own_segments.contains(&new_ulid));
+
+    vol.finalize_gc_handoff(new_ulid).unwrap();
+    assert!(vol.own_segments.contains(&new_ulid));
+
+    let expected: Vec<Ulid> = vol.own_segments.iter().copied().collect();
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.own_segments.iter().copied().collect::<Vec<_>>(),
+        expected
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn gc_staged_crash_recovery_bare_wins() {
     // Crash state: rename tmp→bare succeeded, but `.plan` removal

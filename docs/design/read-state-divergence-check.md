@@ -41,19 +41,24 @@ see the inputs.
 **Every input segment ULID in a GC plan must be a member of the
 daemon's own-layer segment set at the commit point.**
 
-The own-layer segment set is a `BTreeSet<Ulid>` on the volume state:
+The own-layer segment set is a `BTreeSet<Ulid>` on the volume state,
+covering the committed tier (`gc/` ∪ `index/`) only — GC candidates
+must be cache-resident, so plan inputs are always committed-tier, and
+the pending tier never needs tracking:
 
-- populated at `open_read_state` from the same own-layer scan the
-  lbamap rebuild consumes — by construction, "what a fresh open would
-  load";
-- a segment is added when it enters the local read form
-  (`promote_segment` after confirmed upload; GC handoff output at
-  commit);
-- inputs are removed at GC handoff commit.
+- populated at open from the `index/*.idx` + bare `gc/` scan — the
+  same files the lbamap rebuild loads for the own layer;
+- a segment enters at `promote_segment` (after confirmed upload) and
+  at GC-handoff commit (the bare-output rename);
+- consumed inputs leave when the output's promote deletes their
+  `index/<ulid>.idx`.
 
 The maintenance points are exactly the IPC surfaces through which all
 own-layer mutations flow on a running volume, so the set is a faithful
-mirror of the served view, not a second disk scan.
+mirror of the *applied* view, not a second disk scan. Between a
+worker's idx write and the actor's apply phase, disk transiently leads
+the set — which is why the check compares against the set, and why the
+mirror is not asserted as a runtime equality invariant.
 
 The check runs in `apply_plan_apply_result`, before the stale-liveness
 loop: `plan.inputs ⊆ own_segments`, O(|inputs|) set lookups. A miss is
@@ -62,12 +67,16 @@ which is a benign race with concurrent writes and retries next tick.
 
 ## Failure response: fail-stop, self-healing
 
-On divergence the daemon logs the missing ULIDs at ERROR and exits.
-The supervisor's ordinary respawn (with its existing fast-failure
-backoff) rebuilds the read state from disk; the rebuilt state includes
-the previously-unseen segments, so the respawned daemon serves the
-merged view and the check passes. Recovery *is* the rebuild — no new
-serve-path state, no reload machinery.
+On divergence the daemon logs the missing ULIDs at ERROR and exits
+(exit code 70; the binary installs the exit as a hook on the actor,
+so library callers and tests get log-and-continue with the plan
+retained instead of a process exit). The supervisor's ordinary
+respawn (with its existing fast-failure backoff) rebuilds the read
+state from disk; the rebuilt state includes the previously-unseen
+segments, so the respawned daemon serves the merged view and the
+check passes. Recovery *is* the rebuild — no new serve-path state, no
+reload machinery. Accepted writes are already durable in the WAL, so
+the hard exit loses nothing.
 
 Continuing to serve after detection is not an option worth having:
 every guest write lands at a higher ULID and permanently shadows the
@@ -96,14 +105,19 @@ segments' bytes regardless of how long the condition persists.
 
 ## Testing
 
-- Deterministic: open a volume, drop a foreign `.idx` + `.body` into
-  its `index//cache/` behind the running state (re-enacting a
-  re-own under a live daemon), run a GC pass, assert the divergence
-  outcome with no committed output.
-- Set-mirror property: after any sequence of promote / GC-apply
-  operations, `own_segments` equals the set a fresh
-  `open_read_state` would load — the rebuild-equality invariant,
-  suitable for the existing volume-invariants machinery.
+- `gc_plan_with_unknown_input_diverges_and_reopen_recovers`: a
+  committed segment's idx is hidden across a reopen and restored
+  after (re-enacting a re-own under a live daemon); a plan folding it
+  is refused with the plan retained and no output committed, and a
+  fresh open then applies the same plan cleanly — the recovery path,
+  exercised end to end.
+- `own_segments_mirrors_committed_lifecycle`: the set across
+  write → promote → GC apply → output promote → finalize → reopen,
+  asserting pending exclusion, input removal, and rebuild equality at
+  every settled point. The mirror is asserted here, on the
+  synchronous lifecycle, rather than in the runtime invariants
+  umbrella — the worker protocol makes disk transiently lead the set
+  mid-promote, so runtime equality would false-panic.
 
 ## Open questions
 

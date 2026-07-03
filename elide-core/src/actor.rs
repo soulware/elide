@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, tick};
-use log::warn;
+use log::{error, warn};
 
 use ulid::Ulid;
 
@@ -198,6 +198,13 @@ pub struct VolumeActor {
     worker_rx: Receiver<WorkerResult>,
     /// Join handle for the worker thread, joined on shutdown.
     worker_handle: Option<JoinHandle<()>>,
+    /// Fail-stop hook for [`StagedApply::Diverged`]: the daemon binary
+    /// installs a process-exit here so a read-state divergence halts
+    /// serving instead of continuing on a provably incomplete view
+    /// (`docs/design/read-state-divergence-check.md`). `None` (tests,
+    /// library callers): the divergence is logged and the plan left on
+    /// disk, nothing exits.
+    divergence_exit: Option<Box<dyn Fn() + Send>>,
     /// Number of promote jobs dispatched but not yet applied.
     promotes_in_flight: usize,
     /// Monotonic counter, incremented on every `WorkerJob::Promote`
@@ -348,6 +355,28 @@ fn publish_snapshot(volume: &Volume, snapshot: &ArcSwap<ReadSnapshot>, flush_gen
 impl VolumeActor {
     fn lock_volume(&self) -> MutexGuard<'_, Volume> {
         lock_volume(&self.volume)
+    }
+
+    /// Install the fail-stop hook invoked on [`StagedApply::Diverged`].
+    /// The daemon binary passes a process-exit; the hook is expected
+    /// not to return.
+    pub fn set_divergence_exit(&mut self, exit: impl Fn() + Send + 'static) {
+        self.divergence_exit = Some(Box::new(exit));
+    }
+
+    /// A GC plan named an input this daemon's read state never loaded.
+    /// Fail-stop via the installed hook; without one (tests, library
+    /// callers) serving continues on the incomplete view and the
+    /// retained plan re-arms the check.
+    fn on_divergence(&self) {
+        error!(
+            "read-state divergence: GC plan named input segment(s) unknown to \
+             this daemon; failing stop so a fresh open rebuilds from disk \
+             (docs/design/read-state-divergence-check.md)"
+        );
+        if let Some(exit) = &self.divergence_exit {
+            exit();
+        }
     }
 
     fn publish_snapshot(&mut self) {
@@ -802,8 +831,10 @@ impl VolumeActor {
                 Ok(WorkerResult::GcPlan(Ok(result))) => {
                     self.handoff_in_flight = false;
                     let applied = self.lock_volume().apply_plan_apply_result(result);
-                    if let Ok(crate::volume::StagedApply::Applied) = applied {
-                        self.publish_snapshot();
+                    match applied {
+                        Ok(crate::volume::StagedApply::Applied) => self.publish_snapshot(),
+                        Ok(crate::volume::StagedApply::Diverged) => self.on_divergence(),
+                        Ok(crate::volume::StagedApply::Cancelled) | Err(_) => {}
                     }
                 }
                 Ok(WorkerResult::GcPlan(Err(e))) => {
@@ -1100,6 +1131,15 @@ impl VolumeActor {
                                 Ok(crate::volume::StagedApply::Cancelled) => {
                                     // Cancelled in worker or stale-liveness in
                                     // apply; plan/tmp already cleaned up inside.
+                                }
+                                Ok(crate::volume::StagedApply::Diverged) => {
+                                    self.on_divergence();
+                                    // No hook (tests): drop the rest of the
+                                    // batch — every remaining plan is suspect
+                                    // against the same read state.
+                                    if let Some(parked) = self.parked_handoffs.as_mut() {
+                                        parked.remaining.clear();
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("gc plan apply failed: {e}");
@@ -2869,6 +2909,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         worker_tx: Some(worker_job_tx),
         worker_rx: worker_result_rx,
         worker_handle: Some(worker_handle),
+        divergence_exit: None,
         promotes_in_flight: 0,
         promote_gen: 0,
         completed_gen: 0,
