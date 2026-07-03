@@ -1704,6 +1704,16 @@ fn tree_volumes(data_dir: &Path) -> std::io::Result<()> {
             None => roots.push(node.ulid),
         }
     }
+    // Siblings order along the parent's timeline: by branch snapshot,
+    // then by their own ULID — same-basis forks render adjacent.
+    for kids in children.values_mut() {
+        kids.sort_by_key(|k| {
+            let snapshot = forest
+                .get(*k)
+                .and_then(|n| n.parent.as_ref().map(|p| p.snapshot));
+            (snapshot, *k)
+        });
+    }
 
     fn describe(node: &ForestNode) -> String {
         let mut parts: Vec<String> = Vec::new();
