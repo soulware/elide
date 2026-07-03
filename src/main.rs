@@ -197,6 +197,10 @@ enum VolumeCommand {
         all: bool,
     },
 
+    /// Show local volume lineage as a tree: anchors, ancestor skeletons,
+    /// snapshot-pinned fork edges, missing ancestors
+    Tree,
+
     /// Deep on-disk inspection: WAL, pending and cached segments, ancestry
     Inspect {
         /// Volume name
@@ -452,6 +456,12 @@ fn main() {
                     ListFilter::All
                 };
                 if let Err(e) = list_volumes(&data_dir, &coord, filter, all) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            VolumeCommand::Tree => {
+                if let Err(e) = tree_volumes(&data_dir) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1670,6 +1680,107 @@ fn list_volumes(
             "coordinator is not running ({})",
             coord.socket_path().display()
         );
+    }
+    Ok(())
+}
+
+/// Render the local lineage forest (`docs/design/ancestor-liveness.md`):
+/// anchors and skeletons joined by fork-parent edges, each child row
+/// carrying its branch snapshot pin. Reads only local `by_id/` state.
+fn tree_volumes(data_dir: &Path) -> std::io::Result<()> {
+    use elide_coordinator::lineage_forest::{ForestNode, NodeClass, build_forest};
+
+    let forest = build_forest(data_dir)?;
+    if forest.nodes.is_empty() {
+        println!("no volumes");
+        return Ok(());
+    }
+
+    let mut children: std::collections::BTreeMap<ulid::Ulid, Vec<ulid::Ulid>> = Default::default();
+    let mut roots: Vec<ulid::Ulid> = Vec::new();
+    for node in &forest.nodes {
+        match &node.parent {
+            Some(edge) => children.entry(edge.ulid).or_default().push(node.ulid),
+            None => roots.push(node.ulid),
+        }
+    }
+
+    fn describe(node: &ForestNode) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        match node.class {
+            NodeClass::Anchor => {
+                let lifecycle = node.lifecycle.as_ref();
+                let readonly = matches!(
+                    lifecycle,
+                    Some(elide_coordinator::volume_state::VolumeLifecycle::ReadonlyImported)
+                );
+                parts.push(if readonly { "ro".into() } else { "rw".into() });
+                if let Some(l) = lifecycle {
+                    parts.push(l.label().to_owned());
+                }
+            }
+            NodeClass::Skeleton => {
+                parts.push("skeleton".into());
+                if !node.live {
+                    parts.push("unreferenced".into());
+                }
+            }
+            NodeClass::Missing => parts.push("MISSING".into()),
+            NodeClass::Unclassified => parts.push("unclassified".into()),
+        }
+        if node.extent_sources > 0 {
+            parts.push(format!("+{} extent source(s)", node.extent_sources));
+        }
+        if node.recovery_sources > 0 {
+            parts.push(format!("+{} recovery source(s)", node.recovery_sources));
+        }
+        if node.lineage_error.is_some() {
+            parts.push("provenance unreadable".into());
+        }
+        parts.join("  ")
+    }
+
+    fn render(
+        forest: &elide_coordinator::lineage_forest::LineageForest,
+        children: &std::collections::BTreeMap<ulid::Ulid, Vec<ulid::Ulid>>,
+        visited: &mut std::collections::HashSet<ulid::Ulid>,
+        ulid: ulid::Ulid,
+        prefix: &str,
+        connector: &str,
+        child_prefix: &str,
+    ) {
+        let Some(node) = forest.get(ulid) else {
+            return;
+        };
+        let name = node.name.as_deref().unwrap_or("-");
+        let pin = node
+            .parent
+            .as_ref()
+            .map(|e| format!("  @{}", e.snapshot))
+            .unwrap_or_default();
+        if !visited.insert(ulid) {
+            println!("{prefix}{connector}{name}  {ulid}  cycle!");
+            return;
+        }
+        println!("{prefix}{connector}{name}  {ulid}  {}{pin}", describe(node));
+        let kids = children.get(&ulid).map(Vec::as_slice).unwrap_or(&[]);
+        for (i, kid) in kids.iter().enumerate() {
+            let last = i == kids.len() - 1;
+            render(
+                forest,
+                children,
+                visited,
+                *kid,
+                &format!("{prefix}{child_prefix}"),
+                if last { "└─ " } else { "├─ " },
+                if last { "   " } else { "│  " },
+            );
+        }
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    for root in roots {
+        render(&forest, &children, &mut visited, root, "", "", "");
     }
     Ok(())
 }
