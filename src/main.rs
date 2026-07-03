@@ -1771,10 +1771,10 @@ fn tree_volumes(data_dir: &Path) -> std::io::Result<()> {
             .map(|e| format!("@{}  ", e.snapshot))
             .unwrap_or_default();
         if !visited.insert(ulid) {
-            println!("{prefix}{connector}{pin}{name}  {ulid}  cycle!");
+            println!("{prefix}{connector}{pin}{ulid}  {name}  cycle!");
             return;
         }
-        println!("{prefix}{connector}{pin}{name}  {ulid}  {}", describe(node));
+        println!("{prefix}{connector}{pin}{ulid}  {name}  {}", describe(node));
         let kids = children.get(&ulid).map(Vec::as_slice).unwrap_or(&[]);
         for (i, kid) in kids.iter().enumerate() {
             let last = i == kids.len() - 1;
