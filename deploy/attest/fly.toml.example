@@ -18,9 +18,6 @@ primary_region = "iad"
     # coord.toml [mint].url as http://<MINT_APP>.internal:8085.
     MINT_APP = "mint-for-elide"
 
-[env]
-  RUST_LOG = "info"
-
 # Durable state — the attest-ro credential and the identity keypair under
 # credentials/ and keys — lives here so it survives redeploys (matches
 # data_dir in coord.toml). No AWS_* secrets: coord B gets its S3 credentials

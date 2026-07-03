@@ -15,9 +15,6 @@ primary_region = "iad"
     # into coord.toml [store].bucket.
     DATA_BUCKET = "elide"
 
-[env]
-  RUST_LOG = "info"
-
 # Coordinator state — index/, cache/, credentials/, keys — lives here on the
 # volume so it survives redeploys (matches data_dir in coord.toml). The Tigris
 # read/write keypair is supplied as secrets, not here:

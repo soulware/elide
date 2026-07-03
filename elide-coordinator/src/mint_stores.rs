@@ -137,8 +137,16 @@ impl RoleStore {
                 source: e.into(),
             })?;
         let total_elapsed = mint_started.elapsed();
+        // The credential's baked-in scope caveats (`sub`, `aud`,
+        // `volume`, …) so the log line says who assumed and what the
+        // key is scoped to, not just which role.
+        let scope = self
+            .endpoint
+            .credential_scope(self.role, self.target)
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default();
         info!(
-            "[mint] assume role={} target={:?} assume={:.2?} total={:.2?} ttl={}s",
+            "[mint] assume role={} target={:?}{scope} assume={:.2?} total={:.2?} ttl={}s",
             self.role, self.target, assume_elapsed, total_elapsed, self.ttl_secs,
         );
 
