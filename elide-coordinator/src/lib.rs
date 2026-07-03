@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod key_shadow;
 pub mod lifecycle;
 pub mod lineage_forest;
+pub mod liveness;
 pub mod local_cond_store;
 pub mod log_init;
 pub mod log_relay;

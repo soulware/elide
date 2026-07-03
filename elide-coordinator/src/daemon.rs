@@ -384,6 +384,35 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // its volume's HEAD and the sole DELETEr of its superseded
     // inputs.
 
+    // Ancestor-liveness pass: heal missing ancestors, sweep
+    // unreferenced skeletons (`docs/design/ancestor-liveness.md`).
+    // Coordinator-wide — the lineage forest spans all of `by_id/` —
+    // so it runs as its own tick, not inside a per-volume loop. The
+    // first tick fires immediately: a boot onto a data_dir with a
+    // missing ancestor heals before the supervisor's backoff expires.
+    {
+        let data_dir = data_dir.clone();
+        let stores = stores.clone();
+        let liveness_interval = config.supervisor.liveness_interval;
+        tasks.spawn(async move {
+            let mut tick = tokio::time::interval(liveness_interval);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut condemned = std::collections::HashSet::new();
+            loop {
+                tick.tick().await;
+                if let Err(e) = elide_coordinator::liveness::liveness_pass(
+                    data_dir.as_ref(),
+                    &stores,
+                    &mut condemned,
+                )
+                .await
+                {
+                    warn!("[liveness] pass failed: {e}");
+                }
+            }
+        });
+    }
+
     let mut scan_tick = tokio::time::interval(scan_interval);
     scan_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consume the first tick so the loop body runs immediately at startup.
