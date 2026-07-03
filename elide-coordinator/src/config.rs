@@ -499,6 +499,11 @@ pub struct SupervisorConfig {
     /// How often root directories are re-scanned for newly-created forks.
     #[serde(default = "default_scan_interval", with = "humantime_serde")]
     pub scan_interval: Duration,
+
+    /// How often the ancestor-liveness pass runs: heal missing
+    /// ancestors, sweep unreferenced skeletons.
+    #[serde(default = "default_liveness_interval", with = "humantime_serde")]
+    pub liveness_interval: Duration,
 }
 
 fn default_drain_interval() -> Duration {
@@ -507,12 +512,16 @@ fn default_drain_interval() -> Duration {
 fn default_scan_interval() -> Duration {
     Duration::from_secs(30)
 }
+fn default_liveness_interval() -> Duration {
+    Duration::from_secs(30)
+}
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
             drain_interval: default_drain_interval(),
             scan_interval: default_scan_interval(),
+            liveness_interval: default_liveness_interval(),
         }
     }
 }

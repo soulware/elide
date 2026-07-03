@@ -173,22 +173,42 @@ RO credentials.
 
 ### Sweep and heal
 
-One pass, folded into the coordinator's existing tick loop, computes
-the reachable set once and acts in both directions:
+One pass (`liveness::liveness_pass`, its own coordinator-wide tick —
+`[supervisor].liveness_interval`, default 30s, first tick at boot)
+computes the forest once and acts in both directions:
 
-- **sweep**: delete skeletons outside the reachable set;
-- **heal**: for each anchor, if any lineage hop is missing its dir or its
-  read form is incomplete (missing `.idx` for a manifest segment,
-  missing manifest), run the existing `prefetch_indexes` chain walk to
-  re-materialise it — the same code the claim path uses, with a new
-  trigger: *lineage incompleteness* instead of *fork looks freshly
-  pulled*.
+- **heal**: for every anchor whose lineage reaches a `Missing` node,
+  run the existing `prefetch_indexes` chain walk — the same code the
+  claim path uses, triggered by *lineage incompleteness* instead of
+  *fork looks freshly pulled*. Anchors carrying a claiming/importing
+  marker are skipped (their own job hydrates them); healing is
+  otherwise ungated, since re-pulling a reachable ancestor is safe
+  regardless of what else is in flight.
+- **sweep**: delete skeletons outside the reachable set, under
+  **two-tick condemnation** — a skeleton dies only when two
+  consecutive clean passes agree it is unreferenced, so a fork or
+  claim that starts referencing it between the forest snapshot and
+  the delete gets a full tick to land its provenance.
+
+The sweep runs only on a **complete** forest, and a skipped pass
+resets all condemnation:
+
+- no `volume.claiming` / `volume.importing` markers anywhere — a
+  mid-claim fork's just-pulled ancestors are referenced by nothing
+  readable yet;
+- no lineage-walk errors — a failed walk contributes nothing to
+  reachability, so "unreferenced" is unreliable;
+- no live missing ancestors — a lineage walk stops at a missing hop,
+  so skeletons *above* the break look unreferenced until heal
+  re-pulls it.
 
 Heal turns the incident's terminal crash-loop into a self-repairing
 blip: the supervisor's open fails, the next tick re-pulls the parent
 skeleton and sections from the bucket, the next spawn succeeds. It also
 covers any other cause of a missing ancestor (partial pull, operator
-surgery, disk restore).
+surgery, disk restore). The boot-time first tick means a machine
+restarted into the broken state heals before the supervisor's backoff
+expires.
 
 ### Operator surface: `volume tree`
 
@@ -222,14 +242,12 @@ wired to deletion.
 
 The sweep must not eat a skeleton pulled for a claim that has not yet
 finalized: mid-claim, the new fork's provenance may not be readable, so
-nothing on disk references the just-pulled ancestors. `volume.claiming`
-and `volume.importing` dirs are anchors, but their lineages may be
-unreadable; options, to be settled at implementation time:
-
-- skip the sweep entirely while any claiming/importing marker exists
-  (simplest; claims are seconds long);
-- exempt skeletons younger than a grace window;
-- have the claim job register pulled ULIDs in its in-flight state.
+nothing on disk references the just-pulled ancestors. The complete-
+forest gate handles it — the sweep skips entirely while any
+claiming/importing marker exists (claims are seconds long), and
+two-tick condemnation plus a final marker re-check before each
+`remove_dir_all` covers jobs that anchor a directory between the
+forest snapshot and the delete.
 
 ## Field recovery and the stale hint
 
@@ -268,9 +286,8 @@ subsystem (#650). It should name the actual recovery
 
 ## Open questions
 
-- Sweep cadence. (Removing an *unreferenced* target already deletes at
-  the verb, so the sweep only collects skeletons orphaned by later
-  removals of their dependents.)
 - Whether `heal` should also verify skeleton *completeness* against the
   manifest on every tick or only on open-failure signal from the
-  supervisor (cost: one chain walk per anchor per tick).
+  supervisor (cost: one chain walk per anchor per tick). Today heal
+  triggers on a missing *directory*; a present-but-partial skeleton
+  (manifest without its `.idx` sections) still fails at open.
