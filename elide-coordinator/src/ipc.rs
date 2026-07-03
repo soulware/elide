@@ -191,11 +191,14 @@ pub enum Request {
     /// continues to serve.
     NotifyVolumeReady { vol_ulid: Ulid },
     /// Remove the local instance of a volume: `by_name/<volume>`
-    /// symlink + `by_id/<vol_ulid>/` directory. Bucket records are
-    /// untouched. With `force = false`, refuses if `pending/` or
-    /// `wal/` is non-empty. The CLI resolves the user-typed name to a
-    /// ULID before sending so the coordinator never re-reads
-    /// `names/<name>` for the deletion decision.
+    /// symlink + `by_id/<vol_ulid>/` directory — unless another local
+    /// volume's lineage walks through that directory, in which case it
+    /// is demoted to a readonly ancestor skeleton instead (see
+    /// [`RemoveReply`]). Bucket records are untouched. With
+    /// `force = false`, refuses if `pending/` or `wal/` is non-empty.
+    /// The CLI resolves the user-typed name to a ULID before sending
+    /// so the coordinator never re-reads `names/<name>` for the
+    /// deletion decision.
     Remove {
         volume_ulid: Ulid,
         #[serde(default)]
@@ -355,6 +358,16 @@ pub struct StatusRemoteReply {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseReply {
     pub handoff_snapshot: Ulid,
+}
+
+/// Reply for [`Request::Remove`]. `kept_as_ancestor = true` means the
+/// directory was demoted to a readonly ancestor skeleton instead of
+/// deleted, because `dependents` other local volumes' lineages walk
+/// through it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveReply {
+    pub kept_as_ancestor: bool,
+    pub dependents: usize,
 }
 
 /// Internal return type for `claim_volume_bucket_op`, the synchronous

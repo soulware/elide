@@ -717,9 +717,17 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = coord.remove_volume(volume_ulid, force) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
+                match coord.remove_volume(volume_ulid, force) {
+                    Ok(reply) if reply.kept_as_ancestor => println!(
+                        "{name}: kept as read-only ancestor (referenced by {} volume{})",
+                        reply.dependents,
+                        if reply.dependents == 1 { "" } else { "s" }
+                    ),
+                    Ok(_) => println!("{name}: removed"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
 

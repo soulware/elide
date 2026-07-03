@@ -143,26 +143,33 @@ pool, where it survives exactly as long as forks reference it.
 ### Remove: unbind + demote
 
 `remove_volume` keeps its current preconditions (halted, flushed unless
-`--force`, ownership released first). It then always unbinds the name
-and settles S3 ownership as today, but instead of `remove_dir_all`:
+`--force`, ownership released first). It unbinds the name and settles
+S3 ownership as today, then asks the forest whether any other anchor's
+lineage reaches the target (`LineageForest::referencing_anchors`):
 
-- drop `volume.key`, `wal/`, `pending/`, `gc/`, `volume.lock`,
-  `volume.toml`, `control.sock`;
-- keep `index/`, `snapshots/`, `volume.pub`, `volume.provenance`, and
-  `cache/` (already-fetched bodies keep serving dependents);
-- write `volume.readonly`.
+- **unreferenced** → `remove_dir_all`, as today — disk is freed at the
+  verb, without waiting for a sweep tick;
+- **referenced** → demote to the skeleton shape
+  (`volume_state::demote_to_skeleton`): drop `volume.key`, `wal/`,
+  `pending/`, `gc/`, `uploaded/`, `volume.lock`, `volume.toml`,
+  `control.sock`, and the pid/stopped/released markers; keep `index/`,
+  `snapshots/`, `volume.pub`, `volume.provenance`, and `cache/`
+  (already-fetched bodies keep serving dependents); write
+  `volume.readonly` last, so a crash mid-demotion leaves an anchor
+  with partial state rather than a half-stripped skeleton.
 
-The result is byte-shape-identical to what `pull_volume_skeleton` +
-prefetch would produce, so "removed here" and "claimed onto a fresh
-coord" converge to the same on-disk state. The signing-key shadow at
-`keys/<ulid>.key` survives, as today, so a released name stays
-reclaimable.
+The demoted result is byte-shape-identical to what
+`pull_volume_skeleton` + prefetch would produce, so "removed here" and
+"claimed onto a fresh coord" converge to the same on-disk state. The
+signing-key shadow at `keys/<ulid>.key` survives, as today, so a
+released name stays reclaimable.
 
-Remove never refuses for dependency reasons and needs no dependency
-check of its own — an unreferenced skeleton is the sweep's problem, not
-the verb's. The reply should still say what happened
-(`kept as read-only ancestor; N volume(s) reference it` /
-`removed`), so an operator reclaiming disk space is not surprised.
+Remove never refuses for dependency reasons, and the reply says what
+happened (`kept as read-only ancestor (referenced by N volumes)` /
+`removed`), so an operator reclaiming disk space is not surprised. The
+per-volume IAM teardown that follows a remove is skipped on demotion —
+dependents still read the target's `by_id/` prefix with per-ancestor
+RO credentials.
 
 ### Sweep and heal
 
@@ -261,9 +268,9 @@ subsystem (#650). It should name the actual recovery
 
 ## Open questions
 
-- Sweep cadence, and whether `remove` runs a synchronous sweep so
-  removing the *last* referent frees disk immediately.
-- Exact wording of the remove reply for the demoted case.
+- Sweep cadence. (Removing an *unreferenced* target already deletes at
+  the verb, so the sweep only collects skeletons orphaned by later
+  removals of their dependents.)
 - Whether `heal` should also verify skeleton *completeness* against the
   manifest on every tick or only on open-failure signal from the
   supervisor (cost: one chain walk per anchor per tick).

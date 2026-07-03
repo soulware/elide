@@ -287,6 +287,47 @@ pub fn clear_claiming_marker(vol_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Strip a fork directory down to the readonly ancestor-skeleton
+/// shape: the byte-shape `pull_volume_skeleton` + prefetch produce, so
+/// "demoted by remove" and "pulled onto a fresh coord" converge to the
+/// same on-disk state (`docs/design/ancestor-liveness.md`).
+///
+/// Drops the write capability and every lifecycle surface — the key,
+/// lock, config, control socket, pid and state markers, and the
+/// `wal/`, `pending/`, `gc/`, `uploaded/` working directories. Keeps
+/// the read form dependents walk: `index/`, `snapshots/`,
+/// `volume.pub`, `volume.provenance`, and `cache/` (already-fetched
+/// bodies keep serving). Writes `volume.readonly` last, so a crash
+/// mid-demotion leaves an anchor with partial state, never a
+/// half-stripped dir already classified as a skeleton.
+pub fn demote_to_skeleton(vol_dir: &Path) -> std::io::Result<()> {
+    let remove_file = |name: &str| match std::fs::remove_file(vol_dir.join(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    let remove_dir = |name: &str| match std::fs::remove_dir_all(vol_dir.join(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    for file in [
+        elide_core::signing::VOLUME_KEY_FILE,
+        "volume.lock",
+        "volume.toml",
+        "control.sock",
+        PID_FILE,
+        STOPPED_FILE,
+        RELEASED_FILE,
+    ] {
+        remove_file(file)?;
+    }
+    for dir in ["wal", "pending", "gc", "uploaded"] {
+        remove_dir(dir)?;
+    }
+    std::fs::write(vol_dir.join("volume.readonly"), "")
+}
+
 /// The fork directory for `vol`: `data_dir/by_id/<vol>`.
 pub fn fork_dir(data_dir: &Path, vol: Ulid) -> PathBuf {
     data_dir.join("by_id").join(vol.to_string())

@@ -70,9 +70,9 @@ use elide_coordinator::config::{StoreSection, store_config};
 use elide_coordinator::ipc::{
     self, ClaimAttachEvent, ClaimStartReply, CreateReply, Envelope, EvictReply, ForkAttachEvent,
     ForkStartReply, GenerateFilemapReply, ImportAttachEvent, ImportStartReply, ImportStatusReply,
-    IpcError, PeerClaimerTokenReply, PullReadonlyReply, RegisterReply, ReleaseReply, Request,
-    SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply, UpdateReply,
-    VolumeEventsReply,
+    IpcError, PeerClaimerTokenReply, PullReadonlyReply, RegisterReply, ReleaseReply, RemoveReply,
+    Request, SnapshotReply, StatusRemoteReply, StatusReply, StoreConfigReply, StoreCredsReply,
+    UpdateReply, VolumeEventsReply,
 };
 use elide_coordinator::macaroon::{self, Caveat, Macaroon, Scope, VerifyCtx};
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE, write_released_marker};
@@ -399,11 +399,16 @@ async fn dispatch_json(
             let result = remove_volume(volume_ulid, force, ctx).await;
             // After local removal, tear down the per-volume IAM key +
             // policy. Best-effort: any IAM error is logged inside
-            // `release` and does not block the IPC reply.
-            if let (Ok(Some(vol_ulid)), Some(credentialer)) = (&result, ctx.credentialer.as_ref()) {
-                credentialer.release_volume_ro(*vol_ulid).await;
+            // `release` and does not block the IPC reply. Skipped when
+            // the directory was demoted rather than deleted — dependents
+            // still read this volume's by_id prefix with per-ancestor RO
+            // credentials.
+            if let (Ok(reply), Some(credentialer)) = (&result, ctx.credentialer.as_ref())
+                && !reply.kept_as_ancestor
+            {
+                credentialer.release_volume_ro(volume_ulid).await;
             }
-            let env: Envelope<()> = result.map(|_| ()).into();
+            let env: Envelope<RemoveReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
@@ -1168,7 +1173,7 @@ async fn remove_volume(
     volume_ulid: ulid::Ulid,
     force: bool,
     ctx: &IpcContext,
-) -> Result<Option<ulid::Ulid>, IpcError> {
+) -> Result<RemoveReply, IpcError> {
     use elide_coordinator::volume_state::VolumeLifecycle;
     let data_dir: &Path = &ctx.data_dir;
     let volume_ulid_str = volume_ulid.to_string();
@@ -1177,9 +1182,6 @@ async fn remove_volume(
         .map_err(|e| IpcError::internal(format!("resolving by_id/{volume_ulid_str}: {e}")))?;
     let vol_dir = vol_dir
         .ok_or_else(|| IpcError::not_found(format!("volume not found: {volume_ulid_str}")))?;
-    // ULID is the input; carry it through to the caller for the
-    // post-delete IAM cleanup hook.
-    let vol_ulid = Some(volume_ulid);
 
     // Best-effort reverse-resolve of the local name claim, used for
     // the `data_dir/remote/<name>` breadcrumb, the by_name symlink
@@ -1261,8 +1263,21 @@ async fn remove_volume(
         let _ = std::fs::remove_file(data_dir.join("by_name").join(name));
     }
 
-    std::fs::remove_dir_all(&vol_dir)
-        .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
+    // Directories are shared state: another local volume's fork chain
+    // may walk through this one (`docs/design/ancestor-liveness.md`).
+    // Referenced → demote to the readonly ancestor-skeleton shape;
+    // unreferenced → delete outright, freeing the disk immediately.
+    let dependents = elide_coordinator::lineage_forest::build_forest(data_dir)
+        .map_err(|e| IpcError::internal(format!("lineage forest: {e}")))?
+        .referencing_anchors(volume_ulid);
+    let kept_as_ancestor = !dependents.is_empty();
+    if kept_as_ancestor {
+        elide_coordinator::volume_state::demote_to_skeleton(&vol_dir)
+            .map_err(|e| IpcError::internal(format!("demote to skeleton failed: {e}")))?;
+    } else {
+        std::fs::remove_dir_all(&vol_dir)
+            .map_err(|e| IpcError::internal(format!("remove failed: {e}")))?;
+    }
 
     // The release flip (when it ran) already del_dev'd the fork's ublk
     // device, so tear down here only when nothing was released — a second
@@ -1274,11 +1289,22 @@ async fn remove_volume(
         elide_coordinator::ublk_sweep::teardown_bound_device(&vol_dir, id).await;
     }
 
-    match local_name.as_deref() {
-        Some(name) => info!("[inbound] removed volume {name} ({volume_ulid_str})"),
-        None => info!("[inbound] removed volume {volume_ulid_str}"),
+    let removed = match local_name.as_deref() {
+        Some(name) => format!("{name} ({volume_ulid_str})"),
+        None => volume_ulid_str.clone(),
+    };
+    if kept_as_ancestor {
+        info!(
+            "[inbound] removed volume {removed}; kept as readonly ancestor of {} volume(s)",
+            dependents.len()
+        );
+    } else {
+        info!("[inbound] removed volume {removed}");
     }
-    Ok(vol_ulid)
+    Ok(RemoveReply {
+        kept_as_ancestor,
+        dependents: dependents.len(),
+    })
 }
 
 /// Best-effort reverse-resolve from `volume_ulid` to the current local
@@ -3298,6 +3324,83 @@ mod tests {
             .await
             .expect_err("absent volume should be NotFound");
         assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn remove_volume_demotes_when_lineage_referenced() {
+        use elide_core::signing::{
+            ParentRef, ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
+            generate_keypair, write_provenance,
+        };
+        let tmp = TempDir::new().unwrap();
+        let parent_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAG";
+        let (parent_dir, link) =
+            setup_removable_volume(tmp.path(), "vol", parent_ulid_str, None, true);
+        let parent_key = generate_keypair(&parent_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &parent_dir,
+            &parent_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::root(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(parent_dir.join("index")).unwrap();
+        std::fs::create_dir_all(parent_dir.join("wal")).unwrap();
+
+        // A second keyed fork whose signed provenance names the target
+        // as parent — the target's directory is load-bearing.
+        let child_dir = tmp.path().join("by_id").join("01JQAAAAAAAAAAAAAAAAAAAAAH");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let child_key = generate_keypair(&child_dir, VOLUME_KEY_FILE, VOLUME_PUB_FILE).unwrap();
+        write_provenance(
+            &child_dir,
+            &child_key,
+            VOLUME_PROVENANCE_FILE,
+            &ProvenanceLineage::fork(ParentRef {
+                volume_ulid: parent_ulid_str.to_owned(),
+                snapshot_ulid: "01JQAAAAAAAAAAAAAAAAAAAAAJ".to_owned(),
+                pubkey: parent_key.verifying_key().to_bytes(),
+            }),
+        )
+        .unwrap();
+
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        let reply = remove_volume(ulid_from(parent_ulid_str), false, &ctx)
+            .await
+            .unwrap();
+
+        assert!(reply.kept_as_ancestor);
+        assert_eq!(reply.dependents, 1);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "by_name link is unbound either way"
+        );
+        assert!(parent_dir.exists(), "referenced dir must survive");
+        assert!(
+            parent_dir.join("volume.readonly").exists(),
+            "demoted to skeleton shape"
+        );
+        assert!(!parent_dir.join(VOLUME_KEY_FILE).exists());
+        assert!(!parent_dir.join("volume.toml").exists());
+        assert!(!parent_dir.join(STOPPED_FILE).exists());
+        assert!(!parent_dir.join("wal").exists());
+        assert!(parent_dir.join("index").exists(), "read form retained");
+        assert!(parent_dir.join(VOLUME_PROVENANCE_FILE).exists());
+        assert!(parent_dir.join(VOLUME_PUB_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn remove_volume_unreferenced_reply_says_removed() {
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid_str = "01JQAAAAAAAAAAAAAAAAAAAAAK";
+        let (vol_dir, _link) = setup_removable_volume(tmp.path(), "vol", vol_ulid_str, None, true);
+        let ctx = minimal_ctx(tmp.path(), empty_store());
+        let reply = remove_volume(ulid_from(vol_ulid_str), false, &ctx)
+            .await
+            .unwrap();
+        assert!(!reply.kept_as_ancestor);
+        assert_eq!(reply.dependents, 0);
+        assert!(!vol_dir.exists());
     }
 
     #[tokio::test]
