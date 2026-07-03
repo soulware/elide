@@ -1763,16 +1763,18 @@ fn tree_volumes(data_dir: &Path) -> std::io::Result<()> {
             return;
         };
         let name = node.name.as_deref().unwrap_or("-");
+        // The pin leads the row: siblings sort by it, so it reads as
+        // the position in the parent's history the fork branched from.
         let pin = node
             .parent
             .as_ref()
-            .map(|e| format!("  @{}", e.snapshot))
+            .map(|e| format!("@{}  ", e.snapshot))
             .unwrap_or_default();
         if !visited.insert(ulid) {
-            println!("{prefix}{connector}{name}  {ulid}  cycle!");
+            println!("{prefix}{connector}{pin}{name}  {ulid}  cycle!");
             return;
         }
-        println!("{prefix}{connector}{name}  {ulid}  {}{pin}", describe(node));
+        println!("{prefix}{connector}{pin}{name}  {ulid}  {}", describe(node));
         let kids = children.get(&ulid).map(Vec::as_slice).unwrap_or(&[]);
         for (i, kid) in kids.iter().enumerate() {
             let last = i == kids.len() - 1;
