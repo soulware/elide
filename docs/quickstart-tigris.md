@@ -6,7 +6,7 @@ This guide uses **static credentials** shared between coordinator and volume —
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`) and binaries built per [quickstart.md](quickstart.md).
+- Rust toolchain (`cargo`) and binaries built per [quickstart-local.md](quickstart-local.md).
 - A Tigris account ([console.storage.dev](https://console.storage.dev)) with:
   - A bucket (e.g. `elide-test`)
   - An access key pair — **Admin** scope on the bucket is sufficient for a single-credentials test. For the eventual volume/coordinator split, mint a separate **Read-only** key pair for the volume.

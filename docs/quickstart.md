@@ -1,113 +1,189 @@
 # Quickstart
 
-Import an OCI image, fork it, and serve it over ublk.
+Deploy a standalone Elide coordinator on [Fly.io](https://fly.io) backed by
+[Tigris](https://www.tigrisdata.com) object storage, create a block volume,
+put a filesystem on it, and write a file. Part 2 moves the live volume to a
+second machine.
+
+This uses `deploy/elide-standalone/` — a simplified deployment where the
+coordinator talks to Tigris directly with one read/write keypair. See
+[deploy/elide-standalone/README.md](../deploy/elide-standalone/README.md) for
+its security model, and `deploy/elide/` for the mint-backed alternative with
+per-volume scoped credentials.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`)
-- `mke2fs` from e2fsprogs (macOS: `brew install e2fsprogs`)
-- Linux with `CONFIG_BLK_DEV_UBLK` for the block device (on macOS use QEMU direct kernel boot — see [vm-boot.md](vm-boot.md))
+- A [Fly.io](https://fly.io) account and the [`fly` CLI](https://fly.io/docs/flyctl/install/), logged in (`fly auth login`)
 
-## Build
+Everything below runs from `deploy/elide-standalone/`:
 
 ```sh
-cargo build -p elide -p elide-import -p elide-coordinator
+cd deploy/elide-standalone
 ```
 
-Binaries land in `target/debug/`.
-
-## Start the coordinator
-
-The coordinator supervises volume processes, drains segments to the store, and handles imports. Run it in a dedicated terminal from the project root:
+## 1. Create the Fly app
 
 ```sh
-./target/debug/elide-coordinator serve
+fly apps create my-elide
 ```
 
-With no config file it defaults to `elide_data/` for volume state and `elide_store/` for local object storage — no setup needed for local development.
+Pick your own app name — it's global across Fly. Use it wherever `my-elide`
+appears below.
 
-## Import an OCI image
+## 2. Create a Tigris bucket
+
+Create the bucket with the Tigris integration, targeting the app:
 
 ```sh
-./target/debug/elide volume import start ubuntu-22.04 ubuntu:22.04
-# prints an import job ULID, e.g.: 01JQA3NDEKTSV4RRFFQ69G5FAV
+fly storage create -a my-elide -n my-elide-data
 ```
 
-Stream the import log until completion:
+This sets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` on the app — the
+two secrets the coordinator signs S3 operations with.
+
+To use a bucket created another way (the Fly.io dashboard, an existing
+bucket), copy its keypair from the Tigris console and set the secrets
+directly:
 
 ```sh
-./target/debug/elide volume import attach 01JQA3NDEKTSV4RRFFQ69G5FAV
+fly secrets set -a my-elide AWS_ACCESS_KEY_ID=tid_… AWS_SECRET_ACCESS_KEY=tsec_…
 ```
 
-Or poll the state:
+Note the bucket name — `fly storage list` shows it — you'll need it in
+step 3.
+
+## 3. Configure fly.toml
 
 ```sh
-./target/debug/elide volume import status 01JQA3NDEKTSV4RRFFQ69G5FAV
-# ubuntu-22.04: done
+cp fly.toml.example fly.toml
 ```
 
-On Apple Silicon, `elide-import` auto-selects `arm64`.
+Edit `fly.toml`:
 
-## Check volumes
+- `app` — your app name (`my-elide`)
+- `primary_region` — your preferred [region](https://fly.io/docs/reference/regions/)
+- `DATA_BUCKET` build arg — the Tigris bucket name from step 2; the
+  Dockerfile bakes it into the coordinator's config
+
+This completes the configuration: the Tigris endpoint and region are baked
+into the image's `coord.toml`, and the keypair arrives via the secrets.
+
+## 4. Create the machine's state volume
+
+Coordinator state (segment indexes, cache, keys) lives on a Fly volume so it
+survives redeploys:
 
 ```sh
-./target/debug/elide volume list
-# ubuntu-22.04  01JQA3...  readonly
+fly volumes create elide_data --size 1 -r <region> -a my-elide
 ```
+
+## 5. Deploy
 
 ```sh
-./target/debug/elide volume inspect ubuntu-22.04
+./deploy.sh
 ```
 
-## Branch a writable replica for a VM
+`deploy.sh` resolves the latest elide release tag, verifies its binaries
+exist, and runs `fly deploy` with that version. `./deploy.sh v0.1.3` pins a
+specific release.
 
-Create a writable replica branched from the imported base:
+The coordinator comes up serving immediately. If the keypair secrets are
+missing it fails loudly at startup.
+
+## 6. Create an elide volume
+
+The coordinator's control plane is a Unix socket inside the machine, so
+volume operations run over SSH:
 
 ```sh
-./target/debug/elide volume create vm1 --from ubuntu-22.04
+fly ssh console -a my-elide
 ```
 
-`--from` accepts a volume name (resolved locally or against the remote
-store), a bare volume ULID, or an explicit `<vol_ulid>/<snap_ulid>` pin.
-The explicit-pin form is forward-compatible — see
-[design/replica-model.md](design/replica-model.md).
-
-## Serve the volume
-
-A coordinator that can serve ublk — running as root with the module loaded
-(`sudo modprobe ublk_drv`, one-time) — gives new volumes the ublk transport
-by default: `vm1` exposes `/dev/ublkbN` on first start, with the
-kernel-allocated device id recorded in `volume.toml` for crash recovery.
-
-The unprivileged coordinator above can't serve ublk, so `vm1` starts
-IPC-only (no host-visible block device). Attach the transport explicitly:
+Inside the machine:
 
 ```sh
-./target/debug/elide volume update vm1 --ublk
+elide volume create --size 1G vol1
 ```
 
-The volume then serves over ublk once the coordinator runs as root. Then:
+The coordinator runs as root with `ublk_drv` loaded, so the volume comes up
+serving a kernel block device: `/dev/ublkb0`.
+
+## 7. Format, mount, write
+
+Still inside the machine:
 
 ```sh
-sudo mount /dev/ublkb0 /mnt
+mkfs.ext4 /dev/ublkb0
+mkdir -p /mnt/vol1
+mount /dev/ublkb0 /mnt/vol1
+echo "hello!" > /mnt/vol1/hello.txt
+cat /mnt/vol1/hello.txt
 ```
 
-Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
+Writes land in the volume's write-ahead log; the coordinator drains sealed
+segments to Tigris automatically every few seconds. `elide volume list`
+shows the volume's state, and `elide volume events vol1` shows its event
+log.
 
-## Take a snapshot
+## Part 2 — Move the volume to a second machine
+
+A volume has exactly one owner. Handing it to another machine is
+stop-and-release on the current owner, then claim-and-start on the new one —
+the bucket is the sole rendezvous between the two coordinators.
+
+### 1. Scale to two machines
+
+Each machine needs its own `elide_data` Fly volume; `fly scale` offers to
+create the second one:
 
 ```sh
-./target/debug/elide volume snapshot vm1
-# prints the snapshot ULID
+fly scale count 2 -a my-elide
 ```
 
-`vm1/snapshots/<ulid>` is now a branch point — `elide volume create vm2 --from vm1` will branch a new writable replica from the latest snapshot.
-
-## Clean up
+Get both machine IDs:
 
 ```sh
-./target/debug/elide volume stop vm1
-./target/debug/elide volume remove vm1
-./target/debug/elide volume stop ubuntu-22.04
-./target/debug/elide volume remove ubuntu-22.04
+fly machine list -a my-elide
 ```
+
+### 2. Release on machine 1
+
+SSH to the machine that owns `vol1` (the original one):
+
+```sh
+fly ssh console -a my-elide --machine <machine1-id>
+```
+
+Inside:
+
+```sh
+umount /mnt/vol1
+elide volume release vol1
+```
+
+`release` stops the volume — drains the remaining WAL to Tigris, publishes a
+stop snapshot, detaches the block device — and then releases the name in the
+bucket so any coordinator may claim it.
+
+### 3. Claim on machine 2
+
+SSH to the other machine:
+
+```sh
+fly ssh console -a my-elide --machine <machine2-id>
+```
+
+Inside:
+
+```sh
+elide volume claim vol1
+elide volume start vol1
+mkdir -p /mnt/vol1
+mount /dev/ublkb0 /mnt/vol1
+cat /mnt/vol1/hello.txt
+# hello!
+```
+
+`claim` takes ownership of the released name; `start` serves it over ublk,
+demand-fetching segment data from Tigris as it is read. (`elide volume start
+vol1 --claim` does both in one step.)

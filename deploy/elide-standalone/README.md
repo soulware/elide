@@ -49,4 +49,4 @@ operations run there:
 The keypair is shared, unscoped, and long-lived: every volume the coordinator
 serves can read and write the whole bucket. There is no per-volume IAM scoping
 and no operator authorization on writes. That is the deliberate trade for a
-single-knob deploy; `deploy/elide/` is the scoped, mint-backed alternative.
+simplified deploy; `deploy/elide/` is the scoped, mint-backed alternative.
