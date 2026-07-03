@@ -22,9 +22,6 @@ primary_region = "iad"
     # [mint].attestation_transport as http://<ATTEST_APP>.internal:8087.
     ATTEST_APP = "elide-attest"
 
-[env]
-  RUST_LOG = "info"
-
 # Coordinator state — index/, cache/, credentials/, keys — lives here on the
 # volume so it survives redeploys (matches data_dir in coord.toml). No AWS_*
 # secrets: the coordinator gets its S3 credentials from mint via assume-role.

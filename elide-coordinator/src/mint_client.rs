@@ -322,6 +322,14 @@ impl WireMacaroon {
         })
     }
 
+    /// Every first-party caveat as `(name, value)`.
+    pub(crate) fn first_party_caveats(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.caveats.iter().filter_map(|c| match c {
+            Caveat::FirstParty { name, value } => Some((name.as_str(), value.as_str())),
+            _ => None,
+        })
+    }
+
     /// The value of the first-party caveat named `name`, if present. Used
     /// to read the anchor's `aud` so a self-issued discharge declares the
     /// same audience the primary clears under (`crate::enroll`).
@@ -870,22 +878,41 @@ impl MintEndpoint {
         Ok(credential)
     }
 
+    /// On-disk location of the stored credential for `(role, target)`.
+    /// Coord roles store one credential per role; attested roles store
+    /// one per baked volume (the volume is finalized into the credential
+    /// at `exchange-finalize`, so a credential is per-volume).
+    fn credential_path(&self, role: &str, target: AssumeTarget) -> std::path::PathBuf {
+        let base = self.data_dir.join("credentials").join(role);
+        match target.volume() {
+            Some(v) => base.join(v.to_string()),
+            None => base,
+        }
+    }
+
+    /// The stored credential's first-party caveats rendered as
+    /// space-separated `name=value` pairs — the scope mint baked in at
+    /// enrollment/finalize (`sub`, `aud`, `volume`, …), for the assume
+    /// log line. `cnf` is skipped (a base64 key-confirmation blob).
+    /// `None` when the credential is absent or undecodable.
+    pub(crate) fn credential_scope(&self, role: &str, target: AssumeTarget) -> Option<String> {
+        let stored = std::fs::read_to_string(self.credential_path(role, target)).ok()?;
+        let mac = WireMacaroon::decode(&stored).ok()?;
+        let parts: Vec<String> = mac
+            .first_party_caveats()
+            .filter(|(name, _)| *name != "cnf")
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+
     pub async fn assume_role(
         &self,
         role: &str,
         ttl_secs: u64,
         target: AssumeTarget,
     ) -> io::Result<IssuedCredentials> {
-        // Coord roles store one credential per role; attested roles store
-        // one per baked volume (the volume is finalized into the credential
-        // at `exchange-finalize`, so a credential is per-volume).
-        let cred_path = {
-            let base = self.data_dir.join("credentials").join(role);
-            match target.volume() {
-                Some(v) => base.join(v.to_string()),
-                None => base,
-            }
-        };
+        let cred_path = self.credential_path(role, target);
         let stored = match std::fs::read_to_string(&cred_path) {
             Ok(s) => s,
             // An attested volume role's per-volume credential is finalized
@@ -1237,6 +1264,48 @@ mod tests {
         let expected = mint_like(&root, 0, nonce, &[("aud", "mint"), ("exp", "1700000000")]);
         assert_eq!(m.encode(), expected);
         assert_eq!(m.caveats.len(), 2);
+    }
+
+    #[test]
+    fn credential_scope_renders_first_party_caveats_skipping_cnf() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let identity = Arc::new(
+            CoordinatorIdentity::load_or_generate(tmp.path()).expect("identity load_or_generate"),
+        );
+        let cfg = MintConfig {
+            url: "unix:/tmp/elide-mint-test.sock".to_owned(),
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            attestation_transport: None,
+        };
+        let endpoint = MintEndpoint::new(&cfg, tmp.path().to_path_buf(), identity);
+
+        let wire = mint_like(
+            &[7u8; 32],
+            0,
+            [3u8; NONCE_LEN],
+            &[
+                ("sub", "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                ("cnf", "a2V5YmxvYg"),
+                ("aud", "mint"),
+            ],
+        );
+        let creds_dir = tmp.path().join("credentials");
+        std::fs::create_dir_all(&creds_dir).expect("mkdir credentials");
+        std::fs::write(creds_dir.join("attest-ro"), wire).expect("write credential");
+
+        assert_eq!(
+            endpoint
+                .credential_scope("attest-ro", AssumeTarget::Coord)
+                .as_deref(),
+            Some("sub=01ARZ3NDEKTSV4RRFFQ69G5FAV aud=mint"),
+            "caveats render in chain order with cnf elided"
+        );
+        assert_eq!(
+            endpoint.credential_scope("coord-ro", AssumeTarget::Coord),
+            None,
+            "absent credential renders no scope"
+        );
     }
 
     #[test]
