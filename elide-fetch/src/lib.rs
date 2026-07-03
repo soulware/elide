@@ -96,7 +96,7 @@ impl FetchConfig {
     ///
     /// Returns `Ok(None)` only if none of the above is present.
     ///
-    /// Note: CLI commands (`remote list`, `remote pull`, `create --from`)
+    /// Note: CLI commands (e.g. `create --from`)
     /// should prefer asking a running coordinator for config+creds via its
     /// IPC socket before falling through to this function. `FetchConfig`
     /// intentionally does not read `coordinator.toml` itself — the config

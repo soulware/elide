@@ -104,7 +104,7 @@ pub fn verify_ancestor_manifests(fork_dir: &Path, by_id_dir: &Path) -> io::Resul
         let parent_dir = resolve_ancestor_dir(by_id_dir, &current_parent.volume_ulid);
         if !parent_dir.exists() {
             return Err(io::Error::other(format!(
-                "ancestor {} not found locally (run `elide volume remote pull` first)",
+                "ancestor {} not found locally",
                 current_parent.volume_ulid
             )));
         }
