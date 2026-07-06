@@ -1243,9 +1243,49 @@ impl Volume {
             return Ok(StagedApply::Cancelled);
         }
 
+        // Lazily-read full-file layout of the output (still at `tmp_path`
+        // until the rename below): Delta locations against a full segment
+        // file need its `body_length` to find the delta body section.
+        let mut delta_full: Option<extentindex::DeltaBodySource> = None;
         for (i, e) in entries.iter().enumerate() {
             // DedupRef and Zero entries don't own a body.
             if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
+                continue;
+            }
+            if e.kind == EntryKind::Delta {
+                // Carried Delta entries register in the delta index, as
+                // the disk rebuild does — planting them in the DATA map
+                // routes reads through the body path with
+                // `stored_length == 0` and serves garbage or EIO. The
+                // location is `Full` against the bare `gc/<new_ulid>`
+                // file; the gc-carried promote flips it to `Cached`.
+                let should_update = match self.extent_index.lookup_delta(&e.hash) {
+                    None => self.extent_index.lookup(&e.hash).is_none(),
+                    Some(loc) => inputs.contains(&loc.segment_id),
+                };
+                if should_update {
+                    let body_source = match delta_full {
+                        Some(s) => s,
+                        None => {
+                            let body_length = segment::read_segment_layout(&tmp_path)?.body_length;
+                            let s = extentindex::DeltaBodySource::Full {
+                                body_section_start: new_bss,
+                                body_length,
+                            };
+                            delta_full = Some(s);
+                            s
+                        }
+                    };
+                    Arc::make_mut(&mut self.extent_index).insert_delta(
+                        e.hash,
+                        extentindex::DeltaLocation {
+                            segment_id: new_ulid,
+                            entry_idx: i as u32,
+                            body_source,
+                            options: e.delta_options.clone(),
+                        },
+                    );
+                }
                 continue;
             }
             let current = self.extent_index.lookup(&e.hash);
@@ -1959,6 +1999,19 @@ impl Volume {
                 ulid,
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
             );
+
+            // Carried Delta entries: the delta blob now lives in the
+            // `cache/<ulid>.delta` sidecar rather than the bare
+            // `gc/<ulid>` file, so flip `DeltaBodySource::Full →
+            // Cached`. CAS against `segment_id == ulid` so a
+            // concurrent repoint at a newer segment wins.
+            for entry in entries.iter() {
+                if entry.kind != EntryKind::Delta {
+                    continue;
+                }
+                Arc::make_mut(&mut self.extent_index)
+                    .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
+            }
         }
         let caller = if is_drain {
             "apply_promote_segment_result_drain"

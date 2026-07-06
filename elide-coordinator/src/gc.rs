@@ -2811,6 +2811,118 @@ mod tests {
         );
     }
 
+    /// Regression for the 2026-07-06 quickstart incident: a GC fold
+    /// that keeps a fully-live Delta entry must leave its LBAs readable
+    /// through the live, incrementally-updated read state — the same
+    /// daemon that applied the handoff, no reopen. The reopen-based
+    /// sibling test above rebuilds the index from disk and cannot see
+    /// an incremental-update divergence.
+    #[tokio::test]
+    async fn gc_fold_kept_delta_readable_without_reopen() {
+        use elide_core::segment::{DeltaOption, write_segment_with_delta_body};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let signer =
+            elide_core::signing::load_signer(dir, elide_core::signing::VOLUME_KEY_FILE).unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut parent_bytes = vec![0u8; 4 * 4096];
+        for (i, b) in parent_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let parent_hash = blake3::hash(&parent_bytes);
+
+        let mut child_bytes = parent_bytes.clone();
+        for b in &mut child_bytes[0..256] {
+            *b = 0xCC;
+        }
+        let child_hash = blake3::hash(&child_bytes);
+
+        // ── S1: parent DATA at LBA 0..4 (the delta's dictionary source).
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &parent_bytes).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // ── S2: fully-live Delta at LBA 100..104 — no LBA of it is ever
+        //    overwritten, so the fold keeps the record as a Delta.
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+        let delta_blob = compressor.compress(&child_bytes).unwrap();
+        let delta_ulid = Ulid::new();
+        let delta_pending = dir.join("pending").join(delta_ulid.to_string());
+        let opt = DeltaOption {
+            source_hash: parent_hash,
+            delta_offset: 0,
+            delta_length: delta_blob.len() as u32,
+            delta_hash: blake3::hash(&delta_blob),
+        };
+        let mut delta_entries = vec![SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])];
+        write_segment_with_delta_body(
+            &delta_pending,
+            &mut delta_entries,
+            &delta_blob,
+            signer.as_ref(),
+        )
+        .unwrap();
+        let bytes = fs::read(&delta_pending).unwrap();
+        let key = segment_key(Ulid::nil(), delta_ulid);
+        store
+            .put(&key, bytes::Bytes::from(bytes).into())
+            .await
+            .unwrap();
+        drop(vol);
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.promote_segment(delta_ulid).unwrap();
+
+        // ── S3/S4: unrelated write + overwrite at LBA 300 so the GC
+        //    bucket has dead bytes to reclaim.
+        vol.write(300, &vec![0x33u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        vol.write(300, &vec![0x44u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        drop(vol);
+
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        assert!(
+            stats.candidates >= 1,
+            "GC must compact at least one bucket, got candidates={}",
+            stats.candidates
+        );
+
+        // ── Apply the handoff and read through the SAME volume handle.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert!(applied > 0, "GC handoff must be applied");
+
+        for (i, lba) in (100..104).enumerate() {
+            let got = vol.read(lba, 1).unwrap();
+            assert_eq!(
+                got.as_slice(),
+                &child_bytes[i * 4096..(i + 1) * 4096],
+                "LBA {lba} must serve the delta-materialised child bytes \
+                 through the post-apply live read state"
+            );
+        }
+    }
+
     /// Regression: GC compactor must preserve the COMPRESSED flag on inline
     /// entries.  Without it, the GC output contains a tiny compressed blob
     /// marked as uncompressed; the read path skips decompression and tries to

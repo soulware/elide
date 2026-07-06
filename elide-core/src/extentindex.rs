@@ -365,6 +365,14 @@ impl ExtentIndex {
         }
     }
 
+    /// Insert or overwrite the Delta location for `hash`. Unlike
+    /// [`Self::insert_delta_if_absent`] this does not consult the DATA
+    /// map — the caller decides precedence (e.g. GC apply repointing a
+    /// carried Delta from a consumed input to the fold output).
+    pub fn insert_delta(&mut self, hash: blake3::Hash, location: DeltaLocation) {
+        self.deltas.insert(hash, location);
+    }
+
     /// Look up a Delta entry by its content hash. Returns `None` if
     /// the hash is not registered as a Delta (either unknown, or
     /// present as a direct DATA entry instead).
