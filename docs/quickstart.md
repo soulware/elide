@@ -27,8 +27,8 @@ cd deploy/elide-standalone
 ./launch
 ```
 
-`launch` provisions and deploys in one step: it creates the Fly app
-(auto-named `elide-<hex>`), asks for a region, creates a Tigris bucket
+`launch` provisions and deploys in one step: it creates the Fly app (Fly
+generates a name), asks for a region, creates a Tigris bucket
 targeting the app — which sets the keypair secrets the coordinator signs
 S3 operations with — writes `fly.toml`, and deploys the newest elide
 release. It echoes each `fly` command as it runs it; `./launch <region>`
