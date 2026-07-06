@@ -25,8 +25,14 @@ command -v fly >/dev/null 2>&1 \
   || { echo "fly CLI not found — install it: https://fly.io/docs/flyctl/install/" >&2; exit 1; }
 fly auth whoami >/dev/null 2>&1 \
   || { echo "not logged in to Fly — run: fly auth login" >&2; exit 1; }
-[ ! -e fly.toml ] \
-  || { echo "fly.toml already exists — this deployment is configured; run fly deploy, or remove fly.toml to launch a new one" >&2; exit 1; }
+if [ -e fly.toml ]; then
+  {
+    echo "fly.toml already exists — a launch has happened here:"
+    sed -n 's/^app = "\(.*\)"/  app:    \1/p; s/^ *DATA_BUCKET = "\(.*\)"/  bucket: \1/p' fly.toml
+    echo "redeploy it with ./deploy.sh, or remove fly.toml to launch a new deployment"
+  } >&2
+  exit 1
+fi
 
 region="${1:-}"
 if [ -z "$region" ] && [ -t 0 ]; then
