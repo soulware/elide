@@ -1001,14 +1001,21 @@ pub(crate) enum FastPathDisposition {
 /// S3 step is a server-side COPY + DELETE: zero data transit through
 /// the coordinator, no re-sign.
 ///
-/// Ordering: S3 first (COPY new key, DELETE old key), then locally.
-/// A crash between the COPY and the DELETE leaves both
-/// `<ulid>.manifest` and `<ulid>-stop.manifest` in S3; the reader
-/// path (and `latest_snapshot_marker`) prefers `User` on a tie, so
-/// the transient state is benign. A crash between S3-OK and
-/// local-rename leaves stale `<ulid>-stop.manifest` on disk — since
-/// the volume is about to be released and removed locally, this is
-/// irrelevant.
+/// The promotion also advances `snapshots/LATEST` to the promoted
+/// manifest — it is now the volume's newest stable user manifest,
+/// and `LATEST` is what data-plane basis resolution (force-claim)
+/// reads.
+///
+/// Ordering: S3 first (COPY new key, DELETE old key), then the
+/// `LATEST` bump, then locally. A crash between the COPY and the
+/// DELETE leaves both `<ulid>.manifest` and `<ulid>-stop.manifest`
+/// in S3; the reader path (and `latest_snapshot_marker`) prefers
+/// `User` on a tie, so the transient state is benign. A crash
+/// before the `LATEST` bump leaves the pointer stale — safe:
+/// force-claim's basis falls back to copying every live segment
+/// instead of pinning. A crash between S3-OK and local-rename
+/// leaves stale `<ulid>-stop.manifest` on disk — since the volume
+/// is about to be released and removed locally, this is irrelevant.
 pub(crate) async fn promote_stop_snapshot(
     vol_dir: &Path,
     vd: &elide_coordinator::volume_data::VolumeData,
@@ -1017,7 +1024,19 @@ pub(crate) async fn promote_stop_snapshot(
     // 1+2. Server-side COPY + DELETE in S3 via the shared helper.
     promote_stop_in_store(vd, snap_ulid).await?;
 
-    // 3. Rename the local files. Best-effort: if the local copy was
+    // 3. Advance `snapshots/LATEST`: the COPY above minted a stable
+    //    user manifest, and LATEST tracks the newest one. Monotonic
+    //    CAS — same bump the snapshot upload path performs.
+    vd.snapshots()
+        .bump_latest_if_newer(snap_ulid)
+        .await
+        .map_err(|e| {
+            IpcError::store(format!(
+                "advancing snapshots/LATEST to promoted manifest {snap_ulid}: {e}"
+            ))
+        })?;
+
+    // 4. Rename the local files. Best-effort: if the local copy was
     //    already cleaned by NotifyVolumeReady at start, the source
     //    won't exist and the rename returns NotFound — that's fine,
     //    S3 is the source of truth and is already promoted.
@@ -1038,7 +1057,7 @@ pub(crate) async fn promote_stop_snapshot(
         }
     }
 
-    // 4. Rename the upload sentinel so the drain loop doesn't try
+    // 5. Rename the upload sentinel so the drain loop doesn't try
     //    to re-upload anything for either kind.
     let uploaded_dir = vol_dir.join("uploaded").join("snapshots");
     let sentinel_from = uploaded_dir.join(format!("{snap_ulid}-stop"));
@@ -1550,6 +1569,49 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
+
+    // ── promote_stop_snapshot ─────────────────────────────────────────────
+
+    /// The stop→user promotion mints the volume's newest stable user
+    /// manifest and must advance `snapshots/LATEST` to it — that
+    /// pointer is what force-claim's basis resolution reads. Without
+    /// the bump, a force-claim after release→reclaim sees `basis
+    /// <none>` and copies every live segment instead of pinning.
+    #[tokio::test]
+    async fn promote_stop_snapshot_advances_latest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let tmp = TempDir::new().unwrap();
+        let vol_ulid = ulid::Ulid::new();
+        let snap_ulid = ulid::Ulid::new();
+        let fork_dir = tmp.path().join("by_id").join(vol_ulid.to_string());
+        let snap_dir = fork_dir.join("snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let manifest_path = snap_dir.join(elide_core::signing::stop_snapshot_manifest_filename(
+            &snap_ulid,
+        ));
+        std::fs::write(&manifest_path, b"signed-bytes").unwrap();
+
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), vol_ulid);
+        vd.snapshots()
+            .put_stop_manifest_from_file(snap_ulid, &manifest_path)
+            .await
+            .unwrap();
+        assert!(
+            vd.snapshots().read_latest().await.unwrap().is_none(),
+            "stop-manifest upload must not touch LATEST"
+        );
+
+        promote_stop_snapshot(&fork_dir, &vd, snap_ulid)
+            .await
+            .unwrap();
+
+        let latest = vd.snapshots().read_latest().await.unwrap().map(|(u, _)| u);
+        assert_eq!(
+            latest,
+            Some(snap_ulid),
+            "promotion must advance snapshots/LATEST to the promoted manifest"
+        );
+    }
 
     // ── cleanup_stop_snapshots ────────────────────────────────────────────
 
