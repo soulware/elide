@@ -74,6 +74,7 @@ Create a volume and put a filesystem on it:
 
   fly ssh console
   elide volume create --size 1G vol1
+  elide volume list
   mkfs.ext4 /dev/ublkb0
   mkdir -p /mnt/vol1 && mount -o discard /dev/ublkb0 /mnt/vol1
 EOF

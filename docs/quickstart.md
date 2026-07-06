@@ -52,10 +52,11 @@ Inside the machine:
 
 ```sh
 elide volume create --size 1G vol1
+elide volume list
 ```
 
 The coordinator runs as root with `ublk_drv` loaded, so the volume comes up
-serving a kernel block device: `/dev/ublkb0`.
+serving a kernel block device — `list` shows it running on `/dev/ublkb0`.
 
 ## 3. Format, mount, write
 
@@ -70,9 +71,8 @@ cat /mnt/vol1/hello.txt
 ```
 
 Writes land in the volume's write-ahead log; the coordinator drains sealed
-segments to Tigris automatically every few seconds. `elide volume list`
-shows the volume's state, and `elide volume events vol1` shows its event
-log.
+segments to Tigris automatically every few seconds. `elide volume events
+vol1` shows the volume's event log.
 
 ## Part 2 — Move the volume to a second machine
 
