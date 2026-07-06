@@ -70,7 +70,10 @@ provenance pins; the frontier is the newest seal of either kind,
 discovered via HEAD's anchor — a clean `stop` truncates HEAD to
 empty anchored at its stop-snapshot, which `LATEST` never names.
 Stop-snapshots are ephemeral, so segments only they cover are
-copied into V2 rather than referenced through lineage. Anything A
+copied into V2 rather than referenced through lineage. A `release`
+promotes its covering stop-snapshot to a stable user manifest and
+advances `LATEST` to it, so a fork force-claimed after a
+release→reclaim cycle pins that handoff as its basis. Anything A
 publishes after the cut is a post-displacement write and is
 excluded by the same policy that loses A's undrained WAL. B never
 re-reads V1's HEAD to pick up new entries: doing so would fold an
