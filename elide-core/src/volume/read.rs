@@ -497,7 +497,11 @@ fn try_read_delta_extent(
     dmat_stats.record_lookup();
 
     // dmat hit path: materialised bytes are already on disk for this
-    // (segment, entry_idx). Read + lz4-decompress, copy out, return.
+    // (segment, entry_idx). Read + lz4-decompress, verify against the
+    // entry's content hash (the dmat open-scan does not authenticate
+    // records), copy out, return. A mismatch is treated as a miss —
+    // re-materialisation writes a fresh record that supersedes the
+    // corrupt one in the in-memory map.
     if let Some(materialised) = dmat_lookup(
         dmat_cache,
         dmat_stats,
@@ -505,8 +509,14 @@ fn try_read_delta_extent(
         delta_segment_id,
         delta_entry_idx,
     )? {
-        dmat_stats.record_hit();
-        return copy_materialised_into(er, lba, &materialised, out).map(|()| true);
+        if blake3::hash(&materialised) == er.hash {
+            dmat_stats.record_hit();
+            return copy_materialised_into(er, lba, &materialised, out).map(|()| true);
+        }
+        log::warn!(
+            "dmat record for segment {delta_segment_id}[{delta_entry_idx}] failed \
+             hash verification; re-materialising"
+        );
     }
     dmat_stats.record_miss();
 
@@ -618,6 +628,20 @@ fn try_read_delta_extent(
     // portion below; the decompressor returns every byte the delta was
     // computed over, regardless of which LBA sub-range we want.
     let decompressed = delta_compute::apply_delta(&source_bytes, &delta_blob)?;
+
+    // The zstd-dict decompress carries no content checksum: a wrong or
+    // stale source dictionary yields plausible-length garbage, not an
+    // error. The entry's content hash is the only integrity anchor.
+    let got = blake3::hash(&decompressed);
+    if got != er.hash {
+        return Err(io::Error::other(format!(
+            "delta materialisation for segment {delta_segment_id}[{delta_entry_idx}] \
+             hashed {} instead of {} (source {})",
+            got.to_hex(),
+            er.hash.to_hex(),
+            opt.source_hash.to_hex(),
+        )));
+    }
 
     // Cache the materialised bytes for future reads. Failure to write the
     // cache record is not fatal — the materialisation already succeeded

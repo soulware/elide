@@ -550,11 +550,25 @@ fn resolve_composite_body(
                 opt.delta_length,
                 ctx.resolver,
             )?;
-            crate::delta_compute::apply_delta(&base, &blob).map_err(|e| {
+            let composite = crate::delta_compute::apply_delta(&base, &blob).map_err(|e| {
                 MaterialiseOutcome::from(MaterialiseError::Internal(format!(
                     "apply_delta failed (input={input_ulid} idx={entry_idx}): {e}"
                 )))
-            })?
+            })?;
+            // The zstd-dict decompress carries no content checksum: a
+            // wrong source dictionary yields plausible-length garbage,
+            // not an error — and the fold would write it into a durable
+            // segment. The entry's content hash is the integrity anchor.
+            let got = blake3::hash(&composite);
+            if got != entry.hash {
+                return Err(MaterialiseError::BodyIntegrity(format!(
+                    "delta materialisation hashed {got} instead of {} \
+                     (input={input_ulid} idx={entry_idx} source={})",
+                    entry.hash, opt.source_hash
+                ))
+                .into());
+            }
+            composite
         }
         other => {
             return Err(MaterialiseError::Internal(format!(
