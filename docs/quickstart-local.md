@@ -76,8 +76,9 @@ The explicit-pin form is forward-compatible — see
 
 A coordinator that can serve ublk — running as root with the module loaded
 (`sudo modprobe ublk_drv`, one-time) — gives new volumes the ublk transport
-by default: `vm1` exposes `/dev/ublkbN` on first start, with the
-kernel-allocated device id recorded in `volume.toml` for crash recovery.
+by default: `vm1` exposes `/dev/ublkbN` on first start (reachable by name at
+`/dev/elide/vm1`), with the kernel-allocated device id recorded in
+`volume.toml` for crash recovery.
 
 The unprivileged coordinator above can't serve ublk, so `vm1` starts
 IPC-only (no host-visible block device). Attach the transport explicitly:
@@ -89,7 +90,7 @@ IPC-only (no host-visible block device). Attach the transport explicitly:
 The volume then serves over ublk once the coordinator runs as root. Then:
 
 ```sh
-sudo mount /dev/ublkb0 /mnt
+sudo mount /dev/elide/vm1 /mnt
 ```
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).

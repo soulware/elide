@@ -56,16 +56,17 @@ elide volume list
 ```
 
 The coordinator runs as root with `ublk_drv` loaded, so the volume comes up
-serving a kernel block device — `list` shows it running on `/dev/ublkb0`.
+serving a kernel block device — `list` shows it running on `/dev/ublkb0`,
+and every served volume is also reachable by name at `/dev/elide/<name>`.
 
 ## 3. Format, mount, write
 
 Still inside the machine:
 
 ```sh
-mkfs.ext4 /dev/ublkb0
+mkfs.ext4 /dev/elide/vol1
 mkdir -p /mnt/vol1
-mount -o discard /dev/ublkb0 /mnt/vol1
+mount -o discard /dev/elide/vol1 /mnt/vol1
 echo "hello!" > /mnt/vol1/hello.txt
 cat /mnt/vol1/hello.txt
 ```
@@ -128,7 +129,7 @@ Inside:
 elide volume claim vol1
 elide volume start vol1
 mkdir -p /mnt/vol1
-mount -o discard /dev/ublkb0 /mnt/vol1
+mount -o discard /dev/elide/vol1 /mnt/vol1
 cat /mnt/vol1/hello.txt
 # hello!
 ```
