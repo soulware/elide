@@ -126,6 +126,11 @@ JSON, read via the ublk control ioctl — sysfs exposes no attribute udev could
 match a rule on. elide manages the links itself
 (`elide-coordinator/src/dev_link.rs`).
 
+The name link is the path users type, so it is what the CLI shows:
+`elide volume list`'s DEVICE column reads `/dev/elide/<name>` for a named
+volume with a bound device (`/dev/ublkb<id>` for an unnamed one), and
+`elide volume inspect` shows both: `device: /dev/elide/vol1 -> /dev/ublkb0`.
+
 **Held vs replaceable.** A link counts as *held* only while its target device
 is live and that device's ownership stamp (`target_data.elide.volume_dir`)
 names a volume whose `volume.toml` still claims the link's name. The claim

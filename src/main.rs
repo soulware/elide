@@ -1906,7 +1906,12 @@ fn print_local_status(
     if let Some(pid) = lifecycle.pid() {
         println!("  pid:      {pid}");
     }
-    println!("  device:   {}", device_summary(&vol_dir));
+    match device_paths(&vol_dir) {
+        DevicePaths::Linked { link, node } => println!("  device:   {link} -> {node}"),
+        DevicePaths::Bare { node } => println!("  device:   {node}"),
+        DevicePaths::Auto => println!("  device:   auto"),
+        DevicePaths::None => println!("  device:   -"),
+    }
     let p = inspect::pending_summary(&vol_dir)?;
     if p.total_bytes() == 0 {
         println!("  pending:  none");
@@ -1934,21 +1939,52 @@ fn print_local_status(
     Ok(())
 }
 
-/// Summarise the volume's ublk block device for display: the bound
-/// `/dev/ublkb<id>` (written back to `volume.toml` on a successful ADD),
-/// `auto` for a `[ublk]` section with no id yet, or `-` when ublk is off.
+/// Summarise the volume's ublk block device for display: the
+/// `/dev/elide/<name>` link for a named volume with a bound device, the
+/// bound `/dev/ublkb<id>` otherwise (written back to `volume.toml` on a
+/// successful ADD), `auto` for a `[ublk]` section with no id yet, or `-`
+/// when ublk is off.
 fn device_summary(vol_dir: &Path) -> String {
-    let cfg = match elide_core::config::VolumeConfig::read(vol_dir) {
-        Ok(c) => c,
-        Err(_) => return "-".to_owned(),
-    };
-    if let Some(ublk) = cfg.ublk.as_ref() {
-        return match ublk.dev_id {
-            Some(id) => format!("/dev/ublkb{id}"),
-            None => "auto".to_owned(),
-        };
+    match device_paths(vol_dir) {
+        DevicePaths::Linked { link, .. } => link,
+        DevicePaths::Bare { node } => node,
+        DevicePaths::Auto => "auto".to_owned(),
+        DevicePaths::None => "-".to_owned(),
     }
-    "-".to_owned()
+}
+
+/// The volume's ublk device display paths, from `volume.toml`'s `[ublk]`
+/// section and `name` field.
+enum DevicePaths {
+    /// Named volume with a bound device: the `/dev/elide/<name>` link and
+    /// the `/dev/ublkb<id>` node it points at.
+    Linked { link: String, node: String },
+    /// Bound device on an unnamed volume: the node only.
+    Bare { node: String },
+    /// `[ublk]` present, no device id assigned yet.
+    Auto,
+    /// No ublk transport.
+    None,
+}
+
+fn device_paths(vol_dir: &Path) -> DevicePaths {
+    let Ok(cfg) = elide_core::config::VolumeConfig::read(vol_dir) else {
+        return DevicePaths::None;
+    };
+    let Some(ublk) = cfg.ublk.as_ref() else {
+        return DevicePaths::None;
+    };
+    let Some(id) = ublk.dev_id else {
+        return DevicePaths::Auto;
+    };
+    let node = format!("/dev/ublkb{id}");
+    match cfg.name {
+        Some(name) => DevicePaths::Linked {
+            link: format!("/dev/elide/{name}"),
+            node,
+        },
+        None => DevicePaths::Bare { node },
+    }
 }
 
 /// Encode the CLI's typed transport flags as the space-separated tokens
@@ -2391,6 +2427,51 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn write_volume_config(dir: &Path, name: Option<&str>, ublk: Option<Option<i32>>) {
+        let cfg = elide_core::config::VolumeConfig {
+            name: name.map(str::to_owned),
+            ublk: ublk.map(|dev_id| elide_core::config::UblkConfig { dev_id }),
+            ..Default::default()
+        };
+        cfg.write(dir).expect("write volume.toml");
+    }
+
+    #[test]
+    fn device_summary_prefers_name_link() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(Some(3)));
+        assert_eq!(device_summary(tmp.path()), "/dev/elide/vol1");
+    }
+
+    #[test]
+    fn device_summary_unnamed_shows_node() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), None, Some(Some(3)));
+        assert_eq!(device_summary(tmp.path()), "/dev/ublkb3");
+    }
+
+    #[test]
+    fn device_summary_unbound_and_off() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(None));
+        assert_eq!(device_summary(tmp.path()), "auto");
+        write_volume_config(tmp.path(), Some("vol1"), None);
+        assert_eq!(device_summary(tmp.path()), "-");
+    }
+
+    #[test]
+    fn device_paths_linked_carries_both() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(Some(0)));
+        match device_paths(tmp.path()) {
+            DevicePaths::Linked { link, node } => {
+                assert_eq!(link, "/dev/elide/vol1");
+                assert_eq!(node, "/dev/ublkb0");
+            }
+            _ => panic!("expected Linked"),
+        }
+    }
 
     #[test]
     fn parse_fork_source_pinned_ulid() {
