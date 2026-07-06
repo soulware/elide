@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
@@ -26,6 +26,24 @@ use crate::{SnapshotLockRegistry, control, gc, snapshot_lock_for, upload};
 pub enum TickOutcome {
     Continue,
     Stop,
+}
+
+/// How long an idle fork may go between displacement-fence checks. An
+/// active tick (pending segments to drain) always re-checks; this bounds
+/// how long a displaced-but-idle fork keeps its device up before the
+/// fence halts and rehomes it.
+const FENCE_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// Result of re-reading `names/<name>` against this fork's ULID. The
+/// two consumers dispose of the non-`Bound` cases differently — the
+/// tick-top fence stays conservative (only `Displaced` fences), the
+/// reap gate fails safe (anything but `Bound` skips the DELETEs) — so
+/// the variants carry the facts and the call sites choose.
+enum NameBinding {
+    Bound,
+    Displaced(elide_core::name_record::NameRecord),
+    Missing,
+    Unreadable(crate::name_store::NameStoreError),
 }
 
 /// Drives one drain + GC cycle per `run_tick()` call. Constructed once per
@@ -53,6 +71,11 @@ pub struct GcCycleOrchestrator {
     /// unchanged from the old standalone reaper); see
     /// `docs/design/segment-index.md` *Reaper fold*.
     last_reap: Instant,
+    /// Cross-tick: last time the displacement fence completed a
+    /// name-binding check. Constructed backdated so the first tick
+    /// always checks; not bumped when the fence returns an outcome,
+    /// so a failed halt retries on the very next tick.
+    last_fence: Instant,
     /// Per-tick scratch: ULIDs uploaded (drain) or produced (GC output)
     /// that must land in HEAD's `Added` set before this tick reports
     /// success. Cleared at the start of every `run_tick`.
@@ -120,6 +143,7 @@ impl GcCycleOrchestrator {
         } else {
             now
         };
+        let last_fence = now.checked_sub(FENCE_HEARTBEAT).unwrap_or(now);
         let volume_data = VolumeData::new(Arc::clone(&store), vol_ulid);
         Self {
             fork_dir,
@@ -133,6 +157,7 @@ impl GcCycleOrchestrator {
             last_gc,
             gc_was_active: true,
             last_reap,
+            last_fence,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
             name_claims,
@@ -163,19 +188,31 @@ impl GcCycleOrchestrator {
     /// binding. Returns `Some(Stop)` once halted (the per-volume task then
     /// exits), `Some(Continue)` to retry a failed halt next tick, or `None`
     /// when the fork is still the bound owner.
+    /// One `names/<name>` GET, compared against this fork's ULID. Every
+    /// claim episode mints a fresh fork ULID, so a matching ULID means
+    /// the binding is still this episode's.
+    async fn read_binding(&self, name: &str) -> NameBinding {
+        match self.name_claims.read(name).await {
+            Ok(Some(rec)) if rec.vol_ulid == self.vol_ulid => NameBinding::Bound,
+            Ok(Some(rec)) => NameBinding::Displaced(rec),
+            Ok(None) => NameBinding::Missing,
+            Err(e) => NameBinding::Unreadable(e),
+        }
+    }
+
     async fn fence_if_displaced(&self) -> Option<TickOutcome> {
         let name = self.volume_name.as_ref()?;
-        let rec = match self.name_claims.read(name).await {
-            Ok(Some(rec)) if rec.vol_ulid == self.vol_ulid => return None,
-            Ok(Some(rec)) => rec,
-            Ok(None) => {
+        let rec = match self.read_binding(name).await {
+            NameBinding::Bound => return None,
+            NameBinding::Displaced(rec) => rec,
+            NameBinding::Missing => {
                 warn!(
                     "[fence {}] names/{name} record is gone; not fencing",
                     self.vol_ulid
                 );
                 return None;
             }
-            Err(e) => {
+            NameBinding::Unreadable(e) => {
                 warn!(
                     "[fence {}] reading names/{name}: {e}; not fencing",
                     self.vol_ulid
@@ -260,9 +297,16 @@ impl GcCycleOrchestrator {
         }
 
         // Fence and stop before any drain/GC if this fork has been
-        // displaced — another coordinator now owns the name.
-        if let Some(outcome) = self.fence_if_displaced().await {
-            return outcome;
+        // displaced — another coordinator now owns the name. The check
+        // is one `names/<name>` GET per run, so it fires only when this
+        // tick has segments to drain (guest writes are the risk the
+        // fence exists for) or the idle heartbeat has elapsed — not on
+        // every 5s tick of a quiescent fork.
+        if pending_has_files(&self.fork_dir) || self.last_fence.elapsed() >= FENCE_HEARTBEAT {
+            if let Some(outcome) = self.fence_if_displaced().await {
+                return outcome;
+            }
+            self.last_fence = Instant::now();
         }
 
         // Skip drain/GC while an import is in its write phase (volume.importing
@@ -572,9 +616,9 @@ impl GcCycleOrchestrator {
         // effort (check-then-act, one-tick window) — the claimant's
         // per-pass HEAD re-read remains the correctness backstop.
         if let Some(name) = &self.volume_name {
-            match self.name_claims.read(name).await {
-                Ok(Some(rec)) if rec.vol_ulid == self.vol_ulid => {}
-                Ok(Some(rec)) => {
+            match self.read_binding(name).await {
+                NameBinding::Bound => {}
+                NameBinding::Displaced(rec) => {
                     error!(
                         "[reap {}] names/{name} now binds {}; this fork has been \
                          displaced — skipping reap",
@@ -582,14 +626,14 @@ impl GcCycleOrchestrator {
                     );
                     return false;
                 }
-                Ok(None) => {
+                NameBinding::Missing => {
                     error!(
                         "[reap {}] names/{name} record is gone; skipping reap",
                         self.vol_ulid
                     );
                     return false;
                 }
-                Err(e) => {
+                NameBinding::Unreadable(e) => {
                     warn!(
                         "[reap {}] reading names/{name}: {e}; skipping reap",
                         self.vol_ulid
@@ -720,9 +764,7 @@ impl GcCycleOrchestrator {
 /// backlog — a false negative defers the forced first-tick pass to
 /// the natural cadence, with no correctness consequence.
 fn fork_has_local_backlog(fork_dir: &Path) -> bool {
-    if let Ok(mut entries) = std::fs::read_dir(fork_dir.join("pending"))
-        && entries.next().is_some()
-    {
+    if pending_has_files(fork_dir) {
         return true;
     }
     let gc_dir = fork_dir.join("gc");
@@ -731,6 +773,15 @@ fn fork_has_local_backlog(fork_dir: &Path) -> bool {
     }
     gc::collect_bare_handoffs(&gc_dir)
         .map(|bare| !bare.is_empty())
+        .unwrap_or(false)
+}
+
+/// `pending/` holds segments the volume flushed but the drain has not
+/// yet promoted to S3 — the signal that this fork has guest writes in
+/// flight. An absent or unreadable dir counts as empty.
+fn pending_has_files(fork_dir: &Path) -> bool {
+    std::fs::read_dir(fork_dir.join("pending"))
+        .map(|mut entries| entries.next().is_some())
         .unwrap_or(false)
 }
 
@@ -1202,6 +1253,72 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (orch, _tmp) = orchestrator(store);
         assert!(orch.fence_if_displaced().await.is_none());
+    }
+
+    /// Plant a `names/vol2` record binding a different fork, so any
+    /// fence check that actually runs will fence this orchestrator.
+    async fn displace(store: &Arc<dyn ObjectStore>) {
+        let other = Ulid::from_string("01J0000000000000000000000W").unwrap();
+        let rec = elide_core::name_record::NameRecord::live_minimal(other, 0);
+        crate::name_store::create_name_record(store, "vol2", &rec)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fence_skipped_on_idle_tick_within_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, tmp) = orchestrator_named(store.clone(), Some("vol2"));
+        displace(&store).await;
+        orch.last_fence = std::time::Instant::now();
+
+        assert!(matches!(orch.run_tick().await, TickOutcome::Continue));
+
+        let new_name = format!(
+            "vol2-{}",
+            crate::rehome::rehome_suffix("vol2", vol_ulid(), 0)
+        );
+        assert!(
+            orch.name_claims.read(&new_name).await.unwrap().is_none(),
+            "idle tick inside the heartbeat must not run the fence"
+        );
+        assert!(!tmp.path().join("by_name").join(&new_name).exists());
+    }
+
+    #[tokio::test]
+    async fn fence_runs_on_idle_tick_after_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol2"));
+        displace(&store).await;
+        orch.last_fence =
+            std::time::Instant::now() - super::FENCE_HEARTBEAT - std::time::Duration::from_secs(1);
+
+        assert!(matches!(orch.run_tick().await, TickOutcome::Stop));
+
+        let new_name = format!(
+            "vol2-{}",
+            crate::rehome::rehome_suffix("vol2", vol_ulid(), 0)
+        );
+        assert!(
+            orch.name_claims.read(&new_name).await.unwrap().is_some(),
+            "heartbeat-due tick must fence and rehome"
+        );
+    }
+
+    #[tokio::test]
+    async fn fence_runs_on_active_tick_within_heartbeat() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol2"));
+        displace(&store).await;
+        orch.last_fence = std::time::Instant::now();
+        let pending = orch.fork_dir().join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
+
+        assert!(
+            matches!(orch.run_tick().await, TickOutcome::Stop),
+            "pending segments make the tick active; the fence must run"
+        );
     }
 
     #[test]
