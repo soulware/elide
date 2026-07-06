@@ -2,6 +2,7 @@ pub mod bins;
 pub mod bucket_position;
 pub mod config;
 pub mod control;
+pub mod dev_link;
 pub mod eligibility;
 pub mod event_journal;
 pub mod gc;

@@ -62,7 +62,7 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 - Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → daemon-exit detection → `START_USER_RECOVERY` (next serve) → `END_USER_RECOVERY`. `libublk::run_target` handles the first three; elide installs a SIGINT/SIGTERM/SIGHUP handler that fsyncs the WAL and `process::exit(0)`s without calling `STOP_DEV` or `DEL_DEV` — the kernel's monitor work observes the io_uring fds close and parks the device in QUIESCED via `UBLK_F_USER_RECOVERY`. Explicit deletion is the operator action `elide ublk delete <id>` (or the coordinator's startup reconciliation sweep). See `docs/design/ublk-shutdown-park.md`.
 - `UblkConfig { dev_id: Option<i32> }` in `elide-core/src/config.rs`.
-- CLI: `--ublk` (the kernel auto-allocates the id and records it in `volume.toml`).
+- CLI: `volume create` / `volume update` take `--device` / `--no-device` (user intent: serve a host block device or not); the kernel auto-allocates the id and records it in `volume.toml`.
 - Conflict detection: `find_ublk_conflict` checks for `dev_id` collisions.
 - Coordinator supervision: spawn `elide serve-volume ... --ublk`, respawn on crash.
 
@@ -111,6 +111,80 @@ For deployments where the daemon and the workload sit inside the same trust boun
 
 The capability check for zero-copy isn't really "do we trust this user" in our deployment — the operator daemon already has the capability. It's the kernel's way of saying "this device exposes more of itself to userspace; do not combine with the unprivileged path." Honour that boundary as a deployment-mode constraint, not a footnote.
 
+## `/dev/elide/<name>` device links
+
+`/dev/ublkb<N>` is positional: the kernel assigns `N`, it differs per volume,
+and Route::Relocate can move it. Mounting a volume by name means reading the
+`elide volume list` table first. Every served named volume therefore also has
+a symlink `/dev/elide/<name>` → `/dev/ublkb<N>` — the `/dev/disk/by-label/`
+idiom, standard tooling, no new CLI verb:
+
+    mount -o discard /dev/elide/vol1 /mnt/vol1
+
+**Not udev.** The volume identity lives in the kernel device's `target_data`
+JSON, read via the ublk control ioctl — sysfs exposes no attribute udev could
+match a rule on. elide manages the links itself
+(`elide-coordinator/src/dev_link.rs`).
+
+The name link is the path users type, so it is what the CLI shows:
+`elide volume list`'s DEVICE column reads `/dev/elide/<name>` for a named
+volume with a bound device (`/dev/ublkb<id>` for an unnamed one), and
+`elide volume inspect` shows both: `device: /dev/elide/vol1 -> /dev/ublkb0`.
+
+**Held vs replaceable.** A link counts as *held* only while its target device
+is live and that device's ownership stamp (`target_data.elide.volume_dir`)
+names a volume whose `volume.toml` still claims the link's name. The claim
+lives in `volume.toml`, not in the link: after a reboot the kernel can hand a
+volume's old device id to a different volume, leaving a link that points at a
+live foreign device which never asked for the name — that link is stale, not
+held. Replaceable: no link, dangling target, our own device, an unstamped
+device, a stamped device whose volume claims a different name. Refused
+outright: a path that is not a symlink or whose target is outside `/dev` — not
+an elide artefact, not elide's to replace.
+
+**Creation.** The serving daemon publishes the link in `run_volume_ublk`:
+a preflight before `ADD_DEV` (link directory writable, name not held — failing
+here leaves no kernel device), then the atomic publish (symlink at a temp
+path, `rename` over) once ADD/RECOVER has assigned the device id, before the
+device goes live. The daemon already runs as root and reads its own name from
+`volume.toml`.
+
+**Lifecycle follows the kernel device, not the daemon.** Shutdown-park means a
+parked QUIESCED device keeps its mounts across serve restarts, so the link
+persists across daemon exits too:
+
+- device added or recovered → link published/refreshed
+- daemon exits (clean or crash), device parks QUIESCED → link stays, exactly
+  as the mount does
+- explicit deletion (`elide ublk delete <id>`, the coordinator's
+  `teardown_bound_device`) → link retracted alongside the `[ublk] dev_id`
+  binding, and only if it still points at the deleted device's node
+- `ublk_sweep::reconcile` sweeps `/dev/elide`: a link is dropped when it
+  dangles, or when its target device is stamped with a `volume_dir` under this
+  coordinator whose `volume.toml` name no longer matches the link (a rename —
+  e.g. displacement rehome — left it stale). Links attributable to other
+  coordinators are left for their owners.
+
+**Failure semantics: fail closed.** The link is an invariant of serving, not a
+best-effort decoration — *every running named volume is reachable at
+`/dev/elide/<name>`*, so tooling and docs may rely on it unconditionally.
+
+- **A name collision fails the second claimant.** `/dev/elide` is a
+  host-global name registry, and the link with its held-vs-replaceable check
+  is the registry: names are per-coordinator, so two coordinators on one host
+  can serve the same name — a real operational ambiguity, surfaced by failing
+  the serve that introduces it with an error naming the holder's `volume_dir`.
+  Holding is first-live-wins: an already-serving volume is never unseated, and
+  a parked QUIESCED device — which may still hold live mounts — keeps its
+  name. Kernel-lane tests running as root on a shared host must mint unique
+  volume names.
+- **An unwritable `/dev/elide` fails the serve** in the pre-`ADD_DEV`
+  preflight, the same fail-fast treatment as any other persistent environment
+  error (`UblkRunError::Config`, so the supervisor parks the volume instead of
+  respawn-looping). Serving over ublk already requires root and
+  `/dev/ublk-control`; a host that grants those but refuses a symlink in
+  `/dev` is a deliberate lockdown for the operator to resolve.
+
 ## Testing
 
 - Not runnable in `cargo test` sandbox — needs `/dev/ublk-control`, kernel module, udev perms. Sandbox-incompatible; run on a real Linux host.
@@ -126,7 +200,7 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Beyond the obvious cost — root is required (`CAP_SYS_ADMIN`) and the kernel floor lifts to 6.10+ for `AUTO_BUF_REG` — the real cost is that the synchronous `VolumeReader` model in *Async model* breaks. Zero-copy hands the daemon a kernel-registered buffer index per tag; reads must land directly in that buffer via io_uring SQEs against the queue's ring, not via a sync `pread` into an arbitrary `&mut [u8]`. The backend either reworks its I/O path to issue ring-targeted ops, or copies into the registered buffer at the boundary and gives up the win. Internal copies (cache, dedup, decompression) further bound the upside, so this should be measured before committing. Likely a separate "privileged" tier.
-5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` grew `--ublk` / `--no-ublk` flags (no id is pinnable — the kernel auto-allocates and the chosen id is recorded into `volume.toml`). Supervisor reads `[ublk]` and passes `--ublk` to `serve-volume`, which reads the bound id from `volume.toml`. `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart-local.md`.
+5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` carry `--device` / `--no-device` flags (no id is pinnable — the kernel auto-allocates and the chosen id is recorded into `volume.toml`). Supervisor reads `[ublk]` and passes `--ublk` to `serve-volume`, which reads the bound id from `volume.toml`. `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart-local.md`.
 
 ## References
 

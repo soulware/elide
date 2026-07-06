@@ -89,6 +89,13 @@ pub async fn reconcile(data_dir: &Path) {
             warn!("[ublk-sweep] del_dev ublk{id}: {e}");
         }
     }
+
+    crate::dev_link::sweep(
+        &crate::dev_link::LinkPaths::system(),
+        &by_id_root,
+        read_owner_volume_dir,
+        crate::dev_link::read_config_name,
+    );
 }
 
 /// Drop any live id whose `target_data` does not stamp it as owned by a
@@ -135,7 +142,7 @@ fn is_under(volume_dir: &Path, by_id_root: &Path) -> bool {
 /// `elide.volume_dir` field if present. Returns `None` for devices not
 /// stamped by elide or whose ctrl cannot be opened.
 #[cfg(target_os = "linux")]
-fn read_owner_volume_dir(id: i32) -> Option<PathBuf> {
+pub fn read_owner_volume_dir(id: i32) -> Option<PathBuf> {
     let ctrl = libublk::ctrl::UblkCtrl::new_simple(id).ok()?;
     let value = ctrl.get_target_data_from_json()?;
     let stamp: OwnerStamp = serde_json::from_value(value).ok()?;
@@ -143,7 +150,7 @@ fn read_owner_volume_dir(id: i32) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_owner_volume_dir(_id: i32) -> Option<PathBuf> {
+pub fn read_owner_volume_dir(_id: i32) -> Option<PathBuf> {
     None
 }
 
@@ -325,6 +332,7 @@ pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
             vol_dir.display()
         );
     }
+    crate::dev_link::retract_for_volume(&crate::dev_link::LinkPaths::system(), vol_dir, bound_id);
 }
 
 /// Rewrite `vol_dir/volume.toml`'s `[ublk]` section to the host-capability

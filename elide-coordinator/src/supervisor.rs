@@ -9,7 +9,7 @@
 //   The supervisor passes `--ublk` when `volume.toml` has a `[ublk]` section;
 //   without one the volume is IPC-only. Create/claim write the section by
 //   default when the host can serve ublk (root with /dev/ublk-control
-//   present), and `volume update --ublk/--no-ublk` flips it. The bound
+//   present), and `volume update --device/--no-device` flips it. The bound
 //   dev_id is read by serve-volume from volume.toml itself, and the kernel
 //   auto-allocates on first serve.
 //
@@ -103,9 +103,9 @@ pub async fn supervise(fork_dir: PathBuf, data_dir: PathBuf, child_env: ChildEnv
         // the volume is parked under volume.stopped.
         if requires_ublk(&fork_dir) && !is_root() {
             error!(
-                "[supervisor {label}] volume requires --ublk but coordinator is not running as root. \
+                "[supervisor {label}] volume requires a block device but coordinator is not running as root. \
                  Rerun the coordinator under sudo (or grant it CAP_SYS_ADMIN), \
-                 or run `elide volume update <name> --no-ublk`. Marking volume.stopped."
+                 or run `elide volume update <name> --no-device`. Marking volume.stopped."
             );
             let _ = std::fs::write(fork_dir.join(STOPPED_FILE), "");
             continue;

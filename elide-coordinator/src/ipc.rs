@@ -825,7 +825,7 @@ mod tests {
             from: ForkSource::Name {
                 name: "parent".to_owned(),
             },
-            flags: vec!["ublk".to_owned()],
+            flags: vec!["device".to_owned()],
         };
         let s = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&s).unwrap();

@@ -1459,11 +1459,13 @@ impl TransportPatch {
     }
 }
 
-/// Parse a flat space-separated flag list. Recognised tokens: `ublk`,
-/// `no-ublk` — mutually exclusive.
+/// Parse a flat space-separated flag list. Recognised tokens: `device`,
+/// `no-device` — mutually exclusive. The tokens name the user intent
+/// (serve a host block device or not); the patch fields name the
+/// mechanism config they toggle (`[ublk]` in `volume.toml`).
 ///
 /// Unknown tokens produce an error so silent typos don't get accepted.
-/// There is no `ublk-id=<n>` token: the kernel auto-allocates the device
+/// There is no device-id token: the kernel auto-allocates the device
 /// id on first ADD and the chosen id is sticky across restarts (recorded
 /// in `volume.toml`). To move a volume to a different id, edit
 /// `[ublk] dev_id` in `volume.toml`.
@@ -1475,8 +1477,8 @@ pub(crate) fn parse_transport_flags(args: &str) -> Result<TransportPatch, String
             None => (tok, None),
         };
         match (key, val) {
-            ("ublk", None) => patch.ublk = true,
-            ("no-ublk", None) => patch.no_ublk = true,
+            ("device", None) => patch.ublk = true,
+            ("no-device", None) => patch.no_ublk = true,
             _ => return Err(format!("unknown flag: {tok}")),
         }
     }
@@ -2580,8 +2582,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_flags_ublk() {
-        let p = parse_transport_flags("ublk").unwrap();
+    fn parse_flags_device() {
+        let p = parse_transport_flags("device").unwrap();
         assert!(p.ublk);
     }
 
@@ -2599,13 +2601,13 @@ mod tests {
 
     #[test]
     fn parse_flags_clearing() {
-        let p = parse_transport_flags("no-ublk").unwrap();
+        let p = parse_transport_flags("no-device").unwrap();
         assert!(p.no_ublk);
     }
 
     #[test]
     fn parse_flags_unknown_rejected() {
-        assert!(parse_transport_flags("ublk unknown=1").is_err());
+        assert!(parse_transport_flags("device unknown=1").is_err());
         assert!(parse_transport_flags("not-a-flag").is_err());
     }
 
@@ -2616,8 +2618,8 @@ mod tests {
 
     #[test]
     fn parse_flags_conflicting_rejected() {
-        let err = match parse_transport_flags("ublk no-ublk") {
-            Ok(_) => panic!("ublk + no-ublk should be rejected"),
+        let err = match parse_transport_flags("device no-device") {
+            Ok(_) => panic!("device + no-device should be rejected"),
             Err(e) => e,
         };
         assert!(err.contains("conflicting"), "got {err:?}");
@@ -2625,9 +2627,9 @@ mod tests {
 
     #[test]
     fn ublk_cfg_explicit_flags_win() {
-        let on = parse_transport_flags("ublk").unwrap();
+        let on = parse_transport_flags("device").unwrap();
         assert!(on.ublk_cfg_or_default().is_some());
-        let off = parse_transport_flags("no-ublk").unwrap();
+        let off = parse_transport_flags("no-device").unwrap();
         assert!(off.ublk_cfg_or_default().is_none());
     }
 

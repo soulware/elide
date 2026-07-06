@@ -34,8 +34,9 @@ When the coordinator can serve ublk — running as root with the `ublk_drv`
 module loaded — create writes a `[ublk]` section into `volume.toml` and the
 supervisor attaches a kernel block device on first start. The kernel
 auto-allocates a device id; the chosen id is sticky across restarts. Pass
-`--no-ublk` to keep the volume IPC-only, or `--ublk` to force the transport
-on a host that can't serve it yet (the volume stays parked until it can).
+`--no-device` to keep the volume IPC-only, or `--device` to require the
+block device on a host that can't serve it yet (the volume stays parked
+until it can).
 
 ## Mount from the VM
 

@@ -239,25 +239,25 @@ enum VolumeCommand {
         /// Fork source: <name>, <name>/<snap_ulid>, or <vol_ulid>/<snap_ulid>
         #[arg(long)]
         from: Option<String>,
-        /// Serve over ublk even if this host can't right now
-        /// (default: ublk when the coordinator is root with ublk_drv loaded)
-        #[arg(long, conflicts_with = "no_ublk")]
-        ublk: bool,
-        /// Never serve this volume over ublk (IPC only)
+        /// Serve a host block device even if this host can't right now
+        /// (default: on when the coordinator is root with ublk_drv loaded)
+        #[arg(long, conflicts_with = "no_device")]
+        device: bool,
+        /// Never serve this volume as a host block device (IPC only)
         #[arg(long)]
-        no_ublk: bool,
+        no_device: bool,
     },
 
     /// Update configuration for a running volume
     Update {
         /// Volume name
         name: String,
-        /// Switch this volume to ublk transport (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["no_ublk"])]
-        ublk: bool,
-        /// Disable ublk serving (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk"])]
-        no_ublk: bool,
+        /// Serve this volume as a host block device (restarts the volume process)
+        #[arg(long, conflicts_with_all = ["no_device"])]
+        device: bool,
+        /// Stop serving the block device (restarts the volume process)
+        #[arg(long, conflicts_with_all = ["device"])]
+        no_device: bool,
     },
 
     /// Show the running status of a volume
@@ -323,10 +323,10 @@ enum VolumeCommand {
         /// Claim a released name first, then start
         #[arg(long)]
         claim: bool,
-        /// Disable ublk before starting (persists, like `update --no-ublk`;
-        /// revert with `update --ublk`)
+        /// Disable the block device before starting (persists, like
+        /// `update --no-device`; revert with `update --device`)
         #[arg(long)]
-        no_ublk: bool,
+        no_device: bool,
     },
 
     /// Claim a released volume name into local ownership without starting it
@@ -510,15 +510,15 @@ fn main() {
                 name,
                 size,
                 from,
-                ublk,
-                no_ublk,
+                device,
+                no_device,
             } => {
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    let flags = encode_transport_flags(ublk, no_ublk);
+                    let flags = encode_transport_flags(device, no_device);
                     if let Err(e) = create_fork(&data_dir, &name, from, &coord, &by_id_dir, &flags)
                     {
                         eprintln!("error: {e}");
@@ -543,7 +543,7 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let flags = encode_transport_flags(ublk, no_ublk);
+                    let flags = encode_transport_flags(device, no_device);
                     let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
@@ -560,10 +560,10 @@ fn main() {
 
             VolumeCommand::Update {
                 name,
-                ublk,
-                no_ublk,
+                device,
+                no_device,
             } => {
-                let flags = encode_transport_flags(ublk, no_ublk);
+                let flags = encode_transport_flags(device, no_device);
                 match coord.update_volume(&name, &flags) {
                     Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
@@ -801,7 +801,7 @@ fn main() {
             VolumeCommand::Start {
                 name,
                 claim,
-                no_ublk,
+                no_device,
             } => {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
@@ -833,7 +833,7 @@ fn main() {
                         }
                     }
                 }
-                if no_ublk {
+                if no_device {
                     // Drop the transport before the first spawn so the
                     // volume never attempts a ublk start.
                     let flags = encode_transport_flags(false, true);
@@ -1906,7 +1906,12 @@ fn print_local_status(
     if let Some(pid) = lifecycle.pid() {
         println!("  pid:      {pid}");
     }
-    println!("  device:   {}", device_summary(&vol_dir));
+    match device_paths(&vol_dir) {
+        DevicePaths::Linked { link, node } => println!("  device:   {link} -> {node}"),
+        DevicePaths::Bare { node } => println!("  device:   {node}"),
+        DevicePaths::Auto => println!("  device:   auto"),
+        DevicePaths::None => println!("  device:   -"),
+    }
     let p = inspect::pending_summary(&vol_dir)?;
     if p.total_bytes() == 0 {
         println!("  pending:  none");
@@ -1934,33 +1939,64 @@ fn print_local_status(
     Ok(())
 }
 
-/// Summarise the volume's ublk block device for display: the bound
-/// `/dev/ublkb<id>` (written back to `volume.toml` on a successful ADD),
-/// `auto` for a `[ublk]` section with no id yet, or `-` when ublk is off.
+/// Summarise the volume's ublk block device for display: the
+/// `/dev/elide/<name>` link for a named volume with a bound device, the
+/// bound `/dev/ublkb<id>` otherwise (written back to `volume.toml` on a
+/// successful ADD), `auto` for a `[ublk]` section with no id yet, or `-`
+/// when ublk is off.
 fn device_summary(vol_dir: &Path) -> String {
-    let cfg = match elide_core::config::VolumeConfig::read(vol_dir) {
-        Ok(c) => c,
-        Err(_) => return "-".to_owned(),
-    };
-    if let Some(ublk) = cfg.ublk.as_ref() {
-        return match ublk.dev_id {
-            Some(id) => format!("/dev/ublkb{id}"),
-            None => "auto".to_owned(),
-        };
+    match device_paths(vol_dir) {
+        DevicePaths::Linked { link, .. } => link,
+        DevicePaths::Bare { node } => node,
+        DevicePaths::Auto => "auto".to_owned(),
+        DevicePaths::None => "-".to_owned(),
     }
-    "-".to_owned()
 }
 
-/// Encode the CLI's typed transport flags as the space-separated tokens
+/// The volume's ublk device display paths, from `volume.toml`'s `[ublk]`
+/// section and `name` field.
+enum DevicePaths {
+    /// Named volume with a bound device: the `/dev/elide/<name>` link and
+    /// the `/dev/ublkb<id>` node it points at.
+    Linked { link: String, node: String },
+    /// Bound device on an unnamed volume: the node only.
+    Bare { node: String },
+    /// `[ublk]` present, no device id assigned yet.
+    Auto,
+    /// No ublk transport.
+    None,
+}
+
+fn device_paths(vol_dir: &Path) -> DevicePaths {
+    let Ok(cfg) = elide_core::config::VolumeConfig::read(vol_dir) else {
+        return DevicePaths::None;
+    };
+    let Some(ublk) = cfg.ublk.as_ref() else {
+        return DevicePaths::None;
+    };
+    let Some(id) = ublk.dev_id else {
+        return DevicePaths::Auto;
+    };
+    let node = format!("/dev/ublkb{id}");
+    match cfg.name {
+        Some(name) => DevicePaths::Linked {
+            link: format!("/dev/elide/{name}"),
+            node,
+        },
+        None => DevicePaths::Bare { node },
+    }
+}
+
+/// Encode the CLI's typed block-device flags as the space-separated tokens
 /// understood by the coordinator's `create` / `update` IPC verbs. Order
 /// follows the IPC parser; absent options emit nothing.
-fn encode_transport_flags(ublk: bool, no_ublk: bool) -> Vec<String> {
+fn encode_transport_flags(device: bool, no_device: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if ublk {
-        out.push("ublk".to_owned());
+    if device {
+        out.push("device".to_owned());
     }
-    if no_ublk {
-        out.push("no-ublk".to_owned());
+    if no_device {
+        out.push("no-device".to_owned());
     }
     out
 }
@@ -2391,6 +2427,51 @@ fn extract_boot(image: &Path, out_dir: &Path) -> Result<(), Ext4Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn write_volume_config(dir: &Path, name: Option<&str>, ublk: Option<Option<i32>>) {
+        let cfg = elide_core::config::VolumeConfig {
+            name: name.map(str::to_owned),
+            ublk: ublk.map(|dev_id| elide_core::config::UblkConfig { dev_id }),
+            ..Default::default()
+        };
+        cfg.write(dir).expect("write volume.toml");
+    }
+
+    #[test]
+    fn device_summary_prefers_name_link() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(Some(3)));
+        assert_eq!(device_summary(tmp.path()), "/dev/elide/vol1");
+    }
+
+    #[test]
+    fn device_summary_unnamed_shows_node() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), None, Some(Some(3)));
+        assert_eq!(device_summary(tmp.path()), "/dev/ublkb3");
+    }
+
+    #[test]
+    fn device_summary_unbound_and_off() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(None));
+        assert_eq!(device_summary(tmp.path()), "auto");
+        write_volume_config(tmp.path(), Some("vol1"), None);
+        assert_eq!(device_summary(tmp.path()), "-");
+    }
+
+    #[test]
+    fn device_paths_linked_carries_both() {
+        let tmp = TempDir::new().unwrap();
+        write_volume_config(tmp.path(), Some("vol1"), Some(Some(0)));
+        match device_paths(tmp.path()) {
+            DevicePaths::Linked { link, node } => {
+                assert_eq!(link, "/dev/elide/vol1");
+                assert_eq!(node, "/dev/ublkb0");
+            }
+            _ => panic!("expected Linked"),
+        }
+    }
 
     #[test]
     fn parse_fork_source_pinned_ulid() {

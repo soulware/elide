@@ -15,7 +15,7 @@
 //!   Phase 1 — fresh start under coordinator A
 //!     1. Coordinator boot — `elide-coordinator serve --config <toml>`
 //!        with a file-backed store (no S3) and a short scan interval.
-//!     2. `elide volume create ... --ublk` + inbound `rescan`. The
+//!     2. `elide volume create ... --device` + inbound `rescan`. The
 //!        kernel auto-allocates a dev id; the test discovers it from
 //!        `[ublk] dev_id` in `volume.toml` after the daemon's wait_hook
 //!        writes it back.
@@ -88,7 +88,7 @@ unsafe extern "C" {
 }
 
 /// Poll `volume.toml` until `[ublk] dev_id` is populated and return it.
-/// Used after `volume create --ublk` (no pin) to discover the kernel-
+/// Used after `volume create --device` (no pin) to discover the kernel-
 /// assigned id once the daemon's `wait_hook` has written it back.
 fn wait_for_bound_id(fork_dir: &Path) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -406,7 +406,14 @@ fn coordinator_ublk_lifecycle() {
     // by reading `[ublk] dev_id` back from volume.toml.
     elide(
         &data_dir,
-        &["volume", "create", "vtest", "--size", VOLUME_SIZE, "--ublk"],
+        &[
+            "volume",
+            "create",
+            "vtest",
+            "--size",
+            VOLUME_SIZE,
+            "--device",
+        ],
     );
 
     let name_link = data_dir.join("by_name").join("vtest");
@@ -438,6 +445,15 @@ fn coordinator_ublk_lifecycle() {
     // Small settle so the kernel has published queue limits before our
     // first open(2). Mirrors the same pattern in tests/ublk_crash.rs.
     thread::sleep(Duration::from_millis(200));
+
+    // The /dev/elide name link is published before the device goes
+    // live, so it is present as soon as the bdev is.
+    let dev_link = Path::new("/dev/elide/vtest");
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[A] /dev/elide/vtest points at the served device"
+    );
 
     // Capture the volume PID before shutdown so phase 2's PID file
     // appearance can be distinguished from a stale carryover.
@@ -541,6 +557,11 @@ fn coordinator_ublk_lifecycle() {
         Some(dev_id),
         "[A] bound dev_id must persist for Route::Recover on next serve"
     );
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[A] /dev/elide/vtest survives shutdown-park, as the device and its mounts do"
+    );
     let _ = volume_ctrl;
 
     // ── Phase 2: restart + Route::Recover under coordinator B ───────────────
@@ -584,6 +605,12 @@ fn coordinator_ublk_lifecycle() {
         },
     );
     thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[B] /dev/elide/vtest intact across Route::Recover"
+    );
 
     // Durability proof: the pattern written under coordinator A reads
     // back identically after:
@@ -663,6 +690,10 @@ fn coordinator_ublk_lifecycle() {
     // Cleanup: explicit DEL_DEV so the next CI run starts from a clean
     // kernel state. Failures here would indicate a leaked device.
     delete_and_wait_sysfs_gone(dev_id);
+    assert!(
+        std::fs::symlink_metadata(dev_link).is_err(),
+        "`elide ublk delete` retracts /dev/elide/vtest"
+    );
 }
 
 /// Probe whether `pid` is alive without waiting on it. `kill(pid, 0)`
