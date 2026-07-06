@@ -31,8 +31,9 @@ cd deploy/elide-standalone
 generates a name), asks for a region, creates a Tigris bucket
 targeting the app — which sets the keypair secrets the coordinator signs
 S3 operations with — writes `fly.toml`, and deploys the newest elide
-release. It echoes each `fly` command as it runs it; `./launch.sh <region>`
-skips the prompt. The coordinator comes up serving immediately.
+release. It echoes each `fly` command as it runs it, prompting for the
+region (and the org, when your account has several); `./launch.sh <region>
+<org>` skips the prompts. The coordinator comes up serving immediately.
 
 Use the app name `launch.sh` chose wherever `my-elide` appears below. To pick
 your own app name, reuse an existing bucket, or pin a release, run the same
