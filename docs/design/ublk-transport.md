@@ -111,6 +111,54 @@ For deployments where the daemon and the workload sit inside the same trust boun
 
 The capability check for zero-copy isn't really "do we trust this user" in our deployment — the operator daemon already has the capability. It's the kernel's way of saying "this device exposes more of itself to userspace; do not combine with the unprivileged path." Honour that boundary as a deployment-mode constraint, not a footnote.
 
+## Proposed: `/dev/elide/<name>` device links
+
+`/dev/ublkb<N>` is positional: the kernel assigns `N`, it differs per volume,
+and Route::Relocate can move it. Mounting a volume by name means reading the
+`elide volume list` table first. A coordinator-managed symlink
+`/dev/elide/<name>` → `/dev/ublkb<N>` gives the `/dev/disk/by-label/` idiom
+with standard tooling and no new CLI verb:
+
+    mount -o discard /dev/elide/vol1 /mnt/vol1
+
+**Not udev.** The volume identity lives in the kernel device's `target_data`
+JSON, read via the ublk control ioctl — sysfs exposes no attribute udev could
+match a rule on. elide manages the links itself.
+
+**Creation.** The serving daemon creates the link in `run_volume_ublk` as soon
+as the device is live, on every route (Add, Recover, Relocate). It already
+runs as root (device add requires it) and reads its own name from
+`volume.toml`'s `name` field. Creation is atomic: symlink at a temp path,
+`rename` over `/dev/elide/<name>`. Before replacing an existing link, resolve
+it: replace only if it dangles or its target device's ownership stamp
+(`target_data.elide.volume_dir`) names this volume's directory.
+
+**Lifecycle follows the kernel device, not the daemon.** Shutdown-park means a
+parked QUIESCED device keeps its mounts across serve restarts, so the link
+must persist across daemon exits too:
+
+- device goes LIVE → link created/refreshed
+- daemon exits (clean or crash), device parks QUIESCED → link stays, exactly
+  as the mount does
+- explicit deletion (`elide ublk delete <id>`, volume stop/release detach) →
+  link removed alongside the `[ublk] dev_id` binding
+- coordinator's `ublk_sweep::reconcile` gains a symmetric pass: a
+  `/dev/elide/*` link is dropped when it dangles, or when its target device is
+  stamped with a `volume_dir` under this coordinator whose `volume.toml` name
+  no longer matches the link (a rename — e.g. displacement rehome — left it
+  stale). Links whose target is stamped foreign are left untouched.
+
+**Open questions.**
+
+1. Two coordinators on one host can serve distinct volumes with the same name
+   (names are per-coordinator; `/dev` is host-global). Options: fail the serve
+   loudly on a foreign-stamped live link; create the device but skip the link
+   with a warning; or namespace links per coordinator. Skipping quietly makes
+   the link an optional surface; failing makes a cosmetic feature
+   serve-blocking. Needs a decision before implementation.
+2. Whether an unwritable `/dev/elide` (locked-down container `/dev`) fails the
+   serve or downgrades to no link — same optional-surface tension.
+
 ## Testing
 
 - Not runnable in `cargo test` sandbox — needs `/dev/ublk-control`, kernel module, udev perms. Sandbox-incompatible; run on a real Linux host.
