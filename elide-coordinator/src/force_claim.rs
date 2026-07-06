@@ -1298,6 +1298,135 @@ mod tests {
         );
     }
 
+    /// Mirror of the 2026-07-06 quickstart incident: the dead owner's
+    /// head delta carries a `Delta` entry (from `delta_repack`) whose
+    /// source extent lives in a sealed segment, the handoff manifest
+    /// exists as a user-kind object but `snapshots/LATEST` is absent,
+    /// and the name record still hints the handoff snapshot. After the
+    /// forced claim, opening the fork the way the volume daemon does
+    /// and reading the delta LBA must materialise the post-delta bytes.
+    #[tokio::test]
+    async fn force_claimed_fork_serves_delta_entries() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s_src = mint.next();
+        let anchor = mint.next();
+        let s_delta = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+
+        // v2 = v1 with a small edit, so the zstd-dict delta is tiny.
+        let v1 = vec![0x11u8; 4096];
+        let mut v2 = v1.clone();
+        v2[100..140].copy_from_slice(&[0xAB; 40]);
+        let h1 = blake3::hash(&v1);
+        let h2 = blake3::hash(&v2);
+
+        let src_bytes = {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("seg");
+            let mut entries = vec![SegmentEntry::new_data(
+                h1,
+                0,
+                1,
+                SegmentFlags::empty(),
+                v1.clone(),
+            )];
+            elide_core::segment::write_segment(&path, &mut entries, dead.signer.as_ref()).unwrap();
+            std::fs::read(&path).unwrap()
+        };
+
+        let blob = zstd::bulk::Compressor::with_dictionary(3, &v1)
+            .unwrap()
+            .compress(&v2)
+            .unwrap();
+        let delta_bytes = {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("seg");
+            let mut entries = vec![elide_core::segment::SegmentEntry::new_delta(
+                h2,
+                0,
+                1,
+                vec![elide_core::segment::DeltaOption {
+                    source_hash: h1,
+                    delta_offset: 0,
+                    delta_length: blob.len() as u32,
+                    delta_hash: blake3::hash(&blob),
+                }],
+            )];
+            elide_core::segment::write_segment_with_delta_body(
+                &path,
+                &mut entries,
+                &blob,
+                dead.signer.as_ref(),
+            )
+            .unwrap();
+            std::fs::read(&path).unwrap()
+        };
+
+        put_segment(&store, dead.vol, s_src, src_bytes.clone()).await;
+        put_segment(&store, dead.vol, s_delta, delta_bytes).await;
+
+        // Handoff-shaped data plane: user-kind manifest at `anchor`
+        // covering the source segment, no `snapshots/LATEST`, HEAD
+        // anchored at the seal with the delta segment as head delta.
+        let manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s_src]);
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
+        vd.snapshots()
+            .put_manifest(anchor, bytes::Bytes::from(manifest.clone()))
+            .await
+            .unwrap();
+        put_head(&store, dead.vol, Some(anchor), &[s_delta]).await;
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        rec.latest_snapshot = Some(anchor);
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        // LATEST absent → data-plane basis none → both segments copied.
+        assert_materialised(data_dir.path(), fork, s_src);
+        assert_materialised(data_dir.path(), fork, s_delta);
+
+        // Populate the pulled ancestor's read state the way the
+        // prefetch/heal pass does before the daemon opens: the pinned
+        // manifest plus the idx of every manifest-covered segment.
+        let dead_dir = data_dir.path().join("by_id").join(dead.vol.to_string());
+        std::fs::create_dir_all(dead_dir.join("snapshots")).unwrap();
+        std::fs::write(
+            dead_dir
+                .join("snapshots")
+                .join(format!("{anchor}.manifest")),
+            &manifest,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dead_dir.join("index")).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let segf = tmp.path().join(s_src.to_string());
+        std::fs::write(&segf, &src_bytes).unwrap();
+        elide_core::segment::extract_idx(
+            &segf,
+            &dead_dir.join("index").join(format!("{s_src}.idx")),
+        )
+        .unwrap();
+
+        // Open the fork the way the volume daemon does and read the
+        // delta LBA.
+        let fork_dir = data_dir.path().join("by_id").join(fork.to_string());
+        let vol =
+            elide_core::volume::Volume::open(&fork_dir, &data_dir.path().join("by_id")).unwrap();
+        let got = vol.read(0, 1).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            v2.as_slice(),
+            "delta LBA must materialise the post-delta bytes on the claimed fork"
+        );
+    }
+
     #[tokio::test]
     async fn never_snapshotted_root_reowns_everything() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
