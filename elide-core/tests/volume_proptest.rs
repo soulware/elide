@@ -286,14 +286,28 @@ enum SimOp {
     HalfPromotePending,
     /// Phase 5 Tier 1 dictionary-delta repack of post-snapshot pending
     /// segments. No-op when there is no sealed snapshot or no Data
-    /// entries match same-LBA extents in the prior snapshot. Segment
-    /// files are rewritten in place under their original ULID via
-    /// atomic rename, so no new ULID files appear. The actor-layer
-    /// proptest covers this through `ActorOp::DeltaRepack`; modelling
-    /// it here exercises the same invariants directly against the
-    /// volume layer (ULID set unchanged, oracle preserved across
-    /// subsequent crash + rebuild).
+    /// entries match same-LBA extents in the prior snapshot. Each
+    /// converted input is rewritten under a freshly-minted output ULID
+    /// and unlinked. The actor-layer proptest covers this through
+    /// `ActorOp::DeltaRepack`; modelling it here exercises the same
+    /// invariants directly against the volume layer (oracle preserved
+    /// across subsequent crash + rebuild).
     DeltaRepack,
+    /// Write a near-duplicate incompressible block:
+    /// `incompressible_block(base_seed)` with the first 32 bytes set to
+    /// `tweak`. Two draws sharing `(lba, base_seed)` with different
+    /// tweaks differ by ~32 bytes, so once the earlier one sits under a
+    /// signed snapshot, `DeltaRepack` converts the later write into a
+    /// thin Delta entry — the only op shape that arms the Delta
+    /// read/GC-fold paths (`WriteLarge`/`WriteMulti` bodies are
+    /// uncorrelated per seed, so the delta-smaller-than-stored gate
+    /// never passes on them).
+    ///
+    /// LBA range 52..56 — disjoint from Write (0..8), WriteZeroes
+    /// (8..16), PopulateFetched (16..24), WriteLarge (24..32),
+    /// SameContentWrite (32..40), WriteMulti (40..52), and
+    /// ReadUnwritten (64).
+    WriteNearDup { lba: u8, base_seed: u8, tweak: u8 },
     /// Seal a snapshot manifest over the current `index/` set: pick
     /// the max ULID in `index/` (or a fresh one if empty) and call
     /// `vol.sign_snapshot_manifest`. Writes `snapshots/<ulid>.manifest`
@@ -346,10 +360,11 @@ enum SimOp {
     /// post-crash rebuild. `ReadAfterDrain` closes that gap by checking
     /// the in-process read path against the oracle on every fire.
     ///
-    /// `lba` is in 0..52 to cover the union of the write ranges (Write
+    /// `lba` is in 0..56 to cover the union of the write ranges (Write
     /// 0..8, WriteZeroes 8..16, PopulateFetched 16..24, WriteLarge
-    /// 24..32, SameContentWrite 32..40, WriteMulti 40..52). Unwritten
-    /// LBAs in that range read back as zeros, which is checked too.
+    /// 24..32, SameContentWrite 32..40, WriteMulti 40..52, WriteNearDup
+    /// 52..56). Unwritten LBAs in that range read back as zeros, which
+    /// is checked too.
     ReadAfterDrain { lba: u8 },
 }
 
@@ -395,6 +410,11 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::HalfPromotePending),
         Just(SimOp::DeltaRepack),
         Just(SimOp::SignSnapshot),
+        (0u8..4, 0u8..4, any::<u8>()).prop_map(|(lba, base_seed, tweak)| SimOp::WriteNearDup {
+            lba,
+            base_seed,
+            tweak,
+        }),
         (0u8..8, 2u8..=4, any::<u8>()).prop_map(|(start_lba, lba_count, seed)| {
             SimOp::WriteMulti {
                 start_lba,
@@ -403,7 +423,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             }
         }),
         Just(SimOp::EvictCacheBody),
-        (0u8..52).prop_map(|lba| SimOp::ReadAfterDrain { lba }),
+        (0u8..56).prop_map(|lba| SimOp::ReadAfterDrain { lba }),
     ]
 }
 
@@ -596,6 +616,33 @@ fn post_gc_prefix() -> Vec<SimOp> {
     ]
 }
 
+/// A sealed base plus a post-seal near-duplicate overwrite converted to
+/// a thin Delta entry. The random suffix's CoordGcLocal / GcApply /
+/// ReadAfterDrain / Crash ops then explore fold-keeps-delta,
+/// read-without-reopen (the #681 shape), and rebuild against a live
+/// Delta entry deterministically, rather than waiting for two
+/// WriteNearDup draws to collide on the same `(lba, base_seed)`.
+fn delta_gc_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::WriteNearDup {
+            lba: 0,
+            base_seed: 0,
+            tweak: 0x01,
+        },
+        SimOp::Flush,
+        SimOp::DrainWithRedact,
+        SimOp::Snapshot,
+        SimOp::SignSnapshot,
+        SimOp::WriteNearDup {
+            lba: 0,
+            base_seed: 0,
+            tweak: 0x02,
+        },
+        SimOp::Flush,
+        SimOp::DeltaRepack,
+    ]
+}
+
 fn with_prefix(prefix: Vec<SimOp>, ops: Vec<SimOp>) -> Vec<SimOp> {
     let mut v = prefix;
     v.extend(ops);
@@ -621,6 +668,9 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         arb_sim_ops().prop_map(|ops| with_prefix(repack_and_sweep_prefix(), ops)),
         // Dedup + redact + GC: exercises the redact → drain → GC pipeline with thin DedupRefs.
         arb_sim_ops().prop_map(|ops| with_prefix(dedup_redact_gc_prefix(), ops)),
+        // Live Delta entry in pending: the suffix explores GC folds and
+        // reads over it without a reopen.
+        arb_sim_ops().prop_map(|ops| with_prefix(delta_gc_prefix(), ops)),
     ]
 }
 
@@ -890,6 +940,14 @@ proptest! {
                 SimOp::WriteLarge { lba, seed } => {
                     let data = incompressible_block(*seed);
                     let _ = vol.write(24 + *lba as u64, &data);
+                }
+                SimOp::WriteNearDup {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let data = common::variant_block(*base_seed, *tweak);
+                    let _ = vol.write(52 + *lba as u64, &data);
                 }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
@@ -1191,6 +1249,18 @@ proptest! {
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
                 }
+                SimOp::WriteNearDup {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let data = common::variant_block(*base_seed, *tweak);
+                    let actual_lba = 52 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(actual_lba, block);
+                }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
                     let actual_lba = 32 + *lba as u64;
@@ -1451,6 +1521,18 @@ proptest! {
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
                 }
+                SimOp::WriteNearDup {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let data = common::variant_block(*base_seed, *tweak);
+                    let actual_lba = 52 + *lba as u64;
+                    let _ = vol.write(actual_lba, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(actual_lba, block);
+                }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
                     let actual_lba = 32 + *lba as u64;
@@ -1613,4 +1695,43 @@ proptest! {
             }
         }
     }
+}
+
+/// The `delta_gc_prefix` steps must actually mint a Delta entry —
+/// asserted here on `DeltaRepackStats` so a future change to the
+/// conversion gates (inline threshold, delta-smaller-than-stored,
+/// snapshot resolution) cannot silently regress the suite's Delta
+/// coverage back to a structural no-op, which is the gap that hid the
+/// #681 fold mis-registration for so long.
+#[test]
+fn delta_gc_prefix_mints_a_delta_entry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(52, &common::variant_block(0, 0x01)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    vol.write(52, &common::variant_block(0, 0x02)).unwrap();
+    vol.flush_wal().unwrap();
+    let stats = vol.delta_repack_post_snapshot().unwrap();
+    assert!(
+        stats.entries_converted >= 1,
+        "near-duplicate post-seal overwrite must convert to a Delta entry \
+         (scanned={} rewritten={} converted={})",
+        stats.segments_scanned,
+        stats.segments_rewritten,
+        stats.entries_converted,
+    );
+
+    let expected = common::variant_block(0, 0x02);
+    assert_eq!(
+        vol.read(52, 1).unwrap().as_slice(),
+        expected.as_slice(),
+        "delta LBA must read back the post-conversion bytes"
+    );
 }

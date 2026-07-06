@@ -1340,6 +1340,16 @@ impl Volume {
         fs::rename(&tmp_path, &bare_path)?;
         let _ = fs::remove_file(&plan_path);
         self.own_segments.insert(new_ulid);
+        // Bump last_segment_ulid so a snapshot taken after this apply
+        // (with no intervening write) mints its marker at or above the
+        // fold output — the first-snapshot pinning invariant in
+        // `Volume::snapshot` requires every own-segment extent-index
+        // target to sit at or below the marker. The open-time rebuild
+        // computes this from its gc/ + index/ scan; the live apply must
+        // match it.
+        if self.last_segment_ulid < Some(new_ulid) {
+            self.last_segment_ulid = Some(new_ulid);
+        }
 
         // Merge the GC output into self.lbamap by per-entry conditional
         // insert. `insert_consuming_inputs` skips any sub-range whose

@@ -90,10 +90,70 @@ fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     }
 }
 
+/// One block of incompressible, hash-derived bytes per seed. Mirrors
+/// `common::incompressible_block` in the elide-core test suite. Stored
+/// raw (lz4 can't shrink it), so the write lands as a body-section
+/// Data entry rather than Inline — the shape delta_repack converts.
+fn incompressible_block(seed: u8) -> [u8; 4096] {
+    let mut buf = [0u8; 4096];
+    let key = [seed; 32];
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        chunk.copy_from_slice(&hash.as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    buf
+}
+
+/// `incompressible_block(base_seed)` with the first 32 bytes replaced
+/// by `tweak`: a near-duplicate whose zstd-dict delta against the base
+/// is tiny, so delta_repack's smaller-than-stored gate passes.
+fn variant_block(base_seed: u8, tweak: u8) -> [u8; 4096] {
+    let mut buf = incompressible_block(base_seed);
+    buf[..32].fill(tweak);
+    buf
+}
+
+/// Keypair + default (root) `volume.provenance`, matching production
+/// volume setup. The provenance file is required by snapshot-pinned
+/// readers (`BlockReader::open_snapshot`), which `DeltaRepack` builds.
+fn write_keypair_and_provenance(dir: &Path) {
+    let key = elide_core::signing::generate_keypair(
+        dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    elide_core::signing::write_provenance(
+        dir,
+        &key,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        &elide_core::signing::ProvenanceLineage::default(),
+    )
+    .unwrap();
+}
+
 #[derive(Debug, Clone)]
 enum SimOp {
     /// Write [seed; 4096] to lba.
     Write { lba: u8, seed: u8 },
+    /// Write one incompressible body-section Data block at `lba` — a
+    /// future delta candidate's dictionary source once sealed.
+    BaseWrite { lba: u8, base_seed: u8 },
+    /// Write a near-duplicate of `base_seed`'s block at `lba`. When the
+    /// LBA's sealed prior content shares the base, `DeltaRepack`
+    /// converts this write to a thin Delta entry against it.
+    VariantWrite { lba: u8, base_seed: u8, tweak: u8 },
+    /// Seal: snapshot (flushes the WAL) + sign the manifest. Gives
+    /// `DeltaRepack` its prior reader and activates the GC floor —
+    /// sealed segments are excluded from compaction.
+    SnapshotSign,
+    /// The drain tick's delta_repack: rewrite post-seal single-block
+    /// Data overwrites as Delta entries against the sealed snapshot.
+    /// Content-neutral; no oracle change.
+    DeltaRepack,
     /// Write [seed; 4096] to lba_a then lba_b (disjoint ranges 0..4 / 4..8).
     /// Because the data is identical, lba_b's WAL entry is a DEDUP_REF.
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
@@ -181,6 +241,11 @@ enum SimOp {
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
     prop_oneof![
         4 => (0u8..8, any::<u8>()).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
+        2 => (0u8..8, 0u8..4).prop_map(|(lba, base_seed)| SimOp::BaseWrite { lba, base_seed }),
+        3 => (0u8..8, 0u8..4, any::<u8>())
+            .prop_map(|(lba, base_seed, tweak)| SimOp::VariantWrite { lba, base_seed, tweak }),
+        2 => Just(SimOp::SnapshotSign),
+        2 => Just(SimOp::DeltaRepack),
         2 => (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
             lba_a,
             lba_b,
@@ -227,6 +292,86 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..30)
 }
 
+/// The BaseWrite → seal → VariantWrite → DeltaRepack chain must
+/// actually mint a Delta entry — asserted on `DeltaRepackStats` so a
+/// future change to the conversion gates cannot silently regress the
+/// suite's Delta coverage to a structural no-op (the gap that hid the
+/// #681 fold mis-registration).
+#[test]
+fn delta_ops_mint_a_delta_entry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    write_keypair_and_provenance(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(0, &incompressible_block(0)).unwrap();
+    vol.flush_wal().unwrap();
+    simulate_upload(&mut vol, fork_dir);
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    vol.write(0, &variant_block(0, 0x01)).unwrap();
+    vol.flush_wal().unwrap();
+    let stats = vol.delta_repack_post_snapshot().unwrap();
+    assert!(
+        stats.entries_converted >= 1,
+        "near-duplicate post-seal overwrite must convert to a Delta entry \
+         (scanned={} rewritten={} converted={})",
+        stats.segments_scanned,
+        stats.segments_rewritten,
+        stats.entries_converted,
+    );
+    assert_eq!(
+        vol.read(0, 1).unwrap().as_slice(),
+        variant_block(0, 0x01).as_slice(),
+        "delta LBA must read back the post-conversion bytes"
+    );
+}
+
+/// Deterministic materialisation of the minimal sequence the Delta-op
+/// proptest found on its first run: `[SplitDedupWrite, GcSweep,
+/// SplitDedupWrite, GcSweep, SnapshotSign]`. A snapshot minted right
+/// after a GC apply — no intervening WAL flush — must place its marker
+/// at or above the fold output: `Volume::snapshot`'s first-snapshot
+/// pinning debug invariant requires every own-segment extent-index
+/// target to sit at or below the marker, and the fold output's ULID is
+/// above every flushed segment by construction.
+#[test]
+fn snapshot_after_gc_apply_covers_fold_output() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    write_keypair_and_provenance(fork_dir);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = GcConfig {
+        density_threshold: 0.0,
+        interval: Duration::ZERO,
+        ..GcConfig::default()
+    };
+
+    for seed in [0u8, 1] {
+        let data = [seed; 4096];
+        vol.write(0, &data).unwrap();
+        vol.flush_wal().unwrap();
+        vol.write(4, &data).unwrap();
+        vol.flush_wal().unwrap();
+
+        simulate_upload(&mut vol, fork_dir);
+        let u_gc = vol.gc_checkpoint_for_test().unwrap();
+        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+        let _ = vol.apply_gc_handoffs();
+        promote_gc_outputs(&mut vol, fork_dir);
+        let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
+    }
+
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
@@ -246,12 +391,7 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
-        elide_core::signing::generate_keypair(
-            fork_dir,
-            elide_core::signing::VOLUME_KEY_FILE,
-            elide_core::signing::VOLUME_PUB_FILE,
-        )
-        .unwrap();
+        write_keypair_and_provenance(fork_dir);
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
@@ -270,10 +410,37 @@ proptest! {
         let cache_dir = fork_dir.join("cache");
         let index_dir = fork_dir.join("index");
 
+        // Segments sealed by the most recent SnapshotSign sit below the
+        // GC floor and are excluded from compaction — they stay in
+        // index/ and cache/ across sweeps, so the post-sweep bounds
+        // below must admit them.
+        let mut frozen: usize = 0;
+
         for op in &ops {
             match op {
                 SimOp::Write { lba, seed } => {
                     let _ = vol.write(*lba as u64, &[*seed; 4096]);
+                }
+                SimOp::BaseWrite { lba, base_seed } => {
+                    let _ = vol.write(*lba as u64, &incompressible_block(*base_seed));
+                }
+                SimOp::VariantWrite {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let _ = vol.write(*lba as u64, &variant_block(*base_seed, *tweak));
+                }
+                SimOp::SnapshotSign => {
+                    if let Ok(snap) = vol.snapshot() {
+                        let _ = vol.sign_snapshot_manifest(snap);
+                    }
+                    frozen = fs::read_dir(&index_dir)
+                        .map(|d| d.flatten().count())
+                        .unwrap_or(0);
+                }
+                SimOp::DeltaRepack => {
+                    let _ = vol.delta_repack_post_snapshot();
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -400,23 +567,26 @@ proptest! {
                             })
                             .unwrap_or_default();
                         let idx_after = idx_after_names.len();
-                        let idx_max = 1 + checkpoint_extra + stats.deferred;
+                        let idx_max = 1 + checkpoint_extra + stats.deferred + frozen;
                         prop_assert!(
                             idx_after <= idx_max,
                             "after GcSweep on {} segments, {} .idx files remain \
                              (expected ≤{}: 1 GC output + {} checkpoint segment(s) \
-                             + {} deferred); files=[{}]; strategy={:?} candidates={}",
+                             + {} deferred + {} sealed below the GC floor); \
+                             files=[{}]; strategy={:?} candidates={}",
                             idx_before,
                             idx_after,
                             idx_max,
                             checkpoint_extra,
                             stats.deferred,
+                            frozen,
                             idx_after_names.join(", "),
                             stats.strategy,
                             stats.candidates,
                         );
                         // cache/ .body files: 1 GC output + any deferred
-                        // segments (their bodies are still in cache/).
+                        // segments (their bodies are still in cache/) +
+                        // sealed segments below the GC floor.
                         let bodies_after: usize = fs::read_dir(&cache_dir)
                             .map(|d| {
                                 d.flatten()
@@ -427,12 +597,13 @@ proptest! {
                             })
                             .unwrap_or(0);
                         prop_assert!(
-                            bodies_after <= 1 + stats.deferred,
+                            bodies_after <= 1 + stats.deferred + frozen,
                             "after GcSweep, {} .body files remain in cache/ \
-                             (expected ≤{}: 1 GC output + {} deferred)",
+                             (expected ≤{}: 1 GC output + {} deferred + {} sealed)",
                             bodies_after,
-                            1 + stats.deferred,
+                            1 + stats.deferred + frozen,
                             stats.deferred,
+                            frozen,
                         );
                     }
                 }
@@ -458,12 +629,7 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
-        elide_core::signing::generate_keypair(
-            fork_dir,
-            elide_core::signing::VOLUME_KEY_FILE,
-            elide_core::signing::VOLUME_PUB_FILE,
-        )
-        .unwrap();
+        write_keypair_and_provenance(fork_dir);
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
@@ -487,6 +653,32 @@ proptest! {
                     let data = [*seed; 4096];
                     let _ = vol.write(*lba as u64, &data);
                     oracle.insert(*lba as u64, data);
+                }
+                SimOp::BaseWrite { lba, base_seed } => {
+                    let data = incompressible_block(*base_seed);
+                    let _ = vol.write(*lba as u64, &data);
+                    oracle.insert(*lba as u64, data);
+                }
+                SimOp::VariantWrite {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let data = variant_block(*base_seed, *tweak);
+                    let _ = vol.write(*lba as u64, &data);
+                    oracle.insert(*lba as u64, data);
+                }
+                SimOp::SnapshotSign => {
+                    // Content-neutral: sealing changes which segments GC
+                    // may touch and arms DeltaRepack, not logical bytes.
+                    if let Ok(snap) = vol.snapshot() {
+                        let _ = vol.sign_snapshot_manifest(snap);
+                    }
+                }
+                SimOp::DeltaRepack => {
+                    // Content-neutral: Data entries become thin Delta
+                    // entries materialising to identical bytes.
+                    let _ = vol.delta_repack_post_snapshot();
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -678,12 +870,7 @@ fn gc_oracle_repro_bug_h() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
 
-    elide_core::signing::generate_keypair(
-        fork_dir,
-        elide_core::signing::VOLUME_KEY_FILE,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .unwrap();
+    write_keypair_and_provenance(fork_dir);
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
@@ -756,12 +943,7 @@ fn gc_oracle_repro_bug_h() {
 fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
-    elide_core::signing::generate_keypair(
-        fork_dir,
-        elide_core::signing::VOLUME_KEY_FILE,
-        elide_core::signing::VOLUME_PUB_FILE,
-    )
-    .unwrap();
+    write_keypair_and_provenance(fork_dir);
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
