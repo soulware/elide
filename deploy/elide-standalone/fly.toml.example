@@ -1,7 +1,7 @@
 # Elide coordinator on Fly.io, standalone — a private app (no public service),
 # reachable over 6PN at <app>.internal. Template: copy to fly.toml (gitignored),
 # fill app/primary_region and DATA_BUCKET, set the AWS_* secrets, then
-# `./deploy.sh` from this directory. See README.md.
+# `fly deploy` from this directory. See README.md.
 
 app = "elide-coord-standalone"
 primary_region = "iad"
@@ -9,19 +9,19 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
   [build.args]
-    # ELIDE_VERSION is supplied by deploy.sh (it resolves the release tag); a
-    # bare `fly deploy` fails without it.
     # DATA_BUCKET: the Tigris bucket the AWS_* keypair has read/write on; baked
     # into coord.toml [store].bucket.
     DATA_BUCKET = "elide"
 
 # Coordinator state — index/, cache/, credentials/, keys — lives here on the
-# volume so it survives redeploys (matches data_dir in coord.toml). The Tigris
-# read/write keypair is supplied as secrets, not here:
+# volume so it survives redeploys (matches data_dir in coord.toml). The first
+# deploy creates the volume at initial_size. The Tigris read/write keypair is
+# supplied as secrets, not here:
 #   fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
 [mounts]
   source = "elide_data"
   destination = "/data"
+  initial_size = "10gb"
 
 # Serverless-off: keep one instance up so the served volumes stay live. The
 # coordinator serves block devices over ublk (the image loads `ublk_drv`; Fly

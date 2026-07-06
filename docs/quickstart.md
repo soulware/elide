@@ -68,29 +68,21 @@ Edit `fly.toml`:
 This completes the configuration: the Tigris endpoint and region are baked
 into the image's `coord.toml`, and the keypair arrives via the secrets.
 
-## 4. Create the machine's state volume
-
-Coordinator state (segment indexes, cache, keys) lives on a Fly volume so it
-survives redeploys:
+## 4. Deploy
 
 ```sh
-fly volumes create elide_data --size 1 -r <region> -a my-elide
+fly deploy
 ```
 
-## 5. Deploy
-
-```sh
-./deploy.sh
-```
-
-`deploy.sh` resolves the latest elide release tag, verifies its binaries
-exist, and runs `fly deploy` with that version. `./deploy.sh v0.1.3` pins a
-specific release.
+The image runs the newest elide release, and the first deploy creates the
+machine's `elide_data` Fly volume (10GB, from `initial_size` in fly.toml) —
+coordinator state (segment indexes, cache, keys) lives there and survives
+redeploys. `./deploy.sh v0.1.3` deploys a pinned release instead.
 
 The coordinator comes up serving immediately. If the keypair secrets are
 missing it fails loudly at startup.
 
-## 6. Create an elide volume
+## 5. Create an elide volume
 
 The coordinator's control plane is a Unix socket inside the machine, so
 volume operations run over SSH:
@@ -108,7 +100,7 @@ elide volume create --size 1G vol1
 The coordinator runs as root with `ublk_drv` loaded, so the volume comes up
 serving a kernel block device: `/dev/ublkb0`.
 
-## 7. Format, mount, write
+## 6. Format, mount, write
 
 Still inside the machine:
 
