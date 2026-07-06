@@ -102,14 +102,24 @@ impl GcCycleOrchestrator {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| fork_dir.clone());
         let snap_lock = snapshot_lock_for(snapshot_locks, &fork_dir);
-        // Run GC and reap on the first tick to clear any backlog from a
-        // previous run.
-        let last_gc = Instant::now()
-            .checked_sub(gc_config.interval)
-            .unwrap_or_else(Instant::now);
-        let last_reap = Instant::now()
-            .checked_sub(gc_config.reaper_cadence())
-            .unwrap_or_else(Instant::now);
+        // Force GC and reap on the first tick only when local-fs
+        // markers show work a previous run left mid-stream. A
+        // quiescent fork starts both clocks at their natural cadence:
+        // the forced reap's HEAD read is the first op on the volume's
+        // `coord-data` facade, so an unconditional backdate costs one
+        // mint round-trip per live volume on every coordinator start.
+        let backdate = fork_has_local_backlog(&fork_dir);
+        let now = Instant::now();
+        let last_gc = if backdate {
+            now.checked_sub(gc_config.interval).unwrap_or(now)
+        } else {
+            now
+        };
+        let last_reap = if backdate {
+            now.checked_sub(gc_config.reaper_cadence()).unwrap_or(now)
+        } else {
+            now
+        };
         let volume_data = VolumeData::new(Arc::clone(&store), vol_ulid);
         Self {
             fork_dir,
@@ -703,6 +713,27 @@ impl GcCycleOrchestrator {
     }
 }
 
+/// Local-fs preflight: does this fork hold work a previous run left
+/// mid-stream? True when `pending/` contains any file (segments not
+/// yet promoted to S3) or `gc/` holds a bare volume-applied handoff
+/// awaiting upload. Best-effort: an unreadable dir counts as no
+/// backlog — a false negative defers the forced first-tick pass to
+/// the natural cadence, with no correctness consequence.
+fn fork_has_local_backlog(fork_dir: &Path) -> bool {
+    if let Ok(mut entries) = std::fs::read_dir(fork_dir.join("pending"))
+        && entries.next().is_some()
+    {
+        return true;
+    }
+    let gc_dir = fork_dir.join("gc");
+    if !gc_dir.is_dir() {
+        return false;
+    }
+    gc::collect_bare_handoffs(&gc_dir)
+        .map(|bare| !bare.is_empty())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     //! HEAD-merge integration for the per-volume tick loop.
@@ -742,6 +773,17 @@ mod tests {
         store: Arc<dyn ObjectStore>,
         volume_name: Option<&str>,
     ) -> (GcCycleOrchestrator, TempDir) {
+        orchestrator_prepped(store, volume_name, |_| {})
+    }
+
+    /// `prep` runs against the fork dir before the orchestrator is
+    /// constructed, so tests can plant backlog markers the constructor
+    /// preflight must see.
+    fn orchestrator_prepped(
+        store: Arc<dyn ObjectStore>,
+        volume_name: Option<&str>,
+        prep: impl FnOnce(&Path),
+    ) -> (GcCycleOrchestrator, TempDir) {
         let tmp = TempDir::new().unwrap();
         // Build `<tmp>/by_id/<vol>/` so by_id_dir resolves to a real
         // path; the orchestrator's tick logic exists() checks the fork
@@ -751,6 +793,7 @@ mod tests {
         let vol = vol_ulid();
         let fork_dir = by_id.join(vol.to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
+        prep(&fork_dir);
         let locks = crate::new_snapshot_lock_registry();
         let stores: Arc<dyn crate::stores::ScopedStores> =
             Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
@@ -1159,5 +1202,78 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (orch, _tmp) = orchestrator(store);
         assert!(orch.fence_if_displaced().await.is_none());
+    }
+
+    #[test]
+    fn fork_quiescent_when_no_pending_or_gc_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+        std::fs::create_dir_all(tmp.path().join("pending")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_has_backlog_when_pending_has_files() {
+        let tmp = TempDir::new().unwrap();
+        let pending = tmp.path().join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
+        assert!(super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_has_backlog_for_bare_gc_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let gc = tmp.path().join("gc");
+        std::fs::create_dir_all(&gc).unwrap();
+        std::fs::write(gc.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
+        assert!(super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_quiescent_when_gc_only_holds_staged_or_planned() {
+        // A `.staged` file and a bare ULID with a `.plan` sibling are
+        // mid-apply states the volume resolves on its next apply tick,
+        // not coordinator backlog.
+        let tmp = TempDir::new().unwrap();
+        let gc = tmp.path().join("gc");
+        std::fs::create_dir_all(&gc).unwrap();
+        std::fs::write(gc.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), b"").unwrap();
+        std::fs::write(gc.join("01BX5ZZKBKACTAV9WEVGEMMVRZ.plan"), b"").unwrap();
+        std::fs::write(gc.join("01BX5ZZKBKACTAV9WEVGEMMVRZ"), b"").unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[test]
+    fn fork_quiescent_when_gc_holds_non_ulid_names() {
+        let tmp = TempDir::new().unwrap();
+        let gc = tmp.path().join("gc");
+        std::fs::create_dir_all(&gc).unwrap();
+        std::fs::write(gc.join("notaulid"), b"").unwrap();
+        assert!(!super::fork_has_local_backlog(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn constructor_defers_first_tick_on_quiescent_fork() {
+        // orchestrator() builds an empty fork dir, so neither clock is
+        // backdated: the first tick fires GC and reap on their natural
+        // cadence, not immediately.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, _tmp) = orchestrator(store);
+        assert!(orch.last_gc.elapsed() < orch.gc_config.interval);
+        assert!(orch.last_reap.elapsed() < orch.gc_config.reaper_cadence());
+    }
+
+    #[tokio::test]
+    async fn constructor_forces_first_tick_on_backlogged_fork() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (orch, _tmp) = orchestrator_prepped(store, None, |fork_dir| {
+            let pending = fork_dir.join("pending");
+            std::fs::create_dir_all(&pending).unwrap();
+            std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
+        });
+        assert!(orch.last_gc.elapsed() >= orch.gc_config.interval);
+        assert!(orch.last_reap.elapsed() >= orch.gc_config.reaper_cadence());
     }
 }

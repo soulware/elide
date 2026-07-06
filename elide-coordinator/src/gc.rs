@@ -629,7 +629,7 @@ pub struct HandoffOutcome {
 /// upload. Under the self-describing protocol, a bare file's `inputs`
 /// header field lists the consumed source ULIDs — everything needed to
 /// finish the handoff (upload → promote → S3 delete → local delete).
-fn collect_bare_handoffs(gc_dir: &Path) -> Result<Vec<fs::DirEntry>> {
+pub(crate) fn collect_bare_handoffs(gc_dir: &Path) -> Result<Vec<fs::DirEntry>> {
     let mut bare: Vec<fs::DirEntry> = fs::read_dir(gc_dir)
         .context("reading gc dir")?
         .filter_map(|e| e.ok())
