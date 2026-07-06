@@ -10,23 +10,30 @@ operator-gated enrollment), use `deploy/elide/` instead.
 `Dockerfile` + `fly.toml` (from the committed `fly.toml.example`) deploy the
 coordinator as a **private** Fly app (no public service): it binds no TCP port,
 its control plane is an in-container UDS, and ublk is local. The image downloads
-the released `elide`, `elide-coordinator`, and `elide-import` binaries at
-`ELIDE_VERSION`, bakes `DATA_BUCKET` into `coord.toml`, loads `ublk_drv`, and
-runs `elide-coordinator serve`. Coordinator state (`index/`, `cache/`, keys)
-lives on the `elide_data` volume and survives redeploys.
+the released `elide`, `elide-coordinator`, and `elide-import` binaries — the
+newest release by default, or the tag `deploy.sh` pins — bakes `DATA_BUCKET`
+into `coord.toml`, loads `ublk_drv`, and runs `elide-coordinator serve`.
+Coordinator state (`index/`, `cache/`, keys) lives on the `elide_data` volume
+and survives redeploys.
 
 Prerequisites: the `fly` CLI, a Tigris bucket, and a keypair with read/write on
 it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+
+`./launch.sh` does the whole setup in one step — auto-named app, region prompt,
+Tigris bucket via `fly storage create` (which sets the keypair secrets),
+generated `fly.toml`, deploy — echoing each `fly` command as it runs.
+Manually:
 
 1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
    gitignored) — and set `app` / `primary_region` and the `DATA_BUCKET` build
    arg (= `coord.toml`'s `[store].bucket`). All deploy commands run from this
    directory.
-2. `fly apps create <app>` and `fly volumes create elide_data --size 1`.
+2. `fly apps create <app>`.
 3. `fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…`.
-4. `./deploy.sh` — resolves the latest release tag, checks its assets, and
-   passes it as the `ELIDE_VERSION` build arg. `./deploy.sh v0.1.2` pins a
-   specific tag.
+4. `fly deploy` — runs the newest elide release; the first deploy creates the
+   `elide_data` state volume (`initial_size` in the template). To deploy a
+   specific release, `./deploy.sh v0.1.2` verifies the tag's assets exist and
+   passes its path as the `ELIDE_RELEASE` build arg.
 
 The coordinator comes up serving immediately — there is no enrollment step. If
 the keypair secrets are unset it fails loudly at startup (`AWS_ACCESS_KEY_ID not
@@ -49,4 +56,4 @@ operations run there:
 The keypair is shared, unscoped, and long-lived: every volume the coordinator
 serves can read and write the whole bucket. There is no per-volume IAM scoping
 and no operator authorization on writes. That is the deliberate trade for a
-single-knob deploy; `deploy/elide/` is the scoped, mint-backed alternative.
+simplified deploy; `deploy/elide/` is the scoped, mint-backed alternative.

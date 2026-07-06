@@ -4,7 +4,7 @@ Elide is a log-structured block storage system combining demand-fetch, content-a
 
 ## Documentation
 
-- **Start here** — [quickstart.md](docs/quickstart.md), then [overview.md](docs/overview.md)
+- **Start here** — [quickstart.md](docs/quickstart.md) (Fly.io + Tigris), then [overview.md](docs/overview.md); local-build guides in [quickstart-local.md](docs/quickstart-local.md), [quickstart-data-volume.md](docs/quickstart-data-volume.md), and [quickstart-tigris.md](docs/quickstart-tigris.md)
 - **Concepts & reference** — architecture, formats, operations, testing, findings, reference, and prior-art comparisons, all in [docs/](docs/)
 - **Design notes** — [docs/design/](docs/design/)
 - **Implementation plans** — [docs/plans/](docs/plans/)

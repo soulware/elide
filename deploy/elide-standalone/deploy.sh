@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Deploy the standalone Elide coordinator to Fly.io at a resolved elide release
-# version.
+# Deploy the standalone Elide coordinator to Fly.io at a verified elide release
+# version. A bare `fly deploy` tracks the newest release; this script deploys a
+# concrete tag whose assets it has checked exist first.
 #
 #   ./deploy.sh            deploy the newest version tag's release
 #   ./deploy.sh latest     same, stated explicitly
@@ -11,8 +12,8 @@
 # below instead of silently deploying the previous release.
 #
 # Resolves the version to a concrete tag, checks the release assets exist, and
-# passes the tag as the ELIDE_VERSION build-arg the Dockerfile requires. Any
-# extra arguments pass through to `fly deploy`.
+# passes the tag's release path as the ELIDE_RELEASE build-arg. Any extra
+# arguments pass through to `fly deploy`.
 set -euo pipefail
 
 repo="soulware/elide"
@@ -42,4 +43,4 @@ for asset in "${assets[@]}"; do
 done
 
 echo "deploying elide ${version}"
-exec fly deploy --build-arg "ELIDE_VERSION=${version}" "$@"
+exec fly deploy --build-arg "ELIDE_RELEASE=download/${version}" "$@"
