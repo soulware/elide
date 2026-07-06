@@ -81,10 +81,10 @@ by default: `vol1` exposes `/dev/ublkbN` on first start (reachable by name at
 `volume.toml` for crash recovery.
 
 The unprivileged coordinator above can't serve ublk, so `vol1` starts
-IPC-only (no host-visible block device). Attach the transport explicitly:
+IPC-only (no host-visible block device). Attach the device explicitly:
 
 ```sh
-./target/debug/elide volume update vol1 --ublk
+./target/debug/elide volume update vol1 --device
 ```
 
 The volume then serves over ublk once the coordinator runs as root. Then:

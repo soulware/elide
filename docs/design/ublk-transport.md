@@ -62,7 +62,7 @@ ublk's I/O transport is io_uring — async is inherent. But the async surface is
 
 - Lifecycle: `ADD_DEV` → `SET_PARAMS` → `START_DEV` → run → daemon-exit detection → `START_USER_RECOVERY` (next serve) → `END_USER_RECOVERY`. `libublk::run_target` handles the first three; elide installs a SIGINT/SIGTERM/SIGHUP handler that fsyncs the WAL and `process::exit(0)`s without calling `STOP_DEV` or `DEL_DEV` — the kernel's monitor work observes the io_uring fds close and parks the device in QUIESCED via `UBLK_F_USER_RECOVERY`. Explicit deletion is the operator action `elide ublk delete <id>` (or the coordinator's startup reconciliation sweep). See `docs/design/ublk-shutdown-park.md`.
 - `UblkConfig { dev_id: Option<i32> }` in `elide-core/src/config.rs`.
-- CLI: `--ublk` (the kernel auto-allocates the id and records it in `volume.toml`).
+- CLI: `volume create` / `volume update` take `--device` / `--no-device` (user intent: serve a host block device or not); the kernel auto-allocates the id and records it in `volume.toml`.
 - Conflict detection: `find_ublk_conflict` checks for `dev_id` collisions.
 - Coordinator supervision: spawn `elide serve-volume ... --ublk`, respawn on crash.
 
@@ -200,7 +200,7 @@ First PR is the spike only. Later steps are sequenced separately, each on its ow
 2b. **Depth > 1 (landed).** `queue_depth = 64` via uring-registered eventfd bridging from a per-queue worker pool. See Async model above for the dead-end we avoided.
 3. **USER_RECOVERY_REISSUE (landed).** Added with `UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE` by default; sysfs-scan-based add/recover routing at serve startup; `START_USER_RECOVERY` issued before the recovery builder, `END_USER_RECOVERY` via libublk's internal `start_dev` path. Crash-injection integration test is a follow-up.
 4. **Zero-copy (optional, future).** `UBLK_F_AUTO_BUF_REG` on WRITE. Benchmark. Beyond the obvious cost — root is required (`CAP_SYS_ADMIN`) and the kernel floor lifts to 6.10+ for `AUTO_BUF_REG` — the real cost is that the synchronous `VolumeReader` model in *Async model* breaks. Zero-copy hands the daemon a kernel-registered buffer index per tag; reads must land directly in that buffer via io_uring SQEs against the queue's ring, not via a sync `pread` into an arbitrary `&mut [u8]`. The backend either reworks its I/O path to issue ring-targeted ops, or copies into the registered buffer at the boundary and gives up the win. Internal copies (cache, dedup, decompression) further bound the upside, so this should be measured before committing. Likely a separate "privileged" tier.
-5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` grew `--ublk` / `--no-ublk` flags (no id is pinnable — the kernel auto-allocates and the chosen id is recorded into `volume.toml`). Supervisor reads `[ublk]` and passes `--ublk` to `serve-volume`, which reads the bound id from `volume.toml`. `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart-local.md`.
+5. **Config + CLI (landed).** `[ublk]` section in `volume.toml`. `volume create` / `volume update` carry `--device` / `--no-device` flags (no id is pinnable — the kernel auto-allocates and the chosen id is recorded into `volume.toml`). Supervisor reads `[ublk]` and passes `--ublk` to `serve-volume`, which reads the bound id from `volume.toml`. `find_ublk_conflict` resolves `dev_id` collisions by lowest-ULID-wins. Operator docs in `operations.md` and `quickstart-local.md`.
 
 ## References
 

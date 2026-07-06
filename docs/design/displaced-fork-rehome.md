@@ -126,7 +126,7 @@ parked and there is no guest to fence — the rehome involves no device work.
 Where a device is still bound, the stop is a teardown, not a park: A `del_dev`s
 V1's kernel device and removes the `[ublk]` transport from its config. The
 rehomed fork therefore starts transport-less until an explicit
-`volume update --ublk` re-exposes it over a freshly-allocated device.
+`volume update --device` re-exposes it over a freshly-allocated device.
 
 ### Rehome
 
@@ -271,7 +271,7 @@ A rehomed fork's choices are the same as any volume's:
 - **Preserve (default): rehome.** The fork becomes `<name>-<suffix>`, a
   first-class `released` volume — visible like any released volume and
   revived by the ordinary reclaim-then-start, though it carries no ublk
-  transport until `volume update --ublk` re-enables it.
+  transport until `volume update --device` re-enables it.
 - **Remove locally: `volume remove`.** A rehomed fork *is* a normal volume, so
   it is removed from the host by the ordinary local-removal path, identical to
   any other volume — there is no displaced-special verb.

@@ -239,25 +239,25 @@ enum VolumeCommand {
         /// Fork source: <name>, <name>/<snap_ulid>, or <vol_ulid>/<snap_ulid>
         #[arg(long)]
         from: Option<String>,
-        /// Serve over ublk even if this host can't right now
-        /// (default: ublk when the coordinator is root with ublk_drv loaded)
-        #[arg(long, conflicts_with = "no_ublk")]
-        ublk: bool,
-        /// Never serve this volume over ublk (IPC only)
+        /// Serve a host block device even if this host can't right now
+        /// (default: on when the coordinator is root with ublk_drv loaded)
+        #[arg(long, conflicts_with = "no_device")]
+        device: bool,
+        /// Never serve this volume as a host block device (IPC only)
         #[arg(long)]
-        no_ublk: bool,
+        no_device: bool,
     },
 
     /// Update configuration for a running volume
     Update {
         /// Volume name
         name: String,
-        /// Switch this volume to ublk transport (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["no_ublk"])]
-        ublk: bool,
-        /// Disable ublk serving (restarts the volume process)
-        #[arg(long, conflicts_with_all = ["ublk"])]
-        no_ublk: bool,
+        /// Serve this volume as a host block device (restarts the volume process)
+        #[arg(long, conflicts_with_all = ["no_device"])]
+        device: bool,
+        /// Stop serving the block device (restarts the volume process)
+        #[arg(long, conflicts_with_all = ["device"])]
+        no_device: bool,
     },
 
     /// Show the running status of a volume
@@ -323,10 +323,10 @@ enum VolumeCommand {
         /// Claim a released name first, then start
         #[arg(long)]
         claim: bool,
-        /// Disable ublk before starting (persists, like `update --no-ublk`;
-        /// revert with `update --ublk`)
+        /// Disable the block device before starting (persists, like
+        /// `update --no-device`; revert with `update --device`)
         #[arg(long)]
-        no_ublk: bool,
+        no_device: bool,
     },
 
     /// Claim a released volume name into local ownership without starting it
@@ -510,15 +510,15 @@ fn main() {
                 name,
                 size,
                 from,
-                ublk,
-                no_ublk,
+                device,
+                no_device,
             } => {
                 if let Some(from) = &from {
                     if let Err(e) = validate_volume_name(&name) {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
-                    let flags = encode_transport_flags(ublk, no_ublk);
+                    let flags = encode_transport_flags(device, no_device);
                     if let Err(e) = create_fork(&data_dir, &name, from, &coord, &by_id_dir, &flags)
                     {
                         eprintln!("error: {e}");
@@ -543,7 +543,7 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let flags = encode_transport_flags(ublk, no_ublk);
+                    let flags = encode_transport_flags(device, no_device);
                     let ulid = match coord.create_volume_remote(&name, bytes, &flags) {
                         Ok(u) => u,
                         Err(e) => {
@@ -560,10 +560,10 @@ fn main() {
 
             VolumeCommand::Update {
                 name,
-                ublk,
-                no_ublk,
+                device,
+                no_device,
             } => {
-                let flags = encode_transport_flags(ublk, no_ublk);
+                let flags = encode_transport_flags(device, no_device);
                 match coord.update_volume(&name, &flags) {
                     Ok(reply) if reply.restarted => {
                         println!("volume restarting with new config")
@@ -801,7 +801,7 @@ fn main() {
             VolumeCommand::Start {
                 name,
                 claim,
-                no_ublk,
+                no_device,
             } => {
                 if claim {
                     // run_claim's foreign-claim path streams the prefetch
@@ -833,7 +833,7 @@ fn main() {
                         }
                     }
                 }
-                if no_ublk {
+                if no_device {
                     // Drop the transport before the first spawn so the
                     // volume never attempts a ublk start.
                     let flags = encode_transport_flags(false, true);
@@ -1987,16 +1987,16 @@ fn device_paths(vol_dir: &Path) -> DevicePaths {
     }
 }
 
-/// Encode the CLI's typed transport flags as the space-separated tokens
+/// Encode the CLI's typed block-device flags as the space-separated tokens
 /// understood by the coordinator's `create` / `update` IPC verbs. Order
 /// follows the IPC parser; absent options emit nothing.
-fn encode_transport_flags(ublk: bool, no_ublk: bool) -> Vec<String> {
+fn encode_transport_flags(device: bool, no_device: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if ublk {
-        out.push("ublk".to_owned());
+    if device {
+        out.push("device".to_owned());
     }
-    if no_ublk {
-        out.push("no-ublk".to_owned());
+    if no_device {
+        out.push("no-device".to_owned());
     }
     out
 }

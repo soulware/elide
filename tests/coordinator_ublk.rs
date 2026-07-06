@@ -15,7 +15,7 @@
 //!   Phase 1 — fresh start under coordinator A
 //!     1. Coordinator boot — `elide-coordinator serve --config <toml>`
 //!        with a file-backed store (no S3) and a short scan interval.
-//!     2. `elide volume create ... --ublk` + inbound `rescan`. The
+//!     2. `elide volume create ... --device` + inbound `rescan`. The
 //!        kernel auto-allocates a dev id; the test discovers it from
 //!        `[ublk] dev_id` in `volume.toml` after the daemon's wait_hook
 //!        writes it back.
@@ -88,7 +88,7 @@ unsafe extern "C" {
 }
 
 /// Poll `volume.toml` until `[ublk] dev_id` is populated and return it.
-/// Used after `volume create --ublk` (no pin) to discover the kernel-
+/// Used after `volume create --device` (no pin) to discover the kernel-
 /// assigned id once the daemon's `wait_hook` has written it back.
 fn wait_for_bound_id(fork_dir: &Path) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -406,7 +406,14 @@ fn coordinator_ublk_lifecycle() {
     // by reading `[ublk] dev_id` back from volume.toml.
     elide(
         &data_dir,
-        &["volume", "create", "vtest", "--size", VOLUME_SIZE, "--ublk"],
+        &[
+            "volume",
+            "create",
+            "vtest",
+            "--size",
+            VOLUME_SIZE,
+            "--device",
+        ],
     );
 
     let name_link = data_dir.join("by_name").join("vtest");
