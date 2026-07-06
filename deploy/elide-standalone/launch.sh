@@ -4,7 +4,7 @@
 # bucket targeting it (which sets the AWS_* keypair secrets), writes fly.toml
 # from fly.toml.example, and deploys the newest elide release.
 #
-#   ./launch [region] [org]
+#   ./launch.sh [region] [org]
 #
 # Prompts for the region if not given; flyctl prompts for the org when the
 # account has several. Pass both when there is no tty to prompt on. Echoes

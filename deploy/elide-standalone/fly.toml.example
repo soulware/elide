@@ -1,5 +1,5 @@
 # Elide coordinator on Fly.io, standalone — a private app (no public service),
-# reachable over 6PN at <app>.internal. Template: ./launch generates fly.toml
+# reachable over 6PN at <app>.internal. Template: ./launch.sh generates fly.toml
 # (gitignored) from this; or copy it yourself, fill app/primary_region and
 # DATA_BUCKET, set the AWS_* secrets, then `fly deploy` from this directory.
 # See README.md.

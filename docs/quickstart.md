@@ -24,17 +24,17 @@ cd deploy/elide-standalone
 ## 1. Launch
 
 ```sh
-./launch
+./launch.sh
 ```
 
-`launch` provisions and deploys in one step: it creates the Fly app (Fly
+`launch.sh` provisions and deploys in one step: it creates the Fly app (Fly
 generates a name), asks for a region, creates a Tigris bucket
 targeting the app — which sets the keypair secrets the coordinator signs
 S3 operations with — writes `fly.toml`, and deploys the newest elide
-release. It echoes each `fly` command as it runs it; `./launch <region>`
+release. It echoes each `fly` command as it runs it; `./launch.sh <region>`
 skips the prompt. The coordinator comes up serving immediately.
 
-Use the app name `launch` chose wherever `my-elide` appears below. To pick
+Use the app name `launch.sh` chose wherever `my-elide` appears below. To pick
 your own app name, reuse an existing bucket, or pin a release, run the same
 steps by hand instead — see [Manual setup](#manual-setup).
 
@@ -138,7 +138,7 @@ vol1 --claim` does both in one step.)
 
 ## Manual setup
 
-The steps `launch` runs, by hand — for a chosen app name, an existing
+The steps `launch.sh` runs, by hand — for a chosen app name, an existing
 bucket, or a pinned release.
 
 ### 1. Create the Fly app
