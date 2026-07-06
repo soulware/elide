@@ -648,6 +648,11 @@ pub enum ClaimAttachEvent {
     PullingAncestor { vol_ulid: Ulid },
     /// Fresh fork minted from the released volume's handoff snapshot.
     ForkCreated { new_vol_ulid: Ulid },
+    /// Forced claims only: how many segments were re-owned from the
+    /// dead fork's prefix, and the basis snapshot the claim set was
+    /// computed over. `segments == 0` with no basis means the claim
+    /// recovered nothing — the fork is empty.
+    ReOwned { segments: u64, basis: Option<Ulid> },
     /// Background prefetch of the ancestor index has started.
     PrefetchStarted,
     /// Background prefetch finished (or budget expired — coordinator
