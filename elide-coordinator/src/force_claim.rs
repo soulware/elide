@@ -180,6 +180,8 @@ struct ForceClaimOrchestrator {
     /// (`snapshots/LATEST`), or the record-hint basis on resume.
     /// `None` = the dead fork never published a `User` manifest.
     basis: Option<Option<Ulid>>,
+    /// Head-delta segments re-owned into the new fork.
+    reowned: usize,
 }
 
 impl ForceClaimOrchestrator {
@@ -201,6 +203,7 @@ impl ForceClaimOrchestrator {
             source_vol: None,
             fork: None,
             basis: None,
+            reowned: 0,
         }
     }
 
@@ -619,6 +622,7 @@ impl ForceClaimOrchestrator {
             head_delta.len(),
             basis.map(|b| b.to_string()).as_deref().unwrap_or("<none>")
         );
+        self.reowned = head_delta.len();
         Ok(())
     }
 
@@ -914,6 +918,13 @@ impl ForceClaimOrchestrator {
         crate::rescan::trigger();
         self.job.append(ClaimAttachEvent::ForkCreated {
             new_vol_ulid: fork.vol_ulid,
+        });
+        // Appended after ForkCreated so a CLI that predates the
+        // variant fails its stream parse only past the point
+        // `finalize_or_err` treats as success.
+        self.job.append(ClaimAttachEvent::ReOwned {
+            segments: self.reowned as u64,
+            basis,
         });
         info!(
             "[force-claim {}] finalized fork {} (source {source})",
@@ -1249,6 +1260,22 @@ mod tests {
         assert_eq!(head.anchor, Some(basis));
         assert_eq!(head.added, [s2, s3].into_iter().collect());
 
+        // The attach stream reports the re-own summary to the CLI.
+        let job = ctx
+            .claim_registry
+            .lock()
+            .unwrap()
+            .get("vol")
+            .cloned()
+            .unwrap();
+        assert!(
+            job.read_from(0).contains(&ClaimAttachEvent::ReOwned {
+                segments: 2,
+                basis: Some(basis),
+            }),
+            "attach stream must carry the re-own summary"
+        );
+
         // Provenance: pinned at (dead, basis).
         let lineage = read_lineage_verifying_signature(
             &data_dir.path().join("by_id").join(fork.to_string()),
@@ -1424,6 +1451,40 @@ mod tests {
             got.as_slice(),
             v2.as_slice(),
             "delta LBA must materialise the post-delta bytes on the claimed fork"
+        );
+    }
+
+    /// A forced claim of a volume with no basis snapshot and nothing
+    /// drained recovers an empty fork — the attach stream must say so
+    /// (the CLI renders `segments: 0, basis: None` as a warning).
+    #[tokio::test]
+    async fn empty_recovery_reports_zero_segments() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let dead = make_dead_volume(&store, Ulid::new()).await;
+        put_head(&store, dead.vol, None, &[]).await;
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, _data_dir) = fixture(Arc::clone(&store));
+        run_force_claim(&ctx, &store).await;
+
+        let job = ctx
+            .claim_registry
+            .lock()
+            .unwrap()
+            .get("vol")
+            .cloned()
+            .unwrap();
+        assert!(
+            job.read_from(0).contains(&ClaimAttachEvent::ReOwned {
+                segments: 0,
+                basis: None,
+            }),
+            "attach stream must report the empty recovery"
         );
     }
 

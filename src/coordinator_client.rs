@@ -824,6 +824,13 @@ fn render_claim_event(event: &ClaimAttachEvent) -> Option<String> {
         ClaimAttachEvent::ForkCreated { new_vol_ulid } => {
             Some(format!("[claim] fork created at {new_vol_ulid}"))
         }
+        ClaimAttachEvent::ReOwned { segments, basis } => Some(match (segments, basis) {
+            (0, None) => "[claim] WARNING: recovered nothing — no basis snapshot and \
+                          no drained segments in the store; the fork is empty"
+                .to_owned(),
+            (n, None) => format!("[claim] re-owned {n} segment(s) (no basis snapshot)"),
+            (n, Some(b)) => format!("[claim] re-owned {n} segment(s) above basis {b}"),
+        }),
         ClaimAttachEvent::PrefetchStarted => {
             Some("[claim] prefetching ancestor index...".to_owned())
         }
@@ -1237,6 +1244,37 @@ mod tests {
         ok_event(&format!(
             r#"{{"kind":"fork-created","new_vol_ulid":"{TEST_FORK_ULID}"}}"#
         ))
+    }
+
+    /// `ReOwned` rendering: a normal recovery states the count and
+    /// basis; recovering nothing warns that the fork is empty.
+    #[test]
+    fn render_reowned_summary_shapes() {
+        let basis = ulid::Ulid::from_string(TEST_FORK_ULID).unwrap();
+        let with_basis = render_claim_event(&ClaimAttachEvent::ReOwned {
+            segments: 4,
+            basis: Some(basis),
+        })
+        .unwrap();
+        assert!(
+            with_basis.contains("re-owned 4 segment(s)") && with_basis.contains(TEST_FORK_ULID),
+            "{with_basis}"
+        );
+        let no_basis = render_claim_event(&ClaimAttachEvent::ReOwned {
+            segments: 4,
+            basis: None,
+        })
+        .unwrap();
+        assert!(no_basis.contains("no basis snapshot"), "{no_basis}");
+        let empty = render_claim_event(&ClaimAttachEvent::ReOwned {
+            segments: 0,
+            basis: None,
+        })
+        .unwrap();
+        assert!(
+            empty.contains("WARNING") && empty.contains("empty"),
+            "{empty}"
+        );
     }
 
     /// `finalize_or_err`: once `ForkCreated` has been seen (`Some`), a
