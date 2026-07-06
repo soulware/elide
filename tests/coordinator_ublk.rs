@@ -439,6 +439,15 @@ fn coordinator_ublk_lifecycle() {
     // first open(2). Mirrors the same pattern in tests/ublk_crash.rs.
     thread::sleep(Duration::from_millis(200));
 
+    // The /dev/elide name link is published before the device goes
+    // live, so it is present as soon as the bdev is.
+    let dev_link = Path::new("/dev/elide/vtest");
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[A] /dev/elide/vtest points at the served device"
+    );
+
     // Capture the volume PID before shutdown so phase 2's PID file
     // appearance can be distinguished from a stale carryover.
     let pid_a = std::fs::read_to_string(&volume_pid)
@@ -541,6 +550,11 @@ fn coordinator_ublk_lifecycle() {
         Some(dev_id),
         "[A] bound dev_id must persist for Route::Recover on next serve"
     );
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[A] /dev/elide/vtest survives shutdown-park, as the device and its mounts do"
+    );
     let _ = volume_ctrl;
 
     // ── Phase 2: restart + Route::Recover under coordinator B ───────────────
@@ -584,6 +598,12 @@ fn coordinator_ublk_lifecycle() {
         },
     );
     thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        std::fs::read_link(dev_link).ok().as_deref(),
+        Some(bdev.as_path()),
+        "[B] /dev/elide/vtest intact across Route::Recover"
+    );
 
     // Durability proof: the pattern written under coordinator A reads
     // back identically after:
@@ -663,6 +683,10 @@ fn coordinator_ublk_lifecycle() {
     // Cleanup: explicit DEL_DEV so the next CI run starts from a clean
     // kernel state. Failures here would indicate a leaked device.
     delete_and_wait_sysfs_gone(dev_id);
+    assert!(
+        std::fs::symlink_metadata(dev_link).is_err(),
+        "`elide ublk delete` retracts /dev/elide/vtest"
+    );
 }
 
 /// Probe whether `pid` is alive without waiting on it. `kill(pid, 0)`

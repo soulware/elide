@@ -594,6 +594,26 @@ mod imp {
         // `docs/design/ublk-shutdown-park.md`.
         let _sig_watcher = spawn_ublk_signal_watcher(client.clone(), peer_counters)?;
 
+        // The /dev/elide/<name> link is an invariant of serving a named
+        // volume: preflight before ADD_DEV so an unwritable /dev or a name
+        // held by another volume on this host fails the serve without
+        // creating a kernel device. Both are permanent host conditions →
+        // Config, so the supervisor parks instead of respawn-looping.
+        let link_paths = elide_coordinator::dev_link::LinkPaths::system();
+        let link_name = elide_core::config::VolumeConfig::read(dir)
+            .map_err(|e| io::Error::other(format!("reading volume config: {e}")))?
+            .name;
+        if let Some(name) = &link_name {
+            elide_coordinator::dev_link::preflight(
+                &link_paths,
+                name,
+                dir,
+                elide_coordinator::ublk_sweep::read_owner_volume_dir,
+                elide_coordinator::dev_link::read_config_name,
+            )
+            .map_err(|e| super::UblkRunError::Config(format!("/dev/elide/{name}: {e}")))?;
+        }
+
         let persisted_id = elide_core::config::VolumeConfig::bound_ublk_id(dir)
             .map_err(|e| io::Error::other(format!("reading bound ublk id: {e}")))?;
         let our_ulid = dir
@@ -685,6 +705,37 @@ mod imp {
                 .build()
                 .map_err(|e| classify_build_error(e, target_id, recovering))?,
         );
+
+        // ADD_DEV/RECOVER_DEV has assigned the id; publish the name link
+        // before the device goes live. A failure here fails the serve
+        // (fail-closed), and a freshly-added device is deleted rather than
+        // leaked — it has no recorded binding yet, so nothing would recover
+        // it before the next coordinator sweep.
+        if let Some(name) = &link_name {
+            let dev_id = ctrl.dev_info().dev_id as i32;
+            if let Err(e) = elide_coordinator::dev_link::publish(
+                &link_paths,
+                name,
+                dev_id,
+                dir,
+                elide_coordinator::ublk_sweep::read_owner_volume_dir,
+                elide_coordinator::dev_link::read_config_name,
+            ) {
+                if !recovering {
+                    // del_dev on the for-add ctrl deadlocks in libublk;
+                    // reopen a simple ctrl after dropping it.
+                    drop(ctrl);
+                    if let Ok(c) = UblkCtrl::new_simple(dev_id) {
+                        let _ = c.kill_dev();
+                        let _ = c.del_dev();
+                    }
+                }
+                return Err(super::UblkRunError::Config(format!(
+                    "/dev/elide/{name}: {e}"
+                )));
+            }
+            tracing::info!("[ublk device link: /dev/elide/{name} -> /dev/ublkb{dev_id}]");
+        }
 
         // Stamp the per-device JSON (`/run/ublksrvd/<id>.json`) with the
         // owning volume directory and ULID. Two consumers: (1) operators
@@ -1127,6 +1178,11 @@ mod imp {
                     vol_dir.display()
                 );
             }
+            elide_coordinator::dev_link::retract_for_volume(
+                &elide_coordinator::dev_link::LinkPaths::system(),
+                vol_dir,
+                id,
+            );
             println!(
                 "deleted ublk device {id} (volume {})",
                 owner.elide.volume_ulid
