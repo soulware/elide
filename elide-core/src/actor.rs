@@ -3089,6 +3089,21 @@ fn read_reclaim_extent_body(
                 continue;
             };
             let fragment = crate::delta_compute::apply_delta(&source_plain, &delta_blob)?;
+            // The zstd-dict decompress carries no content checksum: a
+            // wrong source dictionary yields plausible-length garbage,
+            // not an error — and reclaim would write it into a durable
+            // segment. The entry's content hash is the integrity anchor.
+            let got = blake3::hash(&fragment);
+            if got != *hash {
+                return Err(io::Error::other(format!(
+                    "reclaim delta materialisation for segment {} hashed {} \
+                     instead of {} (source {})",
+                    delta_loc.segment_id,
+                    got.to_hex(),
+                    hash.to_hex(),
+                    option.source_hash.to_hex(),
+                )));
+            }
             return Ok(ReclaimBody::Delta {
                 source_hash: option.source_hash,
                 source_plain,

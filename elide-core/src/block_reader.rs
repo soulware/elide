@@ -257,7 +257,7 @@ impl BlockReader {
             return self.read_data_block(&loc.clone(), block_offset);
         }
         if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
-            return self.read_delta_block(&delta_loc.clone(), block_offset);
+            return self.read_delta_block(&delta_loc.clone(), block_offset, &hash);
         }
         Err(io::Error::other(format!(
             "lba {lba}: hash {} present in lbamap but not in extent index (data, inline, or delta) — possible corruption",
@@ -309,6 +309,7 @@ impl BlockReader {
         &self,
         delta_loc: &DeltaLocation,
         block_offset: u32,
+        expected_hash: &blake3::Hash,
     ) -> io::Result<[u8; 4096]> {
         let mut picked = None;
         for opt in &delta_loc.options {
@@ -333,6 +334,20 @@ impl BlockReader {
         )?;
 
         let decompressed = crate::delta_compute::apply_delta(&source_bytes, &delta_blob)?;
+
+        // The zstd-dict decompress carries no content checksum: a wrong
+        // source dictionary yields plausible-length garbage, not an
+        // error. The entry's content hash is the only integrity anchor.
+        let got = blake3::hash(&decompressed);
+        if got != *expected_hash {
+            return Err(io::Error::other(format!(
+                "delta materialisation for segment {} hashed {} instead of {} (source {})",
+                delta_loc.segment_id,
+                got.to_hex(),
+                expected_hash.to_hex(),
+                opt.source_hash.to_hex(),
+            )));
+        }
 
         let src = block_offset as usize * 4096;
         let src_end = src + 4096;

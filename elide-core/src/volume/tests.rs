@@ -3099,3 +3099,60 @@ fn all_inline_segment_readable() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// A Delta entry whose declared content hash does not match the bytes
+/// its materialisation produces must fail the read loudly. Without the
+/// hash check the zstd-dict decompress silently serves the mismatched
+/// bytes — the wrong-dictionary failure shape of the 2026-07-06
+/// quickstart incident.
+#[test]
+fn delta_materialisation_hash_mismatch_errors() {
+    let base = keyed_temp_dir();
+    let signer = crate::signing::load_signer(&base, crate::signing::VOLUME_KEY_FILE).unwrap();
+
+    // Parent extent: the delta's dictionary source.
+    let parent = vec![0x11u8; 4096];
+    let parent_hash = blake3::hash(&parent);
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(0, &parent).unwrap();
+    vol.flush_wal().unwrap();
+    drop(vol);
+
+    // The blob materialises to `child`, but the entry declares a hash
+    // of different content — the shape a wrong source dictionary
+    // produces.
+    let mut child = parent.clone();
+    child[0..64].fill(0xCC);
+    let wrong_hash = blake3::hash(b"not the child bytes");
+
+    let blob = zstd::bulk::Compressor::with_dictionary(3, &parent)
+        .unwrap()
+        .compress(&child)
+        .unwrap();
+    let delta_ulid = ulid::Ulid::new();
+    let pending = base.join("pending").join(delta_ulid.to_string());
+    let mut entries = vec![segment::SegmentEntry::new_delta(
+        wrong_hash,
+        100,
+        1,
+        vec![segment::DeltaOption {
+            source_hash: parent_hash,
+            delta_offset: 0,
+            delta_length: blob.len() as u32,
+            delta_hash: blake3::hash(&blob),
+        }],
+    )];
+    segment::write_segment_with_delta_body(&pending, &mut entries, &blob, signer.as_ref()).unwrap();
+
+    // Reopen so the rebuild registers the hand-written pending segment.
+    let vol = Volume::open(&base, &base).unwrap();
+    let err = vol
+        .read(100, 1)
+        .expect_err("mismatched delta materialisation must error, not serve bytes");
+    assert!(
+        err.to_string().contains("hashed"),
+        "unexpected error: {err}"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
