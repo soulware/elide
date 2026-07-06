@@ -433,6 +433,14 @@ impl BlockReader {
         let extentindex::BodySource::Cached(entry_idx) = loc.body_source else {
             return Ok(());
         };
+        // Presence first: a set bit means the bytes are already local,
+        // and the owner-dir resolution below is only needed to target a
+        // fetch (it also requires a ULID-named fork dir, which local
+        // reads must not depend on).
+        let presence = self.extent_index.segment_presence(loc.segment_id);
+        if presence.is_some_and(|p| p.test(entry_idx)) {
+            return Ok(());
+        }
         let (owner_vol_id, index_dir, body_dir) = self
             .find_owner_dirs_for_segment(loc.segment_id)
             .ok_or_else(|| {
@@ -444,10 +452,6 @@ impl BlockReader {
                     ),
                 )
             })?;
-        let presence = self.extent_index.segment_presence(loc.segment_id);
-        if presence.is_some_and(|p| p.test(entry_idx)) {
-            return Ok(());
-        }
         match &self.fetcher {
             Some(fetcher) => fetcher.fetch_extent(
                 loc.segment_id,
