@@ -64,7 +64,7 @@ On Apple Silicon, `elide-import` auto-selects `arm64`.
 Create a writable replica branched from the imported base:
 
 ```sh
-./target/debug/elide volume create vm1 --from ubuntu-22.04
+./target/debug/elide volume create vol1 --from ubuntu-22.04
 ```
 
 `--from` accepts a volume name (resolved locally or against the remote
@@ -76,21 +76,21 @@ The explicit-pin form is forward-compatible — see
 
 A coordinator that can serve ublk — running as root with the module loaded
 (`sudo modprobe ublk_drv`, one-time) — gives new volumes the ublk transport
-by default: `vm1` exposes `/dev/ublkbN` on first start (reachable by name at
-`/dev/elide/vm1`), with the kernel-allocated device id recorded in
+by default: `vol1` exposes `/dev/ublkbN` on first start (reachable by name at
+`/dev/elide/vol1`), with the kernel-allocated device id recorded in
 `volume.toml` for crash recovery.
 
-The unprivileged coordinator above can't serve ublk, so `vm1` starts
+The unprivileged coordinator above can't serve ublk, so `vol1` starts
 IPC-only (no host-visible block device). Attach the transport explicitly:
 
 ```sh
-./target/debug/elide volume update vm1 --ublk
+./target/debug/elide volume update vol1 --ublk
 ```
 
 The volume then serves over ublk once the coordinator runs as root. Then:
 
 ```sh
-sudo mount /dev/elide/vm1 /mnt
+sudo mount /dev/elide/vol1 /mnt
 ```
 
 Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
@@ -98,17 +98,17 @@ Or boot directly with QEMU — see [vm-boot.md](vm-boot.md).
 ## Take a snapshot
 
 ```sh
-./target/debug/elide volume snapshot vm1
+./target/debug/elide volume snapshot vol1
 # prints the snapshot ULID
 ```
 
-`vm1/snapshots/<ulid>` is now a branch point — `elide volume create vm2 --from vm1` will branch a new writable replica from the latest snapshot.
+`vol1/snapshots/<ulid>` is now a branch point — `elide volume create vol2 --from vol1` will branch a new writable replica from the latest snapshot.
 
 ## Clean up
 
 ```sh
-./target/debug/elide volume stop vm1
-./target/debug/elide volume remove vm1
+./target/debug/elide volume stop vol1
+./target/debug/elide volume remove vol1
 ./target/debug/elide volume stop ubuntu-22.04
 ./target/debug/elide volume remove ubuntu-22.04
 ```
