@@ -148,16 +148,25 @@ must persist across daemon exits too:
   no longer matches the link (a rename — e.g. displacement rehome — left it
   stale). Links whose target is stamped foreign are left untouched.
 
-**Open questions.**
+**Failure semantics: fail closed.** The link is an invariant of serving, not a
+best-effort decoration — *every running named volume is reachable at
+`/dev/elide/<name>`*, so tooling and docs may rely on it unconditionally.
 
-1. Two coordinators on one host can serve distinct volumes with the same name
-   (names are per-coordinator; `/dev` is host-global). Options: fail the serve
-   loudly on a foreign-stamped live link; create the device but skip the link
-   with a warning; or namespace links per coordinator. Skipping quietly makes
-   the link an optional surface; failing makes a cosmetic feature
-   serve-blocking. Needs a decision before implementation.
-2. Whether an unwritable `/dev/elide` (locked-down container `/dev`) fails the
-   serve or downgrades to no link — same optional-surface tension.
+- **A name collision fails the second claimant.** `/dev/elide` is a
+  host-global name registry, and the link with its ownership-stamp check is
+  the registry: names are per-coordinator, so two coordinators on one host can
+  serve the same name — a real operational ambiguity, surfaced by failing the
+  serve that introduces it with an error naming the holder's `volume_dir`
+  (read from the stamp). The replace-only-dangling-or-ours rule makes this
+  first-live-wins: an already-serving volume is never unseated, and a parked
+  QUIESCED device — which may still hold live mounts — keeps its name.
+  Kernel-lane tests running as root on a shared host must mint unique volume
+  names.
+- **An unwritable `/dev/elide` fails the serve** at device-live time, the same
+  fail-fast treatment as any other persistent environment error. Serving over
+  ublk already requires root and `/dev/ublk-control`; a host that grants those
+  but refuses a symlink in `/dev` is a deliberate lockdown for the operator to
+  resolve.
 
 ## Testing
 
