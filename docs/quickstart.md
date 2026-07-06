@@ -63,7 +63,7 @@ Still inside the machine:
 ```sh
 mkfs.ext4 /dev/ublkb0
 mkdir -p /mnt/vol1
-mount /dev/ublkb0 /mnt/vol1
+mount -o discard /dev/ublkb0 /mnt/vol1
 echo "hello!" > /mnt/vol1/hello.txt
 cat /mnt/vol1/hello.txt
 ```
@@ -127,7 +127,7 @@ Inside:
 elide volume claim vol1
 elide volume start vol1
 mkdir -p /mnt/vol1
-mount /dev/ublkb0 /mnt/vol1
+mount -o discard /dev/ublkb0 /mnt/vol1
 cat /mnt/vol1/hello.txt
 # hello!
 ```
