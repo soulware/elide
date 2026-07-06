@@ -55,7 +55,8 @@ const RELAY_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// clamped to WARN so the coordinator log stays readable. Override
 /// with `RUST_LOG` for ad-hoc debugging.
 const DEFAULT_FILTER: &str = "info,\
-    object_store::aws::builder=warn";
+    object_store::aws::builder=warn,\
+    object_store::client::retry=warn";
 
 /// Initialise tracing with stderr-only output. Use for short-lived
 /// CLI commands that don't have (or care about) a `data_dir`.
