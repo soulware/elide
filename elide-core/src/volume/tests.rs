@@ -3156,3 +3156,37 @@ fn delta_materialisation_hash_mismatch_errors() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// A hash mapped in the lbamap but absent from both the data and delta
+/// extent indexes is read-state divergence, not a hole. `read_extents`
+/// must error loudly — serving zeros masks corruption (and did, in the
+/// 2026-07-06 quickstart incident's failure family).
+#[test]
+fn read_extents_errors_on_hash_missing_from_both_indexes() {
+    let tmp = keyed_temp_dir();
+    let mut map = lbamap::LbaMap::new();
+    map.insert(0, 1, blake3::hash(b"orphan"), ulid::Ulid::new());
+    let index = extentindex::ExtentIndex::new();
+    let file_cache = std::cell::RefCell::new(read::FileCache::new(4));
+    let dmat_cache: read::DmatCache = Default::default();
+    let dmat_stats = Arc::new(crate::dmat::DmatStats::default());
+    let mut out = vec![0u8; 4096];
+    let err = read::read_extents(
+        0,
+        &mut out,
+        &map,
+        &index,
+        &file_cache,
+        &dmat_cache,
+        &dmat_stats,
+        &tmp,
+        |_, _, _| Err(io::Error::other("find_segment must not be consulted")),
+        |_| Err(io::Error::other("open_delta_body must not be consulted")),
+    )
+    .expect_err("mapped hash absent from both indexes must error");
+    assert!(
+        err.to_string().contains("not in extent index"),
+        "unexpected error: {err}"
+    );
+    fs::remove_dir_all(tmp).unwrap();
+}

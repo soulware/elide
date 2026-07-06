@@ -275,7 +275,16 @@ pub(crate) fn read_extents(
                 )? {
                     continue;
                 }
-                continue; // truly unknown — treat as unwritten
+                // A mapped hash in neither index is lbamap/extent-index
+                // divergence. Serving zeros here would mask corruption
+                // as a hole; error loudly like `BlockReader::read_block`.
+                return Err(io::Error::other(format!(
+                    "lba {}..{}: hash {} present in lbamap but not in extent \
+                     index (data, inline, or delta) — possible corruption",
+                    er.range_start,
+                    er.range_end,
+                    er.hash.to_hex()
+                )));
             }
         };
 
