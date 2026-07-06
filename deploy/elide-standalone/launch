@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# One-step quickstart: provision and deploy a standalone Elide coordinator on
+# Fly.io. Creates the Fly app (auto-named elide-<hex>), creates a Tigris
+# bucket targeting it (which sets the AWS_* keypair secrets), writes fly.toml
+# from fly.toml.example, and deploys the newest elide release.
+#
+#   ./launch [region]
+#
+# Prompts for the region if not given. Echoes each fly command before running
+# it — the same commands docs/quickstart.md documents as the manual path.
+#
+# fly.toml is written before any fly command runs, so its presence means a
+# launch has happened here — and launch fails fast on it, so it never creates
+# resources twice. If a step fails, finish with the remaining commands by hand
+# (fly.toml has the app and bucket names), or remove fly.toml and the app to
+# start over.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+run() { echo "+ $*" >&2; "$@"; }
+
+command -v fly >/dev/null 2>&1 \
+  || { echo "fly CLI not found — install it: https://fly.io/docs/flyctl/install/" >&2; exit 1; }
+fly auth whoami >/dev/null 2>&1 \
+  || { echo "not logged in to Fly — run: fly auth login" >&2; exit 1; }
+[ ! -e fly.toml ] \
+  || { echo "fly.toml already exists — this deployment is configured; run fly deploy, or remove fly.toml to launch a new one" >&2; exit 1; }
+
+region="${1:-}"
+if [ -z "$region" ] && [ -t 0 ]; then
+  read -rp "Fly region [iad] (https://fly.io/docs/reference/regions/): " region
+fi
+region="${region:-iad}"
+
+app="elide-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+bucket="${app}-data"
+
+sed -e "s|^app = .*|app = \"${app}\"|" \
+    -e "s|^primary_region = .*|primary_region = \"${region}\"|" \
+    -e "s|DATA_BUCKET = .*|DATA_BUCKET = \"${bucket}\"|" \
+    fly.toml.example > fly.toml
+echo "wrote fly.toml: app ${app}, region ${region}, bucket ${bucket}"
+
+run fly apps create "$app"
+run fly storage create -a "$app" -n "$bucket"
+run fly deploy
+
+cat <<EOF
+
+Deployed: app ${app}, bucket ${bucket}.
+
+Create a volume and put a filesystem on it:
+
+  fly ssh console -a ${app}
+  elide volume create --size 1G vol1
+  mkfs.ext4 /dev/ublkb0
+  mkdir -p /mnt/vol1 && mount /dev/ublkb0 /mnt/vol1
+EOF

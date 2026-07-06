@@ -19,6 +19,11 @@ and survives redeploys.
 Prerequisites: the `fly` CLI, a Tigris bucket, and a keypair with read/write on
 it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
 
+`./launch` does the whole setup in one step — auto-named app, region prompt,
+Tigris bucket via `fly storage create` (which sets the keypair secrets),
+generated `fly.toml`, deploy — echoing each `fly` command as it runs.
+Manually:
+
 1. Copy the template — `cp fly.toml.example fly.toml` (the live `fly.toml` is
    gitignored) — and set `app` / `primary_region` and the `DATA_BUCKET` build
    arg (= `coord.toml`'s `[store].bucket`). All deploy commands run from this
