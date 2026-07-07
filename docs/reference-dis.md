@@ -1,6 +1,6 @@
 # dis (Original LSVD Paper Implementation) Notes
 
-[asch/dis](https://github.com/asch/dis) is the EuroSys 2022 LSVD paper authors' own implementation — the paper uses the name LSVD, the code uses DIS ("blockDevice over Immutable Storage"). It is a Linux device-mapper kernel module (`kernel/dm-disbd.c`) plus a Go userspace daemon (`userspace/`), pinned to kernel ≤5.0.
+[asch/dis](https://github.com/asch/dis) is the [EuroSys 2022 LSVD paper](https://doi.org/10.1145/3492321.3524271) authors' own implementation — the paper uses the name LSVD, the code uses DIS ("blockDevice over Immutable Storage"). It is a Linux device-mapper kernel module (`kernel/dm-disbd.c`) plus a Go userspace daemon (`userspace/`), pinned to kernel ≤5.0.
 
 dis is best understood as the paper's benchmarking artefact rather than a full realisation of the paper's design: it proves the performance thesis (acknowledge writes at local NVMe speed, batch to an object store, demand-fetch on read) while most of the durability, layering, and efficiency machinery the paper describes exists only in the paper. [lab47/lsvd](https://github.com/lab47/lsvd) — an independent reimplementation, and our primary studied reference (see [reference-lsvd.md](reference-lsvd.md)) — is closer to the paper's described design than the paper authors' own code.
 
