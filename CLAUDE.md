@@ -100,5 +100,6 @@ Design documentation is indexed in `README.md` and lives in `docs/`.
 ## References
 
 - `refs/lsvd-paper.pdf` — local copy of "Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks" (EuroSys 2022)
-- `refs/lsvd/` — local clone of lab47/lsvd, Evan Phoenix's Go reference implementation
+- [asch/dis](https://github.com/asch/dis) — the paper authors' original implementation (named DIS in code; kernel device-mapper module + Go userspace daemon)
+- `refs/lsvd/` — local clone of lab47/lsvd, Evan Phoenix's independent Go reimplementation of the paper; our primary studied reference
 - [composefs/composefs-rs](https://github.com/composefs/composefs-rs) — Rust composefs implementation

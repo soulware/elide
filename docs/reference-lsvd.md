@@ -1,6 +1,6 @@
 # lsvd Reference Implementation Notes
 
-The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. Key design decisions we studied and how they influenced Elide:
+The [lab47/lsvd](https://github.com/lab47/lsvd) Go implementation is the primary reference. It is an independent reimplementation of the EuroSys 2022 LSVD paper; the paper authors' original implementation is [asch/dis](https://github.com/asch/dis) (named DIS in code — a kernel device-mapper module plus Go userspace daemon). Key design decisions we studied and how they influenced Elide:
 
 ## lsvd local directory layout
 
