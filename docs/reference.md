@@ -5,7 +5,7 @@ Background reading, implementation notes, and open questions.
 ## Prior art and related systems
 
 - [reference-lsvd.md](reference-lsvd.md) — lab47/lsvd Go reference implementation: directory layout, design decisions, and how they influenced Elide
-- [asch/dis](https://github.com/asch/dis) — the LSVD paper authors' original implementation (DIS: kernel device-mapper module + Go userspace daemon); lab47/lsvd is an independent reimplementation of the same paper
+- [reference-dis.md](reference-dis.md) — asch/dis, the LSVD paper authors' original implementation (kernel device-mapper module + Go userspace daemon): what the paper's own code implements, and how it compares to Elide
 - [reference-nydus.md](reference-nydus.md) — containerd/nydus-snapshotter: lazy-loading container images, RAFS format, NRI optimizer plugin, boot hints, failure modes
 
 ---
