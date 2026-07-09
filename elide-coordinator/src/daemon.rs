@@ -46,8 +46,8 @@ use crate::supervisor;
 use elide_coordinator::identity::CoordinatorIdentity;
 use elide_coordinator::volume_state::{CLAIMING_FILE, IMPORTING_FILE, PID_FILE};
 use elide_coordinator::{
-    EvictRegistry, PrefetchTracker, ReadinessTracker, SnapshotLockRegistry, new_prefetch_tracker,
-    new_readiness_tracker, new_snapshot_lock_registry, register_prefetch_or_get, replace_prefetch,
+    EvictRegistry, ForkSyncRegistry, PrefetchTracker, ReadinessTracker, new_fork_sync_registry,
+    new_prefetch_tracker, new_readiness_tracker, register_prefetch_or_get, replace_prefetch,
 };
 
 /// Exponential backoff for an idempotent startup S3 publish that should pend
@@ -295,7 +295,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
 
     // Per-fork snapshot lock registry (shared by the snapshot inbound handler
     // and every per-volume tick loop via try_lock).
-    let snapshot_locks: SnapshotLockRegistry = new_snapshot_lock_registry();
+    let fork_sync: ForkSyncRegistry = new_fork_sync_registry();
 
     // Per-fork prefetch tracker. Read by the `await-prefetch` IPC; written by
     // the daemon on volume discovery (entry inserted before `run_volume_tasks`
@@ -353,7 +353,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
             fork_registry: fork_registry.clone(),
             claim_registry: claim_registry.clone(),
             evict_registry: evict_registry.clone(),
-            snapshot_locks: snapshot_locks.clone(),
+            fork_sync: fork_sync.clone(),
             prefetch_tracker: prefetch_tracker.clone(),
             readiness_tracker: readiness_tracker.clone(),
             stores: stores.clone(),
@@ -555,7 +555,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                     drain_interval,
                     gc_config.clone(),
                     evict_rx,
-                    snapshot_locks.clone(),
+                    fork_sync.clone(),
                     prefetch_tx,
                     prefetch_tracker.clone(),
                 ));

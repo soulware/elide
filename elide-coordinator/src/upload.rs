@@ -260,13 +260,14 @@ pub async fn drain_pending(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
     meta_store: &Arc<dyn ObjectStore>,
+    head_cache: &crate::HeadCache,
 ) -> Result<DrainResult> {
     let pending_dir = vol_dir.join("pending");
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
     let published_user_snapshot =
-        upload_volume_metadata(vol_dir, vol_ulid, store, meta_store).await;
+        upload_volume_metadata(vol_dir, vol_ulid, store, meta_store, head_cache).await;
 
     // Upload + promote in ULID-ascending order so each promote moves
     // the lowest-ULID pending to committed, preserving
@@ -348,6 +349,7 @@ async fn upload_volume_metadata(
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
     meta_store: &Arc<dyn ObjectStore>,
+    head_cache: &crate::HeadCache,
 ) -> Option<Ulid> {
     let pub_key_path = vol_dir.join("volume.pub");
     match std::fs::read(&pub_key_path) {
@@ -403,7 +405,7 @@ async fn upload_volume_metadata(
         Err(e) => warn!("failed to read provenance: {e:#}"),
     }
 
-    match upload_snapshot_metadata(vol_dir, vol_ulid, store).await {
+    match upload_snapshot_metadata(vol_dir, vol_ulid, store, head_cache).await {
         Ok(published) => published,
         Err(e) => {
             warn!("snapshot upload failed: {e:#}");
@@ -554,6 +556,7 @@ pub async fn upload_snapshot_metadata(
     vol_dir: &Path,
     vol_ulid: Ulid,
     store: &Arc<dyn ObjectStore>,
+    head_cache: &crate::HeadCache,
 ) -> Result<Option<Ulid>> {
     let snap_dir = vol_dir.join("snapshots");
     let entries = match std::fs::read_dir(&snap_dir) {
@@ -635,14 +638,24 @@ pub async fn upload_snapshot_metadata(
     // that authors HEAD), so a plain unconditional PUT — same pattern
     // as `snapshots/LATEST`. See `docs/design/segment-index.md`
     // *Truncation*.
+    //
+    // The shared writer cache is updated under its lock around the
+    // PUT: the tick loop's next merge must start from the truncated
+    // form, never a pre-seal body. On a failed PUT the cache is
+    // emptied instead — the next merge re-reads S3.
     if let Some(snap_ulid) = sealed {
         let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
         let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
-        if let Err(e) = vd.head().put(&empty).await {
-            warn!(
-                "[upload] truncating HEAD for {snap_ulid}: {e}; \
-                 self-heals on next active tick"
-            );
+        let mut cache = head_cache.lock().await;
+        match vd.head().put(&empty).await {
+            Ok(()) => *cache = Some(empty),
+            Err(e) => {
+                *cache = None;
+                warn!(
+                    "[upload] truncating HEAD for {snap_ulid}: {e}; \
+                     self-heals on next active tick"
+                );
+            }
         }
     }
 
@@ -797,9 +810,15 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        let result = drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.uploaded_ulids.len(), 2);
         assert_eq!(result.upload_failed, 0);
@@ -849,9 +868,15 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        let result = drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        let result = drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.uploaded_ulids.len(), 0);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
@@ -892,9 +917,15 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         let name_key = StorePath::from("names/my-vol");
         assert!(
@@ -928,9 +959,15 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         // Delete the store object behind the coordinator's back. If gating
         // works, re-drain sees a matching `uploaded/volume.pub` and skips —
@@ -941,17 +978,29 @@ mod tests {
         ));
         store.delete(&pub_key).await.unwrap();
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(store.head(&pub_key).await.is_err());
 
         // Now change volume.pub content — re-drain must upload.
         std::fs::write(vol_dir.join("volume.pub"), b"rotated").unwrap();
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let got = store.get(&pub_key).await.expect("volume.pub re-uploaded");
         assert_eq!(got.bytes().await.unwrap().as_ref(), b"rotated");
     }
@@ -991,9 +1040,15 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
-        drain_pending(&vol_dir, VOL_ULID.parse().unwrap(), &store, &store)
-            .await
-            .unwrap();
+        drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         // Manifest is in store.
         let vol = ulid::Ulid::from_string(VOL_ULID).unwrap();
@@ -1043,8 +1098,9 @@ mod tests {
         let mut stale = crate::segment_head::SegmentHead::empty(None);
         stale.added.insert(Ulid::from_parts(1743110000000, 9));
         vd.head().put(&stale).await.unwrap();
+        let head_cache: crate::HeadCache = Arc::new(tokio::sync::Mutex::new(Some(stale)));
 
-        let published = upload_snapshot_metadata(&vol_dir, vol, &store)
+        let published = upload_snapshot_metadata(&vol_dir, vol, &store, &head_cache)
             .await
             .unwrap();
 
@@ -1054,6 +1110,11 @@ mod tests {
             head,
             crate::segment_head::SegmentHead::empty(Some(snap)),
             "stop seal truncates HEAD anchored at the stop-snapshot"
+        );
+        assert_eq!(
+            *head_cache.lock().await,
+            Some(crate::segment_head::SegmentHead::empty(Some(snap))),
+            "truncation replaces the shared writer cache with the truncated form"
         );
         assert!(
             vd.snapshots().read_latest().await.unwrap().is_none(),
@@ -1089,7 +1150,7 @@ mod tests {
         .unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
-        let published = upload_snapshot_metadata(&vol_dir, vol, &store)
+        let published = upload_snapshot_metadata(&vol_dir, vol, &store, &Default::default())
             .await
             .unwrap();
 

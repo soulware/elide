@@ -77,7 +77,7 @@ use elide_coordinator::ipc::{
 use elide_coordinator::macaroon::{self, Caveat, Macaroon, Scope, VerifyCtx};
 use elide_coordinator::volume_state::{IMPORTING_FILE, PID_FILE, write_released_marker};
 use elide_coordinator::{
-    EvictRegistry, PrefetchTracker, ReadinessTracker, SnapshotLockRegistry, subscribe_prefetch,
+    EvictRegistry, ForkSyncRegistry, PrefetchTracker, ReadinessTracker, subscribe_prefetch,
 };
 use elide_core::process::pid_is_alive;
 
@@ -98,7 +98,7 @@ pub struct IpcContext {
     pub fork_registry: ForkRegistry,
     pub claim_registry: ClaimRegistry,
     pub evict_registry: EvictRegistry,
-    pub snapshot_locks: SnapshotLockRegistry,
+    pub fork_sync: ForkSyncRegistry,
     pub prefetch_tracker: PrefetchTracker,
     pub readiness_tracker: ReadinessTracker,
     pub stores: Arc<dyn elide_coordinator::stores::ScopedStores>,
@@ -147,13 +147,13 @@ impl IpcContext {
 
     /// Construct a [`crate::fork::ForkContext`] — the hot core plus the
     /// fork-domain registries (fork_registry, prefetch_tracker,
-    /// snapshot_locks).
+    /// fork_sync).
     pub(crate) fn for_fork(&self) -> crate::fork::ForkContext {
         crate::fork::ForkContext {
             core: self.core(),
             fork_registry: self.fork_registry.clone(),
             prefetch_tracker: self.prefetch_tracker.clone(),
-            snapshot_locks: self.snapshot_locks.clone(),
+            fork_sync: self.fork_sync.clone(),
         }
     }
 
@@ -289,7 +289,7 @@ async fn dispatch_json(
                 &volume,
                 force,
                 &ctx.core(),
-                &ctx.snapshot_locks,
+                &ctx.fork_sync,
                 ctx.identity.coordinator_id_str(),
                 ctx.identity.hostname(),
             )
@@ -352,7 +352,7 @@ async fn dispatch_json(
             // Per-volume artefact upload + events/<volume>/ emit.
             // Coordinator-wide today; future Tigris work splits the
             // upload from the event emit.
-            let result = snapshot_volume(&volume, &ctx.core(), &ctx.snapshot_locks).await;
+            let result = snapshot_volume(&volume, &ctx.core(), &ctx.fork_sync).await;
             let env: Envelope<SnapshotReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -749,6 +749,7 @@ pub(crate) async fn drain_volume_for_seal(
     vol_ulid: ulid::Ulid,
     store: &Arc<dyn object_store::ObjectStore>,
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
+    head_cache: &elide_coordinator::HeadCache,
 ) -> Result<Option<ulid::Ulid>, IpcError> {
     if !elide_coordinator::control::promote_wal(fork_dir).await {
         return Err(IpcError::internal(
@@ -765,6 +766,7 @@ pub(crate) async fn drain_volume_for_seal(
         vol_ulid,
         store,
         &meta_store,
+        head_cache,
     )
     .await
     {
@@ -794,12 +796,12 @@ pub(crate) async fn drain_volume_for_seal(
 pub(crate) async fn snapshot_volume(
     vol_name: &str,
     core: &CoordinatorCore,
-    snapshot_locks: &SnapshotLockRegistry,
+    fork_sync: &ForkSyncRegistry,
 ) -> Result<SnapshotReply, IpcError> {
     snapshot_volume_kind(
         vol_name,
         core,
-        snapshot_locks,
+        fork_sync,
         elide_core::signing::SnapshotKind::User,
     )
     .await
@@ -814,7 +816,7 @@ pub(crate) async fn snapshot_volume(
 pub(crate) async fn snapshot_volume_kind(
     vol_name: &str,
     core: &CoordinatorCore,
-    snapshot_locks: &SnapshotLockRegistry,
+    fork_sync: &ForkSyncRegistry,
     kind: elide_core::signing::SnapshotKind,
 ) -> Result<SnapshotReply, IpcError> {
     let link = core.data_dir.join("by_name").join(vol_name);
@@ -843,11 +845,12 @@ pub(crate) async fn snapshot_volume_kind(
         .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
     let store = core.stores.volume_rw(&vol_ulid);
 
-    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &fork_dir);
+    let lock = elide_coordinator::snapshot_lock_for(fork_sync, &fork_dir);
+    let head_cache = elide_coordinator::head_cache_for(fork_sync, &fork_dir);
     let _guard = lock.lock_owned().await;
 
     let drained_user_snapshot =
-        drain_volume_for_seal(&fork_dir, vol_ulid, &store, &core.stores).await?;
+        drain_volume_for_seal(&fork_dir, vol_ulid, &store, &core.stores, &head_cache).await?;
 
     let snap_ulid = pick_snapshot_ulid(&fork_dir)
         .map_err(|e| IpcError::internal(format!("picking snap_ulid: {e}")))?;
@@ -892,10 +895,14 @@ pub(crate) async fn snapshot_volume_kind(
         )));
     }
 
-    let uploaded_user_snapshot =
-        elide_coordinator::upload::upload_snapshot_metadata(&fork_dir, vol_ulid, &store)
-            .await
-            .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
+    let uploaded_user_snapshot = elide_coordinator::upload::upload_snapshot_metadata(
+        &fork_dir,
+        vol_ulid,
+        &store,
+        &head_cache,
+    )
+    .await
+    .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
 
     // Best-effort `names/<name>.latest_snapshot` bump (`coord-rw` —
     // the volume-rw drain above cannot write it). Mirrors the
@@ -3022,7 +3029,7 @@ mod tests {
             stores: recording.clone(),
             identity,
         };
-        let locks = SnapshotLockRegistry::default();
+        let locks = ForkSyncRegistry::default();
 
         // promote_wal will fail (no control.sock) — that's after the
         // credential pick at the top of the function.
@@ -3214,7 +3221,7 @@ mod tests {
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            snapshot_locks: SnapshotLockRegistry::default(),
+            fork_sync: ForkSyncRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
             readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(store)),

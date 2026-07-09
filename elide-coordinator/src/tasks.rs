@@ -25,7 +25,7 @@ use crate::config::GcConfig;
 use crate::gc_cycle::{GcCycleOrchestrator, TickOutcome};
 use crate::prefetch;
 use crate::upload;
-use crate::{PrefetchTracker, SnapshotLockRegistry, unregister_prefetch};
+use crate::{ForkSyncRegistry, PrefetchTracker, unregister_prefetch};
 
 /// Request type for the per-fork evict channel.
 /// The sender receives the eviction result (count of bodies deleted).
@@ -141,7 +141,7 @@ pub async fn run_volume_tasks(
     drain_interval: Duration,
     gc_config: GcConfig,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
-    snapshot_locks: SnapshotLockRegistry,
+    fork_sync: ForkSyncRegistry,
     prefetch_done: Arc<watch::Sender<PrefetchState>>,
     prefetch_tracker: PrefetchTracker,
 ) {
@@ -289,7 +289,7 @@ pub async fn run_volume_tasks(
         data_store,
         &stores,
         gc_config,
-        &snapshot_locks,
+        &fork_sync,
         read_volume_name(&fork_dir),
         identity,
     );
