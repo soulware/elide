@@ -93,6 +93,7 @@ elide_data/by_id/<ulid>/
 ## Disconnect
 
 ```sh
+limactl shell elide-dev sudo sync
 limactl shell elide-dev sudo umount /mnt
 ./target/debug/elide volume stop data-vol
 ```

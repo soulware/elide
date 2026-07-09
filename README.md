@@ -20,6 +20,7 @@ mkdir -p /mnt/vol1 && mount /dev/elide/vol1 /mnt/vol1
 echo "hello!" > /mnt/vol1/hello.txt
 
 # release the volume from this host...
+sync
 umount /mnt/vol1
 elide volume stop --release vol1
 
