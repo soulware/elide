@@ -1015,6 +1015,60 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     );
 }
 
+/// Deterministic regression for a proptest failure on main (CI run
+/// 29011159501): delta_repack rewrote a pending segment holding
+/// {Data lba3, Zero [0,2)} to a fresh ULID above the later pending
+/// segment claiming LBA 1, so the re-emitted Zero resurrected its dead
+/// LBA 1 claim on lbamap rebuild — drift at the promote inside the
+/// final `SnapshotSign`. The superseded-claim guard in
+/// `execute_delta_repack` now skips that segment.
+///
+/// Minimal input from proptest shrinking:
+///   VariantWrite { lba: 3, base_seed: 3, tweak: 0 }
+///   SnapshotSign
+///   VariantWrite { lba: 3, base_seed: 3, tweak: 1 }
+///   ZeroThenPartialWrite { start_lba: 0, span: 2, inner_off: 1, seed: 0 }
+///   DeltaRepack
+///   SnapshotSign
+#[test]
+fn delta_repack_zero_sibling_lbamap_drift() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    write_keypair_and_provenance(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Op 1: VariantWrite lba=3 base_seed=3 tweak=0.
+    vol.write(3, &variant_block(3, 0)).unwrap();
+
+    // Op 2: SnapshotSign.
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // Op 3: VariantWrite lba=3 base_seed=3 tweak=1.
+    vol.write(3, &variant_block(3, 1)).unwrap();
+
+    // Op 4: ZeroThenPartialWrite start_lba=0 span=2 inner_off=1 seed=0.
+    vol.write_zeroes(0, 2).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(1, &[0u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Op 5: DeltaRepack. The Zero [0,2) segment's LBA 1 claim is
+    // superseded by the later data segment, so the guard must skip it.
+    let stats = vol.delta_repack_post_snapshot().unwrap();
+    assert_eq!(stats.segments_rewritten, 0, "stats: {stats:?}");
+    assert_eq!(stats.segments_skipped_superseded, 1, "stats: {stats:?}");
+
+    // Op 6: SnapshotSign — the promotes inside snapshot() run the
+    // lbamap drift assert.
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    assert_eq!(&vol.read(3, 1).unwrap(), &variant_block(3, 1));
+    assert_eq!(&vol.read(1, 1).unwrap(), &[0u8; 4096]);
+    assert_eq!(&vol.read(0, 1).unwrap(), &[0u8; 4096]);
+}
+
 fn list_dir(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .map(|d| {

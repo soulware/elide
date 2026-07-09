@@ -43,6 +43,11 @@ pub struct DeltaRepackStats {
     pub original_body_bytes: u64,
     /// Sum of delta blob sizes written.
     pub delta_body_bytes: u64,
+    /// Number of segments skipped because one of their LBA claims is
+    /// superseded by a later pending segment — rewriting would re-emit
+    /// the dead claim above its overwriter on rebuild.
+    #[serde(default)]
+    pub segments_skipped_superseded: usize,
 }
 
 /// Data needed by the worker to repack sparse segments in `pending/`.
@@ -143,6 +148,13 @@ pub struct DeltaRepackJob {
     /// ULID). Worker assigns them in input-ULID order and only
     /// consumes as many as it actually rewrites.
     pub output_ulids: Vec<Ulid>,
+    /// Prep-time lbamap snapshot (taken after the prep WAL flush). The
+    /// worker only rewrites a segment whose every LBA claim is still
+    /// held by that segment: a rewrite re-emits all entries at a fresh
+    /// ULID that sorts above every other pending segment, so a claim
+    /// superseded by a later segment would be resurrected on the
+    /// last-writer-wins lbamap rebuild.
+    pub lbamap: Arc<lbamap::LbaMap>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
@@ -478,6 +490,7 @@ impl Volume {
             snap_ulid,
             ceiling: u_flush,
             output_ulids,
+            lbamap: Arc::clone(&self.lbamap),
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             segment_cache: Arc::clone(&self.segment_cache),
