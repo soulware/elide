@@ -8,7 +8,7 @@ Data is written to fast direct-attached storage and asynchronously uploaded to o
 
 Elide targets [Tigris](https://www.tigrisdata.com/) object storage, which provides S3 semantics with low storage costs and free egress.
 
-Because the bucket holds the durable copy and local storage is only a cache, volumes are portable: release a volume on one host and claim it on another, and it becomes available immediately. The volume is hydrated from object storage on demand. A volume has exactly one owner at a time — the claim is what moves.
+Because the bucket holds the durable copy and local storage is only a cache, volumes are portable: release a volume on one host and claim it on another, and it becomes available immediately. The volume is hydrated from object storage on demand. A volume has exactly one owner at a time.
 
 ```sh
 # create a new Elide volume
