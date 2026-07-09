@@ -1,205 +1,122 @@
-# Quickstart
+# Quickstart (via Fly.io)
 
-Deploy a standalone Elide coordinator on [Fly.io](https://fly.io) backed by
-[Tigris](https://www.tigrisdata.com) object storage, create a block volume,
-put a filesystem on it, and write a file. Part 2 moves the live volume to a
-second machine.
-
-This uses `deploy/elide-standalone/` — a simplified deployment where the
-coordinator talks to Tigris directly with one read/write keypair. See
-[deploy/elide-standalone/README.md](../deploy/elide-standalone/README.md) for
-its security model, and `deploy/elide/` for the mint-backed alternative with
-per-volume scoped credentials.
+The following demo guides us through launching a "standalone" Elide instance via Fly.io. We will create an Elide volume backed by Tigris object storage. This Elide volume is exposed as a block device and we can create a filesystem on the block device, mount it and write to it. Finally in Part 2 we demonstrate moving an Elide volume between two Fly.io machines.
 
 ## Prerequisites
 
-- A [Fly.io](https://fly.io) account and the [`fly` CLI](https://fly.io/docs/flyctl/install/), logged in (`fly auth login`)
-
-Everything below runs from `deploy/elide-standalone/`:
+* A [Fly.io](https://fly.io/) account
+* [flyctl](https://fly.io/docs/flyctl/install/) installed locally 
 
 ```sh
+# Login via flyctl
+fly auth login
+
+# Run the demo from the "elide-standalone" directory
 cd deploy/elide-standalone
 ```
 
-## 1. Launch
+## Part 1 — Create and write to a volume
+
+### 1. Launch
 
 ```sh
+# launch.sh runs the following steps internally -
+#
+# fly apps create
+# fly storage create
+# writes a local fly.toml
+# fly deploy
+#
+# Feel free to run these steps individually as desired
+#
 ./launch.sh
 ```
 
-`launch.sh` provisions and deploys in one step: it creates the Fly app (Fly
-generates a name), asks for a region, creates a Tigris bucket
-targeting the app — which sets the keypair secrets the coordinator signs
-S3 operations with — writes `fly.toml`, and deploys the newest elide
-release. It echoes each `fly` command as it runs it, prompting for the
-region (and the org, when your account has several); `./launch.sh <region>
-<org>` skips the prompts. The coordinator comes up serving immediately.
+Launching Elide will provision a Fly.io app (choosing a random name) and the associated Tigris storage bucket - 
+* Fly.io app: `bright-smoke-973`
+* Tigris bucket: `bright-smoke-973-data`
 
-Use the app name `launch.sh` chose wherever `my-elide` appears below. To pick
-your own app name, reuse an existing bucket, or pin a release, run the same
-steps by hand instead — see [Manual setup](#manual-setup).
+The machine boots with the ublk kernel module loaded and the Elide coordinator running, holding the bucket credentials Fly provisioned at deploy time.
 
-## 2. Create an elide volume
+### 2. Create an Elide volume
 
-The coordinator's control plane is a Unix socket inside the machine, so
-volume operations run over SSH:
+At this point we have a running app with a single machine instance. Creating a volume registers its name in the bucket and exposes it as a local block device at `/dev/elide/vol1`.
 
 ```sh
-fly ssh console -a my-elide
-```
+# Connect to the machine instance
+fly ssh console
 
-Inside the machine:
-
-```sh
+# Create a new Elide volume
 elide volume create --size 1G vol1
+
+# List Elide volumes
 elide volume list
+
+# View the status of an Elide volume
+elide volume status vol1
 ```
 
-The coordinator runs as root with `ublk_drv` loaded, so the volume comes up
-serving a kernel block device — `list` shows it running on `/dev/ublkb0`,
-and every served volume is also reachable by name at `/dev/elide/<name>`.
+### 3. Format, mount, write
 
-## 3. Format, mount, write
-
-Still inside the machine:
+The device behaves like any disk. Writes land on local storage and drain to the bucket asynchronously. The object store provides durability and the local copy acts as a cache.
 
 ```sh
+# Create a filesystem on the block device
 mkfs.ext4 /dev/elide/vol1
+
+# Mount the filesystem
 mkdir -p /mnt/vol1
 mount -o discard /dev/elide/vol1 /mnt/vol1
+
+# Write a file
 echo "hello!" > /mnt/vol1/hello.txt
+
+# Read the file
 cat /mnt/vol1/hello.txt
 ```
 
-Writes land in the volume's write-ahead log; the coordinator drains sealed
-segments to Tigris automatically every few seconds. `elide volume events
-vol1` shows the volume's event log.
+## Part 2 — Volume release/claim
 
-## Part 2 — Move the volume to a second machine
-
-A volume has exactly one owner. Handing it to another machine is
-stop-and-release on the current owner, then claim-and-start on the new one —
-the bucket is the sole rendezvous between the two coordinators.
+With two Fly.io machines we can demonstrate moving an Elide volume between instances. An Elide volume is owned _exclusively_ by a single instance - we will release it from one instance before claiming on another instance.
 
 ### 1. Scale to two machines
 
-Each machine needs its own `elide_data` Fly volume; `fly scale` offers to
-create the second one:
+The second machine boots the same image and connects to the same Tigris bucket but holds no volume data locally.
 
 ```sh
-fly scale count 2 -a my-elide
+# Make a second machine available by scaling the Fly.io app to 2 instances
+fly scale count 2
 ```
 
-Get both machine IDs:
+### 2. Release the volume
+
+Releasing drains any pending data to the bucket, publishes a snapshot for handoff, and releases the volume so another instance can claim it.
 
 ```sh
-fly machine list -a my-elide
-```
+# Connect to the "original" machine
+fly ssh console -s
 
-### 2. Release on machine 1
-
-SSH to the machine that owns `vol1` (the original one):
-
-```sh
-fly ssh console -a my-elide --machine <machine1-id>
-```
-
-Inside:
-
-```sh
+# Detach the filesystem
 umount /mnt/vol1
-elide volume release vol1
+
+# Release the Elide volume
+elide volume stop --release vol1
 ```
 
-`release` stops the volume — drains the remaining WAL to Tigris, publishes a
-stop snapshot, detaches the block device — and then releases the name in the
-bucket so any coordinator may claim it.
+### 3. Claim the volume
 
-### 3. Claim on machine 2
-
-SSH to the other machine:
+Claiming moves ownership and the volume comes online immediately. A background prefetch warms the local cache from object storage, and anything not yet local is fetched on demand.
 
 ```sh
-fly ssh console -a my-elide --machine <machine2-id>
-```
+# Connect to the "new" machine
+fly ssh console -s
 
-Inside:
+# Claim the released volume
+elide volume start --claim vol1
 
-```sh
-elide volume claim vol1
-elide volume start vol1
+# Mount the filesystem and read the file we created previously
 mkdir -p /mnt/vol1
 mount -o discard /dev/elide/vol1 /mnt/vol1
 cat /mnt/vol1/hello.txt
 # hello!
 ```
-
-`claim` takes ownership of the released name; `start` serves it over ublk,
-demand-fetching segment data from Tigris as it is read. (`elide volume start
-vol1 --claim` does both in one step.)
-
-## Manual setup
-
-The steps `launch.sh` runs, by hand — for a chosen app name, an existing
-bucket, or a pinned release.
-
-### 1. Create the Fly app
-
-```sh
-fly apps create my-elide
-```
-
-Pick your own app name — it's global across Fly. Use it wherever `my-elide`
-appears in this guide.
-
-### 2. Create a Tigris bucket
-
-Create the bucket with the Tigris integration, targeting the app:
-
-```sh
-fly storage create -a my-elide -n my-elide-data
-```
-
-This sets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` on the app — the
-two secrets the coordinator signs S3 operations with.
-
-To use a bucket created another way (the Fly.io dashboard, an existing
-bucket), copy its keypair from the Tigris console and set the secrets
-directly:
-
-```sh
-fly secrets set -a my-elide AWS_ACCESS_KEY_ID=tid_… AWS_SECRET_ACCESS_KEY=tsec_…
-```
-
-Note the bucket name — `fly storage list` shows it — you'll need it in
-step 3.
-
-### 3. Configure fly.toml
-
-```sh
-cp fly.toml.example fly.toml
-```
-
-Edit `fly.toml`:
-
-- `app` — your app name (`my-elide`)
-- `primary_region` — your preferred [region](https://fly.io/docs/reference/regions/)
-- `DATA_BUCKET` build arg — the Tigris bucket name from step 2; the
-  Dockerfile bakes it into the coordinator's config
-
-This completes the configuration: the Tigris endpoint and region are baked
-into the image's `coord.toml`, and the keypair arrives via the secrets.
-
-### 4. Deploy
-
-```sh
-fly deploy
-```
-
-The image runs the newest elide release, and the first deploy creates the
-machine's `elide_data` Fly volume (10GB, from `initial_size` in fly.toml) —
-coordinator state (segment indexes, cache, keys) lives there and survives
-redeploys. `./deploy.sh v0.1.3` deploys a pinned release instead.
-
-The coordinator comes up serving immediately. If the keypair secrets are
-missing it fails loudly at startup.
