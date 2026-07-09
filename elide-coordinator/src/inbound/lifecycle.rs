@@ -121,6 +121,17 @@ pub(crate) async fn stop_volume_op(
         let head_cache = elide_coordinator::head_cache_for(fork_sync, &vol_dir);
         let guard = lock.lock_owned().await;
 
+        // A filesystem mounted on the device holds dirty pages this
+        // process cannot see; sync() pushes them through the ublk
+        // daemon into the WAL while it is still serving I/O, so the
+        // drain below picks them up. Global on purpose: it reaches
+        // every superblock in the kernel, so mounts in other mount
+        // namespaces and filesystems stacked over partitions or
+        // device-mapper are flushed too.
+        tokio::task::spawn_blocking(nix::unistd::sync)
+            .await
+            .map_err(|e| IpcError::internal(format!("stop {volume_name}: sync failed: {e}")))?;
+
         if let Err(e) =
             drain_volume_for_seal(&vol_dir, vol_ulid, &store, &core.stores, &head_cache).await
         {
