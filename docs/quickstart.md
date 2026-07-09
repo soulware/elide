@@ -96,7 +96,8 @@ Releasing drains any pending data to the bucket, publishes a snapshot for handof
 # Connect to the "original" machine
 fly ssh console -s
 
-# Detach the filesystem
+# Flush written data to the device and detach the filesystem
+sync
 umount /mnt/vol1
 
 # Release the Elide volume
