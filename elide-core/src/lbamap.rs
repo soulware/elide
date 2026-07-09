@@ -689,9 +689,11 @@ impl LbaMap {
     }
 
     /// Return the claimant ULID of the entry covering `lba`, if any.
-    /// Used by `assert_lbamap_consistent` to verify the in-memory
-    /// claimant matches the one a from-disk rebuild would produce.
-    #[cfg(feature = "volume-invariants")]
+    ///
+    /// Used by delta_repack's superseded-claim guard (a segment is only
+    /// rewritten if it still claims every LBA it covers) and by
+    /// `assert_lbamap_consistent` to verify the in-memory claimant
+    /// matches the one a from-disk rebuild would produce.
     pub fn claimant_at(&self, lba: u64) -> Option<Ulid> {
         if let Some((&start, entry)) = self.inner.range(..=lba).next_back()
             && lba < start + entry.lba_length as u64

@@ -2565,7 +2565,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 /// snapshot-pinned `BlockReader`, iterates every post-snapshot segment
 /// in `pending/`, and invokes
 /// [`crate::delta_compute::rewrite_post_snapshot_with_prior`] against
-/// the prior-snapshot reader.
+/// the prior-snapshot reader. Segments with an LBA claim superseded by
+/// a later pending segment are skipped — see the guard below.
 ///
 /// Per-segment errors are logged and the segment is skipped so one bad
 /// segment can't derail the whole pass — mirrors the pre-offload
@@ -2581,6 +2582,7 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
         snap_ulid,
         ceiling,
         output_ulids,
+        lbamap,
         signer,
         verifying_key,
         segment_cache,
@@ -2626,6 +2628,29 @@ pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepac
         }
 
         stats.segments_scanned += 1;
+
+        // Rewriting re-emits every entry at a fresh ULID that sorts
+        // above all other pending segments, so it is only sound when
+        // this segment still holds every LBA it claims — a claim
+        // superseded by a later pending segment would be resurrected
+        // on the last-writer-wins lbamap rebuild. Skip the segment
+        // otherwise; the delta conversion is an optimisation only.
+        let parsed = match segment_cache.read_and_verify(&seg_path, &verifying_key) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("delta_repack: seg {seg_id} read failed: {e} — leaving segment unchanged");
+                continue;
+            }
+        };
+        let claims_held = parsed.entries.iter().all(|e| {
+            e.kind.is_canonical_only()
+                || (e.start_lba..e.start_lba + e.lba_length as u64)
+                    .all(|lba| lbamap.claimant_at(lba) == Some(seg_id))
+        });
+        if !claims_held {
+            stats.segments_skipped_superseded += 1;
+            continue;
+        }
 
         // Pre-mint a fresh output ULID for this rewrite. We only pop
         // an ULID if we'll actually use it; rewriters that decline
