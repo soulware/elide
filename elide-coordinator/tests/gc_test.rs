@@ -771,6 +771,7 @@ fn drain_failure_skips_gc_and_data_survives() {
             ulid::Ulid::nil(),
             &fail_store,
             &fail_store,
+            &Default::default(),
         ))
         .expect("drain_pending itself should not error");
     assert!(
@@ -807,6 +808,7 @@ fn drain_failure_skips_gc_and_data_survives() {
             ulid::Ulid::nil(),
             &good_store,
             &good_store,
+            &Default::default(),
         ))
         .expect("drain should succeed with good store");
     assert_eq!(

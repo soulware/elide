@@ -19,7 +19,7 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use tracing::{info, warn};
 
-use elide_coordinator::SnapshotLockRegistry;
+use elide_coordinator::ForkSyncRegistry;
 use elide_coordinator::ipc::{IpcError, ReleaseReply};
 use elide_coordinator::volume_state::{STOPPED_FILE, write_released_marker};
 
@@ -50,7 +50,7 @@ pub(crate) async fn stop_volume_op(
     volume_name: &str,
     force: bool,
     core: &CoordinatorCore,
-    snapshot_locks: &SnapshotLockRegistry,
+    fork_sync: &ForkSyncRegistry,
     coord_id: &str,
     hostname: Option<&str>,
 ) -> Result<(), IpcError> {
@@ -78,7 +78,7 @@ pub(crate) async fn stop_volume_op(
             if force {
                 return Ok(());
             }
-            return ensure_stopped_sealed(volume_name, &vol_dir, core, snapshot_locks).await;
+            return ensure_stopped_sealed(volume_name, &vol_dir, core, fork_sync).await;
         }
         VolumeLifecycle::Importing { import_ulid } => {
             return Err(IpcError::conflict(format!(
@@ -117,16 +117,19 @@ pub(crate) async fn stop_volume_op(
         // Drain/seal write under `by_id/<vol>/` — `volume-rw` scope
         // (`coord-rw` would 403), as in `snapshot_volume`.
         let store = core.stores.volume_rw(&vol_ulid);
-        let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, &vol_dir);
+        let lock = elide_coordinator::snapshot_lock_for(fork_sync, &vol_dir);
+        let head_cache = elide_coordinator::head_cache_for(fork_sync, &vol_dir);
         let guard = lock.lock_owned().await;
 
-        if let Err(e) = drain_volume_for_seal(&vol_dir, vol_ulid, &store, &core.stores).await {
+        if let Err(e) =
+            drain_volume_for_seal(&vol_dir, vol_ulid, &store, &core.stores, &head_cache).await
+        {
             return Err(IpcError::internal(format!(
                 "stop {volume_name}: drain failed: {e}; \
                  retry, or use `stop --force` to halt without a checkpoint"
             )));
         }
-        Some((vol_ulid, store, guard))
+        Some((vol_ulid, store, head_cache, guard))
     } else {
         None
     };
@@ -155,8 +158,8 @@ pub(crate) async fn stop_volume_op(
 
     // Seal over the final durable state, now that the daemon is down
     // and the lock still fences the tick loop.
-    if let Some((vol_ulid, store, _guard)) = &seal {
-        sweep_and_seal_stopped(volume_name, &vol_dir, *vol_ulid, store).await?;
+    if let Some((vol_ulid, store, head_cache, _guard)) = &seal {
+        sweep_and_seal_stopped(volume_name, &vol_dir, *vol_ulid, store, head_cache).await?;
     }
 
     // `stop` is a local-lifecycle verb: its job is to halt the daemon
@@ -215,11 +218,11 @@ async fn ensure_stopped_sealed(
     volume_name: &str,
     vol_dir: &Path,
     core: &CoordinatorCore,
-    snapshot_locks: &SnapshotLockRegistry,
+    fork_sync: &ForkSyncRegistry,
 ) -> Result<(), IpcError> {
     // Lock first: the tick loop's drain also uploads pending/ for
     // stopped volumes, and the sweep must not race it.
-    let lock = elide_coordinator::snapshot_lock_for(snapshot_locks, vol_dir);
+    let lock = elide_coordinator::snapshot_lock_for(fork_sync, vol_dir);
     let _guard = lock.lock_owned().await;
 
     match release_fast_path_handoff(vol_dir) {
@@ -237,7 +240,9 @@ async fn ensure_stopped_sealed(
             let vol_ulid = elide_coordinator::upload::derive_names(vol_dir)
                 .map_err(|e| IpcError::internal(format!("deriving volume id: {e}")))?;
             let store = core.stores.volume_rw(&vol_ulid);
-            let snap = sweep_and_seal_stopped(volume_name, vol_dir, vol_ulid, &store).await?;
+            let head_cache = elide_coordinator::head_cache_for(fork_sync, vol_dir);
+            let snap =
+                sweep_and_seal_stopped(volume_name, vol_dir, vol_ulid, &store, &head_cache).await?;
             info!("[stop {volume_name}] sealed previously-unsealed stop at {snap}");
             Ok(())
         }
@@ -269,6 +274,7 @@ async fn sweep_and_seal_stopped(
     vol_dir: &Path,
     vol_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
+    head_cache: &elide_coordinator::HeadCache,
 ) -> Result<ulid::Ulid, IpcError> {
     if !dir_is_empty_or_absent(&vol_dir.join("wal"))
         .map_err(|e| IpcError::internal(format!("inspecting wal/: {e}")))?
@@ -363,7 +369,7 @@ async fn sweep_and_seal_stopped(
         )
         .map_err(|e| IpcError::internal(format!("writing stop manifest {snap_ulid}: {e}")))?;
     }
-    elide_coordinator::upload::upload_snapshot_metadata(vol_dir, vol_ulid, store)
+    elide_coordinator::upload::upload_snapshot_metadata(vol_dir, vol_ulid, store, head_cache)
         .await
         .map_err(|e| IpcError::store(format!("uploading snapshot files: {e:#}")))?;
     info!("[stop-snapshot {vol_ulid}] committed {snap_ulid}");
@@ -1805,7 +1811,7 @@ mod tests {
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            snapshot_locks: SnapshotLockRegistry::default(),
+            fork_sync: ForkSyncRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
             readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
@@ -1878,7 +1884,7 @@ mod tests {
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            snapshot_locks: SnapshotLockRegistry::default(),
+            fork_sync: ForkSyncRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
             readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
@@ -1937,7 +1943,7 @@ mod tests {
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            snapshot_locks: SnapshotLockRegistry::default(),
+            fork_sync: ForkSyncRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
             readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: Arc::new(elide_coordinator::stores::PassthroughStores::new(
@@ -2040,7 +2046,7 @@ mod tests {
             fork_registry: crate::fork::new_registry(),
             claim_registry: crate::claim::new_registry(),
             evict_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            snapshot_locks: SnapshotLockRegistry::default(),
+            fork_sync: ForkSyncRegistry::default(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
             readiness_tracker: elide_coordinator::new_readiness_tracker(),
             stores: recording.clone(),
@@ -2078,11 +2084,11 @@ mod tests {
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
         let core = test_core(data_dir.path(), &store);
-        let snapshot_locks = SnapshotLockRegistry::default();
+        let fork_sync = ForkSyncRegistry::default();
         // `force = true`: this test exercises only the bucket-state
         // handling, not the drain/snapshot path (the test fixture has
         // no running daemon to IPC).
-        stop_volume_op("vol", true, &core, &snapshot_locks, "coord-self", None)
+        stop_volume_op("vol", true, &core, &fork_sync, "coord-self", None)
             .await
             .expect("stop must halt locally regardless of bucket state");
 
@@ -2116,8 +2122,8 @@ mod tests {
         ns::create_name_record(&store, "vol", &rec).await.unwrap();
 
         let core = test_core(data_dir.path(), &store);
-        let snapshot_locks = SnapshotLockRegistry::default();
-        stop_volume_op("vol", true, &core, &snapshot_locks, "coord-self", None)
+        let fork_sync = ForkSyncRegistry::default();
+        stop_volume_op("vol", true, &core, &fork_sync, "coord-self", None)
             .await
             .expect("stop must halt locally despite foreign bucket state");
 
@@ -2181,7 +2187,7 @@ mod tests {
         )
         .unwrap();
 
-        let sealed = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store)
+        let sealed = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store, &Default::default())
             .await
             .unwrap();
 
@@ -2244,7 +2250,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store)
+        let err = sweep_and_seal_stopped("vol", &vol_dir, vol_ulid, &store, &Default::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unflushed WAL"), "got: {err}");
@@ -2266,8 +2272,8 @@ mod tests {
         std::fs::write(vol_dir.join("index").join(format!("{seg}.idx")), b"idx").unwrap();
 
         let core = test_core(data_dir.path(), &store);
-        let snapshot_locks = SnapshotLockRegistry::default();
-        stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+        let fork_sync = ForkSyncRegistry::default();
+        stop_volume_op("vol", false, &core, &fork_sync, "coord-self", None)
             .await
             .expect("re-running stop seals the halted volume");
 
@@ -2284,7 +2290,7 @@ mod tests {
         ));
 
         // Sealed volume: a further stop is a no-op.
-        stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+        stop_volume_op("vol", false, &core, &fork_sync, "coord-self", None)
             .await
             .expect("stop on a sealed stopped volume is idempotent");
     }
@@ -2305,8 +2311,8 @@ mod tests {
         .unwrap();
 
         let core = test_core(data_dir.path(), &store);
-        let snapshot_locks = SnapshotLockRegistry::default();
-        let err = stop_volume_op("vol", false, &core, &snapshot_locks, "coord-self", None)
+        let fork_sync = ForkSyncRegistry::default();
+        let err = stop_volume_op("vol", false, &core, &fork_sync, "coord-self", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unflushed WAL"), "got: {err}");

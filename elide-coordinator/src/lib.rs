@@ -50,35 +50,58 @@ use ulid::Ulid;
 pub type EvictRegistry =
     Arc<Mutex<HashMap<PathBuf, mpsc::Sender<(Option<String>, tasks::EvictReply)>>>>;
 
-/// Registry of per-fork snapshot locks.
+/// Cached `by_id/<vol>/HEAD` writer state, shared by every in-process
+/// HEAD writer for one fork (the tick loop's merge-and-publish and the
+/// seal-time truncation in `upload.rs`). `Some` holds the body of the
+/// last successful HEAD GET or PUT; `None` means the next merge must
+/// GET before trusting anything. Correct because the owning
+/// coordinator is the sole writer of its fork's HEAD
+/// (`docs/design/segment-index.md` *Writer state*).
+pub type HeadCache = Arc<AsyncMutex<Option<segment_head::SegmentHead>>>;
+
+/// Per-fork shared coordination state.
+#[derive(Default)]
+pub struct ForkSync {
+    /// Held by the snapshot inbound handler for the full duration of a
+    /// snapshot sequence (flush → inline drain → sign manifest →
+    /// upload) across multiple `.await`s, so it must be a tokio mutex.
+    /// The per-volume tick loop `try_lock`s it before running
+    /// drain/GC/eviction and skips the volume for that tick if held.
+    ///
+    /// The lock exists only to keep the coordinator's own background
+    /// tick loop off a volume mid-snapshot. Volume-actor commands are
+    /// already serialised through the actor channel, so intra-volume
+    /// commands never race regardless of this lock.
+    snap_lock: Arc<AsyncMutex<()>>,
+    head_cache: HeadCache,
+}
+
+/// Registry of per-fork shared state ([`ForkSync`]).
 ///
 /// The outer `Mutex` guards the HashMap and is never held across `.await`.
-/// The inner `AsyncMutex` is held by the snapshot inbound handler for the
-/// full duration of a snapshot sequence (flush → inline drain → sign
-/// manifest → upload) across multiple `.await`s, so it must be a tokio
-/// mutex. The per-volume tick loop `try_lock`s the inner mutex before
-/// running drain/GC/eviction and skips the volume for that tick if held.
-///
-/// The lock exists only to keep the coordinator's own background tick loop
-/// off a volume mid-snapshot. Volume-actor commands are already serialised
-/// through the actor channel, so intra-volume commands never race regardless
-/// of this lock.
-pub type SnapshotLockRegistry = Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>;
+pub type ForkSyncRegistry = Arc<Mutex<HashMap<PathBuf, Arc<ForkSync>>>>;
 
-/// Construct an empty `SnapshotLockRegistry`.
-pub fn new_snapshot_lock_registry() -> SnapshotLockRegistry {
+/// Construct an empty `ForkSyncRegistry`.
+pub fn new_fork_sync_registry() -> ForkSyncRegistry {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+fn fork_sync_for(registry: &ForkSyncRegistry, fork_dir: &std::path::Path) -> Arc<ForkSync> {
+    let mut map = registry.lock().expect("fork sync registry poisoned");
+    Arc::clone(map.entry(fork_dir.to_owned()).or_default())
 }
 
 /// Get or create the per-fork snapshot lock for `fork_dir`.
 pub fn snapshot_lock_for(
-    registry: &SnapshotLockRegistry,
+    registry: &ForkSyncRegistry,
     fork_dir: &std::path::Path,
 ) -> Arc<AsyncMutex<()>> {
-    let mut map = registry.lock().expect("snapshot lock registry poisoned");
-    map.entry(fork_dir.to_owned())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-        .clone()
+    Arc::clone(&fork_sync_for(registry, fork_dir).snap_lock)
+}
+
+/// Get or create the per-fork HEAD writer cache for `fork_dir`.
+pub fn head_cache_for(registry: &ForkSyncRegistry, fork_dir: &std::path::Path) -> HeadCache {
+    Arc::clone(&fork_sync_for(registry, fork_dir).head_cache)
 }
 
 /// Per-fork prefetch state. `None` means prefetch is still running; `Some(Ok(()))`

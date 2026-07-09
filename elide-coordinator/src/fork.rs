@@ -46,7 +46,7 @@ pub(crate) struct ForkContext {
     pub core: CoordinatorCore,
     pub fork_registry: ForkRegistry,
     pub prefetch_tracker: elide_coordinator::PrefetchTracker,
-    pub snapshot_locks: elide_coordinator::SnapshotLockRegistry,
+    pub fork_sync: elide_coordinator::ForkSyncRegistry,
 }
 
 // ── Job + registry ────────────────────────────────────────────────────────────
@@ -476,7 +476,7 @@ impl ForkOrchestrator {
         }
 
         // Live source: drive a fresh snapshot via the running daemon.
-        let reply = snapshot_volume(&name, &self.ctx.core, &self.ctx.snapshot_locks).await?;
+        let reply = snapshot_volume(&name, &self.ctx.core, &self.ctx.fork_sync).await?;
         self.job.append(ForkAttachEvent::SnapshotTaken {
             snap_ulid: reply.snap_ulid,
         });
@@ -902,7 +902,7 @@ mod tests {
             },
             fork_registry: new_registry(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
-            snapshot_locks: elide_coordinator::new_snapshot_lock_registry(),
+            fork_sync: elide_coordinator::new_fork_sync_registry(),
         };
         (ctx, data_dir)
     }
@@ -1053,7 +1053,7 @@ mod tests {
             },
             fork_registry: new_registry(),
             prefetch_tracker: elide_coordinator::new_prefetch_tracker(),
-            snapshot_locks: elide_coordinator::new_snapshot_lock_registry(),
+            fork_sync: elide_coordinator::new_fork_sync_registry(),
         };
         let mut orch = orchestrator(
             ctx,

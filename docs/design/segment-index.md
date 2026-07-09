@@ -100,22 +100,26 @@ time), and the per-tick HEAD PUT publishes the post-upload set.
 "Per-tick" never means "per GC tick" or "per reap tick"; both are
 gated sub-steps within the same drain tick.
 
-**Writer state: read-modify-write from S3 each active tick.** No
-cross-tick in-memory HEAD state, no local `since` log: each active
-tick the writer GETs current HEAD, merges in this tick's drain/GC/reap
-changes, and PUTs the new body. S3 HEAD is the single source of truth
-for the writer; the reap step is just one consumer of that per-tick
-read, not a special-cased path. Restart is trivially correct — the
-next active tick after restart does the GET as usual, no separate
-warm-up. A lost or 404 HEAD self-heals on the owner's next active tick
-(treat the GET result as empty and rewrite); in-flight `Superseded`
+**Writer state: cached merge basis, one seed GET per process.** Each
+active tick the writer merges its drain/GC/reap changes into a
+per-fork in-memory cache — the body of the last HEAD GET or PUT this
+process performed — and overwrites S3 from that merge. The cache is
+seeded with one GET on the first merge or reap pass after coordinator
+start and stays warm from then on; sole-writer-per-vol-epoch is what
+makes the cached basis sound, since no other process writes this
+fork's HEAD. Every in-process HEAD writer shares the same cell: the
+tick loop's merge-and-publish and the seal-time truncation both
+update it under its lock, and a failed PUT empties it so the next
+merge re-reads S3 before trusting anything. The reap gate evaluates
+the cached `Superseded` set locally, so a quiescent fork's 60s reap
+passes touch S3 only when an edge is actually past retention — a
+fully idle volume generates no steady-state HEAD traffic beyond the
+per-process seed. A lost or 404 HEAD self-heals at the next seed GET
+(treat the result as empty and rewrite); in-flight `Superseded`
 edges lose their `since` values, so those edges are over-retained by
 one `retention_window` — benign, never under-retained. Cost is one
-GET + one PUT per active tick per volume — fixed-key, small body,
-operationally invisible at any realistic scale. Caching HEAD
-in-memory across ticks (one GET per coordinator restart instead of
-per tick) is a later optimisation lever if it ever appears in
-profiling; explicitly *not* a current gap.
+PUT per active tick per volume plus the seed GET — fixed-key, small
+body, operationally invisible at any realistic scale.
 
 **Reaper fold: mechanic and SLA.** The reap step mirrors GC's
 existing gate exactly — a cross-tick `last_reap: Instant` on the

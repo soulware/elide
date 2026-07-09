@@ -19,7 +19,7 @@ use crate::config::GcConfig;
 use crate::segment_head;
 use crate::volume_data::VolumeData;
 use crate::volume_state::{IMPORTING_FILE, STOPPED_FILE};
-use crate::{SnapshotLockRegistry, control, gc, snapshot_lock_for, upload};
+use crate::{ForkSyncRegistry, control, gc, snapshot_lock_for, upload};
 
 /// Outcome of a single tick. `Stop` is returned when the fork directory has
 /// disappeared and the per-volume task should exit.
@@ -91,6 +91,12 @@ pub struct GcCycleOrchestrator {
     /// manifest whose inline snapshot-op upload failed, and the import
     /// drain). The volume-rw `store` cannot write `names/*`.
     name_claims: Arc<dyn crate::name_claims::NameClaims>,
+    /// Shared per-fork HEAD writer cache: the body of the last
+    /// successful HEAD GET or PUT in this process. Shared with the
+    /// seal-time truncation in `upload.rs`, which resets it to the
+    /// truncated form. A warm cache lets the merge and the reap gate
+    /// run without a per-pass HEAD GET.
+    head_cache: crate::HeadCache,
     /// Name bound to this fork, if it has one. Nameless forks (pulled
     /// ancestors) have no `names/<name>` record to bump.
     volume_name: Option<String>,
@@ -114,7 +120,7 @@ impl GcCycleOrchestrator {
         store: Arc<dyn ObjectStore>,
         stores: &Arc<dyn crate::stores::ScopedStores>,
         gc_config: GcConfig,
-        snapshot_locks: &SnapshotLockRegistry,
+        fork_sync: &ForkSyncRegistry,
         volume_name: Option<String>,
         identity: Arc<crate::identity::CoordinatorIdentity>,
     ) -> Self {
@@ -124,7 +130,8 @@ impl GcCycleOrchestrator {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| fork_dir.clone());
-        let snap_lock = snapshot_lock_for(snapshot_locks, &fork_dir);
+        let snap_lock = snapshot_lock_for(fork_sync, &fork_dir);
+        let head_cache = crate::head_cache_for(fork_sync, &fork_dir);
         // Force GC and reap on the first tick only when local-fs
         // markers show work a previous run left mid-stream. A
         // quiescent fork starts both clocks at their natural cadence:
@@ -161,6 +168,7 @@ impl GcCycleOrchestrator {
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
             name_claims,
+            head_cache,
             volume_name,
             identity,
             stores: Arc::clone(stores),
@@ -336,9 +344,9 @@ impl GcCycleOrchestrator {
             }
         };
 
-        // Fresh scratch every tick — HEAD is read-modify-write per
-        // active tick (`docs/design/segment-index.md` *Writer state*),
-        // never accumulated across ticks in memory.
+        // Fresh scratch every tick — entries land in HEAD via this
+        // tick's merge-and-publish (`docs/design/segment-index.md`
+        // *Writer state*).
         self.tick_added.clear();
         self.tick_superseded.clear();
 
@@ -370,7 +378,7 @@ impl GcCycleOrchestrator {
         // segments-before-HEAD crash ordering (design *Writers and
         // crash ordering*). An idle tick (no drain, no GC outputs) is
         // a no-op; only ticks that actually changed S3 segment state
-        // pay one GET + one PUT. A partial drain still publishes the
+        // pay the HEAD PUT. A partial drain still publishes the
         // segments that did upload — they're durable in S3 and would
         // otherwise be invisible to readers until the next active tick.
         self.publish_head_delta().await;
@@ -446,7 +454,15 @@ impl GcCycleOrchestrator {
             return true;
         }
         let vol_ulid = self.vol_ulid;
-        match upload::drain_pending(&self.fork_dir, vol_ulid, &self.store, &self.meta_store).await {
+        match upload::drain_pending(
+            &self.fork_dir,
+            vol_ulid,
+            &self.store,
+            &self.meta_store,
+            &self.head_cache,
+        )
+        .await
+        {
             Ok(r) => {
                 if r.seen > 0 {
                     info!(
@@ -505,9 +521,9 @@ impl GcCycleOrchestrator {
                     info!("[gc {vol_ulid}] completed {} GC handoff(s)", outcomes.len());
                 }
                 // Stamp `since` once for the whole tick. The reaper
-                // (folded into the tick loop in a follow-up PR) checks
-                // `since + retention_window <= now`; one-tick precision
-                // is well inside the retention window's 10× slack.
+                // checks `since + retention_window <= now`; one-tick
+                // precision is well inside the retention window's 10×
+                // slack.
                 let since = Utc::now();
                 for outcome in outcomes {
                     self.tick_added.push(outcome.output);
@@ -520,16 +536,21 @@ impl GcCycleOrchestrator {
         }
     }
 
-    /// Read HEAD once, apply this tick's drain/GC/reap deltas, and
-    /// overwrite. The reap step is folded in here (`docs/design-
-    /// segment-index.md` *Reaper fold*) so a tick that fires drain +
-    /// GC + reap still pays exactly one GET + one PUT.
+    /// Apply this tick's drain/GC/reap deltas to HEAD and overwrite.
+    /// The reap step is folded in here (`docs/design/segment-index.md`
+    /// *Reaper fold*) so a tick that fires drain + GC + reap still
+    /// pays exactly one HEAD PUT.
     ///
     /// Single-writer-per-vol-epoch is structural (the per-volume tick
-    /// loop is the sole writer for this volume); a plain GET + merge +
-    /// PUT, no CAS. A lost HEAD self-heals on the next active tick:
-    /// `read_head` treats a 404 or unparseable body as empty, and we
-    /// rewrite from the current truth.
+    /// loop is the sole writer for this volume); a plain merge + PUT,
+    /// no CAS. The merge basis is the shared `head_cache` — the body
+    /// of this process's last successful HEAD GET or PUT — so a warm
+    /// cache costs no GET; the cache is seeded with one GET on the
+    /// first pass after start, and re-seeded after a failed PUT or a
+    /// failed seal-time truncation (`upload.rs` empties the cache on
+    /// its failure paths). A lost HEAD self-heals on the next active
+    /// tick's seed: `read` treats a 404 or unparseable body as empty,
+    /// and we rewrite from the current truth.
     async fn publish_head_delta(&mut self) {
         let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
         let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
@@ -537,15 +558,27 @@ impl GcCycleOrchestrator {
             return;
         }
 
-        let mut head = match self.volume_data.head().read().await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(
-                    "[head {}] read failed: {e}; treating as empty",
-                    self.vol_ulid
-                );
-                segment_head::SegmentHead::empty(None)
-            }
+        // Cloning the Arc gives the guard an owner that is not
+        // borrowed from `self`, so `reap_expired(&mut self, ..)` below
+        // doesn't conflict with the live guard.
+        let cell = Arc::clone(&self.head_cache);
+        let mut cache = cell.lock().await;
+        // `trusted` is false only when the seed GET failed: the merge
+        // proceeds against an assumed-empty HEAD (self-heal
+        // semantics), but that fabricated value must not populate the
+        // cache unless the PUT lands it in S3.
+        let (mut head, trusted) = match cache.take() {
+            Some(h) => (h, true),
+            None => match self.volume_data.head().read().await {
+                Ok(h) => (h, true),
+                Err(e) => {
+                    warn!(
+                        "[head {}] read failed: {e}; treating as empty",
+                        self.vol_ulid
+                    );
+                    (segment_head::SegmentHead::empty(None), false)
+                }
+            },
         };
 
         let mut mutated = has_scratch;
@@ -565,14 +598,20 @@ impl GcCycleOrchestrator {
         }
 
         if !mutated {
+            if trusted {
+                *cache = Some(head);
+            }
             return;
         }
-        if let Err(e) = self.volume_data.head().put(&head).await {
-            warn!(
+        match self.volume_data.head().put(&head).await {
+            Ok(()) => *cache = Some(head),
+            // Cache stays empty: the next pass re-reads S3 before
+            // merging, which is what heals the lost overwrite.
+            Err(e) => warn!(
                 "[head {}] put failed: {e}; \
                  self-heals on the next active tick",
                 self.vol_ulid
-            );
+            ),
         }
     }
 
@@ -845,7 +884,7 @@ mod tests {
         let fork_dir = by_id.join(vol.to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
         prep(&fork_dir);
-        let locks = crate::new_snapshot_lock_registry();
+        let locks = crate::new_fork_sync_registry();
         let stores: Arc<dyn crate::stores::ScopedStores> =
             Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
         let identity =
@@ -1061,6 +1100,191 @@ mod tests {
             b"sentinel",
             "publish must not PUT when no work was done"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_cache_is_the_merge_basis_not_s3() {
+        // First publish seeds the cache (GET + PUT). A body written to
+        // S3 behind the writer's back must not leak into the second
+        // publish's merge: the sole-writer invariant means the cache
+        // is the basis, and no per-pass GET happens once it is warm.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        let mut m = UlidMint::new(Ulid::nil());
+        let a1 = m.next();
+        let foreign = m.next();
+        let a2 = m.next();
+
+        orch.tick_added.push(a1);
+        orch.publish_head_delta().await;
+
+        let mut planted = segment_head::SegmentHead::empty(None);
+        planted.added.insert(foreign);
+        put_head_via(&store, &planted).await;
+
+        orch.tick_added.push(a2);
+        orch.publish_head_delta().await;
+
+        let head = read_head_via(&store).await;
+        assert!(head.added.contains(&a1));
+        assert!(head.added.contains(&a2));
+        assert!(
+            !head.added.contains(&foreign),
+            "a warm cache must be the merge basis; a per-pass GET would have absorbed the planted entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_cache_reap_gate_evaluates_locally() {
+        // With a warm cache showing no Superseded edges, a due reap
+        // pass issues no S3 ops at all. An expired edge planted in S3
+        // behind the writer's back is the tripwire: a per-pass GET
+        // would see it and DELETE the input object.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        let mut m = UlidMint::new(Ulid::nil());
+        let a1 = m.next();
+        let input = m.next();
+        let output = m.next();
+
+        orch.tick_added.push(a1);
+        orch.publish_head_delta().await;
+
+        let key = seed_expired_input(&store, &mut orch, input, output).await;
+        let planted = read_head_via(&store).await;
+
+        orch.publish_head_delta().await;
+
+        assert!(
+            store.head(&key).await.is_ok(),
+            "reap gate must evaluate the cached edge set, not re-read S3"
+        );
+        assert_eq!(
+            read_head_via(&store).await,
+            planted,
+            "an idle reap pass with a warm cache must not PUT"
+        );
+    }
+
+    /// Delegates to an inner store but fails `put_opts` while armed.
+    #[derive(Debug)]
+    struct PutFailOnce {
+        inner: Arc<dyn ObjectStore>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for PutFailOnce {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailOnce")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PutFailOnce {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "PutFailOnce",
+                    source: "simulated put failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_put_empties_cache_and_next_pass_reseeds() {
+        // A failed HEAD PUT must leave the cache empty so the next
+        // pass re-reads S3 before merging. The reseed is observable
+        // because a body planted in S3 after the failure IS absorbed
+        // by the next merge — the opposite of the warm-cache case.
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(PutFailOnce {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        let mut m = UlidMint::new(Ulid::nil());
+        let a1 = m.next();
+        let planted_ulid = m.next();
+        let a2 = m.next();
+
+        orch.tick_added.push(a1);
+        orch.publish_head_delta().await;
+
+        let mut planted = segment_head::SegmentHead::empty(None);
+        planted.added.insert(planted_ulid);
+        vd_for(Arc::clone(&inner))
+            .head()
+            .put(&planted)
+            .await
+            .unwrap();
+
+        orch.tick_added.push(a2);
+        orch.publish_head_delta().await;
+
+        let head = read_head_via(&inner).await;
+        assert!(
+            head.added.contains(&planted_ulid),
+            "the pass after a failed PUT must reseed from S3"
+        );
+        assert!(head.added.contains(&a2));
     }
 
     /// Seed an expired Superseded edge for `input` (object body
