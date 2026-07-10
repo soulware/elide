@@ -310,8 +310,46 @@ impl Volume {
                 // gated on the current owner being any of the bucket's
                 // inputs.
                 if let Some(out) = &bucket.output {
-                    for e in &out.out_entries {
+                    let mut delta_full: Option<extentindex::DeltaBodySource> = None;
+                    for (raw_idx, e) in out.out_entries.iter().enumerate() {
                         if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
+                            continue;
+                        }
+                        if e.kind == EntryKind::Delta {
+                            // Carried Delta entries register in the delta
+                            // index, as the disk rebuild does — planting
+                            // them in the DATA map routes reads through
+                            // the body path with `stored_length == 0` and
+                            // serves garbage or EIO.
+                            let should_update = match index.lookup_delta(&e.hash) {
+                                None => index.lookup(&e.hash).is_none(),
+                                Some(loc) => bucket_input_ulids.contains(&loc.segment_id),
+                            };
+                            if should_update {
+                                let body_source = match delta_full {
+                                    Some(s) => s,
+                                    None => {
+                                        let out_path = pending_dir.join(out.new_ulid.to_string());
+                                        let body_length =
+                                            segment::read_segment_layout(&out_path)?.body_length;
+                                        let s = extentindex::DeltaBodySource::Full {
+                                            body_section_start: out.new_body_section_start,
+                                            body_length,
+                                        };
+                                        delta_full = Some(s);
+                                        s
+                                    }
+                                };
+                                index.insert_delta(
+                                    e.hash,
+                                    extentindex::DeltaLocation {
+                                        segment_id: out.new_ulid,
+                                        entry_idx: raw_idx as u32,
+                                        body_source,
+                                        options: e.delta_options.clone(),
+                                    },
+                                );
+                            }
                             continue;
                         }
                         let current = index.lookup(&e.hash);
