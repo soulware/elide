@@ -926,6 +926,49 @@ fn gc_oracle_repro_bug_h() {
     assert_eq!(&vol.read(1, 1).unwrap(), &[195u8; 4096]);
 }
 
+/// Deterministic materialisation of the minimal gc_oracle sequence CI
+/// found 2026-07-10 (seed 68cb98…): a sealed variant base, a split
+/// dedup pair, a near-duplicate overwrite of the sealed LBA, then
+/// DeltaRepack and a drain. The drain's promote trips the
+/// volume-invariants extent-index rebuild check with a phantom inner
+/// entry — an in-memory DATA hash no on-disk index owns.
+#[test]
+fn gc_oracle_repro_delta_repack_phantom_inner() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    write_keypair_and_provenance(fork_dir);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // VariantWrite { lba: 6, base_seed: 0, tweak: 0 }
+    vol.write(6, &variant_block(0, 0)).unwrap();
+
+    // SnapshotSign
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // SplitDedupWrite { lba_a: 0, lba_b: 4, seed: 0 }
+    let data = [0u8; 4096];
+    vol.write(0, &data).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(4, &data).unwrap();
+    vol.flush_wal().unwrap();
+
+    // VariantWrite { lba: 6, base_seed: 0, tweak: 1 }
+    vol.write(6, &variant_block(0, 1)).unwrap();
+
+    // DeltaRepack
+    let _ = vol.delta_repack_post_snapshot();
+
+    // GcSweep's drain: repack + promote each pending segment.
+    simulate_upload(&mut vol, fork_dir);
+
+    assert_eq!(&vol.read(6, 1).unwrap(), &variant_block(0, 1));
+    assert_eq!(&vol.read(0, 1).unwrap(), &data);
+    assert_eq!(&vol.read(4, 1).unwrap(), &data);
+}
+
 /// Deterministic regression for a proptest failure under the plan-based
 /// GC handoff: after two `GcSweep` passes the `index/` directory should
 /// hold exactly 1 .idx (the final GC output) — but the test was finding 3.
