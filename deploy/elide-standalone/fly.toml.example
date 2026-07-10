@@ -30,7 +30,3 @@ primary_region = "iad"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "1024mb"
-
-# No [http_service] and no tcp [checks]: the app is private. The coordinator's
-# control plane is a UDS; its only TCP listener is peer fetch on 6PN port 8443,
-# machine-to-machine traffic that never crosses Fly's proxy.
