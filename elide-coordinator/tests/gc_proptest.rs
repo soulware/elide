@@ -1018,6 +1018,95 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
     assert_eq!(&vol.read(5, 1).unwrap(), &last);
 }
 
+/// A delta-repack rewrite that carries an existing Delta entry must
+/// re-point the in-memory delta location at its output — the apply
+/// unlinks the input segment. `apply_delta_repack_result`'s
+/// `(Delta, Delta)` arm used `insert_delta_if_absent`, which refused
+/// while the hash still pointed at the input, leaving the location
+/// aimed at a deleted file; the LBA's next read then failed at
+/// materialisation with "segment not found".
+///
+/// Reaching the arm takes two delta-repack passes with a drain-tick
+/// repack between them. Pass 1 skips one conversion deterministically
+/// (its source cache body is evicted; the worker treats an unreadable
+/// source as "skip — delta is best-effort"). The repack packs the
+/// pass-1 output — re-keying lbamap claimants, which pass 2's
+/// superseded-claim guard requires. Pass 2 converts the skipped entry
+/// and carries pass 1's Delta. Invisible to the drift invariant: the
+/// on-disk pass-2 output does own the hash, and the checker
+/// deliberately compares ownership, not segment ids.
+#[test]
+fn delta_repack_second_pass_carries_delta() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    write_keypair_and_provenance(fork_dir);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let pending_dir = fork_dir.join("pending");
+    let pending = |exclude: &[ulid::Ulid]| -> ulid::Ulid {
+        elide_core::segment::read_ulid_dir_sorted(&pending_dir)
+            .unwrap()
+            .into_iter()
+            .find(|u| !exclude.contains(u))
+            .unwrap()
+    };
+
+    // Two bases in separate segments so pass 1 can lose exactly one
+    // source body.
+    vol.write(6, &incompressible_block(6)).unwrap();
+    vol.flush_wal().unwrap();
+    let base6_seg = pending(&[]);
+    vol.write(7, &incompressible_block(7)).unwrap();
+    vol.flush_wal().unwrap();
+    let base7_seg = pending(&[base6_seg]);
+
+    // Seal them; snapshot() promotes both to index/ + cache/.
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // Evict lba 7's source body for pass 1.
+    let base7_body = fork_dir.join("cache").join(format!("{base7_seg}.body"));
+    let aside = fork_dir.join("base7.body.aside");
+    fs::rename(&base7_body, &aside).unwrap();
+
+    // A pending segment with no snapshot counterpart, so prepare
+    // pre-mints an output ULID for the worker to rewrite with.
+    vol.write(9, &incompressible_block(9)).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Near-duplicate overwrites of both sealed LBAs in one WAL window —
+    // one flushed segment with two convertible Data entries.
+    let v6 = variant_block(6, 1);
+    let v7 = variant_block(7, 1);
+    vol.write(6, &v6).unwrap();
+    vol.write(7, &v7).unwrap();
+
+    let pass1 = vol.delta_repack_post_snapshot().unwrap();
+    assert_eq!(
+        pass1.entries_converted, 1,
+        "pass 1 must convert lba 6 and skip lba 7 (source body evicted)"
+    );
+
+    fs::rename(&aside, &base7_body).unwrap();
+
+    // Drain-tick repack: packs the pass-1 output with its pending
+    // sibling and re-keys the lbamap claimants to the packed segment.
+    // Without this, pass 2's superseded-claim guard skips the segment
+    // (pass-1 outputs sort below their input's flush ULID, so its
+    // claims still name the deleted input).
+    let _ = vol.repack().unwrap();
+
+    let pass2 = vol.delta_repack_post_snapshot().unwrap();
+    assert_eq!(
+        pass2.entries_converted, 1,
+        "pass 2 must convert the carried lba 7 Data entry"
+    );
+
+    assert_eq!(&vol.read(6, 1).unwrap(), &v6);
+    assert_eq!(&vol.read(7, 1).unwrap(), &v7);
+}
+
 /// Deterministic regression for a proptest failure under the plan-based
 /// GC handoff: after two `GcSweep` passes the `index/` directory should
 /// hold exactly 1 .idx (the final GC output) — but the test was finding 3.
