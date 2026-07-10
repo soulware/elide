@@ -786,7 +786,7 @@ impl ClaimOrchestrator {
 
     /// Stage 2. Discover the previous claimer's peer-fetch endpoint.
     ///
-    /// Best-effort — `peer_ctx` is set only when `[peer_fetch].port` is
+    /// Best-effort — `peer_ctx` is set only when `[peer_fetch].listen` is
     /// configured, the event log yields a clean Released, and the previous
     /// claimer published a peer endpoint. Peer auth now accepts our coord_id
     /// (we `mark_claimed` in stage 1), so peer requests will succeed.

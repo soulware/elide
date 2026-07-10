@@ -8,13 +8,14 @@ volume it serves. For the mint-backed deployment (per-volume scoped credentials,
 operator-gated enrollment), use `deploy/elide/` instead.
 
 `Dockerfile` + `fly.toml` (from the committed `fly.toml.example`) deploy the
-coordinator as a **private** Fly app (no public service): it binds no TCP port,
-its control plane is an in-container UDS, and ublk is local. The image downloads
-the released `elide`, `elide-coordinator`, and `elide-import` binaries — the
-newest release by default, or the tag `deploy.sh` pins — bakes `DATA_BUCKET`
-into `coord.toml`, loads `ublk_drv`, and runs `elide-coordinator serve`.
-Coordinator state (`index/`, `cache/`, keys) lives on the `elide_data` volume
-and survives redeploys.
+coordinator as a **private** Fly app (no public service): its control plane is
+an in-container UDS, ublk is local, and the only TCP listener is peer fetch on
+the 6PN private network. The image downloads the released `elide`,
+`elide-coordinator`, and `elide-import` binaries — the newest release by
+default, or the tag `deploy.sh` pins — bakes `DATA_BUCKET` into `coord.toml`,
+loads `ublk_drv`, and runs `elide-coordinator serve`. Coordinator state
+(`index/`, `cache/`, keys) lives on the `elide_data` volume and survives
+redeploys.
 
 Prerequisites: the `fly` CLI, a Tigris bucket, and a keypair with read/write on
 it (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).

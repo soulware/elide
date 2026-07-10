@@ -9,4 +9,6 @@ modprobe ublk_drv 2>/dev/null || true
 # AWS_SECRET_ACCESS_KEY from the environment and serves immediately. Create
 # volumes over fly ssh:
 #   elide volume create <name> …
-exec elide-coordinator serve
+exec elide-coordinator serve \
+  --peer-fetch-listen "[${FLY_PRIVATE_IP}]:8443" \
+  --peer-fetch-host "${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal"

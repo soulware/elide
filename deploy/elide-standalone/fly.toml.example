@@ -30,6 +30,3 @@ primary_region = "iad"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "1024mb"
-
-# No [http_service] and no tcp [checks]: the app is private and the coordinator
-# binds no TCP port — its control plane is a UDS and ublk is local.

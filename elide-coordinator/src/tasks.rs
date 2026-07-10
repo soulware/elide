@@ -88,7 +88,7 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
 ///
 /// Exits when the volume directory is removed. Intended to be spawned as a
 /// tokio task.
-/// Peer-fetch handle. `Some` when `[peer_fetch].port` is configured;
+/// Peer-fetch handle. `Some` when `[peer_fetch].listen` is configured;
 /// installed as a process-global by `daemon::run` and read on demand by
 /// the per-volume task ([`run_volume_tasks`]), the claim orchestrator
 /// (peer discovery), and the IPC `Register` handler. `client` mints
@@ -99,7 +99,7 @@ pub struct PeerFetchHandle {
 }
 
 /// Process-global peer-fetch handle. Set once by `daemon::run`
-/// (always — `None` when `[peer_fetch].port` is not configured); read
+/// (always — `None` when `[peer_fetch].listen` is not configured); read
 /// from the per-volume task, the claim orchestrator's peer-discovery
 /// stage, and the `Request::Register` IPC handler. Stored as
 /// `Option<&'static PeerFetchHandle>` via `Box::leak` so reads cost

@@ -153,7 +153,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
     // If peer-fetch is configured, advertise our endpoint at
     // `coordinators/<id>/peer-endpoint.toml` so other coordinators
     // can find us during handoff discovery. Sibling write to
-    // `coordinator.pub`. Absence of `peer_fetch.port` keeps the whole
+    // `coordinator.pub`. Absence of `peer_fetch.listen` keeps the whole
     // mechanism off — no server, no advertisement, no peer tier.
     let mut peer_fetch_handle: Option<elide_coordinator::tasks::PeerFetchHandle> = None;
     let mut peer_fetch_server: Option<(
