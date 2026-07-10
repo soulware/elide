@@ -646,18 +646,28 @@ impl Volume {
                         );
                     }
                     (EntryKind::Delta, EntryKind::Delta) => {
-                        ei.insert_delta_if_absent(
-                            post.hash,
-                            extentindex::DeltaLocation {
-                                segment_id: new_ulid,
-                                entry_idx: raw_idx as u32,
-                                body_source: extentindex::DeltaBodySource::Full {
-                                    body_section_start: new_bss,
-                                    body_length: delta_region_body_length,
+                        // Carried Delta: re-point the delta location at
+                        // the output, gated on the current owner being
+                        // the input this rewrite consumes — a concurrent
+                        // writer that re-pointed the hash wins.
+                        let should_update = match ei.lookup_delta(&post.hash) {
+                            None => ei.lookup(&post.hash).is_none(),
+                            Some(loc) => loc.segment_id == input_ulid,
+                        };
+                        if should_update {
+                            ei.insert_delta(
+                                post.hash,
+                                extentindex::DeltaLocation {
+                                    segment_id: new_ulid,
+                                    entry_idx: raw_idx as u32,
+                                    body_source: extentindex::DeltaBodySource::Full {
+                                        body_section_start: new_bss,
+                                        body_length: delta_region_body_length,
+                                    },
+                                    options: post.delta_options.clone(),
                                 },
-                                options: post.delta_options.clone(),
-                            },
-                        );
+                            );
+                        }
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
                         lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
