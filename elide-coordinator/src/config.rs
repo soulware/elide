@@ -1183,6 +1183,18 @@ mod tests {
     }
 
     #[test]
+    fn peer_fetch_listen_parses_bracketed_ipv6() {
+        let cfg = PeerFetchConfig {
+            listen: Some("[fdaa:87:47f6:a7b:502:6f9b:ed34:2]:8443".to_owned()),
+            ..PeerFetchConfig::default()
+        };
+        assert_eq!(
+            cfg.tcp_listen().unwrap().unwrap(),
+            "[fdaa:87:47f6:a7b:502:6f9b:ed34:2]:8443".parse().unwrap()
+        );
+    }
+
+    #[test]
     fn peer_fetch_listen_rejects_unix_socket() {
         let cfg = PeerFetchConfig {
             listen: Some("unix:/run/elide/peer.sock".to_owned()),

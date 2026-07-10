@@ -56,6 +56,14 @@ enum Command {
         /// Override the data_dir from the config file
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Override [peer_fetch].listen from the config file; setting a
+        /// listen address (here or in config) enables peer fetch
+        #[arg(long)]
+        peer_fetch_listen: Option<String>,
+        /// Override [peer_fetch].host from the config file (the hostname
+        /// advertised for other coordinators to dial)
+        #[arg(long)]
+        peer_fetch_host: Option<String>,
     },
 
     /// Write a default coordinator.toml template (all fields commented out)
@@ -113,10 +121,21 @@ async fn run() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Serve { config, data_dir } => {
+        Command::Serve {
+            config,
+            data_dir,
+            peer_fetch_listen,
+            peer_fetch_host,
+        } => {
             let mut config = config::load(&config)?;
             if let Some(dir) = data_dir {
                 config.data_dir = dir;
+            }
+            if let Some(listen) = peer_fetch_listen {
+                config.peer_fetch.listen = Some(listen);
+            }
+            if let Some(host) = peer_fetch_host {
+                config.peer_fetch.host = Some(host);
             }
             // Initialise tracing now that we know the resolved data_dir.
             // Coordinator + every volume share `<data_dir>/elide.log`,

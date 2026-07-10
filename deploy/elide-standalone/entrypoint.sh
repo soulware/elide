@@ -9,4 +9,12 @@ modprobe ublk_drv 2>/dev/null || true
 # AWS_SECRET_ACCESS_KEY from the environment and serves immediately. Create
 # volumes over fly ssh:
 #   elide volume create <name> …
-exec elide-coordinator serve
+#
+# Peer fetch between machines rides on the invocation, not coord.toml:
+# machine identity exists only at runtime, and one image serves every
+# machine. Bind the machine's own 6PN address (reachable only over the
+# private network) and advertise its per-machine DNS name — peers dial the
+# host as a URL host, where a raw fdaa: address literal would be malformed.
+exec elide-coordinator serve \
+  --peer-fetch-listen "[${FLY_PRIVATE_IP}]:8443" \
+  --peer-fetch-host "${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal"
