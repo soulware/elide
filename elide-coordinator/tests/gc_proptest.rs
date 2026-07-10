@@ -969,6 +969,55 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
     assert_eq!(&vol.read(4, 1).unwrap(), &data);
 }
 
+/// Deterministic materialisation of the minimal gc_oracle sequence CI
+/// found 2026-07-10 on the #696 merge run: a sealed base, a
+/// near-duplicate overwrite converted by DeltaRepack, then a plain
+/// overwrite of the same LBA before the drain. The drain's promote
+/// trips the volume-invariants rebuild check with a phantom delta —
+/// an in-memory Delta hash no on-disk index owns.
+///
+///   BaseWrite { lba: 5, base_seed: 3 }
+///   SnapshotSign
+///   VariantWrite { lba: 5, base_seed: 3, tweak: 0 }
+///   Flush
+///   DeltaRepack
+///   BaseWrite { lba: 5, base_seed: 0 }
+///   GcSweep
+#[test]
+fn gc_oracle_repro_overwritten_delta_phantom() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    write_keypair_and_provenance(fork_dir);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // BaseWrite { lba: 5, base_seed: 3 }
+    vol.write(5, &incompressible_block(3)).unwrap();
+
+    // SnapshotSign
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // VariantWrite { lba: 5, base_seed: 3, tweak: 0 }
+    vol.write(5, &variant_block(3, 0)).unwrap();
+
+    // Flush
+    vol.flush_wal().unwrap();
+
+    // DeltaRepack
+    let _ = vol.delta_repack_post_snapshot();
+
+    // BaseWrite { lba: 5, base_seed: 0 } — supersedes the delta's claim.
+    let last = incompressible_block(0);
+    vol.write(5, &last).unwrap();
+
+    // GcSweep's drain: repack + promote each pending segment.
+    simulate_upload(&mut vol, fork_dir);
+
+    assert_eq!(&vol.read(5, 1).unwrap(), &last);
+}
+
 /// Deterministic regression for a proptest failure under the plan-based
 /// GC handoff: after two `GcSweep` passes the `index/` directory should
 /// hold exactly 1 .idx (the final GC output) — but the test was finding 3.

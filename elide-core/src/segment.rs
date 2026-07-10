@@ -441,7 +441,27 @@ impl EntryKind {
     /// `CanonicalInline`. Excludes `DedupRef`, `Zero`, and `Delta`, which
     /// carry no body bytes of their own.
     pub fn has_body_bytes(self) -> bool {
-        self.is_data() || self.is_inline()
+        matches!(
+            self,
+            EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline
+        )
+    }
+
+    /// True for entries whose hash the extent-index rebuild registers as
+    /// owned by their segment: body-bearing kinds in the DATA map,
+    /// `Delta` in the delta map. `DedupRef` and `Zero` register nothing.
+    pub fn owns_extent_hash(self) -> bool {
+        matches!(
+            self,
+            EntryKind::Data
+                | EntryKind::Inline
+                | EntryKind::CanonicalData
+                | EntryKind::CanonicalInline
+                | EntryKind::Delta
+        )
     }
 }
 
