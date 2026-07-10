@@ -506,6 +506,55 @@ impl LbaMap {
         updated
     }
 
+    /// Like [`set_claimant_if_matches`] but also promotes entries whose
+    /// current claimant equals `consumed_input` — the segment the caller
+    /// is consuming and about to delete. Intended for rewrite apply
+    /// paths whose output ULID sorts *below* the input (delta repack
+    /// pre-mints outputs under the prep-time `u_flush`): when the input
+    /// is the WAL-flush segment itself, its claims sit at `u_flush` and
+    /// the strict-newer guard alone would leave them pointing at the
+    /// deleted file. A concurrent writer's claimant is never the input
+    /// ULID, so the identity match can only move claims off the segment
+    /// being deleted. Mirrors [`insert_consuming_inputs`]'s override.
+    ///
+    /// [`set_claimant_if_matches`]: Self::set_claimant_if_matches
+    /// [`insert_consuming_inputs`]: Self::insert_consuming_inputs
+    pub fn set_claimant_consuming_input(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        expected_hash: blake3::Hash,
+        new_claimant: Ulid,
+        consumed_input: Ulid,
+    ) -> u32 {
+        let end = start_lba + lba_length as u64;
+        let promotes =
+            |existing: Ulid| -> bool { existing < new_claimant || existing == consumed_input };
+
+        let mut keys: Vec<u64> = Vec::new();
+
+        if let Some((&pred_start, pred)) = self.inner.range(..start_lba).next_back() {
+            let pred_end = pred_start + pred.lba_length as u64;
+            if pred_end > start_lba && pred.hash == expected_hash && promotes(pred.claimant_ulid) {
+                keys.push(pred_start);
+            }
+        }
+
+        for (&k, entry) in self.inner.range(start_lba..end) {
+            if entry.hash == expected_hash && promotes(entry.claimant_ulid) {
+                keys.push(k);
+            }
+        }
+
+        let updated = keys.len() as u32;
+        for k in keys {
+            if let Some(entry) = self.inner.get_mut(&k) {
+                entry.claimant_ulid = new_claimant;
+            }
+        }
+        updated
+    }
+
     /// Iterate over all extents that overlap `[start_lba, end_lba)`, in ascending LBA order.
     ///
     /// Each yielded item describes the portion of the extent that falls within the requested range:
@@ -1403,6 +1452,39 @@ mod tests {
         assert_eq!(map.lookup(5), Some((h(9), 1)));
         assert_eq!(map.lookup(6), Some((h(2), 6)));
         assert_eq!(map.lookup(9), Some((h(2), 9)));
+    }
+
+    #[test]
+    fn set_claimant_consuming_input_moves_consumed_higher_claimant() {
+        // Delta-repack scenario: the input is the prep-time WAL-flush
+        // segment at u(9); the pre-minted output ULID u(5) sorts below
+        // it. The promotion must move the claim off the input the apply
+        // is about to delete.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        assert_eq!(map.set_claimant_consuming_input(0, 4, h(1), u(5), u(9)), 1);
+        assert_eq!(map.claimant_at(0), Some(u(5)));
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+    }
+
+    #[test]
+    fn set_claimant_consuming_input_preserves_concurrent_claimant() {
+        // Existing claimant u(9) is not the consumed input — it's a
+        // concurrent writer. The strict-newer guard still applies.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(9));
+        assert_eq!(map.set_claimant_consuming_input(0, 4, h(1), u(5), u(7)), 0);
+        assert_eq!(map.claimant_at(0), Some(u(9)));
+    }
+
+    #[test]
+    fn set_claimant_consuming_input_requires_hash_match() {
+        // A consumed-input claimant with a different hash is an
+        // overwriter's sub-run; the promotion must not touch it.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(3), u(9));
+        assert_eq!(map.set_claimant_consuming_input(0, 4, h(1), u(5), u(9)), 0);
+        assert_eq!(map.claimant_at(0), Some(u(9)));
     }
 
     // --- extents_in_range tests ---
