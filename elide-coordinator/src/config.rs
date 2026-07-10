@@ -661,14 +661,14 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 # k_m_a = "..."   # openssl rand -base64 32, shared with mint
 
 [peer_fetch]
-# Setting `port` enables peer fetch: the coordinator binds an HTTP server on
-# this port and advertises it at `coordinators/<id>/peer-endpoint.toml` for
-# other coordinators on the LAN. Leaving `port` unset keeps peer fetch fully
-# disabled — no server, no advertisement, no peer tier in the prefetch path.
-# v1 ships off-by-default.
+# Setting `listen` enables peer fetch: the coordinator binds an HTTP server on
+# this TCP address and advertises it at `coordinators/<id>/peer-endpoint.toml`
+# for other coordinators on the LAN. Leaving `listen` unset keeps peer fetch
+# fully disabled — no server, no advertisement, no peer tier in the prefetch
+# path. Both keys can also be set per invocation via `serve
+# --peer-fetch-listen` / `--peer-fetch-host`, which override this file.
 #
-# port = 8443                  # absent → peer fetch disabled
-# bind = "0.0.0.0"             # interface to bind on; default 0.0.0.0
+# listen = "0.0.0.0:8443"      # absent → peer fetch disabled
 # host = "host.example.com"    # advertised hostname for peers; default gethostname()
 "#;
 
