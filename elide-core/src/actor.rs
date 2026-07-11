@@ -1722,6 +1722,10 @@ impl VolumeReader {
         // the generation and the extent index offsets are always consistent —
         // a single ArcSwap::load() gives both atomically with no window.
         let snap = self.client.snapshot.load();
+        self.read_with_snapshot(&snap, lba, buf)
+    }
+
+    fn read_with_snapshot(&self, snap: &ReadSnapshot, lba: u64, buf: &mut [u8]) -> io::Result<()> {
         if snap.flush_gen != self.last_flush_gen.get() {
             self.file_cache.borrow_mut().clear();
             self.dmat_cache.borrow_mut().clear();
@@ -3463,4 +3467,83 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         segment_written: true,
         pending_dir: job.pending_dir,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::Volume;
+
+    fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("elide-actor-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        crate::signing::generate_keypair(
+            &p,
+            crate::signing::VOLUME_KEY_FILE,
+            crate::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        p
+    }
+
+    /// Distinct, incompressible 4 KiB block per seed (splitmix64 stream)
+    /// so entries land as body extents — compressible data goes inline in
+    /// the extent index and reads of it never resolve a segment file.
+    fn unique_block(seed: u32) -> Vec<u8> {
+        let mut x = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut out = Vec::with_capacity(4096);
+        for _ in 0..512 {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out
+    }
+
+    /// A reader whose snapshot predates a repack must still resolve reads
+    /// after the repack unlinks its input segments — the data is live, only
+    /// its location changed. Reproduces the 2026-07-11 field EIO ("segment
+    /// not found" during the repack swap window).
+    #[test]
+    fn stale_snapshot_read_survives_repack() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        std::thread::Builder::new()
+            .name("volume-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+
+        let block_a = unique_block(1);
+        client.write(0, &block_a).unwrap();
+        client.write(1, &unique_block(2)).unwrap();
+        client.write(2, &unique_block(3)).unwrap();
+        client.promote_wal().unwrap();
+
+        // Overwrite one LBA in a second segment so the first has dead
+        // bytes and is a repack candidate.
+        client.write(1, &unique_block(4)).unwrap();
+        client.promote_wal().unwrap();
+
+        // A reader's view captured before the repack.
+        let stale = client.snapshot.load_full();
+
+        let stats = client.repack().unwrap();
+        assert!(
+            stats.segments_compacted > 0,
+            "setup: repack consumed no segments, race not exercised"
+        );
+
+        let reader = client.reader();
+        let mut buf = vec![0u8; 4096];
+        reader
+            .read_with_snapshot(&stale, 0, &mut buf)
+            .expect("read of live data through a pre-repack snapshot");
+        assert_eq!(buf, block_a, "read must return the live block contents");
+    }
 }
