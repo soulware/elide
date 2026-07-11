@@ -145,6 +145,47 @@ pub struct DeltaLocation {
     pub options: Vec<segment::DeltaOption>,
 }
 
+/// How a registering segment's body-bearing entries resolve their bytes.
+#[derive(Clone, Copy)]
+pub enum RegistrationBodyTier {
+    /// Full segment file on disk (pending/ or gc/): `BodySource::Local`,
+    /// offsets resolved against the file's body section.
+    Local,
+    /// Two-file cache layout (`cache/<id>.body` + `index/<id>.idx`):
+    /// `BodySource::Cached(entry_idx)`.
+    Cached,
+}
+
+/// Where a registering segment's inline entry bytes come from.
+#[derive(Clone, Copy)]
+pub enum InlineSource<'a> {
+    /// Slice `[stored_offset, stored_offset + stored_length)` out of
+    /// the segment's inline section; a truncated section skips the
+    /// entry.
+    Section(&'a [u8]),
+    /// Take the entry's in-memory `data` field.
+    EntryData,
+}
+
+/// Context describing one segment whose index entries are being
+/// registered, shared across every entry of that segment.
+pub struct SegmentRegistrationCtx<'a> {
+    pub segment_id: Ulid,
+    pub body_section_start: u64,
+    pub body_tier: RegistrationBodyTier,
+    /// Location of the segment's delta region. `None` is only valid
+    /// when the segment has no `Delta` entries; registering a `Delta`
+    /// without it is an error.
+    pub delta_body_source: Option<DeltaBodySource>,
+    pub inline: InlineSource<'a>,
+}
+
+/// Admission policy for [`ExtentIndex::register_entry`].
+enum Admission<'a> {
+    IfAbsent,
+    ConsumingInputs(&'a std::collections::HashSet<Ulid>),
+}
+
 /// Per-segment bitset of "this entry's body bytes are durable in
 /// `cache/<id>.body`". Mirror of the on-disk `cache/<id>.present`
 /// file held in memory so the hot read path can replace a per-extent
@@ -512,6 +553,169 @@ impl ExtentIndex {
         }
     }
 
+    /// Register one segment-index entry exactly as the disk rebuild
+    /// does: body-bearing kinds (`Data`, `Inline`, `Canonical*`) in the
+    /// DATA map, `Delta` in the delta map, `DedupRef` and `Zero`
+    /// nowhere. This is the single place that maps `EntryKind` to a
+    /// registration target — apply paths and the rebuild both route
+    /// through it, so an incremental update cannot branch differently
+    /// from what a fresh rebuild would produce.
+    ///
+    /// `admission` decides whether the entry may take over its hash
+    /// slot; the slot-clearing side effects differ with it. `IfAbsent`
+    /// (the rebuild walk, lowest-ULID-wins): a DATA insert leaves an
+    /// existing delta slot alone, a Delta insert refuses when the hash
+    /// is present in either map. `ConsumingInputs`: the current owner
+    /// must be one of the segments the caller is consuming (concurrent
+    /// writers win); a DATA insert clears the delta slot (DATA
+    /// precedence), a Delta insert with no current delta owner also
+    /// requires the DATA map to be free.
+    ///
+    /// Errors if a `Delta` entry arrives with no
+    /// `ctx.delta_body_source` — the caller failed to provide the
+    /// segment's delta-region location.
+    fn register_entry(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        raw_idx: u32,
+        ctx: &SegmentRegistrationCtx<'_>,
+        admission: Admission<'_>,
+    ) -> io::Result<()> {
+        match entry.kind {
+            EntryKind::DedupRef | EntryKind::Zero => {}
+            EntryKind::Delta => {
+                let Some(body_source) = ctx.delta_body_source else {
+                    return Err(io::Error::other(format!(
+                        "registering delta entry for segment {} with no delta body source",
+                        ctx.segment_id
+                    )));
+                };
+                let admitted = match admission {
+                    Admission::IfAbsent => {
+                        !self.inner.contains_key(&entry.hash)
+                            && !self.deltas.contains_key(&entry.hash)
+                    }
+                    Admission::ConsumingInputs(inputs) => match self.deltas.get(&entry.hash) {
+                        None => !self.inner.contains_key(&entry.hash),
+                        Some(loc) => inputs.contains(&loc.segment_id),
+                    },
+                };
+                if admitted {
+                    self.deltas.insert(
+                        entry.hash,
+                        DeltaLocation {
+                            segment_id: ctx.segment_id,
+                            entry_idx: raw_idx,
+                            body_source,
+                            options: entry.delta_options.clone(),
+                        },
+                    );
+                }
+            }
+            EntryKind::Data
+            | EntryKind::Inline
+            | EntryKind::CanonicalData
+            | EntryKind::CanonicalInline => {
+                let inline_data = if entry.kind.is_inline() {
+                    match ctx.inline {
+                        InlineSource::Section(bytes) => {
+                            let start = entry.stored_offset as usize;
+                            let end = start + entry.stored_length as usize;
+                            match bytes.get(start..end) {
+                                Some(b) => Some(b.into()),
+                                // Truncated inline section — skip this entry.
+                                None => return Ok(()),
+                            }
+                        }
+                        InlineSource::EntryData => entry.data.clone().map(Vec::into_boxed_slice),
+                    }
+                } else {
+                    None
+                };
+                let admitted = match admission {
+                    Admission::IfAbsent => !self.inner.contains_key(&entry.hash),
+                    Admission::ConsumingInputs(inputs) => match self.inner.get(&entry.hash) {
+                        None => true,
+                        Some(loc) => inputs.contains(&loc.segment_id),
+                    },
+                };
+                if admitted {
+                    let location = ExtentLocation {
+                        segment_id: ctx.segment_id,
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                        body_source: match ctx.body_tier {
+                            RegistrationBodyTier::Local => BodySource::Local,
+                            RegistrationBodyTier::Cached => BodySource::Cached(raw_idx),
+                        },
+                        body_section_start: ctx.body_section_start,
+                        inline_data,
+                    };
+                    match admission {
+                        Admission::IfAbsent => {
+                            self.inner.insert(entry.hash, location);
+                        }
+                        // DATA precedence on the live path: clear any
+                        // stale delta slot, matching `insert`.
+                        Admission::ConsumingInputs(_) => self.insert(entry.hash, location),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`register_entry`](Self::register_entry) with the rebuild walk's
+    /// first-write-wins admission (walk order makes the lowest ULID
+    /// canonical).
+    pub fn register_entry_if_absent(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        raw_idx: u32,
+        ctx: &SegmentRegistrationCtx<'_>,
+    ) -> io::Result<()> {
+        self.register_entry(entry, raw_idx, ctx, Admission::IfAbsent)
+    }
+
+    /// [`register_entry`](Self::register_entry) with the apply-phase
+    /// admission: the entry takes over its hash slot only when the
+    /// current owner is one of the `inputs` this apply consumes and
+    /// deletes; a concurrent writer that re-pointed the hash wins.
+    pub fn register_entry_consuming_inputs(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        raw_idx: u32,
+        ctx: &SegmentRegistrationCtx<'_>,
+        inputs: &std::collections::HashSet<Ulid>,
+    ) -> io::Result<()> {
+        self.register_entry(entry, raw_idx, ctx, Admission::ConsumingInputs(inputs))
+    }
+
+    /// Drop `input`'s ownership of every hash in `owned` that `carried`
+    /// does not re-register, covering both maps. The removal dual of
+    /// [`register_entry_consuming_inputs`](Self::register_entry_consuming_inputs):
+    /// once the input file is unlinked, a rebuild registers only carried
+    /// locations, so uncarried hashes still owned by the input must
+    /// leave the in-memory index too. Returns the number of removals.
+    pub fn remove_input_owned(
+        &mut self,
+        input: Ulid,
+        owned: &[blake3::Hash],
+        carried: &std::collections::HashSet<blake3::Hash>,
+    ) -> usize {
+        let mut removed = 0;
+        for hash in owned {
+            if carried.contains(hash) {
+                continue;
+            }
+            if self.remove_owner_at(hash, input) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Number of entries in the index.
     #[allow(dead_code)] // used in tests; available for diagnostics
     pub fn len(&self) -> usize {
@@ -634,25 +838,19 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             // the body section); Delta body resolution uses
             // `DeltaBodySource::Cached`, which checks for a separate
             // `cache/<ulid>.delta` file and demand-fetches if missing.
-            let (body_src_builder, delta_body_source): (
-                Box<dyn Fn(u32) -> BodySource>,
-                DeltaBodySource,
-            ) = match sref.tier {
+            let (body_tier, delta_body_source) = match sref.tier {
                 segment::SegmentTier::Pending | segment::SegmentTier::GcApplied => {
                     // Capture body_length for DeltaBodySource::Full; only
                     // needed if Delta entries are present.
-                    let body_length = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
-                        segment::read_segment_layout(path)?.body_length
-                    } else {
-                        0
-                    };
-                    (
-                        Box::new(|_idx: u32| BodySource::Local),
-                        DeltaBodySource::Full {
+                    let delta = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
+                        Some(DeltaBodySource::Full {
                             body_section_start,
-                            body_length,
-                        },
-                    )
+                            body_length: segment::read_segment_layout(path)?.body_length,
+                        })
+                    } else {
+                        None
+                    };
+                    (RegistrationBodyTier::Local, delta)
                 }
                 segment::SegmentTier::Index => {
                     // Read the on-disk `.present` bitmap once and install
@@ -670,57 +868,19 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                         entries.len() as u32,
                     ));
                     index.set_segment_presence(segment_id, presence);
-                    (
-                        Box::new(|idx: u32| BodySource::Cached(idx)),
-                        DeltaBodySource::Cached,
-                    )
+                    (RegistrationBodyTier::Cached, Some(DeltaBodySource::Cached))
                 }
             };
 
+            let ctx = SegmentRegistrationCtx {
+                segment_id,
+                body_section_start,
+                body_tier,
+                delta_body_source,
+                inline: InlineSource::Section(&inline_bytes),
+            };
             for (raw_idx, entry) in entries.iter().enumerate() {
-                match entry.kind {
-                    EntryKind::Data
-                    | EntryKind::Inline
-                    | EntryKind::CanonicalData
-                    | EntryKind::CanonicalInline => {}
-                    EntryKind::DedupRef | EntryKind::Zero => continue,
-                    EntryKind::Delta => {
-                        index.insert_delta_if_absent(
-                            entry.hash,
-                            DeltaLocation {
-                                segment_id,
-                                entry_idx: raw_idx as u32,
-                                body_source: delta_body_source,
-                                options: entry.delta_options.clone(),
-                            },
-                        );
-                        continue;
-                    }
-                }
-                let idata = if entry.kind.is_inline() {
-                    let start = entry.stored_offset as usize;
-                    let end = start + entry.stored_length as usize;
-                    if end <= inline_bytes.len() {
-                        Some(inline_bytes[start..end].into())
-                    } else {
-                        // Truncated inline section — skip this entry.
-                        continue;
-                    }
-                } else {
-                    None
-                };
-                index.insert_if_absent(
-                    entry.hash,
-                    ExtentLocation {
-                        segment_id,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        compressed: entry.compressed,
-                        body_source: body_src_builder(raw_idx as u32),
-                        body_section_start,
-                        inline_data: idata,
-                    },
-                );
+                index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
             }
         }
     }
@@ -1110,6 +1270,173 @@ mod tests {
         let removed = index.remove_if_matches(&hash, seg_ulid, 0);
         assert!(!removed);
         assert!(index.lookup(&hash).is_none());
+    }
+
+    // --- register_entry tests ---
+
+    fn useg(n: u64) -> Ulid {
+        Ulid::from_parts(n, 0)
+    }
+
+    fn delta_opt(source: u8) -> segment::DeltaOption {
+        segment::DeltaOption {
+            source_hash: h(source),
+            delta_offset: 0,
+            delta_length: 16,
+            delta_hash: h(source ^ 0xff),
+        }
+    }
+
+    fn reg_ctx(segment_id: Ulid) -> SegmentRegistrationCtx<'static> {
+        SegmentRegistrationCtx {
+            segment_id,
+            body_section_start: 128,
+            body_tier: RegistrationBodyTier::Local,
+            delta_body_source: Some(DeltaBodySource::Full {
+                body_section_start: 128,
+                body_length: 4096,
+            }),
+            inline: InlineSource::EntryData,
+        }
+    }
+
+    fn data_loc(segment_id: Ulid) -> ExtentLocation {
+        ExtentLocation {
+            segment_id,
+            body_offset: 0,
+            body_length: 4096,
+            compressed: false,
+            body_source: BodySource::Local,
+            body_section_start: 0,
+            inline_data: None,
+        }
+    }
+
+    fn delta_loc(segment_id: Ulid) -> DeltaLocation {
+        DeltaLocation {
+            segment_id,
+            entry_idx: 0,
+            body_source: DeltaBodySource::Cached,
+            options: vec![delta_opt(9)],
+        }
+    }
+
+    #[test]
+    fn register_consuming_repoints_delta_owned_by_input() {
+        let mut index = ExtentIndex::new();
+        index.insert_delta(h(1), delta_loc(useg(3)));
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        let consumed = std::iter::once(useg(3)).collect();
+        index
+            .register_entry_consuming_inputs(&entry, 5, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        let loc = index.lookup_delta(&h(1)).unwrap();
+        assert_eq!(loc.segment_id, useg(7));
+        assert_eq!(loc.entry_idx, 5);
+    }
+
+    #[test]
+    fn register_consuming_preserves_concurrent_delta_owner() {
+        let mut index = ExtentIndex::new();
+        index.insert_delta(h(1), delta_loc(useg(9)));
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        let consumed = std::iter::once(useg(3)).collect();
+        index
+            .register_entry_consuming_inputs(&entry, 5, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        assert_eq!(index.lookup_delta(&h(1)).unwrap().segment_id, useg(9));
+    }
+
+    #[test]
+    fn register_consuming_delta_defers_to_data_owner() {
+        // No delta owner, but the DATA map holds the hash at a segment
+        // outside the consumed set — DATA precedence, the delta entry
+        // must not register.
+        let mut index = ExtentIndex::new();
+        index.insert(h(1), data_loc(useg(9)));
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        let consumed = std::iter::once(useg(3)).collect();
+        index
+            .register_entry_consuming_inputs(&entry, 5, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        assert!(index.lookup_delta(&h(1)).is_none());
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(9));
+    }
+
+    #[test]
+    fn register_consuming_data_takeover_clears_delta_slot() {
+        // The input owned the hash as a Delta; the output re-emits it
+        // as DATA. The takeover must clear the delta slot (DATA
+        // precedence), matching `insert`.
+        let mut index = ExtentIndex::new();
+        index.insert_delta(h(1), delta_loc(useg(3)));
+        let entry =
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+        let consumed = std::iter::once(useg(3)).collect();
+        index
+            .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(7));
+        assert!(index.lookup_delta(&h(1)).is_none());
+    }
+
+    #[test]
+    fn register_consuming_preserves_concurrent_data_owner() {
+        let mut index = ExtentIndex::new();
+        index.insert(h(1), data_loc(useg(9)));
+        let entry =
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+        let consumed = std::iter::once(useg(3)).collect();
+        index
+            .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(9));
+    }
+
+    #[test]
+    fn register_if_absent_data_leaves_delta_slot_alone() {
+        // The rebuild walk registers a Delta first (lower ULID), then
+        // meets a DATA copy of the same hash in a later segment. The
+        // DATA insert must not clear the earlier delta slot —
+        // `insert_if_absent` semantics, unlike the live path.
+        let mut index = ExtentIndex::new();
+        index.insert_delta(h(1), delta_loc(useg(3)));
+        let entry =
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+        index
+            .register_entry_if_absent(&entry, 0, &reg_ctx(useg(7)))
+            .unwrap();
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(7));
+        assert_eq!(index.lookup_delta(&h(1)).unwrap().segment_id, useg(3));
+    }
+
+    #[test]
+    fn register_delta_without_body_source_errors() {
+        let mut index = ExtentIndex::new();
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        let mut ctx = reg_ctx(useg(7));
+        ctx.delta_body_source = None;
+        let consumed = std::iter::once(useg(3)).collect();
+        assert!(
+            index
+                .register_entry_consuming_inputs(&entry, 0, &ctx, &consumed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn register_dedup_ref_and_zero_register_nothing() {
+        let mut index = ExtentIndex::new();
+        let consumed = std::collections::HashSet::new();
+        let dref = SegmentEntry::new_dedup_ref(h(1), 0, 1);
+        let zero = SegmentEntry::new_zero(4, 2);
+        index
+            .register_entry_consuming_inputs(&dref, 0, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        index
+            .register_entry_consuming_inputs(&zero, 1, &reg_ctx(useg(7)), &consumed)
+            .unwrap();
+        assert!(index.is_empty());
     }
 
     #[test]

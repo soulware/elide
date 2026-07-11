@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use ext4_view::Ext4Read;
 
-use crate::extentindex::{BodySource, DeltaBodySource, DeltaLocation, ExtentLocation};
+use crate::extentindex::{DeltaBodySource, DeltaLocation, ExtentLocation};
 use crate::segment::{EntryKind, SegmentFetcher};
 use crate::signing::VerifyingKey;
 use crate::{extentindex, lbamap, segment, signing, volume, writelog};
@@ -612,6 +612,13 @@ fn apply_snapshot_layer(
             )),
         );
 
+        let ctx = extentindex::SegmentRegistrationCtx {
+            segment_id: *seg,
+            body_section_start,
+            body_tier: extentindex::RegistrationBodyTier::Cached,
+            delta_body_source: Some(DeltaBodySource::Cached),
+            inline: extentindex::InlineSource::Section(&inline_bytes),
+        };
         for (raw_idx, entry) in entries.iter().enumerate() {
             // LBA map: every non-canonical entry contributes its range →
             // content hash. Canonical entries carry body for dedup resolution
@@ -632,50 +639,7 @@ fn apply_snapshot_layer(
                 }
             }
 
-            match entry.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {}
-                EntryKind::DedupRef | EntryKind::Zero => continue,
-                EntryKind::Delta => {
-                    extent_index.insert_delta_if_absent(
-                        entry.hash,
-                        DeltaLocation {
-                            segment_id: *seg,
-                            entry_idx: raw_idx as u32,
-                            body_source: DeltaBodySource::Cached,
-                            options: entry.delta_options.clone(),
-                        },
-                    );
-                    continue;
-                }
-            }
-
-            let idata = if entry.kind.is_inline() {
-                let start = entry.stored_offset as usize;
-                let end = start + entry.stored_length as usize;
-                if end <= inline_bytes.len() {
-                    Some(inline_bytes[start..end].into())
-                } else {
-                    continue;
-                }
-            } else {
-                None
-            };
-
-            extent_index.insert_if_absent(
-                entry.hash,
-                ExtentLocation {
-                    segment_id: *seg,
-                    body_offset: entry.stored_offset,
-                    body_length: entry.stored_length,
-                    compressed: entry.compressed,
-                    body_source: BodySource::Cached(raw_idx as u32),
-                    body_section_start,
-                    inline_data: idata,
-                },
-            );
+            extent_index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
         }
     }
     Ok(())

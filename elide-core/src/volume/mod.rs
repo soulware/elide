@@ -1243,82 +1243,32 @@ impl Volume {
             return Ok(StagedApply::Cancelled);
         }
 
-        // Lazily-read full-file layout of the output (still at `tmp_path`
-        // until the rename below): Delta locations against a full segment
-        // file need its `body_length` to find the delta body section.
-        let mut delta_full: Option<extentindex::DeltaBodySource> = None;
-        for (i, e) in entries.iter().enumerate() {
-            // DedupRef and Zero entries don't own a body.
-            if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
-                continue;
+        // Register the output's entries as the disk rebuild would,
+        // gated on the current owner being a consumed input. Carried
+        // Delta locations are `Full` against the bare `gc/<new_ulid>`
+        // file (still at `tmp_path` until the rename below, hence the
+        // layout read); the gc-carried promote flips them to `Cached`.
+        let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
+        let delta_body_source = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
+            Some(extentindex::DeltaBodySource::Full {
+                body_section_start: new_bss,
+                body_length: segment::read_segment_layout(&tmp_path)?.body_length,
+            })
+        } else {
+            None
+        };
+        let ctx = extentindex::SegmentRegistrationCtx {
+            segment_id: new_ulid,
+            body_section_start: new_bss,
+            body_tier: extentindex::RegistrationBodyTier::Cached,
+            delta_body_source,
+            inline: extentindex::InlineSource::Section(&handoff_inline),
+        };
+        {
+            let index = Arc::make_mut(&mut self.extent_index);
+            for (i, e) in entries.iter().enumerate() {
+                index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
             }
-            if e.kind == EntryKind::Delta {
-                // Carried Delta entries register in the delta index, as
-                // the disk rebuild does — planting them in the DATA map
-                // routes reads through the body path with
-                // `stored_length == 0` and serves garbage or EIO. The
-                // location is `Full` against the bare `gc/<new_ulid>`
-                // file; the gc-carried promote flips it to `Cached`.
-                let should_update = match self.extent_index.lookup_delta(&e.hash) {
-                    None => self.extent_index.lookup(&e.hash).is_none(),
-                    Some(loc) => inputs.contains(&loc.segment_id),
-                };
-                if should_update {
-                    let body_source = match delta_full {
-                        Some(s) => s,
-                        None => {
-                            let body_length = segment::read_segment_layout(&tmp_path)?.body_length;
-                            let s = extentindex::DeltaBodySource::Full {
-                                body_section_start: new_bss,
-                                body_length,
-                            };
-                            delta_full = Some(s);
-                            s
-                        }
-                    };
-                    Arc::make_mut(&mut self.extent_index).insert_delta(
-                        e.hash,
-                        extentindex::DeltaLocation {
-                            segment_id: new_ulid,
-                            entry_idx: i as u32,
-                            body_source,
-                            options: e.delta_options.clone(),
-                        },
-                    );
-                }
-                continue;
-            }
-            let current = self.extent_index.lookup(&e.hash);
-            let should_update = match current {
-                None => true,
-                Some(loc) => inputs.contains(&loc.segment_id),
-            };
-            if !should_update {
-                continue;
-            }
-            let idata = if matches!(e.kind, EntryKind::Inline | EntryKind::CanonicalInline) {
-                let start = e.stored_offset as usize;
-                let end = start + e.stored_length as usize;
-                if end <= handoff_inline.len() {
-                    Some(handoff_inline[start..end].into())
-                } else {
-                    continue;
-                }
-            } else {
-                None
-            };
-            Arc::make_mut(&mut self.extent_index).insert(
-                e.hash,
-                extentindex::ExtentLocation {
-                    segment_id: new_ulid,
-                    body_offset: e.stored_offset,
-                    body_length: e.stored_length,
-                    compressed: e.compressed,
-                    body_source: BodySource::Cached(i as u32),
-                    body_section_start: new_bss,
-                    inline_data: idata,
-                },
-            );
         }
 
         for (hash, old_ulid) in &to_remove {
@@ -1366,7 +1316,6 @@ impl Volume {
         // merge, restart's `Volume::open` rebuild walks the same on-disk
         // segments and produces the same claimant ULIDs.
         let lbamap = Arc::make_mut(&mut self.lbamap);
-        let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         for e in &entries {
             // CanonicalData / CanonicalInline make no LBA claim — same
             // filter as `lbamap::rebuild_segments_inner`.
