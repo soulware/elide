@@ -293,88 +293,41 @@ impl Volume {
                 // didn't carry — gated on the specific input's ULID so
                 // a concurrent writer that re-pointed the hash wins.
                 for input in &bucket.inputs {
-                    for hash in &input.owned_hashes {
-                        if carried_hashes.contains(hash) {
-                            continue;
-                        }
-                        // `remove_owner_at` covers both `inner` and `deltas`.
-                        if index.remove_owner_at(hash, input.input_ulid) {
-                            stats.extents_removed += 1;
-                        }
-                    }
+                    stats.extents_removed += index.remove_input_owned(
+                        input.input_ulid,
+                        &input.owned_hashes,
+                        &carried_hashes,
+                    );
                 }
 
-                // Insert carried entries against the new bucket output,
-                // gated on the current owner being any of the bucket's
-                // inputs.
+                // Register carried entries against the new bucket
+                // output as the disk rebuild would, gated on the
+                // current owner being any of the bucket's inputs.
                 if let Some(out) = &bucket.output {
-                    let mut delta_full: Option<extentindex::DeltaBodySource> = None;
-                    for (raw_idx, e) in out.out_entries.iter().enumerate() {
-                        if matches!(e.kind, EntryKind::DedupRef | EntryKind::Zero) {
-                            continue;
-                        }
-                        if e.kind == EntryKind::Delta {
-                            // Carried Delta entries register in the delta
-                            // index, as the disk rebuild does — planting
-                            // them in the DATA map routes reads through
-                            // the body path with `stored_length == 0` and
-                            // serves garbage or EIO.
-                            let should_update = match index.lookup_delta(&e.hash) {
-                                None => index.lookup(&e.hash).is_none(),
-                                Some(loc) => bucket_input_ulids.contains(&loc.segment_id),
-                            };
-                            if should_update {
-                                let body_source = match delta_full {
-                                    Some(s) => s,
-                                    None => {
-                                        let out_path = pending_dir.join(out.new_ulid.to_string());
-                                        let body_length =
-                                            segment::read_segment_layout(&out_path)?.body_length;
-                                        let s = extentindex::DeltaBodySource::Full {
-                                            body_section_start: out.new_body_section_start,
-                                            body_length,
-                                        };
-                                        delta_full = Some(s);
-                                        s
-                                    }
-                                };
-                                index.insert_delta(
-                                    e.hash,
-                                    extentindex::DeltaLocation {
-                                        segment_id: out.new_ulid,
-                                        entry_idx: raw_idx as u32,
-                                        body_source,
-                                        options: e.delta_options.clone(),
-                                    },
-                                );
-                            }
-                            continue;
-                        }
-                        let current = index.lookup(&e.hash);
-                        let should_update = match current {
-                            None => true,
-                            Some(loc) => bucket_input_ulids.contains(&loc.segment_id),
-                        };
-                        if !should_update {
-                            continue;
-                        }
-                        let inline_data = if e.kind.is_inline() {
-                            e.data.clone().map(Vec::into_boxed_slice)
+                    let delta_body_source =
+                        if out.out_entries.iter().any(|e| e.kind == EntryKind::Delta) {
+                            let out_path = pending_dir.join(out.new_ulid.to_string());
+                            Some(extentindex::DeltaBodySource::Full {
+                                body_section_start: out.new_body_section_start,
+                                body_length: segment::read_segment_layout(&out_path)?.body_length,
+                            })
                         } else {
                             None
                         };
-                        index.insert(
-                            e.hash,
-                            extentindex::ExtentLocation {
-                                segment_id: out.new_ulid,
-                                body_offset: e.stored_offset,
-                                body_length: e.stored_length,
-                                compressed: e.compressed,
-                                body_source: BodySource::Local,
-                                body_section_start: out.new_body_section_start,
-                                inline_data,
-                            },
-                        );
+                    let ctx = extentindex::SegmentRegistrationCtx {
+                        segment_id: out.new_ulid,
+                        body_section_start: out.new_body_section_start,
+                        body_tier: extentindex::RegistrationBodyTier::Local,
+                        delta_body_source,
+                        inline: extentindex::InlineSource::EntryData,
+                    };
+                    for (raw_idx, e) in out.out_entries.iter().enumerate() {
+                        index.register_entry_consuming_inputs(
+                            e,
+                            raw_idx as u32,
+                            &ctx,
+                            &bucket_input_ulids,
+                        )?;
                     }
                 }
             }
@@ -570,6 +523,17 @@ impl Volume {
             } = rewrite;
 
             let entries_len = entries.len();
+            let consumed: std::collections::HashSet<Ulid> = std::iter::once(input_ulid).collect();
+            let ctx = extentindex::SegmentRegistrationCtx {
+                segment_id: new_ulid,
+                body_section_start: new_bss,
+                body_tier: extentindex::RegistrationBodyTier::Local,
+                delta_body_source: Some(extentindex::DeltaBodySource::Full {
+                    body_section_start: new_bss,
+                    body_length: delta_region_body_length,
+                }),
+                inline: extentindex::InlineSource::EntryData,
+            };
             let ei = Arc::make_mut(&mut self.extent_index);
             let lm = Arc::make_mut(&mut self.lbamap);
             for (raw_idx, item) in entries.iter().enumerate() {
@@ -622,19 +586,11 @@ impl Volume {
                         );
                     }
                     (EntryKind::Data, EntryKind::Delta) => {
+                        // Converted entry: drop the input's DATA-map
+                        // location, then register the Delta as the disk
+                        // rebuild would.
                         ei.remove_if_matches(&post.hash, input_ulid, item.pre_stored_offset);
-                        ei.insert_delta_if_absent(
-                            post.hash,
-                            extentindex::DeltaLocation {
-                                segment_id: new_ulid,
-                                entry_idx: raw_idx as u32,
-                                body_source: extentindex::DeltaBodySource::Full {
-                                    body_section_start: new_bss,
-                                    body_length: delta_region_body_length,
-                                },
-                                options: post.delta_options.clone(),
-                            },
-                        );
+                        ei.register_entry_consuming_inputs(post, raw_idx as u32, &ctx, &consumed)?;
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
                         lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
@@ -651,24 +607,7 @@ impl Volume {
                         // the output, gated on the current owner being
                         // the input this rewrite consumes — a concurrent
                         // writer that re-pointed the hash wins.
-                        let should_update = match ei.lookup_delta(&post.hash) {
-                            None => ei.lookup(&post.hash).is_none(),
-                            Some(loc) => loc.segment_id == input_ulid,
-                        };
-                        if should_update {
-                            ei.insert_delta(
-                                post.hash,
-                                extentindex::DeltaLocation {
-                                    segment_id: new_ulid,
-                                    entry_idx: raw_idx as u32,
-                                    body_source: extentindex::DeltaBodySource::Full {
-                                        body_section_start: new_bss,
-                                        body_length: delta_region_body_length,
-                                    },
-                                    options: post.delta_options.clone(),
-                                },
-                            );
-                        }
+                        ei.register_entry_consuming_inputs(post, raw_idx as u32, &ctx, &consumed)?;
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
                         lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
