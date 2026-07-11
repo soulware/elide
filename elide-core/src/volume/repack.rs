@@ -415,7 +415,6 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
-        self.assert_volume_invariants("apply_repack_result");
 
         Ok((stats, consumed_inputs))
     }
@@ -427,10 +426,14 @@ impl Volume {
     ///
     /// Already-missing files are fine — a previous partial unlink may
     /// have removed some of the batch.
+    ///
+    /// This is the end of the repack transaction, so the volume
+    /// invariants are asserted here rather than in the apply phase:
+    /// between apply and this unlink the consumed inputs are still on
+    /// disk, and a disk rebuild ranks a still-present `u_flush` input
+    /// above the pre-minted output ULIDs — content-equal but not
+    /// claimant-equal to the in-memory maps.
     pub fn remove_consumed_inputs(&mut self, paths: &[PathBuf]) -> io::Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
         for path in paths {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -438,7 +441,11 @@ impl Volume {
                 Err(e) => return Err(e),
             }
         }
-        segment::fsync_dir(&self.base_dir.join("pending"))
+        if !paths.is_empty() {
+            segment::fsync_dir(&self.base_dir.join("pending"))?;
+        }
+        self.assert_volume_invariants("remove_consumed_inputs");
+        Ok(())
     }
 
     /// Phase 5 Tier 1: rewrite post-snapshot pending segments with
@@ -696,7 +703,6 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
-        self.assert_volume_invariants("apply_delta_repack_result");
 
         Ok((stats, consumed_inputs))
     }
