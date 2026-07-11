@@ -282,7 +282,7 @@ The body-fetch path is genuinely more complex than `.idx` (range arithmetic, par
 
 Per `docs/architecture.md` (§ S3 credential distribution via macaroons), each volume holds a short-lived read-only S3 credential scoped via IAM to its own S3 prefix and its ancestor prefixes. The peer **mirrors this scoping**: whatever a volume can read from S3, it can read from the peer; nothing more.
 
-The trust root is split. Token authenticity is the requester's Ed25519 signature, verified against the signer's published pubkey (`coordinators/<id>/coordinator.pub`, immutable). Current ownership is `names/<name>`, read ETag-conditionally so the auth fence stays coincident with the S3 CAS that defines the claimer (the gap-free forced-claim fence). Lineage is the signed `volume.provenance` chain the peer holds **locally** for every fork it serves — verified with no S3 read and no credential, and failing closed when absent (the requester then falls back to S3). No separate credential service or pre-shared coordinator secret is required.
+The trust root is split. Token authenticity is the requester's Ed25519 signature, verified against the signer's published pubkey (`coordinators/<id>/coordinator.pub`, immutable). Current ownership is `names/<name>`, held in a TTL'd cache and revalidated ETag-conditionally, so the auth fence tracks the S3 CAS that defines the claimer within one bounded window (see *Auth-fence properties under caching*). Lineage is the signed `volume.provenance` chain the peer holds **locally** for every fork it serves — verified with no S3 read and no credential, and failing closed when absent (the requester then falls back to S3). No separate credential service or pre-shared coordinator secret is required.
 
 ### Token shape
 
@@ -307,13 +307,26 @@ The peer's verify pipeline is five checks, each tied to a property the auth mode
 
 | # | Check | Source | What it proves |
 |---|---|---|---|
-| 1 | Decode + freshness | token bytes, local clock | replay defence (±60 s window) |
+| 1 | Decode + freshness | token bytes, local clock | replay defence (issued ≤ 15 min ago, ≤ 90 s ahead — see *Freshness bounds*) |
 | 2 | Ed25519 signature valid against `coordinator.pub` | `coordinators/<token.coordinator_id>/coordinator.pub` from S3 | which coordinator is requesting |
-| 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (ETag-conditional) | the requesting coordinator currently owns/claims this volume |
+| 3 | `names/<token.volume_name>.coordinator_id == token.coordinator_id` | `names/<token.volume_name>` from S3 (TTL'd; ETag-conditional revalidation) | the requesting coordinator currently owns/claims this volume |
 | 4 | URL `vol_id` has a self-consistent signed chain the peer serves | walk the signed `volume.provenance` chain from the peer's **local** `by_id/<vol_id>/volume.{provenance,pub}`, anchored at `vol_id` itself (the peer holds these for every fork it serves, pulled with the volume); fail closed if absent | the peer serves `vol_id` and its chain verifies |
 | 5 | `index/<ulid>.idx` (or `cache/<ulid>.present`) exists locally under `vol_id` | local fs | `ulid` is a segment of `vol_id` (implicit — falls out as 404) |
 
-Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves).
+Failures map to status codes: 1–3 fail → 401 (bad credentials); 4 fails → 403 (out of authorised lineage); 5 fails → 404. Distinguishing 403 from 404 is fine here — there is no information leak (the requester has the lineage walk in hand and could derive the answer themselves). A token naming a coordinator with no published `coordinator.pub` is 401 (`UnknownCoordinator`), not a backend error: for any enrolled coordinator the key exists before it can mint tokens, so the miss describes the token, not the peer.
+
+#### Freshness bounds
+
+Check 1 is asymmetric:
+
+```
+now - issued_at <= FRESHNESS_PAST_SECS    (900 — 15 min)
+issued_at - now <= FRESHNESS_FUTURE_SECS  (90)
+```
+
+The past bound is the token's validity period. A 15-minute-old token is legitimately reusable, so the bound is sized for reuse, and it also absorbs a slow verifier clock. The future bound exists only for clock skew; a token minted further than ~90 s in the future means a broken clock, never a valid reuse, so it stays tight. The client refreshes at half the past bound (7.5 min), and the `.body` path's coordinator IPC amortises on the same cadence. All source-side cache lifetimes are capped at the token's residual freshness.
+
+Hosts whose clocks disagree by more than the bounds cannot peer-fetch, and the failure is silent (the client falls through to S3 and keeps paying egress), so the bounds are sized for hosts without NTP, which drift by minutes.
 
 #### Route auth modes
 
@@ -392,12 +405,12 @@ The volume cannot sign a `PeerFetchToken` (it has no
   mints a `PeerFetchToken` over `(name, coordinator_id)` with
   `coordinator.key`. A coordinator with no local `by_name` entry for
   the volume is not its current local claimer and the mint is refused.
-- The volume caches the token and refreshes it at ≈ half the freshness
-  window — the same lazy-cache + idle-drop lifecycle and the same
+- The volume caches the token and refreshes it at ≈ half the validity
+  period — the same lazy-cache + idle-drop lifecycle and the same
   coordinator socket it already uses for S3 credentials
   (`creds_fetcher`). `.body` requests between refreshes are pure
-  cached-bearer reuse. This is **one amortised IPC per freshness
-  window**, never per cache miss and never per read; a cache hit never
+  cached-bearer reuse. This is **one amortised IPC per validity
+  period**, never per cache miss and never per read; a cache hit never
   touches the peer at all.
 
 What this gives, by construction (it is the `.idx` model):
@@ -418,34 +431,30 @@ What this gives, by construction (it is the `.idx` model):
 
 #### Caching profile
 
-Each check has its own staleness shape, and v1 ships with all three caches active:
+Each check has its own staleness shape:
 
-- **`coordinator.pub`** (check 2) — immutable per `coordinator_id`. Cache forever; rotate is a separate operational event.
-- **`names/<volume_name>`** (check 3) — ETag-conditional GET. The peer holds `(NameRecord, ETag)` per volume name; every cache-miss request fires `If-None-Match: <etag>`. A 304 confirms the cached value (no body transferred); a 200 ships the new value and the cache updates. The auth fence coincides exactly with the S3 CAS that defines current ownership.
+- **`coordinator.pub`** (check 2) — immutable per `coordinator_id`. Cache forever; rotate is a separate operational event. A miss is never cached: for any enrolled coordinator the key exists (published at enrolment, before it can mint tokens), so a miss only ever describes garbage, and bounding garbage-driven lookups is the rate limiter's job, not a cache's.
+- **`names/<volume_name>`** (check 3) — TTL'd `(NameRecord, ETag)` entry, trusted for the validity period (`FRESHNESS_PAST_SECS`, 15 min) from its last S3 contact; within that, check 3 is answered from memory with no S3 request. On expiry an ETag-conditional GET revalidates it — a 304 confirms the cached value (no body transferred), a 200 ships the new value. Revalidation is per volume name per TTL, shared across every requester and every re-mint. When a TTL-fresh record *fails* the check-3 claimer test it is revalidated early, at most once per `REVALIDATION_FLOOR_SECS` (60 s) per name — a mismatch is how a legitimate new claimer's first request after a handoff looks, and the early revalidation admits it within a minute instead of leaving it to S3 fallback until the TTL runs out. A miss is never cached: claiming is what creates `names/<name>`, so a legitimate requester's record always exists.
 - **`ancestry(vol_id)`** (check 4) — walked from the peer's **local** signed `volume.provenance` chain rooted at the URL's `vol_id`, which is **immutable once the fork exists**. Forking creates new volumes; it does not alter the ancestry of existing ones. Cache forever per `vol_id`, never invalidate. (A fork the peer doesn't serve has no local chain — the walk fails closed; nothing to cache.)
 - **Local file existence** (check 5) — `stat`, basically free.
 
-On top of those per-check caches, the resolved [`Authorized`] outcome is also memoised, keyed on the bearer-token bytes plus URL `vol_id`, with a lifetime equal to the **token's residual freshness window**. Within that window, repeat requests with the same token + `vol_id` skip checks 3 and 4 entirely — no S3 round-trip even for the conditional `names/<name>` GET. A refreshed token (any coordinator re-mints in steady state every freshness-window interval) is a fresh cache miss and re-runs the full pipeline.
+On top of those per-check caches, the resolved [`Authorized`] outcome is also memoised, keyed on the bearer-token bytes plus URL `vol_id`, with a lifetime equal to the **token's residual freshness**. Within that window, repeat requests with the same token + `vol_id` skip checks 3 and 4 entirely. A refreshed token (any coordinator re-mints in steady state every half-validity-period) is a fresh cache miss and re-runs the pipeline against the in-memory caches.
 
 So a steady-state prefetch session looks like:
 
 - **First request:** Ed25519 verify + 1 GET (`coordinator.pub`, ~once per coordinator ever) + 1 GET (`names/<name>`, full body) + N local reads (`volume.provenance` ancestry walk, once per volume ever) + local stat.
 - **Subsequent requests on same token, different `vol_id`:** Ed25519 verify + cache hits for everything except lineage check (which uses cached ancestry) + local stat.
 - **Subsequent requests on same token, same `vol_id`:** Ed25519 verify + resolved-Authorized cache hit + local stat. Zero S3 round-trips.
-- **Token refresh:** like first request, but `coordinator.pub` and ancestry stay cached, so it's just one ETag-conditional `names/<name>` (likely 304) + local stat.
+- **Token refresh:** like first request, but `coordinator.pub` and ancestry stay cached and the name record is normally TTL-fresh — zero S3 round-trips. The conditional `names/<name>` GET (likely 304) fires only when the record's TTL has expired, about once per name per 15 min.
 
 #### Auth-fence properties under caching
 
 - **`coordinator.pub`** rotation: not modelled in v1 — keys never rotate; if compromised, the resolution is to mint a new coordinator. Cache-forever has no fence to violate.
 - **`ancestry`**: provenance is immutable, so cache-forever has no fence to violate.
-- **`names/<volume_name>`**: ETag revalidation makes the fence coincide with the S3 CAS — `claim --force` flips the record, the next conditional GET returns 200 with the new value, the auth check fails on the next request that misses the resolved-Authorized cache.
-- **Resolved-Authorized cache**: the only layer that introduces a fence gap. A force-claimed-out coordinator's already-issued token can serve cached requests for up to the token's residual freshness — at most `DEFAULT_FRESHNESS_WINDOW_SECS` (60 s in v1). This is bounded, scoped to read-only operations against bytes the holder already had access to, and incurs no write-fence violation (writes are gated by S3 IAM, which `claim --force` revokes independently). The trade is acceptable in exchange for skipping per-request S3 round-trips during normal prefetch sessions.
+- **`names/<volume_name>`**: the TTL bounds how long a flipped record goes unobserved. A displaced coordinator holds its own signing key and can re-mint at will, so its access tail is bounded by the name-record TTL; through an already-cached bearer it is bounded by residual token freshness. Both bounds are the same constant (`FRESHNESS_PAST_SECS`, 15 min), so the fence statement is a single number: after `claim --force` flips the record, the displaced coordinator can keep *reading* from peers for at most one validity period — bytes it could in any case still read directly from S3, since the lineage gate is intent scoping, not confidentiality (*Route auth modes*). The write fence is unaffected: writes are gated by S3 IAM, which `claim --force` revokes independently of this path. In practice the tail is usually much shorter — the *new* claimer's first mismatching request forces the early revalidation, which replaces the record and disauthorises the old claimer's next fresh mint.
+- **Resolved-Authorized cache**: same bound, same reasoning — a force-claimed-out coordinator's already-issued token can serve cached requests for up to the token's residual freshness.
 
-#### Why no time-bounded cache for `names/<name>`
-
-The `names/<name>` cache uses ETag-conditional revalidation, **not** a wall-clock TTL. The reason is that ETag revalidation keeps the auth fence coincident with the S3 CAS at the cost of one small round-trip per cache miss; a TTL would introduce an additional fence gap on top of the resolved-Authorized cache without any further perf benefit.
-
-The resolved-Authorized cache *is* a time-bounded cache, but its bound is the token's freshness — not an arbitrary clock window — so it lines up naturally with the existing replay-window guarantee.
+That bounded read tail is the price of tolerating real clock skew and cutting steady-state S3 traffic to ~one conditional GET per fetching volume name per 15 min, and we take it.
 
 #### Anti-abuse properties
 
@@ -461,15 +470,15 @@ These are not v1 features (the simple version of v1 has no rate-limit at all), b
 
 - **Trust root is the existing key + claim state.** Token authenticity chains back to `coordinator.pub`; current ownership is `names/<name>`, the canonical claim record; lineage is the signed `volume.provenance` chain the peer already holds locally. Same trust boundary the rest of Elide uses — no new authority.
 - **No shared secrets between hosts.** A and B do not need to pre-establish trust. A learns about B's fork from S3 the first time B asks; ETag-conditional GETs make subsequent checks cheap.
-- **Handoff fence and auth fence coincide.** When B successfully CAS-claims `names/<name>`, A's next read of that key sees B as claimer. The S3 CAS that defines "B is now the holder" is also the moment B becomes peer-authorised. No separate "tell A about B" step.
-- **Forced-claim fence and auth fence coincide.** This is the load-bearing property of the no-cache design. `claim --force` fences a split-brain old host by flipping `names/<name>` via CAS (see `docs/design/force-release-fencing.md`). Because every peer request re-validates `names/<name>` against S3 in the same round-trip as the fetch, the moment the CAS lands, the old fork's tokens stop authorising — no TTL gap, no stale-claim window during which a fenced-out host can still pull bytes from peers. Any time-bounded cache would have created exactly the gap `--force` is trying to close.
+- **Handoff admits the new claimer promptly.** When B successfully CAS-claims `names/<name>`, B's first request to A either finds A's cache cold (fresh GET sees B as claimer) or mismatches a stale record and forces the early revalidation. The S3 CAS that defines "B is now the holder" makes B peer-authorised within the revalidation floor at worst. No separate "tell A about B" step.
+- **Forced-claim read fence is one bounded window.** `claim --force` fences a split-brain old host by flipping `names/<name>` via CAS (see `docs/design/force-release-fencing.md`). Peer *reads* by the fenced-out host tail off within one validity period (usually much sooner — the claimant's first request replaces the cached record); the *write* fence is S3 IAM, revoked by `claim --force` independently of this path. See *Auth-fence properties under caching*.
 - **There is no "Released" interregnum on the forced path.** `claim --force` CASes the record directly from the dead owner to the claimant, so at every moment exactly one coordinator's tokens can match `names/<name>`. (The graceful `release` → `claim` window remains, and is naturally safe: a `released` record names no claimer, so no token matches and clients fall through to S3.)
 - **Image-pull case fits naturally.** Each fetching host's own fork has its own claim on its own name; the ancestor prefixes are reachable through that fork's signed ancestry. Same auth code path as handoff.
 - **No new S3 artifacts.** Uses `names/<name>`, `volume.pub`, `volume.provenance` — all of which already exist with the right semantics.
 
 ### Caveats
 
-- **Replay window.** `issued_at` ±60 s allows replay within that window. Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill for v1.
+- **Replay window.** A captured token replays for the rest of its validity period (up to 15 min — see *Freshness bounds*). Strictly fine for read-only requests against signed bytes (worst case: replayed token retrieves bytes the original holder was already entitled to). Could tighten with a peer-issued challenge; probably overkill.
 - **Coordinator key compromise.** Anyone with `coordinator.key` can claim and operate volumes for that coordinator anyway; peer fetch does not widen this blast radius. Rotation is the same event as today.
 
 ### Bearer format: public-key `PeerFetchToken`

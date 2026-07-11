@@ -24,10 +24,16 @@ use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
 /// across artefact types.
 pub const DOMAIN_TAG: &[u8] = b"elide peer-fetch v1\0";
 
-/// Default freshness window in seconds. A token whose `issued_at`
-/// is more than `DEFAULT_FRESHNESS_WINDOW_SECS` away from the
-/// verifier's clock is rejected as stale.
-pub const DEFAULT_FRESHNESS_WINDOW_SECS: u64 = 60;
+/// Validity period in seconds: how far in the past `issued_at` may
+/// lie. Sized for token reuse (the client refreshes at half this),
+/// and it also absorbs a slow verifier clock.
+pub const FRESHNESS_PAST_SECS: u64 = 900;
+
+/// Future skew tolerance in seconds: how far ahead of the verifier's
+/// clock `issued_at` may lie. A token from further in the future only
+/// ever means a broken clock, never a valid reuse, so this stays
+/// tight.
+pub const FRESHNESS_FUTURE_SECS: u64 = 90;
 
 /// Bearer token presented by a fetching coordinator to a peer.
 ///
@@ -210,11 +216,22 @@ impl PeerFetchToken {
         })
     }
 
-    /// Reject the token if `issued_at` differs from `now` by more
-    /// than `window_secs` in either direction.
-    pub fn check_freshness(&self, now: u64, window_secs: u64) -> Result<(), TokenVerifyError> {
+    /// Reject the token if `issued_at` lies more than `past_secs`
+    /// behind `now` (the validity period) or more than `future_secs`
+    /// ahead of it (clock-skew tolerance).
+    pub fn check_freshness(
+        &self,
+        now: u64,
+        past_secs: u64,
+        future_secs: u64,
+    ) -> Result<(), TokenVerifyError> {
         let skew = self.issued_at.abs_diff(now);
-        if skew > window_secs {
+        let bound = if self.issued_at > now {
+            future_secs
+        } else {
+            past_secs
+        };
+        if skew > bound {
             Err(TokenVerifyError::Stale { skew_secs: skew })
         } else {
             Ok(())
@@ -358,27 +375,42 @@ mod tests {
     }
 
     #[test]
-    fn freshness_accepts_within_window() {
+    fn freshness_accepts_within_bounds() {
         let key = fresh_keypair();
         let tok = build("vol-a", "coord-x", 1_700_000_000, &key);
-        tok.check_freshness(1_700_000_010, DEFAULT_FRESHNESS_WINDOW_SECS)
-            .expect("within +/-60s");
-        tok.check_freshness(1_699_999_990, DEFAULT_FRESHNESS_WINDOW_SECS)
-            .expect("within +/-60s in the past");
+        // Token in the past: accepted up to and including past_secs.
+        tok.check_freshness(1_700_000_000 + FRESHNESS_PAST_SECS, 900, 90)
+            .expect("at the past boundary");
+        // Token in the future: accepted up to and including future_secs.
+        tok.check_freshness(1_700_000_000 - FRESHNESS_FUTURE_SECS, 900, 90)
+            .expect("at the future boundary");
     }
 
     #[test]
-    fn freshness_rejects_outside_window() {
+    fn freshness_rejects_outside_bounds() {
         let key = fresh_keypair();
         let tok = build("vol-a", "coord-x", 1_700_000_000, &key);
         let err = tok
-            .check_freshness(1_700_000_120, 60)
-            .expect_err("future drift > window");
-        assert!(matches!(err, TokenVerifyError::Stale { skew_secs } if skew_secs == 120));
+            .check_freshness(1_700_000_901, 900, 90)
+            .expect_err("past drift > validity period");
+        assert!(matches!(err, TokenVerifyError::Stale { skew_secs } if skew_secs == 901));
         let err = tok
-            .check_freshness(1_699_999_800, 60)
-            .expect_err("past drift > window");
-        assert!(matches!(err, TokenVerifyError::Stale { skew_secs } if skew_secs == 200));
+            .check_freshness(1_699_999_909, 900, 90)
+            .expect_err("future drift > skew tolerance");
+        assert!(matches!(err, TokenVerifyError::Stale { skew_secs } if skew_secs == 91));
+    }
+
+    #[test]
+    fn freshness_bounds_are_asymmetric() {
+        let key = fresh_keypair();
+        let tok = build("vol-a", "coord-x", 1_700_000_000, &key);
+        // 5 minutes in the past is fine; 5 minutes in the future is not.
+        tok.check_freshness(1_700_000_300, 900, 90)
+            .expect("5 min old is within the validity period");
+        let err = tok
+            .check_freshness(1_699_999_700, 900, 90)
+            .expect_err("5 min in the future exceeds skew tolerance");
+        assert!(matches!(err, TokenVerifyError::Stale { skew_secs } if skew_secs == 300));
     }
 
     #[test]

@@ -25,19 +25,30 @@
 //! Four layers of cache, each tightly scoped:
 //!
 //! - **`coordinator.pub`** — immutable per `coordinator_id`. Cached
-//!   forever after first fetch.
+//!   forever after first fetch. A miss is never cached: for any
+//!   enrolled coordinator the key exists (published at enrolment,
+//!   before it can mint tokens), so a miss only ever describes
+//!   garbage; bounding garbage-driven lookups is the
+//!   [`RateLimiter`]'s job, not a cache's.
 //!
 //! - **Ancestry walk** — immutable per `vol_ulid` (provenance is
 //!   write-once at fork time). Cached forever after first walk.
 //!
-//! - **`names/<volume_name>`** — ETag-conditional. The underlying
-//!   cache holds `(NameRecord, ETag)` and a conditional GET with
-//!   `If-None-Match` revalidates against S3. Used as the fallback
-//!   when the per-bearer name-step cache (below) misses.
+//! - **`names/<volume_name>`** — TTL'd `(NameRecord, ETag)` entry,
+//!   trusted for the validity period ([`FRESHNESS_PAST_SECS`]) from
+//!   its last S3 contact; within that, step 3 is answered from memory
+//!   with no S3 request. On expiry a conditional GET with
+//!   `If-None-Match` revalidates (304 confirms, 200 replaces). When a
+//!   TTL-fresh record *fails* the step-3 check, it is revalidated
+//!   early — at most once per [`REVALIDATION_FLOOR_SECS`] per name —
+//!   so a legitimate new claimer forces one conditional GET instead
+//!   of being 401'd until the TTL runs out. A miss is never cached:
+//!   claiming is what creates `names/<name>`, so a legitimate
+//!   requester's record always exists.
 //!
 //! - **Per-bearer name-step cache** — keyed on the bearer bytes,
 //!   stores the verified `NameRecord` for the token's residual
-//!   freshness window. Skips the ETag round-trip entirely on hit.
+//!   freshness window. Skips even the in-memory TTL logic on hit.
 //!   Designed for chain walks: same token, many ancestor `vol_id`s,
 //!   step 3 answer is identical across them.
 //!
@@ -71,8 +82,12 @@ use ulid::Ulid;
 
 use crate::ancestry::walk_ancestry;
 use crate::token::{
-    DEFAULT_FRESHNESS_WINDOW_SECS, PeerFetchToken, TokenDecodeError, TokenVerifyError,
+    FRESHNESS_FUTURE_SECS, FRESHNESS_PAST_SECS, PeerFetchToken, TokenDecodeError, TokenVerifyError,
 };
+
+/// Per-name floor between mismatch-triggered revalidations of a
+/// TTL-fresh name record.
+pub const REVALIDATION_FLOOR_SECS: u64 = 60;
 
 /// Outcome of a failed authorisation check. Each variant maps to a
 /// specific HTTP status code via [`AuthError::status_code`].
@@ -82,9 +97,12 @@ pub enum AuthError {
     MissingBearer,
     /// Token wire form did not decode.
     BadToken(TokenDecodeError),
-    /// Token clock skew exceeds the freshness window, or signature
+    /// Token clock skew exceeds the freshness bounds, or signature
     /// failed to verify against the coordinator's published pubkey.
     BadCredentials(TokenVerifyError),
+    /// Token names a `coordinator_id` with no published
+    /// `coordinators/<id>/coordinator.pub`.
+    UnknownCoordinator,
     /// Volume name in the token does not currently resolve to the
     /// requesting coordinator (state isn't `Live` / `Stopped`, or
     /// `coordinator_id` doesn't match).
@@ -107,6 +125,7 @@ impl AuthError {
             Self::MissingBearer => 401,
             Self::BadToken(_) => 401,
             Self::BadCredentials(_) => 401,
+            Self::UnknownCoordinator => 401,
             Self::NotCurrentClaimer => 401,
             Self::OutsideLineage => 403,
             Self::RateLimited(_) => 429,
@@ -121,6 +140,7 @@ impl std::fmt::Display for AuthError {
             Self::MissingBearer => f.write_str("missing or malformed Authorization header"),
             Self::BadToken(e) => write!(f, "token decode failed: {e}"),
             Self::BadCredentials(e) => write!(f, "credentials rejected: {e}"),
+            Self::UnknownCoordinator => f.write_str("token names an unknown coordinator"),
             Self::NotCurrentClaimer => f.write_str("token holder is not the current claimer"),
             Self::OutsideLineage => {
                 f.write_str("requested vol_id is outside claimed volume's lineage")
@@ -165,9 +185,11 @@ struct AuthStateInner {
     lineage_store: Arc<dyn ObjectStore>,
     pub_keys: RwLock<HashMap<String, VerifyingKey>>,
     ancestry_cache: RwLock<HashMap<Ulid, HashSet<Ulid>>>,
-    /// `(NameRecord, ETag)` per volume name. Revalidated via
-    /// `If-None-Match` on every request that reaches step 3.
-    name_records: RwLock<HashMap<String, (NameRecord, Option<String>)>>,
+    /// `NameRecord` + ETag per volume name, trusted for the validity
+    /// period from `verified_at`; the conditional GET runs only on
+    /// expiry (or early, rate-capped, when a fresh record fails the
+    /// step-3 check — see `verify`).
+    name_records: RwLock<HashMap<String, NameRecordEntry>>,
     /// Per-bearer name-record outcome. Skipping the ETag-conditional
     /// GET on every request: chain walks reuse one token across
     /// many `vol_id`s, and step 3 (`names/<volume>` ownership) is
@@ -181,7 +203,10 @@ struct AuthStateInner {
     /// Entries expire at the token's residual freshness window so a
     /// cached result never outlives the token's own freshness.
     verified_tokens: RwLock<HashMap<VerifiedKey, VerifiedEntry>>,
-    freshness_window_secs: u64,
+    /// Validity period for tokens (how old `issued_at` may be), and
+    /// with it the TTL on `name_records` entries and the lifetime cap
+    /// on every per-bearer cache.
+    freshness_past_secs: u64,
     rate_limiter: Arc<dyn RateLimiter>,
 }
 
@@ -284,12 +309,23 @@ struct NameStepEntry {
     expires_at: Instant,
 }
 
+/// Cached `names/<name>` record. `verified_at` is the last moment the
+/// value was confirmed against S3 (initial GET, 304 revalidation, or
+/// 200 replacement); the entry is trusted for the validity period
+/// from then.
+#[derive(Debug, Clone)]
+struct NameRecordEntry {
+    record: NameRecord,
+    etag: Option<String>,
+    verified_at: Instant,
+}
+
 impl AuthState {
     /// `store` is the coord-wide (S3) handle for steps 2–3.
     /// `lineage_store` is the peer-local handle for step 4 — in
     /// production a `LocalFileSystem` rooted at `data_dir`, never S3.
     pub fn new(store: Arc<dyn ObjectStore>, lineage_store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_freshness_window(store, lineage_store, DEFAULT_FRESHNESS_WINDOW_SECS)
+        Self::with_freshness_window(store, lineage_store, FRESHNESS_PAST_SECS)
     }
 
     /// Test double: one in-memory store backs both the coord-wide (S3)
@@ -300,15 +336,17 @@ impl AuthState {
         Self::new(store.clone(), store)
     }
 
+    /// `freshness_past_secs` is the token validity period; the future
+    /// skew bound is always [`FRESHNESS_FUTURE_SECS`].
     pub fn with_freshness_window(
         store: Arc<dyn ObjectStore>,
         lineage_store: Arc<dyn ObjectStore>,
-        freshness_window_secs: u64,
+        freshness_past_secs: u64,
     ) -> Self {
         Self::with_freshness_window_and_limiter(
             store,
             lineage_store,
-            freshness_window_secs,
+            freshness_past_secs,
             Arc::new(NoRateLimit),
         )
     }
@@ -320,7 +358,7 @@ impl AuthState {
     pub fn with_freshness_window_and_limiter(
         store: Arc<dyn ObjectStore>,
         lineage_store: Arc<dyn ObjectStore>,
-        freshness_window_secs: u64,
+        freshness_past_secs: u64,
         rate_limiter: Arc<dyn RateLimiter>,
     ) -> Self {
         Self {
@@ -332,7 +370,7 @@ impl AuthState {
                 name_records: RwLock::new(HashMap::new()),
                 name_step_cache: RwLock::new(HashMap::new()),
                 verified_tokens: RwLock::new(HashMap::new()),
-                freshness_window_secs,
+                freshness_past_secs,
                 rate_limiter,
             }),
         }
@@ -368,7 +406,7 @@ impl AuthState {
         let token = PeerFetchToken::decode(bearer_value).map_err(AuthError::BadToken)?;
         let now = PeerFetchToken::now_unix_seconds();
         token
-            .check_freshness(now, self.inner.freshness_window_secs)
+            .check_freshness(now, self.inner.freshness_past_secs, FRESHNESS_FUTURE_SECS)
             .map_err(AuthError::BadCredentials)?;
 
         // Step 2: signature. Always runs — the cache only memoises
@@ -399,28 +437,38 @@ impl AuthState {
 
         // Step 3: ownership — the volume name's current claim record
         // must point at this coordinator. The per-bearer
-        // `name_step_cache` short-circuits the ETag-conditional GET
-        // when we've already resolved this token's name record within
-        // its freshness window — chain walks reuse one bearer across
-        // many ancestor `vol_id`s, so this is the hot path. The
+        // `name_step_cache` short-circuits the name-record lookup when
+        // we've already resolved this token's name record within its
+        // freshness window — chain walks reuse one bearer across many
+        // ancestor `vol_id`s, so this is the hot path. The
         // state/coord_id check is re-applied on every hit (cheap, and
         // ensures we never bypass the actual gating logic).
         let name_record = if let Some(cached) = self.lookup_name_step_cached(bearer_value).await {
             cached
         } else {
-            let nr = self.fetch_name_record(&token.volume_name).await?;
-            self.cache_name_step(bearer_value, nr.clone(), &token, now)
-                .await;
+            let nr = self.fetch_name_record(&token.volume_name, false).await?;
+            // A TTL-fresh record that fails the claimer check may be
+            // stale rather than a genuine rejection — a new claimer's
+            // first request after a handoff lands exactly here. Force
+            // one revalidation (rate-capped inside fetch_name_record)
+            // before rejecting, so the new claimer is admitted on its
+            // first request instead of waiting out the TTL.
+            let nr = if claimer_check(&nr, &token.coordinator_id).is_err() {
+                self.fetch_name_record(&token.volume_name, true).await?
+            } else {
+                nr
+            };
+            // Only passing records enter the per-bearer sub-cache. A
+            // mismatch may be a rate-capped stale answer; caching it
+            // per-bearer would pin the rejection to the bearer's whole
+            // residual freshness instead of the revalidation cap.
+            if claimer_check(&nr, &token.coordinator_id).is_ok() {
+                self.cache_name_step(bearer_value, nr.clone(), &token, now)
+                    .await;
+            }
             nr
         };
-        match name_record.state {
-            NameState::Live | NameState::Stopped => {}
-            _ => return Err(AuthError::NotCurrentClaimer),
-        }
-        match name_record.coordinator_id.as_deref() {
-            Some(id) if id == token.coordinator_id => {}
-            _ => return Err(AuthError::NotCurrentClaimer),
-        }
+        claimer_check(&name_record, &token.coordinator_id)?;
 
         // Step 4: lineage — `LineageGated` only. Skeletons skip this.
         // Anchored at the URL's `vol_id`, not the name record's: the
@@ -487,7 +535,7 @@ impl AuthState {
         now_unix: u64,
     ) {
         let drift = now_unix.abs_diff(token.issued_at);
-        let remaining = self.inner.freshness_window_secs.saturating_sub(drift);
+        let remaining = self.inner.freshness_past_secs.saturating_sub(drift);
         if remaining == 0 {
             return;
         }
@@ -511,7 +559,7 @@ impl AuthState {
         now_unix: u64,
     ) {
         let drift = now_unix.abs_diff(token.issued_at);
-        let remaining = self.inner.freshness_window_secs.saturating_sub(drift);
+        let remaining = self.inner.freshness_past_secs.saturating_sub(drift);
         if remaining == 0 {
             // Token will be stale by next request anyway; don't bother
             // caching (the entry would be invalidated immediately).
@@ -537,19 +585,17 @@ impl AuthState {
         }
 
         let key = StorePath::from(format!("coordinators/{coordinator_id}/coordinator.pub"));
-        let body = self
-            .inner
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| {
-                AuthError::Backend(io::Error::other(format!("fetch coordinator.pub: {e}")))
-            })?
-            .bytes()
-            .await
-            .map_err(|e| {
+        let body = match self.inner.store.get(&key).await {
+            Ok(r) => r.bytes().await.map_err(|e| {
                 AuthError::Backend(io::Error::other(format!("read coordinator.pub: {e}")))
-            })?;
+            })?,
+            Err(ObjectStoreError::NotFound { .. }) => return Err(AuthError::UnknownCoordinator),
+            Err(e) => {
+                return Err(AuthError::Backend(io::Error::other(format!(
+                    "fetch coordinator.pub: {e}"
+                ))));
+            }
+        };
         let text = std::str::from_utf8(&body).map_err(|e| {
             AuthError::Backend(io::Error::other(format!("coordinator.pub not utf-8: {e}")))
         })?;
@@ -565,10 +611,17 @@ impl AuthState {
         Ok(vk)
     }
 
-    async fn fetch_name_record(&self, volume_name: &str) -> Result<NameRecord, AuthError> {
-        // ETag-conditional revalidation: if we have a cached value
-        // for this volume, send `If-None-Match: <etag>`. A 304
-        // confirms the cached value; a 200 ships the new value.
+    /// Resolve `names/<volume_name>`, serving a cached record within
+    /// its TTL (the validity period) and revalidating with an
+    /// ETag-conditional GET on expiry. `force_revalidate` shrinks the
+    /// TTL to [`REVALIDATION_FLOOR_SECS`] — the mismatch path uses it
+    /// so a failing claimer check triggers at most one early
+    /// revalidation per name per floor interval.
+    async fn fetch_name_record(
+        &self,
+        volume_name: &str,
+        force_revalidate: bool,
+    ) -> Result<NameRecord, AuthError> {
         let cached = self
             .inner
             .name_records
@@ -576,8 +629,22 @@ impl AuthState {
             .await
             .get(volume_name)
             .cloned();
-        let cached_etag = cached.as_ref().and_then(|(_, e)| e.clone());
 
+        let ttl = if force_revalidate {
+            Duration::from_secs(REVALIDATION_FLOOR_SECS)
+        } else {
+            Duration::from_secs(self.inner.freshness_past_secs)
+        };
+        if let Some(entry) = &cached
+            && entry.verified_at.elapsed() < ttl
+        {
+            return Ok(entry.record.clone());
+        }
+
+        // ETag-conditional revalidation: if we have a (TTL-expired)
+        // cached value, send `If-None-Match: <etag>`. A 304 confirms
+        // the cached value; a 200 ships the new value.
+        let cached_etag = cached.as_ref().and_then(|entry| entry.etag.clone());
         let key = StorePath::from(format!("names/{volume_name}"));
         let opts = GetOptions {
             if_none_match: cached_etag,
@@ -587,8 +654,14 @@ impl AuthState {
         let get_result = match self.inner.store.get_opts(&key, opts).await {
             Ok(r) => r,
             Err(ObjectStoreError::NotModified { .. }) => {
-                // Cached value still authoritative — return it.
-                let (record, _) = cached.expect("304 implies a cached value existed");
+                let mut entry = cached.expect("304 implies a cached value existed");
+                entry.verified_at = Instant::now();
+                let record = entry.record.clone();
+                self.inner
+                    .name_records
+                    .write()
+                    .await
+                    .insert(volume_name.to_owned(), entry);
                 return Ok(record);
             }
             Err(ObjectStoreError::NotFound { .. }) => return Err(AuthError::NotCurrentClaimer),
@@ -614,11 +687,14 @@ impl AuthState {
             AuthError::Backend(io::Error::other(format!("parse names/{volume_name}: {e}")))
         })?;
 
-        self.inner
-            .name_records
-            .write()
-            .await
-            .insert(volume_name.to_owned(), (record.clone(), new_etag));
+        self.inner.name_records.write().await.insert(
+            volume_name.to_owned(),
+            NameRecordEntry {
+                record: record.clone(),
+                etag: new_etag,
+                verified_at: Instant::now(),
+            },
+        );
 
         Ok(record)
     }
@@ -643,6 +719,19 @@ impl AuthState {
             .await
             .insert(vol_ulid, set.clone());
         Ok(set)
+    }
+}
+
+/// Step-3 predicate: the record names a live claim held by
+/// `coordinator_id`.
+fn claimer_check(record: &NameRecord, coordinator_id: &str) -> Result<(), AuthError> {
+    match record.state {
+        NameState::Live | NameState::Stopped => {}
+        _ => return Err(AuthError::NotCurrentClaimer),
+    }
+    match record.coordinator_id.as_deref() {
+        Some(id) if id == coordinator_id => Ok(()),
+        _ => Err(AuthError::NotCurrentClaimer),
     }
 }
 
@@ -882,7 +971,7 @@ mod tests {
         let coord_id = "coord-a";
         publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
 
-        // Token issued in the distant past — well outside the 60s window.
+        // Token issued in the distant past — well outside the validity period.
         let stale_at = PeerFetchToken::now_unix_seconds() - 3600;
         let token = sign_token("myvol", coord_id, stale_at, &coord_key);
         let bearer = token.encode();
@@ -1223,13 +1312,22 @@ mod tests {
         assert!(matches!(err, AuthError::OutsideLineage));
     }
 
-    /// ETag-conditional names lookup: a verify with no prior cache
-    /// (e.g. a different bearer that misses the resolved-Authorized
-    /// cache) still hits the names record cache via `If-None-Match`.
-    /// Updating the underlying names record changes the ETag, so the
-    /// next request observes the new value.
+    /// Rewind the cached name record's `verified_at` so the next
+    /// lookup treats it as older than `age_secs`.
+    async fn age_name_record(auth: &AuthState, vol_name: &str, age_secs: u64) {
+        let mut guard = auth.inner.name_records.write().await;
+        let entry = guard.get_mut(vol_name).expect("entry exists");
+        entry.verified_at = Instant::now()
+            .checked_sub(Duration::from_secs(age_secs))
+            .expect("test host uptime exceeds the rewind");
+    }
+
+    /// A TTL-fresh name record answers step 3 from memory: a bucket-
+    /// side flip is *not* observed by the still-matching claimer's
+    /// fresh bearer until the TTL expires. This is the accepted
+    /// staleness bound (docs/design/peer-segment-fetch.md).
     #[tokio::test]
-    async fn etag_conditional_picks_up_names_changes_on_cache_miss() {
+    async fn name_record_ttl_serves_stale_within_ttl() {
         let (store, auth) = make_state();
         let coord_key = SigningKey::generate(&mut OsRng);
         let vol_key = SigningKey::generate(&mut OsRng);
@@ -1239,28 +1337,61 @@ mod tests {
         let vol_ulid = Ulid::new();
 
         publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
-        publish_coordinator(store.as_ref(), other_coord, &coord_key).await;
         publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
         publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
 
-        // First verify warms the names ETag cache.
+        // First verify warms the name-record cache.
         let now = PeerFetchToken::now_unix_seconds();
         let token1 = sign_token(vol_name, coord_id, now, &coord_key);
         auth.verify(&token1.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
             .unwrap();
 
-        // Flip names to other_coord. ETag changes → next conditional
-        // GET returns 200 with the new value.
+        // Flip names to other_coord, then verify with a fresh bearer
+        // (different `issued_at` ⇒ misses the resolved-Authorized and
+        // per-bearer caches). The TTL-fresh record still says coord-a,
+        // and it matches the token, so no revalidation runs and the
+        // flip is not observed.
         publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
+        let token2 = sign_token(vol_name, coord_id, now + 1, &coord_key);
+        let result = auth
+            .verify(&token2.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect("TTL-fresh record answers from memory");
+        assert_eq!(result.coordinator_id, coord_id);
+    }
 
-        // Mint a fresh token so the resolved-Authorized cache misses
-        // (different `issued_at` ⇒ different bearer bytes).
+    /// On TTL expiry the ETag-conditional GET revalidates the record,
+    /// so a bucket-side flip is observed and the displaced claimer's
+    /// fresh bearer is rejected.
+    #[tokio::test]
+    async fn ttl_expiry_revalidates_and_observes_flip() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let other_coord = "coord-b";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+
+        let now = PeerFetchToken::now_unix_seconds();
+        let token1 = sign_token(vol_name, coord_id, now, &coord_key);
+        auth.verify(&token1.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .unwrap();
+
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, other_coord).await;
+        age_name_record(&auth, vol_name, FRESHNESS_PAST_SECS + 1).await;
+
         let token2 = sign_token(vol_name, coord_id, now + 1, &coord_key);
         let err = auth
             .verify(&token2.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
-            .expect_err("names flipped");
+            .expect_err("expired entry revalidates; flip observed");
         assert!(matches!(err, AuthError::NotCurrentClaimer));
     }
 
@@ -1279,16 +1410,11 @@ mod tests {
         publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
         publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
 
-        // Token at exactly the boundary: drift == freshness_window.
+        // Token at exactly the boundary: drift == validity period.
         // `check_freshness` accepts `<=`, so this is the last instant
         // the token is fresh.
         let now = PeerFetchToken::now_unix_seconds();
-        let token = sign_token(
-            vol_name,
-            coord_id,
-            now - DEFAULT_FRESHNESS_WINDOW_SECS,
-            &coord_key,
-        );
+        let token = sign_token(vol_name, coord_id, now - FRESHNESS_PAST_SECS, &coord_key);
         let bearer = token.encode();
 
         let result = auth
@@ -1406,7 +1532,7 @@ mod tests {
         let auth = AuthState::with_freshness_window_and_limiter(
             store.clone(),
             store.clone(),
-            DEFAULT_FRESHNESS_WINDOW_SECS,
+            FRESHNESS_PAST_SECS,
             Arc::new(AlwaysReject),
         );
         let coord_key = SigningKey::generate(&mut OsRng);
@@ -1502,11 +1628,14 @@ mod tests {
         assert_eq!(result.coordinator_id, coord_id);
     }
 
-    /// The sub-cache is keyed on bearer; a different bearer
-    /// (different token bytes) does not share the entry, so the
-    /// flipped `names/<volume>` is observed.
+    /// Handoff shape: after `names/<name>` flips to a new claimer,
+    /// the new claimer's first request finds a TTL-fresh record that
+    /// mismatches its token. Within the revalidation cap the stale
+    /// answer stands (rejected); once the cap elapses the mismatch
+    /// forces one conditional GET, the record updates, and the new
+    /// claimer is admitted — long before the record's own TTL.
     #[tokio::test]
-    async fn name_step_cache_separate_per_bearer() {
+    async fn mismatch_forces_revalidation_after_cap() {
         let (store, auth) = make_state();
         let coord_a_key = SigningKey::generate(&mut OsRng);
         let coord_b_key = SigningKey::generate(&mut OsRng);
@@ -1531,9 +1660,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Bucket flips to coord B. Coord B's token has different
-        // bytes → separate sub-cache slot → fresh fetch → step 3
-        // sees the flip.
+        // Bucket flips to coord B. B's first request mismatches the
+        // TTL-fresh cached record; the forced revalidation is capped
+        // (the entry was verified moments ago), so the stale answer
+        // stands and B is rejected.
         publish_live_name(store.as_ref(), vol_name, vol_ulid, "coord-b").await;
         let token_b = sign_token(
             vol_name,
@@ -1541,15 +1671,127 @@ mod tests {
             PeerFetchToken::now_unix_seconds(),
             &coord_b_key,
         );
-        auth.verify(&token_b.encode(), vol_ulid, RouteAuthMode::LineageGated)
+        let err = auth
+            .verify(&token_b.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
-            .unwrap();
+            .expect_err("revalidation still rate-capped");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
 
-        // Coord A's bearer still passes because A's sub-cache entry
-        // hasn't been invalidated — same staleness window the
-        // `verified_tokens` cache already provides for repeats.
-        auth.verify(&token_a.encode(), vol_ulid, RouteAuthMode::LineageGated)
+        // Once the cap elapses, B's mismatch triggers the conditional
+        // GET, the flip is observed, and B is admitted — with the same
+        // bearer (the mismatch was not pinned to it).
+        age_name_record(&auth, vol_name, REVALIDATION_FLOOR_SECS + 1).await;
+        let result = auth
+            .verify(&token_b.encode(), vol_ulid, RouteAuthMode::LineageGated)
             .await
-            .unwrap();
+            .expect("mismatch revalidates once the cap elapses");
+        assert_eq!(result.coordinator_id, "coord-b");
+
+        // The revalidation replaced the record, so coord A's *fresh*
+        // bearer now mismatches it and is rejected. (A's original
+        // bearer may still ride its per-bearer caches — that bound is
+        // the token's residual freshness.)
+        let token_a2 = sign_token(
+            vol_name,
+            "coord-a",
+            PeerFetchToken::now_unix_seconds() + 1,
+            &coord_a_key,
+        );
+        let err = auth
+            .verify(&token_a2.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("record now names coord-b");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+    }
+
+    /// A token whose `issued_at` is in the future beyond the skew
+    /// tolerance is rejected even though the same drift into the past
+    /// would be well inside the validity period.
+    #[tokio::test]
+    async fn rejects_future_token_beyond_skew_tolerance() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+
+        let future_at = PeerFetchToken::now_unix_seconds() + FRESHNESS_FUTURE_SECS + 60;
+        let token = sign_token("myvol", coord_id, future_at, &coord_key);
+        let err = auth
+            .verify(&token.encode(), Ulid::new(), RouteAuthMode::LineageGated)
+            .await
+            .expect_err("future beyond tolerance");
+        assert!(matches!(
+            err,
+            AuthError::BadCredentials(TokenVerifyError::Stale { .. })
+        ));
+    }
+
+    /// A token naming a coordinator with no published pubkey is 401
+    /// (`UnknownCoordinator`), not a 502 backend error. The miss is
+    /// not cached — the pubkey appearing on S3 is observed by the
+    /// very next request.
+    #[tokio::test]
+    async fn unknown_coordinator_is_401_until_pub_appears() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-late";
+        let vol_name = "myvol";
+        let vol_ulid = Ulid::new();
+
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+        // No coordinators/<id>/coordinator.pub published yet.
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let err = auth
+            .verify(&token.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("no pubkey published");
+        assert!(matches!(err, AuthError::UnknownCoordinator));
+        assert_eq!(err.status_code(), 401);
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        auth.verify(&token.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect("pubkey visible on the next request");
+    }
+
+    /// A missing `names/<name>` is a per-request 401; publishing the
+    /// record is observed by the very next request.
+    #[tokio::test]
+    async fn missing_name_rejects_until_it_appears() {
+        let (store, auth) = make_state();
+        let coord_key = SigningKey::generate(&mut OsRng);
+        let vol_key = SigningKey::generate(&mut OsRng);
+        let coord_id = "coord-a";
+        let vol_name = "latevol";
+        let vol_ulid = Ulid::new();
+
+        publish_coordinator(store.as_ref(), coord_id, &coord_key).await;
+        publish_volume(store.as_ref(), vol_ulid, &vol_key, None).await;
+        // No names/<name> published yet.
+
+        let token = sign_token(
+            vol_name,
+            coord_id,
+            PeerFetchToken::now_unix_seconds(),
+            &coord_key,
+        );
+        let err = auth
+            .verify(&token.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect_err("no name record");
+        assert!(matches!(err, AuthError::NotCurrentClaimer));
+
+        publish_live_name(store.as_ref(), vol_name, vol_ulid, coord_id).await;
+        auth.verify(&token.encode(), vol_ulid, RouteAuthMode::LineageGated)
+            .await
+            .expect("name visible on the next request");
     }
 }
