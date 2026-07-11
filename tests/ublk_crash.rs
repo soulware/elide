@@ -360,6 +360,65 @@ fn pattern(seed: u8) -> Vec<u8> {
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[test]
+fn io_flusher_set_on_all_daemon_threads() {
+    if !kernel_ready() {
+        eprintln!("skip: /dev/ublk-control not present");
+        return;
+    }
+
+    const PF_MEMALLOC_NOIO: u64 = 0x0008_0000;
+    const PF_LOCAL_THROTTLE: u64 = 0x0010_0000;
+
+    let dir = scratch_dir("ioflusher");
+    bootstrap_volume(&dir);
+    let mut daemon = spawn_daemon(&dir);
+    let dev_id = wait_for_bound_device(&dir);
+
+    let mut checked = 0;
+    let task_dir = format!("/proc/{}/task", daemon.id());
+    for entry in std::fs::read_dir(&task_dir).expect("read task dir") {
+        let tid_path = entry.expect("task dir entry").path();
+        // Threads can exit between read_dir and these reads; a vanished
+        // tid is not a failure.
+        let Ok(comm) = std::fs::read_to_string(tid_path.join("comm")) else {
+            continue;
+        };
+        let comm = comm.trim().to_owned();
+        // iou-wrk-* are kernel-managed io_uring workers, not threads the
+        // daemon spawned.
+        if comm.starts_with("iou-wrk") {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(tid_path.join("stat")) else {
+            continue;
+        };
+        // comm (field 2) may contain spaces; count fields after the
+        // closing paren. flags is field 9 overall, 7th after the paren.
+        let (_, rest) = stat.rsplit_once(')').expect("stat has comm paren");
+        let flags: u64 = rest
+            .split_whitespace()
+            .nth(6)
+            .expect("stat flags field")
+            .parse()
+            .expect("stat flags parses");
+        assert!(
+            flags & PF_MEMALLOC_NOIO != 0 && flags & PF_LOCAL_THROTTLE != 0,
+            "thread {comm} missing IO_FLUSHER flags: {flags:#x}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "expected several daemon threads, saw {checked}"
+    );
+
+    send_signal(&daemon, libc::SIGTERM);
+    reap_clean(&mut daemon, "SIGTERM (cleanup)");
+    delete_and_wait_sysfs_gone(dev_id);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn sigkill_recovery() {
     if !kernel_ready() {
         eprintln!("skip: /dev/ublk-control not present");

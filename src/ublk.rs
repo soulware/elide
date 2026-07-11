@@ -514,11 +514,40 @@ mod imp {
             .map_err(io::Error::other)
     }
 
+    /// From `include/uapi/linux/prctl.h`; the libc crate exports this
+    /// constant only for Android.
+    const PR_SET_IO_FLUSHER: libc::c_int = 57;
+
+    /// Mark the calling task an IO_FLUSHER (`PF_MEMALLOC_NOIO` +
+    /// `PF_LOCAL_THROTTLE`): its buffered writes are throttled only
+    /// against the backing device they target, never the global dirty
+    /// pool. That pool includes the ublk device's own dirty pages, which
+    /// only this process can drain — a thread of ours parked in
+    /// `balance_dirty_pages` waiting on them deadlocks the device.
+    /// Requires `CAP_SYS_RESOURCE`.
+    fn set_io_flusher() -> io::Result<()> {
+        // SAFETY: PR_SET_IO_FLUSHER only sets flags on the calling task;
+        // no pointers are passed.
+        let rc = unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1u64, 0u64, 0u64, 0u64) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn run_volume_ublk(
         dir: &Path,
         size_bytes: u64,
         fetch_inputs: crate::VolumeFetchInputs,
     ) -> Result<(), super::UblkRunError> {
+        // Set before any thread is spawned: task flags are inherited on
+        // clone, so this covers volume-actor, the queue workers, and
+        // libublk's helpers. Failure is a permanent host condition
+        // (missing CAP_SYS_RESOURCE), same class as the other Config
+        // errors below.
+        set_io_flusher()
+            .map_err(|e| super::UblkRunError::Config(format!("prctl(PR_SET_IO_FLUSHER): {e}")))?;
+
         // Block the shutdown signals on the calling thread BEFORE any
         // other thread is spawned. The block is inherited by every
         // subsequent thread (volume-actor, control-server, ublk queue
