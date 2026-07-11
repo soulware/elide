@@ -384,6 +384,37 @@ impl VolumeActor {
         publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
     }
 
+    /// Apply a worker's repack result, publish the read snapshot, then
+    /// unlink the consumed input files. The publish must come before
+    /// the unlinks: publishing first guarantees no published snapshot
+    /// ever references a deleted input, and readers still holding an
+    /// older snapshot recover via the `NotFound` retry in
+    /// [`VolumeReader::read_with_snapshot`].
+    fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
+        let (stats, consumed_inputs) = self.lock_volume().apply_repack_result(result)?;
+        if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
+            self.publish_snapshot();
+        }
+        self.lock_volume()
+            .remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
+    }
+
+    /// Delta-repack twin of [`Self::apply_repack_and_publish`] — same
+    /// publish-before-unlink ordering.
+    fn apply_delta_repack_and_publish(
+        &mut self,
+        result: DeltaRepackResult,
+    ) -> io::Result<DeltaRepackStats> {
+        let (stats, consumed_inputs) = self.lock_volume().apply_delta_repack_result(result)?;
+        if stats.entries_converted > 0 || !consumed_inputs.is_empty() {
+            self.publish_snapshot();
+        }
+        self.lock_volume()
+            .remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
+    }
+
     /// `Flush` arrives.  The current WAL has already been fsynced
     /// by the caller; here we decide whether the reply can go out
     /// immediately or must wait for an in-flight promote's old-WAL
@@ -860,13 +891,7 @@ impl VolumeActor {
                 Ok(WorkerResult::Repack(result)) => {
                     let reply = self.parked_repack.take();
                     let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_repack_result(r);
-                            if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
+                        Ok(r) => self.apply_repack_and_publish(r),
                         Err(e) => {
                             warn!("worker repack failed during shutdown: {e}");
                             Err(e)
@@ -879,13 +904,7 @@ impl VolumeActor {
                 Ok(WorkerResult::DeltaRepack(result)) => {
                     let reply = self.parked_delta_repack.take();
                     let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_delta_repack_result(r);
-                            if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
+                        Ok(r) => self.apply_delta_repack_and_publish(r),
                         Err(e) => {
                             warn!("worker delta_repack failed during shutdown: {e}");
                             Err(e)
@@ -1228,13 +1247,7 @@ impl VolumeActor {
                         Ok(WorkerResult::Repack(result)) => {
                             let reply = self.parked_repack.take();
                             let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.lock_volume().apply_repack_result(r);
-                                    if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
+                                Ok(r) => self.apply_repack_and_publish(r),
                                 Err(e) => {
                                     warn!("worker repack failed: {e}");
                                     Err(e)
@@ -1247,13 +1260,7 @@ impl VolumeActor {
                         Ok(WorkerResult::DeltaRepack(result)) => {
                             let reply = self.parked_delta_repack.take();
                             let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.lock_volume().apply_delta_repack_result(r);
-                                    if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
+                                Ok(r) => self.apply_delta_repack_and_publish(r),
                                 Err(e) => {
                                     warn!("worker delta_repack failed: {e}");
                                     Err(e)
@@ -1725,7 +1732,41 @@ impl VolumeReader {
         self.read_with_snapshot(&snap, lba, buf)
     }
 
+    /// Read through `snap`, upgrading to the currently-published
+    /// snapshot on `NotFound`.
+    ///
+    /// A `NotFound` here means `snap` references a segment file that a
+    /// repack consumed and unlinked after `snap` was published. The
+    /// actor publishes the post-repack snapshot before unlinking, so
+    /// reloading and retrying resolves the same LBA through the
+    /// repack's output. Bounded: each retry requires `flush_gen` to
+    /// have advanced; if it hasn't, the segment is genuinely missing
+    /// and the error propagates.
     fn read_with_snapshot(&self, snap: &ReadSnapshot, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut result = self.read_with_snapshot_once(snap, lba, buf);
+        let mut seen_gen = snap.flush_gen;
+        for _ in 0..2 {
+            match &result {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let fresh = self.client.snapshot.load();
+                    if fresh.flush_gen == seen_gen {
+                        break;
+                    }
+                    seen_gen = fresh.flush_gen;
+                    result = self.read_with_snapshot_once(&fresh, lba, buf);
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    fn read_with_snapshot_once(
+        &self,
+        snap: &ReadSnapshot,
+        lba: u64,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
         if snap.flush_gen != self.last_flush_gen.get() {
             self.file_cache.borrow_mut().clear();
             self.dmat_cache.borrow_mut().clear();
