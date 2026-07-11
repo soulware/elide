@@ -359,6 +359,19 @@ fn pattern(seed: u8) -> Vec<u8> {
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
+/// SIGKILL + reap the daemon when the test unwinds. A leaked daemon
+/// inherits the test's stdio, which keeps the CI SSH session's stdout
+/// open after the test binary exits — the step then hangs until the
+/// job is cancelled.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn io_flusher_set_on_all_daemon_threads() {
     if !kernel_ready() {
@@ -371,49 +384,60 @@ fn io_flusher_set_on_all_daemon_threads() {
 
     let dir = scratch_dir("ioflusher");
     bootstrap_volume(&dir);
-    let mut daemon = spawn_daemon(&dir);
+    let mut daemon = KillOnDrop(spawn_daemon(&dir));
     let dev_id = wait_for_bound_device(&dir);
 
-    let mut checked = 0;
-    let task_dir = format!("/proc/{}/task", daemon.id());
+    // Collect (tid, comm, flags) for every thread; threads can exit
+    // between read_dir and the reads, so a vanished tid is skipped.
+    let mut threads: Vec<(String, String, u64)> = Vec::new();
+    let task_dir = format!("/proc/{}/task", daemon.0.id());
     for entry in std::fs::read_dir(&task_dir).expect("read task dir") {
         let tid_path = entry.expect("task dir entry").path();
-        // Threads can exit between read_dir and these reads; a vanished
-        // tid is not a failure.
+        let tid = tid_path.file_name().unwrap().to_string_lossy().into_owned();
         let Ok(comm) = std::fs::read_to_string(tid_path.join("comm")) else {
             continue;
         };
-        let comm = comm.trim().to_owned();
-        // iou-wrk-* are kernel-managed io_uring workers, not threads the
-        // daemon spawned.
-        if comm.starts_with("iou-wrk") {
-            continue;
-        }
         let Ok(stat) = std::fs::read_to_string(tid_path.join("stat")) else {
             continue;
         };
         // comm (field 2) may contain spaces; count fields after the
         // closing paren. flags is field 9 overall, 7th after the paren.
-        let (_, rest) = stat.rsplit_once(')').expect("stat has comm paren");
-        let flags: u64 = rest
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let Some(flags) = rest
             .split_whitespace()
             .nth(6)
-            .expect("stat flags field")
-            .parse()
-            .expect("stat flags parses");
-        assert!(
-            flags & PF_MEMALLOC_NOIO != 0 && flags & PF_LOCAL_THROTTLE != 0,
-            "thread {comm} missing IO_FLUSHER flags: {flags:#x}"
-        );
-        checked += 1;
+            .and_then(|f| f.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        threads.push((tid, comm.trim().to_owned(), flags));
     }
+
+    for (tid, comm, flags) in &threads {
+        eprintln!("[test] tid={tid} comm={comm} flags={flags:#x}");
+    }
+
+    // iou-wrk-* are kernel-managed io_uring workers, not threads the
+    // daemon spawned.
+    let missing: Vec<&(String, String, u64)> = threads
+        .iter()
+        .filter(|(_, comm, _)| !comm.starts_with("iou-wrk"))
+        .filter(|(_, _, flags)| flags & PF_MEMALLOC_NOIO == 0 || flags & PF_LOCAL_THROTTLE == 0)
+        .collect();
     assert!(
-        checked >= 3,
-        "expected several daemon threads, saw {checked}"
+        missing.is_empty(),
+        "threads missing IO_FLUSHER flags: {missing:?}"
+    );
+    assert!(
+        threads.len() >= 3,
+        "expected several daemon threads, saw {}",
+        threads.len()
     );
 
-    send_signal(&daemon, libc::SIGTERM);
-    reap_clean(&mut daemon, "SIGTERM (cleanup)");
+    send_signal(&daemon.0, libc::SIGTERM);
+    reap_clean(&mut daemon.0, "SIGTERM (cleanup)");
     delete_and_wait_sysfs_gone(dev_id);
     let _ = std::fs::remove_dir_all(&dir);
 }
