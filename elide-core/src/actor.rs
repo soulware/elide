@@ -384,6 +384,37 @@ impl VolumeActor {
         publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
     }
 
+    /// Apply a worker's repack result, publish the read snapshot, then
+    /// unlink the consumed input files. The publish must come before
+    /// the unlinks: publishing first guarantees no published snapshot
+    /// ever references a deleted input, and readers still holding an
+    /// older snapshot recover via the `NotFound` retry in
+    /// [`VolumeReader::read_with_snapshot`].
+    fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
+        let (stats, consumed_inputs) = self.lock_volume().apply_repack_result(result)?;
+        if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
+            self.publish_snapshot();
+        }
+        self.lock_volume()
+            .remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
+    }
+
+    /// Delta-repack twin of [`Self::apply_repack_and_publish`] — same
+    /// publish-before-unlink ordering.
+    fn apply_delta_repack_and_publish(
+        &mut self,
+        result: DeltaRepackResult,
+    ) -> io::Result<DeltaRepackStats> {
+        let (stats, consumed_inputs) = self.lock_volume().apply_delta_repack_result(result)?;
+        if stats.entries_converted > 0 || !consumed_inputs.is_empty() {
+            self.publish_snapshot();
+        }
+        self.lock_volume()
+            .remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
+    }
+
     /// `Flush` arrives.  The current WAL has already been fsynced
     /// by the caller; here we decide whether the reply can go out
     /// immediately or must wait for an in-flight promote's old-WAL
@@ -860,13 +891,7 @@ impl VolumeActor {
                 Ok(WorkerResult::Repack(result)) => {
                     let reply = self.parked_repack.take();
                     let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_repack_result(r);
-                            if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
+                        Ok(r) => self.apply_repack_and_publish(r),
                         Err(e) => {
                             warn!("worker repack failed during shutdown: {e}");
                             Err(e)
@@ -879,13 +904,7 @@ impl VolumeActor {
                 Ok(WorkerResult::DeltaRepack(result)) => {
                     let reply = self.parked_delta_repack.take();
                     let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_delta_repack_result(r);
-                            if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
+                        Ok(r) => self.apply_delta_repack_and_publish(r),
                         Err(e) => {
                             warn!("worker delta_repack failed during shutdown: {e}");
                             Err(e)
@@ -1228,13 +1247,7 @@ impl VolumeActor {
                         Ok(WorkerResult::Repack(result)) => {
                             let reply = self.parked_repack.take();
                             let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.lock_volume().apply_repack_result(r);
-                                    if matches!(&apply_result, Ok(s) if s.segments_compacted > 0) {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
+                                Ok(r) => self.apply_repack_and_publish(r),
                                 Err(e) => {
                                     warn!("worker repack failed: {e}");
                                     Err(e)
@@ -1247,13 +1260,7 @@ impl VolumeActor {
                         Ok(WorkerResult::DeltaRepack(result)) => {
                             let reply = self.parked_delta_repack.take();
                             let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.lock_volume().apply_delta_repack_result(r);
-                                    if matches!(&apply_result, Ok(s) if s.entries_converted > 0) {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
+                                Ok(r) => self.apply_delta_repack_and_publish(r),
                                 Err(e) => {
                                     warn!("worker delta_repack failed: {e}");
                                     Err(e)
@@ -1722,6 +1729,44 @@ impl VolumeReader {
         // the generation and the extent index offsets are always consistent —
         // a single ArcSwap::load() gives both atomically with no window.
         let snap = self.client.snapshot.load();
+        self.read_with_snapshot(&snap, lba, buf)
+    }
+
+    /// Read through `snap`, upgrading to the currently-published
+    /// snapshot on `NotFound`.
+    ///
+    /// A `NotFound` here means `snap` references a segment file that a
+    /// repack consumed and unlinked after `snap` was published. The
+    /// actor publishes the post-repack snapshot before unlinking, so
+    /// reloading and retrying resolves the same LBA through the
+    /// repack's output. Bounded: each retry requires `flush_gen` to
+    /// have advanced; if it hasn't, the segment is genuinely missing
+    /// and the error propagates.
+    fn read_with_snapshot(&self, snap: &ReadSnapshot, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut result = self.read_with_snapshot_once(snap, lba, buf);
+        let mut seen_gen = snap.flush_gen;
+        for _ in 0..2 {
+            match &result {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let fresh = self.client.snapshot.load();
+                    if fresh.flush_gen == seen_gen {
+                        break;
+                    }
+                    seen_gen = fresh.flush_gen;
+                    result = self.read_with_snapshot_once(&fresh, lba, buf);
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    fn read_with_snapshot_once(
+        &self,
+        snap: &ReadSnapshot,
+        lba: u64,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
         if snap.flush_gen != self.last_flush_gen.get() {
             self.file_cache.borrow_mut().clear();
             self.dmat_cache.borrow_mut().clear();
@@ -3463,4 +3508,83 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         segment_written: true,
         pending_dir: job.pending_dir,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::Volume;
+
+    fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("elide-actor-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        crate::signing::generate_keypair(
+            &p,
+            crate::signing::VOLUME_KEY_FILE,
+            crate::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        p
+    }
+
+    /// Distinct, incompressible 4 KiB block per seed (splitmix64 stream)
+    /// so entries land as body extents — compressible data goes inline in
+    /// the extent index and reads of it never resolve a segment file.
+    fn unique_block(seed: u32) -> Vec<u8> {
+        let mut x = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut out = Vec::with_capacity(4096);
+        for _ in 0..512 {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out
+    }
+
+    /// A reader whose snapshot predates a repack must still resolve reads
+    /// after the repack unlinks its input segments — the data is live, only
+    /// its location changed. Reproduces the 2026-07-11 field EIO ("segment
+    /// not found" during the repack swap window).
+    #[test]
+    fn stale_snapshot_read_survives_repack() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        std::thread::Builder::new()
+            .name("volume-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+
+        let block_a = unique_block(1);
+        client.write(0, &block_a).unwrap();
+        client.write(1, &unique_block(2)).unwrap();
+        client.write(2, &unique_block(3)).unwrap();
+        client.promote_wal().unwrap();
+
+        // Overwrite one LBA in a second segment so the first has dead
+        // bytes and is a repack candidate.
+        client.write(1, &unique_block(4)).unwrap();
+        client.promote_wal().unwrap();
+
+        // A reader's view captured before the repack.
+        let stale = client.snapshot.load_full();
+
+        let stats = client.repack().unwrap();
+        assert!(
+            stats.segments_compacted > 0,
+            "setup: repack consumed no segments, race not exercised"
+        );
+
+        let reader = client.reader();
+        let mut buf = vec![0u8; 4096];
+        reader
+            .read_with_snapshot(&stale, 0, &mut buf)
+            .expect("read of live data through a pre-repack snapshot");
+        assert_eq!(buf, block_a, "read must return the live block contents");
+    }
 }

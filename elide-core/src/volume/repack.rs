@@ -89,7 +89,8 @@ pub struct RepackJob {
 /// as `owned_hashes - carried_hashes(output)` and CAS-removes against
 /// the per-input gate (`current loc.segment_id == input_ulid`), then
 /// (b) inserts the carried entries under the same gate against the
-/// new output ULID, and (c) unlinks each input file.
+/// new output ULID, and (c) returns each input file path for the
+/// caller to unlink once its read snapshot is published.
 pub struct RepackedBucket {
     pub inputs: Vec<RepackedInput>,
     pub output: Option<RepackedOutput>,
@@ -190,7 +191,9 @@ impl Volume {
             return Ok(CompactionStats::default());
         };
         let result = crate::actor::execute_repack(job)?;
-        self.apply_repack_result(result)
+        let (stats, consumed_inputs) = self.apply_repack_result(result)?;
+        self.remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
     }
 
     /// Prep phase of `repack` — runs on the actor thread.
@@ -254,8 +257,9 @@ impl Volume {
     ///     win.
     ///   - If a fresh output was written: insert carried entries into
     ///     the extent index under the same per-input CAS gate, and
-    ///     unlink `pending/<input_ulid>`. The worker has already
-    ///     written `pending/<new_ulid>` separately.
+    ///     collect `pending/<input_ulid>` into the returned unlink
+    ///     list. The worker has already written `pending/<new_ulid>`
+    ///     separately.
     ///   - If every entry was dead: the worker already deleted the
     ///     input file; nothing more to unlink.
     ///   - Evict the file-cache fd for the input ULID either way.
@@ -265,10 +269,20 @@ impl Volume {
     /// from `Run` records get installed as they appear in the output;
     /// concurrent live writes have higher claimant ULIDs and are
     /// preserved on overlapping LBAs.
-    pub fn apply_repack_result(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
+    ///
+    /// The consumed input files are returned, not deleted: the caller
+    /// must publish its read snapshot first and then pass them to
+    /// [`Self::remove_consumed_inputs`] — deleting before publishing
+    /// would leave the currently-published snapshot pointing at
+    /// unlinked files, failing concurrent reads with `NotFound`.
+    pub fn apply_repack_result(
+        &mut self,
+        result: RepackResult,
+    ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
         let RepackResult { mut stats, buckets } = result;
 
         let pending_dir = self.base_dir.join("pending");
+        let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
         for bucket in &buckets {
             let carried_hashes: std::collections::HashSet<blake3::Hash> = bucket
@@ -366,18 +380,15 @@ impl Volume {
                 }
             }
 
-            // Per-input bookkeeping: evict cache fd; unlink the input
-            // file if the worker wrote a fresh output (when output is
-            // None the worker already deleted the input).
+            // Per-input bookkeeping: evict cache fd; queue the input
+            // file for unlinking if the worker wrote a fresh output
+            // (when output is None the worker already deleted the
+            // input).
             for input in &bucket.inputs {
                 self.evict_cached_segment(input.input_ulid);
 
                 if bucket.output.is_some() {
-                    match fs::remove_file(&input.input_path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
+                    consumed_inputs.push(input.input_path.clone());
                 }
             }
 
@@ -404,9 +415,37 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
-        self.assert_volume_invariants("apply_repack_result");
 
-        Ok(stats)
+        Ok((stats, consumed_inputs))
+    }
+
+    /// Unlink input segment files consumed by a repack or delta-repack
+    /// apply, then fsync `pending/`. Called after the read snapshot
+    /// reflecting the apply has been published, so no published
+    /// snapshot ever references an unlinked file.
+    ///
+    /// Already-missing files are fine — a previous partial unlink may
+    /// have removed some of the batch.
+    ///
+    /// This is the end of the repack transaction, so the volume
+    /// invariants are asserted here rather than in the apply phase:
+    /// between apply and this unlink the consumed inputs are still on
+    /// disk, and a disk rebuild ranks a still-present `u_flush` input
+    /// above the pre-minted output ULIDs — content-equal but not
+    /// claimant-equal to the in-memory maps.
+    pub fn remove_consumed_inputs(&mut self, paths: &[PathBuf]) -> io::Result<()> {
+        for path in paths {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !paths.is_empty() {
+            segment::fsync_dir(&self.base_dir.join("pending"))?;
+        }
+        self.assert_volume_invariants("remove_consumed_inputs");
+        Ok(())
     }
 
     /// Phase 5 Tier 1: rewrite post-snapshot pending segments with
@@ -437,7 +476,9 @@ impl Volume {
             return Ok(DeltaRepackStats::default());
         };
         let result = crate::actor::execute_delta_repack(job)?;
-        self.apply_delta_repack_result(result)
+        let (stats, consumed_inputs) = self.apply_delta_repack_result(result)?;
+        self.remove_consumed_inputs(&consumed_inputs)?;
+        Ok(stats)
     }
 
     /// Prep phase of `delta_repack_post_snapshot` — runs on the actor
@@ -497,17 +538,20 @@ impl Volume {
     /// rewritten body simply becomes unreferenced until the next pass.
     /// Updates each lbamap entry's claimant ULID in place to the new
     /// output ULID (the rewrite preserves start_lba/lba_length/hash;
-    /// only storage representation changes), evicts the input's fd
-    /// cache, and unlinks the input pending file.
+    /// only storage representation changes) and evicts the input's fd
+    /// cache. The consumed input files are returned for the caller to
+    /// pass to [`Self::remove_consumed_inputs`] after publishing its
+    /// read snapshot.
     pub fn apply_delta_repack_result(
         &mut self,
         result: DeltaRepackResult,
-    ) -> io::Result<DeltaRepackStats> {
+    ) -> io::Result<(DeltaRepackStats, Vec<PathBuf>)> {
         let DeltaRepackResult {
             mut stats,
             segments,
         } = result;
         let pending_dir = self.base_dir.join("pending");
+        let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
         for seg in segments {
             let DeltaRepackedSegment {
@@ -638,11 +682,7 @@ impl Volume {
             }
 
             self.evict_cached_segment(input_ulid);
-            match fs::remove_file(&input_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            consumed_inputs.push(input_path);
             if self.last_segment_ulid < Some(new_ulid) {
                 self.last_segment_ulid = Some(new_ulid);
             }
@@ -663,9 +703,8 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
-        self.assert_volume_invariants("apply_delta_repack_result");
 
-        Ok(stats)
+        Ok((stats, consumed_inputs))
     }
 }
 
@@ -728,6 +767,49 @@ mod tests {
 
         // Data still reads back correctly after compaction.
         assert_eq!(vol.read(0, 1).unwrap(), replacement);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn apply_defers_input_unlink_to_remove_consumed_inputs() {
+        // The apply phase must leave consumed input files on disk and
+        // return their paths — the actor publishes its read snapshot
+        // between apply and unlink, and an unlink inside apply would
+        // fail reads served from the still-published pre-apply
+        // snapshot.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &vec![0x11u8; 4096]).unwrap();
+        vol.write(1, &vec![0x33u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &vec![0x22u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let result = crate::actor::execute_repack(job).unwrap();
+        let (stats, consumed) = vol.apply_repack_result(result).unwrap();
+
+        assert!(stats.segments_compacted > 0);
+        assert!(!consumed.is_empty(), "rewritten inputs must be returned");
+        for path in &consumed {
+            assert!(
+                path.exists(),
+                "consumed input {} must survive apply",
+                path.display()
+            );
+        }
+        // The live maps already resolve through the repack output.
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x33u8; 4096]);
+
+        vol.remove_consumed_inputs(&consumed).unwrap();
+        for path in &consumed {
+            assert!(!path.exists(), "{} must be unlinked", path.display());
+        }
+        assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
+        assert_eq!(vol.read(1, 1).unwrap(), vec![0x33u8; 4096]);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1194,7 +1276,8 @@ mod tests {
         vol.write(100, &payload_b).unwrap();
 
         let result = crate::actor::execute_repack(job).unwrap();
-        vol.apply_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         assert_eq!(
             vol.read(100, 1).unwrap(),
@@ -1243,7 +1326,8 @@ mod tests {
         vol.write(102, &kernel_blocks[2]).unwrap();
 
         let result = crate::actor::execute_repack(job).unwrap();
-        vol.apply_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         for (i, block) in kernel_blocks.iter().enumerate() {
             assert_eq!(
@@ -1328,7 +1412,8 @@ mod tests {
         assert_eq!(vol.read(102, 1).unwrap(), block_a2, "pre-apply lba 102");
 
         let result = crate::actor::execute_repack(job).unwrap();
-        vol.apply_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         // After apply, the bucket output O carries the same 3-block H_A
         // body.  Reads must still resolve to the correct block of H_A on
@@ -1391,7 +1476,8 @@ mod tests {
         vol.flush_wal().unwrap();
 
         let result = crate::actor::execute_repack(job).unwrap();
-        vol.apply_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         for (i, block) in kernel_blocks.iter().enumerate() {
             assert_eq!(
@@ -1441,7 +1527,8 @@ mod tests {
             vol.write(100 + i as u64, block).unwrap();
         }
         let result = crate::actor::execute_repack(job).unwrap();
-        vol.apply_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         // Second repack pass — now operating on the bucket output + the
         // segment(s) carrying the kernel writes.
@@ -1525,7 +1612,8 @@ mod tests {
             .collect();
 
         let result = crate::actor::execute_delta_repack(job).unwrap();
-        vol.apply_delta_repack_result(result).unwrap();
+        let (_stats, consumed) = vol.apply_delta_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
 
         // The post-prep flushed segment must still be in pending/.
         // (It is the highest-ULID entry in `pending/` post-flush.)

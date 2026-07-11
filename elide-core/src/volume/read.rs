@@ -958,5 +958,8 @@ pub(crate) fn find_segment_in_dirs(
         )?;
         return Ok(body_dir.join(format!("{sid}.body")));
     }
-    Err(io::Error::other(format!("segment not found: {sid}")))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("segment not found: {sid}"),
+    ))
 }
