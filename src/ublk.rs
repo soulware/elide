@@ -541,10 +541,10 @@ mod imp {
         fetch_inputs: crate::VolumeFetchInputs,
     ) -> Result<(), super::UblkRunError> {
         // Set before any thread is spawned: task flags are inherited on
-        // clone, so this covers volume-actor, the queue workers, and
-        // libublk's helpers. Failure is a permanent host condition
-        // (missing CAP_SYS_RESOURCE), same class as the other Config
-        // errors below.
+        // clone, so every later thread starts flagged (libublk's queue
+        // threads clear it and are re-asserted in q_handler). Failure is
+        // a permanent host condition (missing CAP_SYS_RESOURCE), same
+        // class as the other Config errors below.
         set_io_flusher()
             .map_err(|e| super::UblkRunError::Config(format!("prctl(PR_SET_IO_FLUSHER): {e}")))?;
 
@@ -788,6 +788,14 @@ mod imp {
         let q_handler = {
             let client = client.clone();
             move |qid, dev: &UblkDev| {
+                // libublk 0.4.5's init_queue_thread runs on this thread
+                // before us and calls prctl(PR_SET_IO_FLUSHER, 0) — arg 0
+                // CLEARS the inherited flags (upstream intended 1).
+                // Re-assert so this queue thread, and the workers it
+                // spawns, keep the storage-stack exemption. Cannot fail:
+                // the same prctl already succeeded at process startup and
+                // CAP_SYS_RESOURCE is never dropped.
+                set_io_flusher().expect("PR_SET_IO_FLUSHER re-assert on queue thread");
                 q_fn(qid, dev, client.clone());
             }
         };
