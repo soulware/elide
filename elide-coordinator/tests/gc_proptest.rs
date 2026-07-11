@@ -90,6 +90,30 @@ fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     }
 }
 
+/// Run one delta-repack pass with the `pick`-th sealed cache body
+/// hidden, restoring it afterwards. Falls back to a plain pass when
+/// there is nothing to hide.
+fn delta_repack_with_evicted_source(vol: &mut Volume, dir: &Path, pick: u8) {
+    let cache_dir = dir.join("cache");
+    let mut bodies: Vec<std::path::PathBuf> = fs::read_dir(&cache_dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "body"))
+                .collect()
+        })
+        .unwrap_or_default();
+    bodies.sort();
+    let target = bodies
+        .get(pick as usize % bodies.len().max(1))
+        .cloned()
+        .filter(|t| fs::rename(t, dir.join("evicted-source.aside")).is_ok());
+    let _ = vol.delta_repack_post_snapshot();
+    if let Some(t) = target {
+        fs::rename(dir.join("evicted-source.aside"), t).unwrap();
+    }
+}
+
 /// One block of incompressible, hash-derived bytes per seed. Mirrors
 /// `common::incompressible_block` in the elide-core test suite. Stored
 /// raw (lz4 can't shrink it), so the write lands as a body-section
@@ -154,6 +178,29 @@ enum SimOp {
     /// Data overwrites as Delta entries against the sealed snapshot.
     /// Content-neutral; no oracle change.
     DeltaRepack,
+    /// `DeltaRepack` with one sealed cache body hidden for the duration
+    /// of the pass (restored afterwards — content-neutral). The worker
+    /// treats an unreadable source as "skip, delta is best-effort", so
+    /// which entries convert varies between passes. This is the
+    /// reachability precondition for a later pass rewriting a segment
+    /// that already carries a Delta entry — the carried-Delta apply
+    /// arms are unreachable when every pass converts everything.
+    DeltaRepackEvictedSource { pick: u8 },
+    /// Two incompressible bases sealed in separate segments (flush
+    /// between them), then near-duplicate overwrites of both in one WAL
+    /// window. The next flush yields one pending segment holding two
+    /// convertible Data entries whose dictionary sources live in
+    /// different sealed segments — so a `DeltaRepackEvictedSource` pass
+    /// converts one and carries the other, and a follow-up pass
+    /// rewrites a segment that already holds a Delta entry. Packaged as
+    /// one op (like `SplitDedupWrite`) because the shape is a
+    /// conjunction random primitives rarely assemble.
+    SealedBaseVariantPair {
+        lba_a: u8,
+        lba_b: u8,
+        base_seed: u8,
+        tweak: u8,
+    },
     /// Write [seed; 4096] to lba_a then lba_b (disjoint ranges 0..4 / 4..8).
     /// Because the data is identical, lba_b's WAL entry is a DEDUP_REF.
     DedupWrite { lba_a: u8, lba_b: u8, seed: u8 },
@@ -246,6 +293,10 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             .prop_map(|(lba, base_seed, tweak)| SimOp::VariantWrite { lba, base_seed, tweak }),
         2 => Just(SimOp::SnapshotSign),
         2 => Just(SimOp::DeltaRepack),
+        2 => any::<u8>().prop_map(|pick| SimOp::DeltaRepackEvictedSource { pick }),
+        2 => (0u8..4, 4u8..8, 0u8..4, any::<u8>()).prop_map(|(lba_a, lba_b, base_seed, tweak)| {
+            SimOp::SealedBaseVariantPair { lba_a, lba_b, base_seed, tweak }
+        }),
         2 => (0u8..4, 4u8..8, any::<u8>()).prop_map(|(lba_a, lba_b, seed)| SimOp::DedupWrite {
             lba_a,
             lba_b,
@@ -441,6 +492,28 @@ proptest! {
                 }
                 SimOp::DeltaRepack => {
                     let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::DeltaRepackEvictedSource { pick } => {
+                    delta_repack_with_evicted_source(&mut vol, fork_dir, *pick);
+                }
+                SimOp::SealedBaseVariantPair {
+                    lba_a,
+                    lba_b,
+                    base_seed,
+                    tweak,
+                } => {
+                    let (sa, sb) = (*base_seed, *base_seed ^ 1);
+                    let _ = vol.write(*lba_a as u64, &incompressible_block(sa));
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(*lba_b as u64, &incompressible_block(sb));
+                    if let Ok(snap) = vol.snapshot() {
+                        let _ = vol.sign_snapshot_manifest(snap);
+                    }
+                    frozen = fs::read_dir(&index_dir)
+                        .map(|d| d.flatten().count())
+                        .unwrap_or(0);
+                    let _ = vol.write(*lba_a as u64, &variant_block(sa, *tweak));
+                    let _ = vol.write(*lba_b as u64, &variant_block(sb, *tweak));
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -679,6 +752,31 @@ proptest! {
                     // Content-neutral: Data entries become thin Delta
                     // entries materialising to identical bytes.
                     let _ = vol.delta_repack_post_snapshot();
+                }
+                SimOp::DeltaRepackEvictedSource { pick } => {
+                    // Content-neutral: the hidden body is restored
+                    // before the op returns.
+                    delta_repack_with_evicted_source(&mut vol, fork_dir, *pick);
+                }
+                SimOp::SealedBaseVariantPair {
+                    lba_a,
+                    lba_b,
+                    base_seed,
+                    tweak,
+                } => {
+                    let (sa, sb) = (*base_seed, *base_seed ^ 1);
+                    let _ = vol.write(*lba_a as u64, &incompressible_block(sa));
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(*lba_b as u64, &incompressible_block(sb));
+                    if let Ok(snap) = vol.snapshot() {
+                        let _ = vol.sign_snapshot_manifest(snap);
+                    }
+                    let va = variant_block(sa, *tweak);
+                    let vb = variant_block(sb, *tweak);
+                    let _ = vol.write(*lba_a as u64, &va);
+                    let _ = vol.write(*lba_b as u64, &vb);
+                    oracle.insert(*lba_a as u64, va);
+                    oracle.insert(*lba_b as u64, vb);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];

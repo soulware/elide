@@ -900,12 +900,15 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 /// whether `self.extent_index[hash].segment_id` matches what the
 /// rebuild walk would assign).
 ///
-/// Returns two maps mirroring the structure of [`ExtentIndex`]:
+/// Returns three views mirroring the structure of [`ExtentIndex`]:
 /// - `inner_owners`: hash → owning segment ULID for body-owning entries
 ///   (DATA, Inline, Canonical*).
 /// - `delta_owners`: hash → owning segment ULID for thin Delta entries
 ///   that didn't already get a body owner from an earlier-walked segment
-///   (matches `insert_delta_if_absent`'s skip-if-DATA-exists rule).
+///   (matches the delta-registration skip-if-DATA-exists rule).
+/// - `live_segments`: every segment ULID the walk visited (segment
+///   files + open WAL files) — the set an in-memory location may
+///   legitimately point at.
 ///
 /// Walk order matches [`rebuild`]: committed (gc ∪ index) sorted by
 /// ULID, then pending sorted by ULID, with `insert_if_absent` semantics
@@ -916,9 +919,14 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 #[cfg(feature = "volume-invariants")]
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
-) -> io::Result<(HashMap<blake3::Hash, Ulid>, HashMap<blake3::Hash, Ulid>)> {
+) -> io::Result<(
+    HashMap<blake3::Hash, Ulid>,
+    HashMap<blake3::Hash, Ulid>,
+    std::collections::HashSet<Ulid>,
+)> {
     let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
     let mut delta_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+    let mut live_segments: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
 
     for (fork_dir, branch_ulid) in forks {
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
@@ -928,6 +936,7 @@ pub fn rebuild_owners_unverified(
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
+            live_segments.insert(sref.ulid);
             let (_bss, entries, _inputs) = parsed;
             for entry in entries {
                 match entry.kind {
@@ -938,7 +947,7 @@ pub fn rebuild_owners_unverified(
                         inner_owners.entry(entry.hash).or_insert(sref.ulid);
                     }
                     EntryKind::Delta => {
-                        // Mirror `insert_delta_if_absent`: skip if a DATA
+                        // Mirror the registration rule: skip if a DATA
                         // entry already claims this hash.
                         if !inner_owners.contains_key(&entry.hash) {
                             delta_owners.entry(entry.hash).or_insert(sref.ulid);
@@ -969,6 +978,7 @@ pub fn rebuild_owners_unverified(
                 let Ok(wal_ulid) = Ulid::from_string(name) else {
                     continue;
                 };
+                live_segments.insert(wal_ulid);
                 let Ok((records, _complete)) = crate::writelog::scan_readonly(&path) else {
                     continue;
                 };
@@ -981,7 +991,7 @@ pub fn rebuild_owners_unverified(
         }
     }
 
-    Ok((inner_owners, delta_owners))
+    Ok((inner_owners, delta_owners, live_segments))
 }
 
 // --- tests ---

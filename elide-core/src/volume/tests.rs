@@ -2296,6 +2296,10 @@ fn write_multi_input_plan(vol: &mut Volume, fork_dir: &Path, inputs: &[Ulid]) ->
 }
 
 #[test]
+#[cfg_attr(
+    feature = "volume-invariants",
+    ignore = "deliberately diverges the daemon's read state from disk — the per-op rebuild checkers flag exactly that"
+)]
 fn gc_plan_with_unknown_input_diverges_and_reopen_recovers() {
     // Re-enacts the 2026-07-02 incident shape: a committed segment lands
     // in index/ + cache/ behind a running daemon's back (there: force-claim
@@ -3189,4 +3193,27 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
         "unexpected error: {err}"
     );
     fs::remove_dir_all(tmp).unwrap();
+}
+
+/// The drift checker's stale-location branch: a hash validly owned on
+/// disk whose in-memory location names a segment no disk walk can see
+/// (the carried-Delta dangle shape) must trip the invariant — the
+/// ownership check alone passes.
+#[cfg(feature = "volume-invariants")]
+#[test]
+#[should_panic(expected = "stale inner: points at deleted segment")]
+fn invariant_catches_stale_location_at_deleted_segment() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(0, &vec![0x42u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    let (hash, mut stale) = {
+        let (h, l) = vol.extent_index.iter().next().expect("flushed entry");
+        (*h, l.clone())
+    };
+    stale.segment_id = ulid::Ulid::from_parts(u64::MAX, u128::MAX);
+    Arc::make_mut(&mut vol.extent_index).insert(hash, stale);
+
+    vol.assert_volume_invariants("stale_location_test");
 }
