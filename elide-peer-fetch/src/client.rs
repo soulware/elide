@@ -25,10 +25,10 @@
 //!   pool reuse across requests to the same peer endpoint within a
 //!   prefetch session.
 //! - Tokens are minted lazily and cached per `volume_name` for
-//!   `DEFAULT_FRESHNESS_WINDOW_SECS / 2` (= 30 s) before refresh,
-//!   so the peer's resolved-Authorized cache stays warm and the
-//!   coordinator is comfortably inside the freshness window when
-//!   the peer verifies.
+//!   `FRESHNESS_PAST_SECS / 2` (= 7.5 min) before refresh, so the
+//!   peer's resolved-Authorized cache stays warm and the coordinator
+//!   is comfortably inside the validity period when the peer
+//!   verifies.
 //!
 //! The signing surface is abstracted via [`TokenSigner`] so this
 //! crate doesn't need to depend on `elide-coordinator`. The
@@ -48,7 +48,7 @@ use ulid::Ulid;
 
 use crate::endpoint::PeerEndpoint;
 use crate::hint::PrefetchHint;
-use crate::token::{DEFAULT_FRESHNESS_WINDOW_SECS, PeerFetchToken};
+use crate::token::{FRESHNESS_PAST_SECS, PeerFetchToken};
 
 /// Trait implemented by anything that can sign peer-fetch tokens
 /// with the coordinator's Ed25519 key.
@@ -100,7 +100,7 @@ impl Debug for PeerFetchClient {
 
 impl PeerFetchClient {
     /// Build a client with the default request timeout (5 s) and the
-    /// default token refresh interval (half the freshness window).
+    /// default token refresh interval (half the validity period).
     pub fn new(signer: Arc<dyn TokenSigner>) -> Result<Self, BuildError> {
         Self::builder(signer).build()
     }
@@ -110,7 +110,7 @@ impl PeerFetchClient {
         PeerFetchClientBuilder {
             signer,
             request_timeout: Duration::from_secs(5),
-            token_refresh_after: Duration::from_secs(DEFAULT_FRESHNESS_WINDOW_SECS / 2),
+            token_refresh_after: Duration::from_secs(FRESHNESS_PAST_SECS / 2),
         }
     }
 
@@ -285,9 +285,9 @@ impl PeerFetchClientBuilder {
     }
 
     /// How long to reuse a minted token before refreshing it.
-    /// Should be comfortably less than `DEFAULT_FRESHNESS_WINDOW_SECS`
-    /// so requests carrying the cached token are still fresh when they
-    /// arrive at the peer. Default is half the freshness window.
+    /// Should be comfortably less than `FRESHNESS_PAST_SECS` so
+    /// requests carrying the cached token are still fresh when they
+    /// arrive at the peer. Default is half the validity period.
     pub fn token_refresh_after(mut self, d: Duration) -> Self {
         self.token_refresh_after = d;
         self

@@ -381,7 +381,7 @@ impl elide_peer_fetch::ClaimerTokenProvider for LazyClaimerToken {
         let client = coordinator_client::Client::new(&self.socket);
         match client.peer_claimer_token(&self.macaroon) {
             Ok(reply) => {
-                let window = elide_peer_fetch::DEFAULT_FRESHNESS_WINDOW_SECS;
+                let window = elide_peer_fetch::FRESHNESS_PAST_SECS;
                 let token = reply.token.clone();
                 *guard = Some(CachedClaimer {
                     token: reply.token,
