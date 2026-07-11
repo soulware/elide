@@ -1018,6 +1018,56 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
     assert_eq!(&vol.read(5, 1).unwrap(), &last);
 }
 
+/// Deterministic materialisation of the lbamap claimant drift two gc
+/// proptests found 2026-07-10 (seeds fdc9b246… and d0e328fc… in
+/// gc_proptest.proptest-regressions): delta-repack converts the
+/// prep-time WAL-flush segment itself, whose pre-minted output ULID
+/// sorts below it, so the apply's strict-newer claimant promotion
+/// refused the re-point and left the in-memory claim naming the
+/// deleted input. The sealing snapshot's promote then tripped the
+/// volume-invariants lbamap rebuild comparison.
+#[test]
+fn gc_oracle_repro_delta_repack_claimant_drift() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    write_keypair_and_provenance(fork_dir);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // BaseWrite { lba: 1, base_seed: 0 }
+    vol.write(1, &incompressible_block(0)).unwrap();
+
+    // SnapshotSign
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // SplitDedupWrite { lba_a: 0, lba_b: 4, seed: 0 }
+    let data = [0u8; 4096];
+    vol.write(0, &data).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(4, &data).unwrap();
+    vol.flush_wal().unwrap();
+
+    // VariantWrite { lba: 1, base_seed: 0, tweak: 0 } — stays in the
+    // WAL so the DeltaRepack prep's own flush segment carries it.
+    let v = variant_block(0, 0);
+    vol.write(1, &v).unwrap();
+
+    // DeltaRepack — rewrites the prep-flush segment under a pre-minted
+    // (lower) output ULID; the lba 1 claim must move with it.
+    let _ = vol.delta_repack_post_snapshot();
+
+    // SnapshotSign — the seal's promote runs the volume-invariants
+    // rebuild comparison.
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    assert_eq!(&vol.read(1, 1).unwrap(), &v);
+    assert_eq!(&vol.read(0, 1).unwrap(), &data);
+    assert_eq!(&vol.read(4, 1).unwrap(), &data);
+}
+
 /// A delta-repack rewrite that carries an existing Delta entry must
 /// re-point the in-memory delta location at its output — the apply
 /// unlinks the input segment. `apply_delta_repack_result`'s

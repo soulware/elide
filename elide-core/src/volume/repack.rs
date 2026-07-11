@@ -133,11 +133,9 @@ pub struct RepackResult {
 /// ULID was minted after prep (e.g. by a `prepare_promote` racing under
 /// the dropped lock). The worker skips such segments — without this,
 /// rewriting a post-prep segment under one of the lower pre-minted
-/// output ULIDs would let `apply_delta_repack_result` delete the input
-/// file while leaving the lbamap claimant pointing at the deleted ULID
-/// (the strict-newer `set_claimant_if_matches` guard refuses to
-/// downgrade), drifting the in-memory state out of agreement with the
-/// on-disk projection. Mirrors the `ceiling` filter on `RepackJob`.
+/// output ULIDs would re-key its claims below claims minted between
+/// prep and the racing segment, which win on the last-writer-wins
+/// rebuild. Mirrors the `ceiling` filter on `RepackJob`.
 pub struct DeltaRepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
@@ -592,11 +590,12 @@ impl Volume {
                                 inline_data: None,
                             },
                         );
-                        lm.set_claimant_if_matches(
+                        lm.set_claimant_consuming_input(
                             post.start_lba,
                             post.lba_length,
                             post.hash,
                             new_ulid,
+                            input_ulid,
                         );
                     }
                     (EntryKind::Inline, EntryKind::Inline) => {
@@ -614,11 +613,12 @@ impl Volume {
                                 inline_data: post.data.clone().map(Vec::into_boxed_slice),
                             },
                         );
-                        lm.set_claimant_if_matches(
+                        lm.set_claimant_consuming_input(
                             post.start_lba,
                             post.lba_length,
                             post.hash,
                             new_ulid,
+                            input_ulid,
                         );
                     }
                     (EntryKind::Data, EntryKind::Delta) => {
@@ -638,11 +638,12 @@ impl Volume {
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
                         lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
-                        lm.set_claimant_if_matches(
+                        lm.set_claimant_consuming_input(
                             post.start_lba,
                             post.lba_length,
                             post.hash,
                             new_ulid,
+                            input_ulid,
                         );
                     }
                     (EntryKind::Delta, EntryKind::Delta) => {
@@ -671,11 +672,12 @@ impl Volume {
                         let sources: Arc<[blake3::Hash]> =
                             post.delta_options.iter().map(|o| o.source_hash).collect();
                         lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
-                        lm.set_claimant_if_matches(
+                        lm.set_claimant_consuming_input(
                             post.start_lba,
                             post.lba_length,
                             post.hash,
                             new_ulid,
+                            input_ulid,
                         );
                     }
                     (EntryKind::DedupRef, EntryKind::DedupRef)
@@ -683,11 +685,12 @@ impl Volume {
                         // No body / extent_index update; LBA range and
                         // hash unchanged. Bring the lbamap claimant
                         // into agreement with the new on-disk segment.
-                        lm.set_claimant_if_matches(
+                        lm.set_claimant_consuming_input(
                             post.start_lba,
                             post.lba_length,
                             post.hash,
                             new_ulid,
+                            input_ulid,
                         );
                     }
                     _ => {}
