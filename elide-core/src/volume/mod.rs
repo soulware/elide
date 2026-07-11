@@ -1561,7 +1561,9 @@ impl Volume {
     /// Stress-only invariant: every hash in `self.extent_index` must
     /// point at a segment that exists somewhere on disk (in-memory may
     /// disagree with the rebuild on *which* specific segment owns the
-    /// hash — see below — but at least one valid owner must exist).
+    /// hash — see below — but at least one valid owner must exist),
+    /// and every in-memory location's `segment_id` must name a segment
+    /// the disk walk can still see.
     ///
     /// Catches the bug class "phantom or stale entry in extent_index":
     /// - **Phantom**: an entry whose hash isn't owned by any on-disk
@@ -1569,7 +1571,11 @@ impl Volume {
     ///   extent_index by mistake). Reads through this hash fail.
     /// - **Stale**: an entry pointing at a deleted segment (the segment
     ///   file was unlinked but extent_index wasn't updated). Reads fail
-    ///   on file-not-found.
+    ///   on file-not-found. Checked per-location against the walk's
+    ///   live-segment set — ownership alone can't see it when a live
+    ///   segment also owns the hash on disk (the carried-Delta dangle
+    ///   shape: disk owner is the rewrite output, in-memory still
+    ///   points at the deleted input).
     ///
     /// **Deliberately does NOT enforce specific segment_id agreement**
     /// between in-memory and disk-rebuild. The two representations
@@ -1603,19 +1609,22 @@ impl Volume {
             .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
             .collect();
         chain.push((self.base_dir.clone(), None));
-        let (disk_inner, disk_deltas) = match extentindex::rebuild_owners_unverified(&chain) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("assert_extent_index_consistent[{caller}]: rebuild failed: {e}");
-                return;
-            }
-        };
+        let (disk_inner, disk_deltas, live_segments) =
+            match extentindex::rebuild_owners_unverified(&chain) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("assert_extent_index_consistent[{caller}]: rebuild failed: {e}");
+                    return;
+                }
+            };
 
         let mut diverging: Vec<String> = Vec::new();
 
-        // For each in-memory hash, just assert that disk owns it
-        // somewhere. See docstring for why we don't compare specific
-        // segment_ids.
+        // For each in-memory hash, assert that disk owns it somewhere
+        // (see docstring for why we don't compare specific segment_ids)
+        // AND that the in-memory location names a segment the walk can
+        // still see — a hash can be validly owned on disk while the
+        // in-memory location dangles at a deleted file.
         for (hash, loc) in self.extent_index.iter() {
             if diverging.len() >= 8 {
                 break;
@@ -1623,6 +1632,12 @@ impl Volume {
             if !disk_inner.contains_key(hash) {
                 diverging.push(format!(
                     "  hash={} in_memory_seg={} disk_seg=None (phantom inner)",
+                    hash.to_hex(),
+                    loc.segment_id,
+                ));
+            } else if !live_segments.contains(&loc.segment_id) {
+                diverging.push(format!(
+                    "  hash={} in_memory_seg={} (stale inner: points at deleted segment)",
                     hash.to_hex(),
                     loc.segment_id,
                 ));
@@ -1635,6 +1650,12 @@ impl Volume {
             if !disk_deltas.contains_key(hash) {
                 diverging.push(format!(
                     "  hash={} in_memory_delta_seg={} disk_delta_seg=None (phantom delta)",
+                    hash.to_hex(),
+                    loc.segment_id,
+                ));
+            } else if !live_segments.contains(&loc.segment_id) {
+                diverging.push(format!(
+                    "  hash={} in_memory_delta_seg={} (stale delta: points at deleted segment)",
                     hash.to_hex(),
                     loc.segment_id,
                 ));

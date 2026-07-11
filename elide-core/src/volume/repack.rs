@@ -404,6 +404,7 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
+        self.assert_volume_invariants("apply_repack_result");
 
         Ok(stats)
     }
@@ -662,6 +663,7 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
+        self.assert_volume_invariants("apply_delta_repack_result");
 
         Ok(stats)
     }

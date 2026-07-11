@@ -82,6 +82,13 @@ jobs:
       - name: cargo test (elide-core reproducers, volume-invariants)
         run: "cargo test -p elide-core --features proptest,volume-invariants --test volume_reproducers --no-fail-fast"
 
+      # Lib tests under the runtime drift checkers: covers the
+      # volume-invariants-gated unit tests (the checker's own
+      # should_panic coverage) and runs every structural op in the lib
+      # suite with per-op rebuild verification.
+      - name: cargo test (elide-core lib, volume-invariants)
+        run: "cargo test -p elide-core --features volume-invariants --lib --no-fail-fast"
+
       - name: cargo test (elide-coordinator proptests)
         run: |
           cargo test -p elide-coordinator --features proptest --no-fail-fast \
