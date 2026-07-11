@@ -514,11 +514,40 @@ mod imp {
             .map_err(io::Error::other)
     }
 
+    /// From `include/uapi/linux/prctl.h`; the libc crate exports this
+    /// constant only for Android.
+    const PR_SET_IO_FLUSHER: libc::c_int = 57;
+
+    /// Mark the calling task an IO_FLUSHER (`PF_MEMALLOC_NOIO` +
+    /// `PF_LOCAL_THROTTLE`): its buffered writes are throttled only
+    /// against the backing device they target, never the global dirty
+    /// pool. That pool includes the ublk device's own dirty pages, which
+    /// only this process can drain — a thread of ours parked in
+    /// `balance_dirty_pages` waiting on them deadlocks the device.
+    /// Requires `CAP_SYS_RESOURCE`.
+    fn set_io_flusher() -> io::Result<()> {
+        // SAFETY: PR_SET_IO_FLUSHER only sets flags on the calling task;
+        // no pointers are passed.
+        let rc = unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1u64, 0u64, 0u64, 0u64) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn run_volume_ublk(
         dir: &Path,
         size_bytes: u64,
         fetch_inputs: crate::VolumeFetchInputs,
     ) -> Result<(), super::UblkRunError> {
+        // Set before any thread is spawned: task flags are inherited on
+        // clone, so every later thread starts flagged (libublk's queue
+        // threads clear it and are re-asserted in q_handler). Failure is
+        // a permanent host condition (missing CAP_SYS_RESOURCE), same
+        // class as the other Config errors below.
+        set_io_flusher()
+            .map_err(|e| super::UblkRunError::Config(format!("prctl(PR_SET_IO_FLUSHER): {e}")))?;
+
         // Block the shutdown signals on the calling thread BEFORE any
         // other thread is spawned. The block is inherited by every
         // subsequent thread (volume-actor, control-server, ublk queue
@@ -759,6 +788,14 @@ mod imp {
         let q_handler = {
             let client = client.clone();
             move |qid, dev: &UblkDev| {
+                // libublk 0.4.5's init_queue_thread runs on this thread
+                // before us and calls prctl(PR_SET_IO_FLUSHER, 0) — arg 0
+                // CLEARS the inherited flags (upstream intended 1).
+                // Re-assert so this queue thread, and the workers it
+                // spawns, keep the storage-stack exemption. Cannot fail:
+                // the same prctl already succeeded at process startup and
+                // CAP_SYS_RESOURCE is never dropped.
+                set_io_flusher().expect("PR_SET_IO_FLUSHER re-assert on queue thread");
                 q_fn(qid, dev, client.clone());
             }
         };
