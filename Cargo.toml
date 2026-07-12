@@ -55,9 +55,21 @@ tempfile = "3"
 # `ublk` is in the default feature set so Linux builds pick it up automatically;
 # to opt out, build with `--no-default-features` (and re-add any other defaults
 # you need).
+#
+# `vhost` gates the vhost-user-blk transport with the same shape: rust-vmm
+# deps are Linux-only, so the feature is a no-op elsewhere and src/vhost_blk.rs
+# compiles to a stub.
 [features]
-default = ["ublk"]
+default = ["ublk", "vhost"]
 ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
+vhost = [
+    "dep:vhost",
+    "dep:vhost-user-backend",
+    "dep:virtio-bindings",
+    "dep:virtio-queue",
+    "dep:vm-memory",
+    "dep:vmm-sys-util",
+]
 # Workspace aggregate for property-based test suites. Enables `proptest`
 # on every member crate that has one, so CI can run them all via a single
 # `cargo test --workspace --features proptest --tests` invocation.
@@ -77,3 +89,17 @@ smol     = { version = "2", optional = true }
 # signalfd + pthread_sigmask for the volume daemon's dedicated signal
 # watcher thread. Linux-only: signalfd does not exist on macOS.
 nix      = { version = "0.31", features = ["signal"] }
+# vhost-user-blk transport (rust-vmm stack). `vhost` provides the protocol
+# message types; `vhost-user-backend` runs the socket, memory-table, and
+# epoll plumbing around our `VhostUserBackendMut` impl.
+vhost              = { version = "0.17", features = ["vhost-user-backend"], optional = true }
+vhost-user-backend = { version = "0.23", optional = true }
+virtio-bindings    = { version = "0.2", optional = true }
+virtio-queue       = { version = "0.18", optional = true }
+vm-memory          = { version = "0.18", features = ["backend-mmap", "backend-atomic"], optional = true }
+vmm-sys-util       = { version = "0.15", optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `test-utils` exposes MockSplitQueue so the vhost_blk tests can craft
+# descriptor chains in a locally built GuestMemoryMmap — no VMM, no KVM.
+virtio-queue = { version = "0.18", features = ["test-utils"] }

@@ -566,33 +566,7 @@ mod imp {
         // anything else propagates.
         let mut volume = crate::volume_open::open_volume_with_retry(dir, by_id_dir)?;
 
-        let mut peer_counters: Option<elide_peer_fetch::PeerFetchCountersHandle> = None;
-        if let Some(build) = crate::build_volume_fetcher(dir, fetch_inputs)? {
-            let fetcher = build.fetcher;
-            let s3_store = build.s3_store;
-            let arc_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> =
-                Arc::clone(&fetcher) as _;
-            let fork_dirs = volume.fork_dirs();
-            let (lba_map, extent_index) = volume.snapshot_maps();
-            volume.set_fetcher(Arc::clone(&arc_fetcher));
-            let fetcher_for_swap = Arc::clone(&fetcher);
-            let body_prefetch_done = crate::body_prefetch::spawn(
-                fork_dirs.clone(),
-                Arc::clone(&arc_fetcher),
-                Arc::clone(&extent_index),
-                move || fetcher_for_swap.set_store(s3_store),
-            );
-            elide_fetch::full_warm::spawn(
-                dir.to_path_buf(),
-                fork_dirs,
-                lba_map,
-                extent_index,
-                arc_fetcher,
-                body_prefetch_done,
-            );
-            peer_counters = build.peer_counters;
-            tracing::info!("[demand-fetch enabled]");
-        }
+        let peer_counters = crate::attach_demand_fetch(dir, &mut volume, fetch_inputs)?;
 
         let (mut actor, client) = elide_core::actor::spawn(volume);
         // Fail-stop on read-state divergence: exit so the supervisor

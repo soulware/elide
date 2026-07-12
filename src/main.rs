@@ -8,7 +8,7 @@ use elide_core::volume;
 
 use elide::{
     VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, parse_size,
-    resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
+    resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify, vhost_blk,
 };
 
 /// Elide volume management and analysis tools.
@@ -45,6 +45,9 @@ enum Command {
         /// Serve over ublk (default is coordinator IPC only, no block device)
         #[arg(long)]
         ublk: bool,
+        /// Serve as a vhost-user-blk backend on this unix socket
+        #[arg(long, value_name = "SOCKET", conflicts_with = "ublk")]
+        vhost_socket: Option<PathBuf>,
     },
 
     /// Scan an image for file extents and analyse dedup + delta compression potential
@@ -881,12 +884,26 @@ fn main() {
             size,
             readonly,
             ublk,
+            vhost_socket,
         } => {
             // In the flat layout, fork_dir IS the volume directory.
             let size_bytes = resolve_volume_size(&fork_dir, size.as_deref())
                 .expect("failed to determine volume size");
             let fetch_config =
                 resolve_volume_fetch_config(&fork_dir).expect("failed to load fetch config");
+            if let Some(socket) = vhost_socket {
+                if readonly {
+                    panic!("vhost-user-blk transport does not yet support --readonly");
+                }
+                match vhost_blk::run_volume_vhost_blk(&fork_dir, size_bytes, &socket, fetch_config)
+                {
+                    Ok(()) => return,
+                    Err(e) => {
+                        eprintln!("vhost-user-blk server error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             if ublk {
                 if readonly {
                     panic!("ublk transport does not yet support --readonly");

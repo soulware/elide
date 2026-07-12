@@ -11,6 +11,7 @@ pub mod inspect_files;
 pub mod serve;
 pub mod ublk;
 pub mod verify;
+pub mod vhost_blk;
 pub mod volume_open;
 
 use std::io;
@@ -165,6 +166,43 @@ pub fn build_volume_fetcher(
         s3_store,
         peer_counters,
     }))
+}
+
+/// Attach the demand-fetch stack to an opened volume: build the remote
+/// fetcher, install it, and spawn the body-prefetch and full-warm passes.
+/// Returns the peer-fetch counters handle when peer fetch is active, and
+/// `None` when the volume is fully local (no `FetchConfig`).
+pub fn attach_demand_fetch(
+    dir: &Path,
+    volume: &mut elide_core::volume::Volume,
+    inputs: VolumeFetchInputs,
+) -> io::Result<Option<PeerFetchCountersHandle>> {
+    let Some(build) = build_volume_fetcher(dir, inputs)? else {
+        return Ok(None);
+    };
+    let fetcher = build.fetcher;
+    let s3_store = build.s3_store;
+    let arc_fetcher: Arc<dyn elide_core::segment::SegmentFetcher> = Arc::clone(&fetcher) as _;
+    let fork_dirs = volume.fork_dirs();
+    let (lba_map, extent_index) = volume.snapshot_maps();
+    volume.set_fetcher(Arc::clone(&arc_fetcher));
+    let fetcher_for_swap = Arc::clone(&fetcher);
+    let body_prefetch_done = body_prefetch::spawn(
+        fork_dirs.clone(),
+        Arc::clone(&arc_fetcher),
+        Arc::clone(&extent_index),
+        move || fetcher_for_swap.set_store(s3_store),
+    );
+    elide_fetch::full_warm::spawn(
+        dir.to_path_buf(),
+        fork_dirs,
+        lba_map,
+        extent_index,
+        arc_fetcher,
+        body_prefetch_done,
+    );
+    tracing::info!("[demand-fetch enabled]");
+    Ok(build.peer_counters)
 }
 
 /// Build the bottom-of-stack `RangeFetcher` for the volume.
