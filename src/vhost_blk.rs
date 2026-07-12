@@ -381,7 +381,7 @@ mod imp {
                     return (S_IOERR, 0);
                 }
             };
-            let unmap_only = VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP as u32;
+            let unmap_only = VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP;
             if seg.flags & !unmap_only != 0 {
                 return (S_UNSUPP, 0);
             }
@@ -886,7 +886,7 @@ mod imp {
             let seg = DiscardSegment {
                 sector: 0,
                 num_sectors: SECTORS_PER_BLOCK,
-                flags: VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP as u32,
+                flags: VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
             };
             let (_, status, _) = run_request(
                 &mut io,
