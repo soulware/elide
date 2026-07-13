@@ -354,29 +354,7 @@ impl Volume {
 
                 let lbamap = Arc::make_mut(&mut self.lbamap);
                 for e in &out.out_entries {
-                    if e.kind.is_canonical_only() {
-                        continue;
-                    }
-                    if e.kind == EntryKind::Delta {
-                        let sources: Arc<[blake3::Hash]> =
-                            e.delta_options.iter().map(|o| o.source_hash).collect();
-                        lbamap.insert_delta_consuming_inputs(
-                            e.start_lba,
-                            e.lba_length,
-                            e.hash,
-                            out.new_ulid,
-                            sources,
-                            &bucket_input_ulids,
-                        );
-                    } else {
-                        lbamap.insert_consuming_inputs(
-                            e.start_lba,
-                            e.lba_length,
-                            e.hash,
-                            out.new_ulid,
-                            &bucket_input_ulids,
-                        );
-                    }
+                    lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
                 }
             }
 
