@@ -196,30 +196,36 @@ pub async fn shutdown(fork_dir: &Path) -> ShutdownOutcome {
     if !socket.exists() {
         return ShutdownOutcome::NotRunning;
     }
-    let mut stream = match UnixStream::connect(&socket).await {
-        Ok(s) => s,
-        Err(e) => {
-            return classify_socket_err(&socket, "shutdown", e);
+    let round_trip = async {
+        let mut stream = match UnixStream::connect(&socket).await {
+            Ok(s) => s,
+            Err(e) => {
+                return classify_socket_err(&socket, "shutdown", e);
+            }
+        };
+        let req = serde_json::to_vec(&VolumeRequest::Shutdown).unwrap_or_default();
+        let mut buf = req;
+        buf.push(b'\n');
+        if let Err(e) = stream.write_all(&buf).await {
+            return ShutdownOutcome::Failed(format!("write: {e}"));
+        }
+        if let Err(e) = stream.flush().await {
+            return ShutdownOutcome::Failed(format!("flush: {e}"));
+        }
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => ShutdownOutcome::Acknowledged,
+            Ok(_) => match parse_envelope::<()>(&line) {
+                Ok(_) => ShutdownOutcome::Acknowledged,
+                Err(e) => ShutdownOutcome::Failed(e.message),
+            },
+            Err(e) => ShutdownOutcome::Failed(format!("read: {e}")),
         }
     };
-    let req = serde_json::to_vec(&VolumeRequest::Shutdown).unwrap_or_default();
-    let mut buf = req;
-    buf.push(b'\n');
-    if let Err(e) = stream.write_all(&buf).await {
-        return ShutdownOutcome::Failed(format!("write: {e}"));
-    }
-    if let Err(e) = stream.flush().await {
-        return ShutdownOutcome::Failed(format!("flush: {e}"));
-    }
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    match reader.read_line(&mut line).await {
-        Ok(0) => ShutdownOutcome::Acknowledged,
-        Ok(_) => match parse_envelope::<()>(&line) {
-            Ok(_) => ShutdownOutcome::Acknowledged,
-            Err(e) => ShutdownOutcome::Failed(e.message),
-        },
-        Err(e) => ShutdownOutcome::Failed(format!("read: {e}")),
+    match tokio::time::timeout(IPC_TIMEOUT, round_trip).await {
+        Ok(outcome) => outcome,
+        Err(_) => ShutdownOutcome::Failed(format!("no reply within {}s", IPC_TIMEOUT.as_secs())),
     }
 }
 
@@ -227,14 +233,21 @@ pub async fn shutdown(fork_dir: &Path) -> ShutdownOutcome {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Ceiling on one control-socket round trip. Every call is awaited
+/// inline by a per-volume tick task, so a volume that accepts the
+/// connection but never replies would otherwise freeze that volume's
+/// drain lane permanently and invisibly. Generous enough for the
+/// slowest healthy op (a full-WAL promote under IO contention).
+const IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Send a request expected to produce a unit (`()`) reply.
 async fn call_unit(fork_dir: &Path, request: &VolumeRequest) -> bool {
     matches!(call_typed::<()>(fork_dir, request).await, Some(()))
 }
 
 /// Send a request and parse the reply as `T`. Returns `None` if the
-/// socket is absent, the call fails at transport level, or the volume
-/// returned an error envelope.
+/// socket is absent, the call fails at transport level, times out,
+/// or the volume returned an error envelope.
 async fn call_typed<T>(fork_dir: &Path, request: &VolumeRequest) -> Option<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -243,7 +256,7 @@ where
     if !socket.exists() {
         return None;
     }
-    let result: std::io::Result<T> = async {
+    let round_trip = async {
         let mut stream = UnixStream::connect(&socket).await?;
         write_request(&mut stream, request).await?;
         let mut reader = BufReader::new(stream);
@@ -253,8 +266,14 @@ where
             Ok(v) => Ok(v),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
-    }
-    .await;
+    };
+    let result: std::io::Result<T> = match tokio::time::timeout(IPC_TIMEOUT, round_trip).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no reply within {}s", IPC_TIMEOUT.as_secs()),
+        )),
+    };
     match result {
         Ok(v) => Some(v),
         Err(e) => {

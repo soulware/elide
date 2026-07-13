@@ -253,6 +253,11 @@ pub enum WorkerJob {
     DeltaRepack(DeltaRepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
     Reclaim(ReclaimJob),
+    /// Test seam: the worker blocks on the receiver, then returns
+    /// [`WorkerResult::Barrier`]. Lets tests hold the worker at a known
+    /// point to build full-queue states deterministically.
+    #[cfg(test)]
+    Barrier(crossbeam_channel::Receiver<()>),
 }
 
 /// Result returned by the worker thread to the actor.
@@ -272,4 +277,7 @@ pub enum WorkerResult {
     DeltaRepack(io::Result<DeltaRepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),
+    /// Test seam: completion of a [`WorkerJob::Barrier`]. No-op on apply.
+    #[cfg(test)]
+    Barrier,
 }
