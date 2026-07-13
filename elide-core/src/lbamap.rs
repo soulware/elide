@@ -67,6 +67,12 @@ struct MapEntry {
     claimant_ulid: Ulid,
 }
 
+/// Admission policy for [`LbaMap::register_entry_inner`].
+enum Admission<'a> {
+    Unconditional,
+    ConsumingInputs(&'a HashSet<Ulid>),
+}
+
 /// The live in-memory LBA map.
 ///
 /// Maps `start_lba → MapEntry` for every committed extent. Unwritten LBA
@@ -265,6 +271,85 @@ impl LbaMap {
             Some(source_hashes),
             Some(consumed_inputs),
         );
+    }
+
+    /// Register one segment entry's LBA claim — the single place that
+    /// maps an [`segment::EntryKind`] to its lbamap routing:
+    /// CanonicalData / CanonicalInline carry a body for dedup resolution
+    /// but make no LBA claim, `Delta` claims its range with the source
+    /// list attached (refcounting each source), and every other kind
+    /// claims its range → content hash. The rebuild walks and the apply
+    /// paths all route through it, so an incremental update cannot
+    /// branch differently from what a fresh rebuild would produce.
+    ///
+    /// `admission` selects the overlap policy: `Unconditional` installs
+    /// over whatever is there (the rebuild walks visit segments in
+    /// ascending ULID order, so the newest claim wins), while
+    /// `ConsumingInputs` defers to any overlapping claimant `>=`
+    /// `claimant` that is not one of the inputs the apply consumes.
+    fn register_entry_inner(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        claimant: Ulid,
+        admission: Admission<'_>,
+    ) {
+        if entry.kind.is_canonical_only() {
+            return;
+        }
+        if entry.kind == segment::EntryKind::Delta {
+            let sources: Arc<[blake3::Hash]> =
+                entry.delta_options.iter().map(|o| o.source_hash).collect();
+            match admission {
+                Admission::Unconditional => self.insert_delta(
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash,
+                    claimant,
+                    sources,
+                ),
+                Admission::ConsumingInputs(inputs) => self.insert_delta_consuming_inputs(
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash,
+                    claimant,
+                    sources,
+                    inputs,
+                ),
+            }
+        } else {
+            match admission {
+                Admission::Unconditional => {
+                    self.insert(entry.start_lba, entry.lba_length, entry.hash, claimant)
+                }
+                Admission::ConsumingInputs(inputs) => self.insert_consuming_inputs(
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash,
+                    claimant,
+                    inputs,
+                ),
+            }
+        }
+    }
+
+    /// [`register_entry_inner`](Self::register_entry_inner) with the
+    /// rebuild walk's unconditional admission.
+    pub fn register_entry(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) {
+        self.register_entry_inner(entry, claimant, Admission::Unconditional);
+    }
+
+    /// [`register_entry_inner`](Self::register_entry_inner) with the
+    /// apply-phase admission: install only on sub-ranges whose current
+    /// claimant is older than `claimant` or is one of the `inputs` this
+    /// apply consumes and deletes; a concurrent writer's higher claim
+    /// wins.
+    pub fn register_entry_consuming_inputs(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        claimant: Ulid,
+        inputs: &HashSet<Ulid>,
+    ) {
+        self.register_entry_inner(entry, claimant, Admission::ConsumingInputs(inputs));
     }
 
     fn insert_inner_if_newer(
@@ -843,26 +928,7 @@ fn rebuild_segments_inner(
                 Err(e) => return Err(e),
             };
             for entry in entries {
-                // CanonicalData / CanonicalInline entries carry a body for
-                // dedup resolution via the extent index but make no LBA claim
-                // on rebuild. Skip them so their zeroed start_lba never
-                // mutates the map.
-                if entry.kind.is_canonical_only() {
-                    continue;
-                }
-                if entry.kind == segment::EntryKind::Delta {
-                    let sources: Arc<[blake3::Hash]> =
-                        entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    map.insert_delta(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        sref.ulid,
-                        sources,
-                    );
-                } else {
-                    map.insert(entry.start_lba, entry.lba_length, entry.hash, sref.ulid);
-                }
+                map.register_entry(&entry, sref.ulid);
             }
         }
     }
@@ -905,6 +971,115 @@ mod tests {
         segment::write_file_atomic(&dir.join(signing::VOLUME_PUB_FILE), pub_hex.as_bytes())
             .unwrap();
         signer
+    }
+
+    // --- register_entry routing tests ---
+
+    fn entry(
+        kind: segment::EntryKind,
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+    ) -> segment::SegmentEntry {
+        segment::SegmentEntry {
+            hash,
+            start_lba,
+            lba_length,
+            compressed: false,
+            kind,
+            stored_offset: 0,
+            stored_length: 0,
+            data: None,
+            delta_options: Vec::new(),
+        }
+    }
+
+    fn delta_entry(
+        start_lba: u64,
+        lba_length: u32,
+        hash: blake3::Hash,
+        source: blake3::Hash,
+    ) -> segment::SegmentEntry {
+        let mut e = entry(segment::EntryKind::Delta, start_lba, lba_length, hash);
+        e.delta_options = vec![segment::DeltaOption {
+            source_hash: source,
+            delta_offset: 0,
+            delta_length: 0,
+            delta_hash: h(0),
+        }];
+        e
+    }
+
+    #[test]
+    fn register_entry_canonical_kinds_make_no_claim() {
+        let mut map = LbaMap::new();
+        map.register_entry(&entry(segment::EntryKind::CanonicalData, 0, 4, h(1)), u(1));
+        map.register_entry(
+            &entry(segment::EntryKind::CanonicalInline, 0, 4, h(2)),
+            u(1),
+        );
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn register_entry_routes_body_kinds_to_plain_claim() {
+        let mut map = LbaMap::new();
+        for (i, kind) in [
+            segment::EntryKind::Data,
+            segment::EntryKind::Inline,
+            segment::EntryKind::DedupRef,
+            segment::EntryKind::Zero,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = i as u64 * 10;
+            map.register_entry(&entry(kind, start, 4, h(i as u8)), u(1));
+            assert_eq!(map.lookup(start), Some((h(i as u8), 0)));
+        }
+        assert_eq!(map.delta_source_refcount(&h(0)), 0);
+    }
+
+    #[test]
+    fn register_entry_routes_delta_with_sources() {
+        let mut map = LbaMap::new();
+        let src = h(9);
+        map.register_entry(&delta_entry(0, 4, h(1), src), u(1));
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.delta_source_refcount(&src), 1);
+    }
+
+    #[test]
+    fn register_entry_consuming_inputs_overrides_input_claim_only() {
+        let mut map = LbaMap::new();
+        // u(5) is a consumed input despite being newer than the output u(3);
+        // u(9) is a concurrent writer and must survive.
+        map.insert(0, 4, h(1), u(5));
+        map.insert(10, 4, h(2), u(9));
+        let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
+        map.register_entry_consuming_inputs(
+            &entry(segment::EntryKind::Data, 0, 4, h(3)),
+            u(3),
+            &inputs,
+        );
+        map.register_entry_consuming_inputs(
+            &entry(segment::EntryKind::Data, 10, 4, h(4)),
+            u(3),
+            &inputs,
+        );
+        assert_eq!(map.lookup(0), Some((h(3), 0)));
+        assert_eq!(map.lookup(10), Some((h(2), 0)));
+    }
+
+    #[test]
+    fn register_entry_consuming_inputs_routes_delta_with_sources() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(5));
+        let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
+        let src = h(9);
+        map.register_entry_consuming_inputs(&delta_entry(0, 4, h(2), src), u(3), &inputs);
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+        assert_eq!(map.delta_source_refcount(&src), 1);
     }
 
     // --- insert / lookup unit tests ---

@@ -1372,31 +1372,7 @@ impl Volume {
         // segments and produces the same claimant ULIDs.
         let lbamap = Arc::make_mut(&mut self.lbamap);
         for e in &entries {
-            // CanonicalData / CanonicalInline make no LBA claim — same
-            // filter as `lbamap::rebuild_segments_inner`.
-            if e.kind.is_canonical_only() {
-                continue;
-            }
-            if e.kind == EntryKind::Delta {
-                let sources: Arc<[blake3::Hash]> =
-                    e.delta_options.iter().map(|o| o.source_hash).collect();
-                lbamap.insert_delta_consuming_inputs(
-                    e.start_lba,
-                    e.lba_length,
-                    e.hash,
-                    new_ulid,
-                    sources,
-                    &consumed,
-                );
-            } else {
-                lbamap.insert_consuming_inputs(
-                    e.start_lba,
-                    e.lba_length,
-                    e.hash,
-                    new_ulid,
-                    &consumed,
-                );
-            }
+            lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
         }
         self.assert_volume_invariants("apply_plan_apply_result_applied");
 

@@ -620,25 +620,7 @@ fn apply_snapshot_layer(
             inline: extentindex::InlineSource::Section(&inline_bytes),
         };
         for (raw_idx, entry) in entries.iter().enumerate() {
-            // LBA map: every non-canonical entry contributes its range →
-            // content hash. Canonical entries carry body for dedup resolution
-            // only and make no LBA claim.
-            if !entry.kind.is_canonical_only() {
-                if entry.kind == EntryKind::Delta {
-                    let sources: std::sync::Arc<[blake3::Hash]> =
-                        entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.insert_delta(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        *seg,
-                        sources,
-                    );
-                } else {
-                    lbamap.insert(entry.start_lba, entry.lba_length, entry.hash, *seg);
-                }
-            }
-
+            lbamap.register_entry(entry, *seg);
             extent_index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
         }
     }
