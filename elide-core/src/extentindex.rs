@@ -203,6 +203,13 @@ pub struct SegmentRegistrationCtx<'a> {
 enum Admission<'a> {
     IfAbsent,
     ConsumingInputs(&'a std::collections::HashSet<Ulid>),
+    /// Body-bearing kinds take over their hash slot unconditionally;
+    /// `Delta` keeps the `IfAbsent` rule. For callers that have already
+    /// proved no concurrent mutation (reclaim's Arc pointer-equality
+    /// guard) — a fresh full body is always an upgrade, while a delta
+    /// never displaces a live DATA body and defers to an existing
+    /// delta owner (the lower ULID, matching rebuild walk order).
+    Unconditional,
 }
 
 /// Per-segment bitset of "this entry's body bytes are durable in
@@ -550,7 +557,10 @@ impl ExtentIndex {
     /// must be one of the segments the caller is consuming (concurrent
     /// writers win); a DATA insert clears the delta slot (DATA
     /// precedence), a Delta insert with no current delta owner also
-    /// requires the DATA map to be free.
+    /// requires the DATA map to be free. `Unconditional` (callers that
+    /// have proved no concurrent mutation): a DATA insert takes the
+    /// slot and clears any delta slot, a Delta insert keeps the
+    /// `IfAbsent` rule.
     ///
     /// Errors if a `Delta` entry arrives with no
     /// `ctx.delta_body_source` — the caller failed to provide the
@@ -572,7 +582,7 @@ impl ExtentIndex {
                     )));
                 };
                 let admitted = match admission {
-                    Admission::IfAbsent => {
+                    Admission::IfAbsent | Admission::Unconditional => {
                         !self.inner.contains_key(&entry.hash)
                             && !self.deltas.contains_key(&entry.hash)
                     }
@@ -619,6 +629,7 @@ impl ExtentIndex {
                         None => true,
                         Some(loc) => inputs.contains(&loc.segment_id),
                     },
+                    Admission::Unconditional => true,
                 };
                 if admitted {
                     let location = ExtentLocation {
@@ -639,7 +650,9 @@ impl ExtentIndex {
                         }
                         // DATA precedence on the live path: clear any
                         // stale delta slot, matching `insert`.
-                        Admission::ConsumingInputs(_) => self.insert(entry.hash, location),
+                        Admission::ConsumingInputs(_) | Admission::Unconditional => {
+                            self.insert(entry.hash, location)
+                        }
                     }
                 }
             }
@@ -671,6 +684,23 @@ impl ExtentIndex {
         inputs: &std::collections::HashSet<Ulid>,
     ) -> io::Result<()> {
         self.register_entry(entry, raw_idx, ctx, Admission::ConsumingInputs(inputs))
+    }
+
+    /// [`register_entry`](Self::register_entry) with the unconditional
+    /// admission, for callers that have already proved no concurrent
+    /// mutation happened (reclaim's Arc pointer-equality guard):
+    /// body-bearing kinds take over their hash slot outright — a fresh
+    /// full body is always an upgrade — while `Delta` keeps the
+    /// `IfAbsent` rule: a delta never displaces a live DATA body, and
+    /// an existing delta owner (the lower ULID, matching rebuild walk
+    /// order) is kept.
+    pub fn register_entry_unconditional(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        raw_idx: u32,
+        ctx: &SegmentRegistrationCtx<'_>,
+    ) -> io::Result<()> {
+        self.register_entry(entry, raw_idx, ctx, Admission::Unconditional)
     }
 
     /// The set of hashes `entries` carries forward — every entry hash
@@ -1405,6 +1435,67 @@ mod tests {
             .unwrap();
         assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(7));
         assert_eq!(index.lookup_delta(&h(1)).unwrap().segment_id, useg(3));
+    }
+
+    #[test]
+    fn register_unconditional_data_takes_over_and_clears_delta_slot() {
+        // Any current owner loses — the caller has proved no concurrent
+        // mutation, so the fresh body is an upgrade. The takeover clears
+        // the delta slot (DATA precedence), matching `insert`.
+        let mut index = ExtentIndex::new();
+        index.insert(h(1), data_loc(useg(9)));
+        index.insert_delta(h(2), delta_loc(useg(3)));
+        let over_data =
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+        let over_delta =
+            SegmentEntry::new_data(h(2), 1, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+        index
+            .register_entry_unconditional(&over_data, 0, &reg_ctx(useg(7)))
+            .unwrap();
+        index
+            .register_entry_unconditional(&over_delta, 1, &reg_ctx(useg(7)))
+            .unwrap();
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(7));
+        assert_eq!(index.lookup(&h(2)).unwrap().segment_id, useg(7));
+        assert!(index.lookup_delta(&h(2)).is_none());
+    }
+
+    #[test]
+    fn register_unconditional_delta_defers_to_data_owner() {
+        // The reclaim shape: the hash's full body is snapshot-pinned and
+        // still in the DATA map, so the thin delta must not register —
+        // a delta never displaces a live body, under any admission.
+        let mut index = ExtentIndex::new();
+        index.insert(h(1), data_loc(useg(9)));
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        index
+            .register_entry_unconditional(&entry, 5, &reg_ctx(useg(7)))
+            .unwrap();
+        assert!(index.lookup_delta(&h(1)).is_none());
+        assert_eq!(index.lookup(&h(1)).unwrap().segment_id, useg(9));
+    }
+
+    #[test]
+    fn register_unconditional_delta_keeps_existing_delta_owner() {
+        let mut index = ExtentIndex::new();
+        index.insert_delta(h(1), delta_loc(useg(3)));
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        index
+            .register_entry_unconditional(&entry, 5, &reg_ctx(useg(7)))
+            .unwrap();
+        assert_eq!(index.lookup_delta(&h(1)).unwrap().segment_id, useg(3));
+    }
+
+    #[test]
+    fn register_unconditional_delta_registers_when_absent() {
+        let mut index = ExtentIndex::new();
+        let entry = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(9)]);
+        index
+            .register_entry_unconditional(&entry, 5, &reg_ctx(useg(7)))
+            .unwrap();
+        let loc = index.lookup_delta(&h(1)).unwrap();
+        assert_eq!(loc.segment_id, useg(7));
+        assert_eq!(loc.entry_idx, 5);
     }
 
     #[test]
