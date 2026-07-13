@@ -23,9 +23,8 @@ use crate::block_reader::BlockReader;
 use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
 use crate::segment::{
-    self, DeltaOption, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner,
-    populate_inline_bodies, read_and_verify_segment_index, read_body_section_bodies,
-    write_segment_with_delta_body,
+    self, DeltaOption, EntryKind, SegmentEntry, SegmentSigner, populate_inline_bodies,
+    read_and_verify_segment_index, read_body_section_bodies, write_segment_with_delta_body,
 };
 use crate::segment_cache::SegmentIndexCache;
 use crate::signing::{self, VerifyingKey};
@@ -297,19 +296,27 @@ fn maybe_rewrite_segment(
     // CanonicalData; delta_compute inputs are fresh imports today so
     // canonical variants don't appear in practice, but the filter aligns
     // with `is_data()` so any future canonical inputs are handled.
-    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
+    // Inline bytes must ride along for the rewrite — the writer emits the
+    // inline section from `entry.inline`.
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
+    if has_inline {
+        let inline_bytes = read_inline_section(seg_path, &entries)?;
+        populate_inline_bodies(&mut entries, &inline_bytes)?;
+    }
+    let mut pendings = read_body_section_bodies(seg_path, body_section_start, entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
 
-    for entry in entries.iter_mut() {
+    for pending in pendings.iter_mut() {
+        let entry = &mut pending.entry;
         if entry.kind != EntryKind::Data {
             continue;
         }
         let Some(conv) = conversions.get(&entry.hash) else {
             continue;
         };
-        let Some(stored) = entry.data.as_deref() else {
+        let Some(stored) = pending.body.as_deref() else {
             continue;
         };
         let child_plain_owned: Vec<u8>;
@@ -343,12 +350,12 @@ fn maybe_rewrite_segment(
         stats.delta_body_bytes += delta_length as u64;
         stats.entries_converted += 1;
 
-        // Convert entry in place. Clear body bookkeeping, drop data,
+        // Convert entry in place. Clear body bookkeeping, drop the body,
         // add delta option, flip the kind.
+        let entry = &mut pending.entry;
         entry.kind = EntryKind::Delta;
         entry.stored_offset = 0;
         entry.stored_length = 0;
-        entry.data = None;
         entry.compressed = false;
         entry.delta_options.push(DeltaOption {
             source_hash: conv.source_hash,
@@ -356,37 +363,15 @@ fn maybe_rewrite_segment(
             delta_length,
             delta_hash,
         });
+        pending.body = None;
     }
 
     if stats.entries_converted == 0 {
         return Ok(stats);
     }
 
-    // Any remaining Data entries need non-None `data` so
-    // write_segment_with_delta_body can emit their bytes. We loaded
-    // them above, so this should always hold; treat a missing body as
-    // a programmer error rather than silently corrupting output.
-    for entry in entries.iter() {
-        if entry.kind == EntryKind::Data && entry.data.is_none() {
-            return Err(io::Error::other(format!(
-                "pending segment {} has Data entry with no body bytes loaded",
-                seg_path.display()
-            )));
-        }
-        // Inline entries: write_segment_with_delta_body writes inline
-        // bodies from `entry.data`, but entries we loaded above were
-        // filtered to Data only. Load inline bodies too by re-reading.
-        let _ = SegmentFlags::empty(); // keep the import alive
-    }
-    // Re-read inline bodies if any are present (separate pass because
-    // inline bodies live in the inline section, not the body section).
-    let has_inline = entries.iter().any(|e| e.kind.is_inline());
-    if has_inline {
-        let inline_bytes = read_inline_section(seg_path, &entries)?;
-        populate_inline_bodies(&mut entries, &inline_bytes)?;
-    }
-
-    // Write to a tmp sibling then rename atomically.
+    // Write to a tmp sibling then rename atomically. The writer checks
+    // that every remaining Data entry still has its loaded body.
     let tmp_path = {
         let mut name = seg_path
             .file_name()
@@ -396,7 +381,7 @@ fn maybe_rewrite_segment(
         seg_path.with_file_name(name)
     };
     let _ = fs::remove_file(&tmp_path);
-    write_segment_with_delta_body(&tmp_path, &mut entries, &delta_body, signer)?;
+    write_segment_with_delta_body(&tmp_path, pendings, &delta_body, signer)?;
     fs::rename(&tmp_path, seg_path)?;
     segment::fsync_dir(seg_path)?;
 
@@ -544,15 +529,22 @@ pub fn rewrite_post_snapshot_with_prior(
     }
 
     // Load all body-section bodies — both the ones we might convert and
-    // the ones we need to re-emit verbatim. Same pattern as
+    // the ones we need to re-emit verbatim, plus inline bytes so the
+    // rewrite can emit the inline section. Same pattern as
     // `maybe_rewrite_segment`.
-    read_body_section_bodies(seg_path, body_section_start, &mut entries)?;
+    let has_inline = entries.iter().any(|e| e.kind.is_inline());
+    if has_inline {
+        let inline_bytes = read_inline_section(seg_path, &entries)?;
+        populate_inline_bodies(&mut entries, &inline_bytes)?;
+    }
+    let mut pendings = read_body_section_bodies(seg_path, body_section_start, entries)?;
 
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
     let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
 
-    for entry in entries.iter_mut() {
+    for pending in pendings.iter_mut() {
+        let entry = &pending.entry;
         if entry.kind != EntryKind::Data || entry.lba_length != 1 {
             continue;
         }
@@ -564,7 +556,7 @@ pub fn rewrite_post_snapshot_with_prior(
             // hash equality; nothing to delta.
             continue;
         }
-        let Some(stored) = entry.data.as_deref() else {
+        let Some(stored) = pending.body.as_deref() else {
             continue;
         };
 
@@ -610,10 +602,10 @@ pub fn rewrite_post_snapshot_with_prior(
         stats.delta_body_bytes += delta_length as u64;
         stats.entries_converted += 1;
 
+        let entry = &mut pending.entry;
         entry.kind = EntryKind::Delta;
         entry.stored_offset = 0;
         entry.stored_length = 0;
-        entry.data = None;
         entry.compressed = false;
         entry.delta_options.push(DeltaOption {
             source_hash,
@@ -621,27 +613,11 @@ pub fn rewrite_post_snapshot_with_prior(
             delta_length,
             delta_hash,
         });
+        pending.body = None;
     }
 
     if stats.entries_converted == 0 {
         return Ok(None);
-    }
-
-    // Remaining Data entries must have their body bytes loaded so
-    // write_segment_with_delta_body can emit them. Inline entries live
-    // in the inline section and need a separate pass.
-    for entry in entries.iter() {
-        if entry.kind == EntryKind::Data && entry.data.is_none() {
-            return Err(io::Error::other(format!(
-                "post-snapshot segment {} has Data entry with no body bytes loaded",
-                seg_path.display()
-            )));
-        }
-    }
-    let has_inline = entries.iter().any(|e| e.kind.is_inline());
-    if has_inline {
-        let inline_bytes = read_inline_section(seg_path, &entries)?;
-        populate_inline_bodies(&mut entries, &inline_bytes)?;
     }
 
     let tmp_path = {
@@ -653,15 +629,10 @@ pub fn rewrite_post_snapshot_with_prior(
         output_path.with_file_name(name)
     };
     let _ = fs::remove_file(&tmp_path);
-    let new_body_section_start =
-        write_segment_with_delta_body(&tmp_path, &mut entries, &delta_body, signer)?;
+    let (new_body_section_start, entries) =
+        write_segment_with_delta_body(&tmp_path, pendings, &delta_body, signer)?;
     fs::rename(&tmp_path, output_path)?;
     segment::fsync_dir(output_path)?;
-
-    // One RewrittenSegment per input accumulates in the delta-repack
-    // result — without this the job retains every rewritten segment's
-    // body bytes at once.
-    segment::drop_written_bodies(&mut entries);
 
     // Delta region starts at `new_body_section_start + delta_region_body_length`.
     // Compute it from post-rewrite stored_length on Data entries; that's the

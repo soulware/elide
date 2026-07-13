@@ -347,7 +347,7 @@ mod tests {
         let parent_signer = load_signer(&scratch, VOLUME_KEY_FILE).unwrap();
 
         let data = vec![0x5Au8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
@@ -355,7 +355,7 @@ mod tests {
             data,
         )];
         let staging = data_dir.join("seg-staging");
-        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
+        write_segment(&staging, entries, parent_signer.as_ref()).unwrap();
 
         store
             .put(

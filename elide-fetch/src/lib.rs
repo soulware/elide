@@ -1416,14 +1416,14 @@ mod tests {
         let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
             SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
             SegmentEntry::new_data(h2, 2, 1, SegmentFlags::empty(), data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         // Write only the .idx portion to index/ — no .body, no .present yet.
@@ -1519,13 +1519,13 @@ mod tests {
         let data1 = vec![0xBBu8; 4096];
         let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
             SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         std::fs::create_dir_all(&index_dir).unwrap();
@@ -1612,7 +1612,7 @@ mod tests {
 
         let data0 = vec![0x55u8; 4096];
         let h0 = blake3::hash(&data0);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             h0,
             0,
             1,
@@ -1621,7 +1621,7 @@ mod tests {
         )];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let mut full_bytes = std::fs::read(&seg_path).unwrap();
 
         // Write the signed .idx — the signed section is authentic.
@@ -1698,7 +1698,9 @@ mod tests {
     /// verification at delta-body fetch time: no `.delta` is written.
     #[test]
     fn fetch_delta_body_rejects_tampered_blob() {
-        use elide_core::segment::{DeltaOption, SegmentEntry, write_segment_with_delta_body};
+        use elide_core::segment::{
+            DeltaOption, PendingEntry, SegmentEntry, write_segment_with_delta_body,
+        };
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1723,16 +1725,15 @@ mod tests {
             delta_hash,
         };
         let reconstructed_hash = blake3::hash(b"reconstructed-content");
-        let mut entries = vec![SegmentEntry::new_delta(
+        let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
             reconstructed_hash,
             0,
             1,
             vec![option],
-        )];
+        ))];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        write_segment_with_delta_body(&seg_path, &mut entries, &delta_blob, signer.as_ref())
-            .unwrap();
+        write_segment_with_delta_body(&seg_path, entries, &delta_blob, signer.as_ref()).unwrap();
         let mut full_bytes = std::fs::read(&seg_path).unwrap();
 
         // Publish the signed .idx locally.
@@ -1795,7 +1796,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seg_path = tmp.path().join("seg");
         let data = vec![0xABu8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
@@ -1803,7 +1804,7 @@ mod tests {
             data,
         )];
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         let mut bytes = std::fs::read(&seg_path).unwrap();
         // Flip the first byte of the index section (covered by the signature).
@@ -1824,7 +1825,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seg_path = tmp.path().join("seg");
         let data = vec![0xCDu8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
@@ -1833,7 +1834,7 @@ mod tests {
         )];
         let (signer_a, _vk_a) = elide_core::signing::generate_ephemeral_signer();
         let (_signer_b, vk_b) = elide_core::signing::generate_ephemeral_signer();
-        write_segment(&seg_path, &mut entries, signer_a.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer_a.as_ref()).unwrap();
 
         let bytes = std::fs::read(&seg_path).unwrap();
         let err = elide_core::segment::verify_segment_bytes(&bytes, "test", &vk_b).unwrap_err();
@@ -1850,7 +1851,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seg_path = tmp.path().join("seg");
         let data = vec![0xEFu8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
@@ -1858,7 +1859,7 @@ mod tests {
             data,
         )];
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         let mut bytes = std::fs::read(&seg_path).unwrap();
         // Zero out the signature field at header[36..100] (segment v5).
@@ -2063,7 +2064,7 @@ mod tests {
         // fetch; followers' targets all fall inside it.
         let data: Vec<Vec<u8>> = (0..3).map(|i| vec![0x10 + i as u8; 4096]).collect();
         let hashes: Vec<_> = data.iter().map(|d| blake3::hash(d)).collect();
-        let mut entries: Vec<SegmentEntry> = data
+        let entries: Vec<_> = data
             .iter()
             .zip(hashes.iter())
             .enumerate()
@@ -2073,7 +2074,7 @@ mod tests {
             .collect();
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         // .idx in place; .body / .present absent so every thread
@@ -2237,7 +2238,7 @@ mod tests {
 
         let data: Vec<Vec<u8>> = (0..N).map(|i| vec![0xA0u8 + i as u8; 4096]).collect();
         let hashes: Vec<_> = data.iter().map(|d| blake3::hash(d)).collect();
-        let mut entries: Vec<SegmentEntry> = data
+        let entries: Vec<_> = data
             .iter()
             .zip(hashes.iter())
             .enumerate()
@@ -2247,7 +2248,7 @@ mod tests {
             .collect();
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         std::fs::create_dir_all(&index_dir).unwrap();
@@ -2373,7 +2374,7 @@ mod tests {
         let payloads: Vec<Vec<u8>> = (0..n)
             .map(|i| vec![(i as u8).wrapping_add(0x10); entry_size])
             .collect();
-        let mut entries: Vec<SegmentEntry> = payloads
+        let entries: Vec<_> = payloads
             .iter()
             .enumerate()
             .map(|(i, data)| {
@@ -2388,7 +2389,7 @@ mod tests {
             .collect();
         let seg_path = tmp.join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
 
         std::fs::write(
@@ -2651,7 +2652,9 @@ mod tests {
     /// indices instead of trying to read their bytes from the GET.
     #[test]
     fn warm_segment_skips_non_data_entries_inside_batch() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use elide_core::segment::{
+            PendingEntry, SegmentEntry, SegmentFlags, check_present_bit, write_segment,
+        };
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -2677,7 +2680,7 @@ mod tests {
         // so the resulting batch has body_start=4096 — that's what makes
         // the verify-loop's `rel = (0 - body_start)` underflow on the
         // non-data entries, triggering the regression.
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(
                 blake3::hash(&payload_pad),
                 0,
@@ -2692,8 +2695,8 @@ mod tests {
                 SegmentFlags::empty(),
                 payload_a.clone(),
             ),
-            SegmentEntry::new_dedup_ref(dedup_target_hash, 2, 1),
-            SegmentEntry::new_zero(3, 1),
+            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(dedup_target_hash, 2, 1)),
+            PendingEntry::from_entry(SegmentEntry::new_zero(3, 1)),
             SegmentEntry::new_data(
                 blake3::hash(&payload_b),
                 4,
@@ -2704,7 +2707,7 @@ mod tests {
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
         let full_bytes = std::fs::read(&seg_path).unwrap();
         std::fs::write(
             index_dir.join(format!("{seg_id}.idx")),

@@ -131,33 +131,43 @@ pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 /// memory growth on large volumes.
 const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 
-/// Read body bytes for each pending entry whose body lives in the WAL,
-/// populating `entry.data` with the bytes pread'd from `wal_path`.
+/// Pair each pending entry with its stored bytes pread from `wal_path`,
+/// producing the build-form [`segment::PendingEntry`]s a segment write
+/// consumes. Inline-kind bytes land on `entry.inline`; Data bytes ride
+/// as the pending body.
 ///
 /// `body_offsets` is parallel to `entries`: `Some(off)` means the entry's
-/// body lives at `off..off + entry.stored_length` in the WAL file; `None`
-/// means the entry has no body bytes (DedupRef, Zero, Delta) or the body
-/// is already in `entry.data`. Used both at promote time (write_and_commit
-/// needs the body in memory to write the segment) and at recovery-time
-/// startup promote.
+/// bytes live at `off..off + entry.stored_length` in the WAL file; `None`
+/// means the entry has none (DedupRef, Zero, Delta). Used both at promote
+/// time (write_and_commit needs the body in memory to write the segment)
+/// and at recovery-time startup promote.
 pub(crate) fn materialise_pending_bodies(
     wal_path: &Path,
-    entries: &mut [segment::SegmentEntry],
+    entries: Vec<segment::SegmentEntry>,
     body_offsets: &[Option<u64>],
-) -> io::Result<()> {
+) -> io::Result<Vec<segment::PendingEntry>> {
     use std::os::unix::fs::FileExt;
     debug_assert_eq!(entries.len(), body_offsets.len());
-    if !body_offsets.iter().any(Option::is_some) {
-        return Ok(());
+    let f = if body_offsets.iter().any(Option::is_some) {
+        Some(fs::File::open(wal_path)?)
+    } else {
+        None
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for (mut entry, off) in entries.into_iter().zip(body_offsets.iter()) {
+        let mut body = None;
+        if let (Some(off), Some(f)) = (off, &f) {
+            let mut buf = vec![0u8; entry.stored_length as usize];
+            f.read_exact_at(&mut buf, *off)?;
+            if entry.kind.is_inline() {
+                entry.inline = Some(buf.into_boxed_slice());
+            } else {
+                body = Some(buf);
+            }
+        }
+        out.push(segment::PendingEntry { entry, body });
     }
-    let f = fs::File::open(wal_path)?;
-    for (entry, off) in entries.iter_mut().zip(body_offsets.iter()) {
-        let Some(off) = off else { continue };
-        let mut buf = vec![0u8; entry.stored_length as usize];
-        f.read_exact_at(&mut buf, *off)?;
-        entry.data = Some(buf);
-    }
-    Ok(())
+    Ok(out)
 }
 
 /// Snapshot the CAS precondition tokens for a promote: the `body_offset`
@@ -215,7 +225,7 @@ fn apply_promoted_entries(
             continue;
         };
         let idata = if entry.kind.is_inline() {
-            entry.data.clone().map(Vec::into_boxed_slice)
+            entry.inline.clone()
         } else {
             None
         };

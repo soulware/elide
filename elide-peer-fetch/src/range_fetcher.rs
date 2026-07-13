@@ -510,7 +510,7 @@ mod tests {
 
         // Build a multi-Data-entry segment per the spec. Each payload
         // is > INLINE_THRESHOLD so it lands in the body section.
-        let mut entries: Vec<SegmentEntry> = entries_spec
+        let entries: Vec<_> = entries_spec
             .iter()
             .enumerate()
             .map(|(i, (payload, _))| {
@@ -520,7 +520,7 @@ mod tests {
             .collect();
         let staging = data_dir.path().join("staging");
         let signer = TestSegSigner(vol_key.clone());
-        write_segment(&staging, &mut entries, &signer).unwrap();
+        write_segment(&staging, entries, &signer).unwrap();
 
         // Lay out cache + index files under data_dir/by_id/<vol>/.
         let by_id = data_dir.path().join("by_id").join(vol_ulid.to_string());

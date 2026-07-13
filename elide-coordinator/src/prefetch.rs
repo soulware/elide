@@ -870,7 +870,7 @@ mod tests {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -879,7 +879,7 @@ mod tests {
         )];
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
+        write_segment(&staging, entries, parent_signer.as_ref()).unwrap();
 
         // Create a snapshot marker in parent (branch point for child).
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
@@ -1003,7 +1003,7 @@ mod tests {
         let data = vec![0x5Au8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -1012,7 +1012,7 @@ mod tests {
         )];
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, parent_signer.as_ref()).unwrap();
+        write_segment(&staging, entries, parent_signer.as_ref()).unwrap();
 
         let snap_ulid = "01BBBBBBBBBBBBBBBBBBBBBBBB";
         std::fs::write(parent_dir.join("snapshots").join(snap_ulid), "").unwrap();
@@ -1093,7 +1093,7 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -1102,7 +1102,7 @@ mod tests {
         )];
         let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&staging, entries, signer.as_ref()).unwrap();
 
         // Upload the segment under its canonical S3 key.
         let store_tmp = TempDir::new().unwrap();
@@ -1177,7 +1177,7 @@ mod tests {
         // there is no manifest yet.
         let data = vec![0xCDu8; 4096];
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
@@ -1186,7 +1186,7 @@ mod tests {
         )];
         let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
-        write_segment(&staging, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&staging, entries, signer.as_ref()).unwrap();
         let store_tmp = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());

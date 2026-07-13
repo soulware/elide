@@ -120,7 +120,7 @@ fn build_segment_bytes(signer: &dyn SegmentSigner, inputs: &[Ulid]) -> Vec<u8> {
     let path = dir.path().join("seg");
     // Single trivial data entry — enough to make the segment well-formed.
     let body = b"x".to_vec();
-    let mut entries = vec![SegmentEntry::new_data(
+    let entries = vec![SegmentEntry::new_data(
         blake3::hash(&body),
         0,
         1,
@@ -128,9 +128,9 @@ fn build_segment_bytes(signer: &dyn SegmentSigner, inputs: &[Ulid]) -> Vec<u8> {
         body,
     )];
     if inputs.is_empty() {
-        segment::write_segment(&path, &mut entries, signer).unwrap();
+        segment::write_segment(&path, entries, signer).unwrap();
     } else {
-        segment::write_gc_segment(&path, &mut entries, inputs, signer).unwrap();
+        segment::write_gc_segment(&path, entries, inputs, signer).unwrap();
     }
     std::fs::read(&path).unwrap()
 }

@@ -93,7 +93,7 @@ fn mk_segment(
     entries_spec: Vec<(Vec<u8>, bool)>,
 ) -> (Ulid, u64) {
     let seg_ulid = Ulid::new();
-    let mut entries: Vec<SegmentEntry> = entries_spec
+    let entries: Vec<_> = entries_spec
         .iter()
         .enumerate()
         .map(|(i, (payload, _))| {
@@ -103,7 +103,7 @@ fn mk_segment(
         .collect();
     let staging = data_dir.join(format!("staging-{seg_ulid}"));
     let signer = TestSegSigner(vol.key.clone());
-    write_segment(&staging, &mut entries, &signer).unwrap();
+    write_segment(&staging, entries, &signer).unwrap();
 
     let by_id = data_dir.join("by_id").join(vol.ulid.to_string());
     let cache = by_id.join("cache");

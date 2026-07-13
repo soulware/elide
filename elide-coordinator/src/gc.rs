@@ -964,7 +964,7 @@ fn collect_stats(
                 let start = entry.stored_offset as usize;
                 let end = start + entry.stored_length as usize;
                 if end <= inline_bytes.len() {
-                    entry.data = Some(inline_bytes[start..end].to_vec());
+                    entry.inline = Some(inline_bytes[start..end].into());
                 }
             }
             let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
@@ -1552,6 +1552,7 @@ mod tests {
                     elide_core::segment::SegmentFlags::empty(),
                     vec![0u8; 512],
                 )
+                .entry
             })
             .collect();
         let live_entry_indices: Vec<u32> = (0..live_data_entries as u32).collect();
@@ -2668,7 +2669,7 @@ mod tests {
     /// reads would both fail.
     #[tokio::test]
     async fn gc_delta_partial_death_compaction() {
-        use elide_core::segment::{DeltaOption, write_segment_with_delta_body};
+        use elide_core::segment::{DeltaOption, PendingEntry, write_segment_with_delta_body};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2723,14 +2724,14 @@ mod tests {
             delta_length: delta_blob.len() as u32,
             delta_hash: blake3::hash(&delta_blob),
         };
-        let mut delta_entries = vec![SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])];
-        write_segment_with_delta_body(
-            &delta_pending,
-            &mut delta_entries,
-            &delta_blob,
-            signer.as_ref(),
-        )
-        .unwrap();
+        let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            100,
+            4,
+            vec![opt],
+        ))];
+        write_segment_with_delta_body(&delta_pending, delta_entries, &delta_blob, signer.as_ref())
+            .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
         let key = segment_key(Ulid::nil(), delta_ulid);
         store
@@ -2819,7 +2820,7 @@ mod tests {
     /// an incremental-update divergence.
     #[tokio::test]
     async fn gc_fold_kept_delta_readable_without_reopen() {
-        use elide_core::segment::{DeltaOption, write_segment_with_delta_body};
+        use elide_core::segment::{DeltaOption, PendingEntry, write_segment_with_delta_body};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2865,14 +2866,14 @@ mod tests {
             delta_length: delta_blob.len() as u32,
             delta_hash: blake3::hash(&delta_blob),
         };
-        let mut delta_entries = vec![SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])];
-        write_segment_with_delta_body(
-            &delta_pending,
-            &mut delta_entries,
-            &delta_blob,
-            signer.as_ref(),
-        )
-        .unwrap();
+        let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            100,
+            4,
+            vec![opt],
+        ))];
+        write_segment_with_delta_body(&delta_pending, delta_entries, &delta_blob, signer.as_ref())
+            .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
         let key = segment_key(Ulid::nil(), delta_ulid);
         store

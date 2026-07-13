@@ -1922,7 +1922,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     drop(ctx);
 
     let rewrite_apply::Materialised {
-        mut entries,
+        entries,
         delta_body,
     } = materialised;
 
@@ -1949,13 +1949,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     // Write the signed output segment to <ulid>.tmp. The actor renames it
     // to bare <ulid> as the commit point.
     let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
-    segment::write_segment_full(
-        &tmp_path,
-        &mut entries,
-        &delta_body,
-        &inputs,
-        signer.as_ref(),
-    )?;
+    segment::write_segment_full(&tmp_path, entries, &delta_body, &inputs, signer.as_ref())?;
 
     let (new_bss, written_entries, _) =
         segment::read_and_verify_segment_index(&tmp_path, &verifying_key)?;
@@ -2062,31 +2056,30 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
 /// Also reachable from the inline (on-actor) `Volume::flush_wal_to_pending_as`
 /// path and the startup recovery promote in `Volume::open_impl`, so all
 /// three execution sites share one write pass.
-pub(crate) fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
+pub(crate) fn execute_promote(job: PromoteJob) -> io::Result<PromoteResult> {
     std::fs::File::open(&job.old_wal_path)?.sync_data()?;
 
     // Body bytes for entries written via `write_commit` live only in the
-    // WAL between commit and promote. Pull them into `entry.data` from
-    // the WAL using `body_offsets` before write_and_commit reads them.
-    crate::volume::materialise_pending_bodies(
+    // WAL between commit and promote. Pair them with their WAL bytes via
+    // `body_offsets` for write_and_commit to consume.
+    let pendings = crate::volume::materialise_pending_bodies(
         &job.old_wal_path,
-        &mut job.entries,
+        job.entries,
         &job.body_offsets,
     )?;
 
-    let body_section_start = segment::write_and_commit(
+    let (body_section_start, entries) = segment::write_and_commit(
         &job.pending_dir,
         job.segment_ulid,
-        &mut job.entries,
+        pendings,
         job.signer.as_ref(),
     )?;
-    segment::drop_written_bodies(&mut job.entries);
     Ok(PromoteResult {
         segment_ulid: job.segment_ulid,
         old_wal_ulid: job.old_wal_ulid,
         old_wal_path: job.old_wal_path,
         body_section_start,
-        entries: job.entries,
+        entries,
         pre_promote_offsets: job.pre_promote_offsets,
     })
 }
@@ -2573,7 +2566,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         drop(ctx);
 
         let Materialised {
-            entries: mut out_entries,
+            entries: out_entries,
             delta_body,
         } = materialised;
 
@@ -2581,22 +2574,12 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let final_path = pending_dir.join(&new_ulid_str);
         let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
         let _ = std::fs::remove_file(&tmp_path);
-        let new_body_section_start = segment::write_segment_full(
-            &tmp_path,
-            &mut out_entries,
-            &delta_body,
-            &[],
-            signer.as_ref(),
-        )?;
+        let (new_body_section_start, out_entries) =
+            segment::write_segment_full(&tmp_path, out_entries, &delta_body, &[], signer.as_ref())?;
         std::fs::rename(&tmp_path, &final_path)?;
         segment::fsync_dir(&final_path)?;
         stats.new_segments += 1;
         stats.bytes_freed += bucket_bytes_freed;
-
-        // Result buckets accumulate until the job returns — without this
-        // the job retains every bucket's body bytes, ~the volume's whole
-        // pending backlog at once.
-        segment::drop_written_bodies(&mut out_entries);
 
         result_buckets.push(crate::volume::RepackedBucket {
             inputs: bucket_inputs,
@@ -3221,7 +3204,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let mut body_cache: std::collections::HashMap<blake3::Hash, ReclaimBody> =
         std::collections::HashMap::new();
 
-    let mut entries: Vec<segment::SegmentEntry> = Vec::new();
+    let mut entries: Vec<segment::PendingEntry> = Vec::new();
     let mut uncompressed_bytes: Vec<u64> = Vec::new();
     // Delta blobs, concatenated in emission order. Offsets recorded on
     // each emitted Delta entry are into this buffer; it becomes the
@@ -3307,10 +3290,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 // If the new hash is already canonical somewhere, emit a thin
                 // DedupRef — cheapest possible output, strictly beats any Delta.
                 if job.extent_index_snapshot.lookup(&new_hash).is_some() {
-                    entries.push(segment::SegmentEntry::new_dedup_ref(
-                        new_hash,
-                        er.range_start,
-                        length_blocks,
+                    entries.push(segment::PendingEntry::from_entry(
+                        segment::SegmentEntry::new_dedup_ref(
+                            new_hash,
+                            er.range_start,
+                            length_blocks,
+                        ),
                     ));
                     uncompressed_bytes.push(bytes.len() as u64);
                     continue;
@@ -3368,16 +3353,18 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                         let delta_hash = blake3::hash(&delta_blob);
                         delta_body.extend_from_slice(&delta_blob);
 
-                        entries.push(segment::SegmentEntry::new_delta(
-                            new_hash,
-                            er.range_start,
-                            length_blocks,
-                            vec![segment::DeltaOption {
-                                source_hash: er.hash,
-                                delta_offset,
-                                delta_length,
-                                delta_hash,
-                            }],
+                        entries.push(segment::PendingEntry::from_entry(
+                            segment::SegmentEntry::new_delta(
+                                new_hash,
+                                er.range_start,
+                                length_blocks,
+                                vec![segment::DeltaOption {
+                                    source_hash: er.hash,
+                                    delta_offset,
+                                    delta_length,
+                                    delta_hash,
+                                }],
+                            ),
                         ));
                         uncompressed_bytes.push(bytes.len() as u64);
                         continue;
@@ -3417,10 +3404,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 // thin DedupRef — a DATA entry is cheaper to read than a
                 // Delta when the body exists.
                 if job.extent_index_snapshot.lookup(&new_hash).is_some() {
-                    entries.push(segment::SegmentEntry::new_dedup_ref(
-                        new_hash,
-                        er.range_start,
-                        length_blocks,
+                    entries.push(segment::PendingEntry::from_entry(
+                        segment::SegmentEntry::new_dedup_ref(
+                            new_hash,
+                            er.range_start,
+                            length_blocks,
+                        ),
                     ));
                     uncompressed_bytes.push(bytes.len() as u64);
                     continue;
@@ -3447,16 +3436,18 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 let delta_hash = blake3::hash(&delta_blob);
                 delta_body.extend_from_slice(&delta_blob);
 
-                entries.push(segment::SegmentEntry::new_delta(
-                    new_hash,
-                    er.range_start,
-                    length_blocks,
-                    vec![segment::DeltaOption {
-                        source_hash: *source_hash,
-                        delta_offset,
-                        delta_length,
-                        delta_hash,
-                    }],
+                entries.push(segment::PendingEntry::from_entry(
+                    segment::SegmentEntry::new_delta(
+                        new_hash,
+                        er.range_start,
+                        length_blocks,
+                        vec![segment::DeltaOption {
+                            source_hash: *source_hash,
+                            delta_offset,
+                            delta_length,
+                            delta_hash,
+                        }],
+                    ),
                 ));
                 uncompressed_bytes.push(bytes.len() as u64);
             }
@@ -3480,19 +3471,18 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let ulid_str = job.segment_ulid.to_string();
     let tmp_path = job.pending_dir.join(format!("{ulid_str}.tmp"));
     let final_path = job.pending_dir.join(&ulid_str);
-    let body_section_start = if delta_body.is_empty() {
-        segment::write_segment(&tmp_path, &mut entries, job.signer.as_ref())?
+    let (body_section_start, entries) = if delta_body.is_empty() {
+        segment::write_segment(&tmp_path, entries, job.signer.as_ref())?
     } else {
         segment::write_segment_with_delta_body(
             &tmp_path,
-            &mut entries,
+            entries,
             &delta_body,
             job.signer.as_ref(),
         )?
     };
     fs::rename(&tmp_path, &final_path)?;
     segment::fsync_dir(&final_path)?;
-    segment::drop_written_bodies(&mut entries);
 
     // body_length = sum of stored_length over entries that contribute
     // to the body section (Data + CanonicalData). Delta, DedupRef, and

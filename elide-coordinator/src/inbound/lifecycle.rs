@@ -2152,14 +2152,14 @@ mod tests {
     fn write_test_segment(path: &Path, signer: &dyn elide_core::segment::SegmentSigner, fill: u8) {
         let body = vec![fill; 4096];
         let hash = blake3::hash(&body);
-        let mut entries = vec![elide_core::segment::SegmentEntry::new_data(
+        let entries = vec![elide_core::segment::SegmentEntry::new_data(
             hash,
             0,
             1,
             elide_core::segment::SegmentFlags::empty(),
             body,
         )];
-        elide_core::segment::write_segment(path, &mut entries, signer).unwrap();
+        elide_core::segment::write_segment(path, entries, signer).unwrap();
     }
 
     fn volume_keypair(vol_dir: &Path) -> Arc<dyn elide_core::segment::SegmentSigner> {

@@ -21,9 +21,8 @@ use super::ZERO_HASH;
 ///
 /// `body_offsets[i]` is `Some(off)` when `pending_entries[i]` is a
 /// body-bearing kind (Data / Inline) — the body lives at `off..off+stored_length`
-/// in the WAL — and `None` for kinds with no body (DedupRef, Zero). Data
-/// entries returned here have `entry.data: None`; the bytes are read
-/// from the WAL on promote, not held in memory.
+/// in the WAL — and `None` for kinds with no body (DedupRef, Zero). The
+/// bytes are read from the WAL on promote, not held in memory.
 pub(super) struct WalReplay {
     pub ulid: Ulid,
     pub valid_size: u64,

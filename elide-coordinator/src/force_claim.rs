@@ -1038,14 +1038,14 @@ mod tests {
         let path = dir.path().join("seg");
         let body = vec![fill; 4096];
         let hash = blake3::hash(&body);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             body,
         )];
-        elide_core::segment::write_segment(&path, &mut entries, signer).unwrap();
+        elide_core::segment::write_segment(&path, entries, signer).unwrap();
         std::fs::read(&path).unwrap()
     }
 
@@ -1351,14 +1351,14 @@ mod tests {
         let src_bytes = {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("seg");
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 h1,
                 0,
                 1,
                 SegmentFlags::empty(),
                 v1.clone(),
             )];
-            elide_core::segment::write_segment(&path, &mut entries, dead.signer.as_ref()).unwrap();
+            elide_core::segment::write_segment(&path, entries, dead.signer.as_ref()).unwrap();
             std::fs::read(&path).unwrap()
         };
 
@@ -1369,20 +1369,22 @@ mod tests {
         let delta_bytes = {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("seg");
-            let mut entries = vec![elide_core::segment::SegmentEntry::new_delta(
-                h2,
-                0,
-                1,
-                vec![elide_core::segment::DeltaOption {
-                    source_hash: h1,
-                    delta_offset: 0,
-                    delta_length: blob.len() as u32,
-                    delta_hash: blake3::hash(&blob),
-                }],
+            let entries = vec![elide_core::segment::PendingEntry::from_entry(
+                elide_core::segment::SegmentEntry::new_delta(
+                    h2,
+                    0,
+                    1,
+                    vec![elide_core::segment::DeltaOption {
+                        source_hash: h1,
+                        delta_offset: 0,
+                        delta_length: blob.len() as u32,
+                        delta_hash: blake3::hash(&blob),
+                    }],
+                ),
             )];
             elide_core::segment::write_segment_with_delta_body(
                 &path,
-                &mut entries,
+                entries,
                 &blob,
                 dead.signer.as_ref(),
             )

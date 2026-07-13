@@ -182,8 +182,8 @@ pub enum InlineSource<'a> {
     /// the segment's inline section; a truncated section skips the
     /// entry.
     Section(&'a [u8]),
-    /// Take the entry's in-memory `data` field.
-    EntryData,
+    /// Take the entry's `inline` field.
+    EntryInline,
 }
 
 /// Context describing one segment whose index entries are being
@@ -618,7 +618,7 @@ impl ExtentIndex {
                                 None => return Ok(()),
                             }
                         }
-                        InlineSource::EntryData => entry.data.clone().map(Vec::into_boxed_slice),
+                        InlineSource::EntryInline => entry.inline.clone(),
                     }
                 } else {
                     None
@@ -1323,7 +1323,7 @@ mod tests {
                 body_section_start: 128,
                 body_length: 4096,
             }),
-            inline: InlineSource::EntryData,
+            inline: InlineSource::EntryInline,
         }
     }
 
@@ -1398,7 +1398,8 @@ mod tests {
         let mut index = ExtentIndex::new();
         index.insert_delta(h(1), delta_loc(useg(3)));
         let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
+                .entry;
         let consumed = std::iter::once(useg(3)).collect();
         index
             .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
@@ -1412,7 +1413,8 @@ mod tests {
         let mut index = ExtentIndex::new();
         index.insert(h(1), data_loc(useg(9)));
         let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
+                .entry;
         let consumed = std::iter::once(useg(3)).collect();
         index
             .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
@@ -1429,7 +1431,8 @@ mod tests {
         let mut index = ExtentIndex::new();
         index.insert_delta(h(1), delta_loc(useg(3)));
         let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
+                .entry;
         index
             .register_entry_if_absent(&entry, 0, &reg_ctx(useg(7)))
             .unwrap();
@@ -1446,9 +1449,11 @@ mod tests {
         index.insert(h(1), data_loc(useg(9)));
         index.insert_delta(h(2), delta_loc(useg(3)));
         let over_data =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
+                .entry;
         let over_delta =
-            SegmentEntry::new_data(h(2), 1, 1, segment::SegmentFlags::empty(), vec![0u8; 4096]);
+            SegmentEntry::new_data(h(2), 1, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
+                .entry;
         index
             .register_entry_unconditional(&over_data, 0, &reg_ctx(useg(7)))
             .unwrap();
@@ -1536,16 +1541,16 @@ mod tests {
 
         let data = vec![0xabu8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             segment::SegmentFlags::empty(),
             data,
         )];
-        let bss = segment::write_segment(
+        let (bss, entries) = segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-            &mut entries,
+            entries,
             signer.as_ref(),
         )
         .unwrap();
@@ -1572,17 +1577,18 @@ mod tests {
         let signer = write_test_pub(&base);
 
         let ref_hash = blake3::hash(b"dedup ref body");
-        let ref_entry = SegmentEntry::new_dedup_ref(ref_hash, 0, 1);
+        let ref_entry =
+            segment::PendingEntry::from_entry(SegmentEntry::new_dedup_ref(ref_hash, 0, 1));
 
         let data_body = b"real data".repeat(512)[..4096].to_vec();
         let data_hash = blake3::hash(&data_body);
-        let mut entries = vec![
+        let entries = vec![
             ref_entry,
             SegmentEntry::new_data(data_hash, 2, 1, segment::SegmentFlags::empty(), data_body),
         ];
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-            &mut entries,
+            entries,
             signer.as_ref(),
         )
         .unwrap();
@@ -1610,32 +1616,33 @@ mod tests {
         let bss1;
         let stored_offset1;
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 hash,
                 0,
                 1,
                 segment::SegmentFlags::empty(),
                 data.clone(),
             )];
-            bss1 = segment::write_segment(
+            let (bss, written) = segment::write_segment(
                 &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-                &mut entries,
+                entries,
                 signer.as_ref(),
             )
             .unwrap();
-            stored_offset1 = entries[0].stored_offset;
+            bss1 = bss;
+            stored_offset1 = written[0].stored_offset;
         }
         // Newer segment: same hash, different position.
         {
             let data2 = vec![0u8; 8192]; // put something before it
             let hash2 = blake3::hash(&data2);
-            let mut entries = vec![
+            let entries = vec![
                 SegmentEntry::new_data(hash2, 10, 2, segment::SegmentFlags::empty(), data2),
                 SegmentEntry::new_data(hash, 0, 1, segment::SegmentFlags::empty(), data),
             ];
             segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
-                &mut entries,
+                entries,
                 signer.as_ref(),
             )
             .unwrap();
@@ -1674,20 +1681,21 @@ mod tests {
         let bss;
         let stored_offset;
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 hash,
                 0,
                 1,
                 segment::SegmentFlags::empty(),
                 data,
             )];
-            bss = segment::write_segment(
+            let (b, written) = segment::write_segment(
                 &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-                &mut entries,
+                entries,
                 signer.as_ref(),
             )
             .unwrap();
-            stored_offset = entries[0].stored_offset;
+            bss = b;
+            stored_offset = written[0].stored_offset;
         }
 
         let index = rebuild(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
@@ -1710,18 +1718,18 @@ mod tests {
 
         let data = vec![0xABu8; 100]; // well below INLINE_THRESHOLD
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             segment::SegmentFlags::empty(),
             data.clone(),
         )];
-        assert_eq!(entries[0].kind, segment::EntryKind::Inline);
+        assert_eq!(entries[0].entry.kind, segment::EntryKind::Inline);
 
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-            &mut entries,
+            entries,
             signer.as_ref(),
         )
         .unwrap();
@@ -1751,7 +1759,7 @@ mod tests {
 
         let data = vec![0xCDu8; 200];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -1761,7 +1769,7 @@ mod tests {
 
         let seg_name = "01AAAAAAAAAAAAAAAAAAAAAAAA";
         let seg_path = pending.join(seg_name);
-        segment::write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        segment::write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Extract .idx and remove the full segment so rebuild uses the .idx.
         let idx_path = index_dir.join(format!("{seg_name}.idx"));

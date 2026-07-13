@@ -489,15 +489,18 @@ pub struct DeltaOption {
 
 /// One entry in the in-memory representation of a segment's index section.
 ///
-/// Used in two contexts:
-/// - Entries accumulated during a write session for promotion: `data` holds raw
-///   extent bytes and `stored_offset` is filled in by `write_segment`.
-/// - Entries read from an existing segment during startup rebuild: `data` is
-///   empty (not needed; body lives on disk). `stored_offset` is section-relative.
+/// Mirrors what the `.idx` tier of a segment carries: the 64-byte index
+/// record plus, for inline kinds, the entry's inline-section bytes. Body
+/// bytes (`Data` / `CanonicalData`) are never held here — they are
+/// addressed on disk via `stored_offset` / `stored_length`. Entries being
+/// built for a segment write pair a `SegmentEntry` with its body in
+/// [`PendingEntry`]; the pairing ends at the segment write, which consumes
+/// the bodies and returns bare `SegmentEntry`s.
 ///
 /// `Clone` is supported for the segment-index cache, which hands out a fresh
-/// `Vec<SegmentEntry>` on each hit. On read-from-disk entries, `data` is
-/// `None` and the clone is a small memcpy plus one `Vec<DeltaOption>` copy.
+/// `Vec<SegmentEntry>` on each hit; the clone is a small memcpy plus the
+/// `Vec<DeltaOption>` copy and, for inline entries, the (< 256 B) inline
+/// bytes.
 #[derive(Debug, Clone)]
 pub struct SegmentEntry {
     pub hash: blake3::Hash,
@@ -513,15 +516,43 @@ pub struct SegmentEntry {
     /// Byte length of the stored data (compressed size if `compressed`).
     /// Zero for dedup refs.
     pub stored_length: u32,
-    /// Raw extent bytes for entries being built for promotion. `None` for dedup
-    /// refs, zero entries, and entries read from a committed segment (data stays
-    /// on disk). Populated by `read_extent_bodies` or during write-session
-    /// accumulation.
-    pub data: Option<Vec<u8>>,
+    /// Inline-section bytes for `Inline` / `CanonicalInline` entries —
+    /// `< INLINE_THRESHOLD` by construction. `None` for every other kind,
+    /// and for inline entries parsed without their inline section (see
+    /// [`populate_inline_bodies`]).
+    pub inline: Option<Box<[u8]>>,
     /// Delta options for this entry (S3 segments only; empty locally).
     /// Each option provides a zstd-dictionary-compressed alternative to the
     /// full body, using a different source extent as dictionary.
     pub delta_options: Vec<DeltaOption>,
+}
+
+/// A [`SegmentEntry`] paired with its body bytes while a segment is being
+/// built. Exists only between body materialisation and the segment write:
+/// every writer consumes `Vec<PendingEntry>` and returns the bare
+/// [`SegmentEntry`]s, so body bytes structurally cannot outlive the write.
+#[derive(Debug)]
+pub struct PendingEntry {
+    pub entry: SegmentEntry,
+    /// Stored body bytes for `Data` / `CanonicalData` entries (compressed
+    /// form if `entry.compressed`). `None` for all other kinds — inline
+    /// bytes live on `entry.inline`.
+    pub body: Option<Vec<u8>>,
+}
+
+impl PendingEntry {
+    /// Pair a body-less entry (DedupRef / Zero / Delta / Inline) for a
+    /// segment write. `Data` entries built this way fail the write's
+    /// missing-body check.
+    pub fn from_entry(entry: SegmentEntry) -> Self {
+        Self { entry, body: None }
+    }
+
+    /// See [`SegmentEntry::into_canonical`].
+    pub fn into_canonical(mut self) -> Self {
+        self.entry = self.entry.into_canonical();
+        self
+    }
 }
 
 impl SegmentEntry {
@@ -535,34 +566,37 @@ impl SegmentEntry {
         lba_length: u32,
         flags: SegmentFlags,
         data: Vec<u8>,
-    ) -> Self {
+    ) -> PendingEntry {
         let stored_length = data.len() as u32;
-        let kind = if would_be_inline(data.len()) {
-            EntryKind::Inline
+        let (kind, inline, body) = if would_be_inline(data.len()) {
+            (EntryKind::Inline, Some(data.into_boxed_slice()), None)
         } else {
-            EntryKind::Data
+            (EntryKind::Data, None, Some(data))
         };
-        Self {
-            hash,
-            start_lba,
-            lba_length,
-            compressed: flags.contains(SegmentFlags::COMPRESSED),
-            kind,
-            stored_offset: 0, // filled by write_segment
-            stored_length,
-            data: Some(data),
-            delta_options: Vec::new(),
+        PendingEntry {
+            entry: Self {
+                hash,
+                start_lba,
+                lba_length,
+                compressed: flags.contains(SegmentFlags::COMPRESSED),
+                kind,
+                stored_offset: 0, // filled by write_segment
+                stored_length,
+                inline,
+                delta_options: Vec::new(),
+            },
+            body,
         }
     }
 
-    /// Create a DATA / INLINE entry whose body bytes are *not* held in
-    /// memory yet (`data: None`).
+    /// Create a DATA / INLINE entry whose stored bytes are *not* held in
+    /// memory.
     ///
     /// Used by the volume write path when the body bytes have just been
     /// appended to the WAL: the body source is recorded out-of-band
-    /// (`Volume::pending_body_offsets`) and `entry.data` is materialised
-    /// from the WAL at promote time. `stored_length` and `kind` are
-    /// derived from the original payload length — the same way
+    /// (`Volume::pending_body_offsets`) and the bytes are paired back in
+    /// as a [`PendingEntry`] at promote time. `stored_length` and `kind`
+    /// are derived from the original payload length — the same way
     /// [`SegmentEntry::new_data`] would have classified the bytes.
     pub fn new_data_no_body(
         hash: blake3::Hash,
@@ -584,7 +618,7 @@ impl SegmentEntry {
             kind,
             stored_offset: 0,
             stored_length,
-            data: None,
+            inline: None,
             delta_options: Vec::new(),
         }
     }
@@ -604,7 +638,7 @@ impl SegmentEntry {
             kind: EntryKind::DedupRef,
             stored_offset: 0,
             stored_length: 0,
-            data: None,
+            inline: None,
             delta_options: Vec::new(),
         }
     }
@@ -619,7 +653,7 @@ impl SegmentEntry {
             kind: EntryKind::Zero,
             stored_offset: 0,
             stored_length: 0,
-            data: None,
+            inline: None,
             delta_options: Vec::new(),
         }
     }
@@ -673,7 +707,7 @@ impl SegmentEntry {
             kind: EntryKind::Delta,
             stored_offset: 0,
             stored_length: 0,
-            data: None,
+            inline: None,
             delta_options,
         }
     }
@@ -695,9 +729,9 @@ impl SegmentEntry {
 /// absolute file offsets: `body_section_start + entry.stored_offset`.
 pub fn write_segment(
     path: &Path,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
     write_segment_full(path, entries, &[], &[], signer)
 }
 
@@ -715,10 +749,10 @@ pub fn write_segment(
 /// those in coherently before writing.
 pub fn write_segment_with_delta_body(
     path: &Path,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     delta_body: &[u8],
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
     write_segment_full(path, entries, delta_body, &[], signer)
 }
 
@@ -733,22 +767,52 @@ pub fn write_segment_with_delta_body(
 /// or [`write_segment_with_delta_body`], which pass an empty `inputs` slice.
 pub fn write_gc_segment(
     path: &Path,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     inputs: &[ulid::Ulid],
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
     write_segment_full(path, entries, &[], inputs, signer)
 }
 
 /// Core write path. All public writers funnel through here.
+///
+/// Consumes the pending entries and returns the bare [`SegmentEntry`]s
+/// with `stored_offset` assigned, alongside `body_section_start` — body
+/// bytes end at this write and do not travel further.
 pub fn write_segment_full(
     path: &Path,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     delta_body: &[u8],
     inputs: &[ulid::Ulid],
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
-    let (entries_region, inline_length, body_length) = assign_offsets(entries);
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
+    let (mut entries, bodies): (Vec<SegmentEntry>, Vec<Option<Vec<u8>>>) =
+        entries.into_iter().map(|p| (p.entry, p.body)).unzip();
+    for (entry, body) in entries.iter().zip(bodies.iter()) {
+        let (has, wants) = (
+            body.is_some(),
+            matches!(entry.kind, EntryKind::Data | EntryKind::CanonicalData),
+        );
+        if wants && !has {
+            return Err(io::Error::other(format!(
+                "{:?} entry {} has no body bytes to write",
+                entry.kind, entry.hash
+            )));
+        }
+        if !wants && has {
+            return Err(io::Error::other(format!(
+                "{:?} entry {} carries body bytes it cannot store",
+                entry.kind, entry.hash
+            )));
+        }
+        if entry.kind.is_inline() && entry.inline.is_none() {
+            return Err(io::Error::other(format!(
+                "{:?} entry {} has no inline bytes to write",
+                entry.kind, entry.hash
+            )));
+        }
+    }
+    let (entries_region, inline_length, body_length) = assign_offsets(&mut entries);
     let inputs_region = inputs_region_length(inputs);
     let index_length = entries_region + inputs_region;
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
@@ -759,7 +823,7 @@ pub fn write_segment_full(
     for entry in entries.iter() {
         write_index_entry(&mut index_buf, entry)?;
     }
-    write_delta_table(&mut index_buf, entries)?;
+    write_delta_table(&mut index_buf, &entries)?;
     for input in inputs {
         index_buf.extend_from_slice(&input.to_bytes());
     }
@@ -793,27 +857,16 @@ pub fn write_segment_full(
     // Inline section.
     for entry in entries.iter() {
         if entry.kind.is_inline()
-            && let Some(data) = &entry.data
+            && let Some(inline) = &entry.inline
         {
-            w.write_all(data)?;
+            w.write_all(inline)?;
         }
     }
     // Body section: raw bytes, no framing.
     // Data and CanonicalData entries write their body bytes.
     // DedupRef, Zero, Delta, Inline, and CanonicalInline contribute nothing.
-    for entry in entries.iter() {
-        match entry.kind {
-            EntryKind::Data | EntryKind::CanonicalData => {
-                if let Some(data) = &entry.data {
-                    w.write_all(data)?;
-                }
-            }
-            EntryKind::DedupRef
-            | EntryKind::Zero
-            | EntryKind::Inline
-            | EntryKind::CanonicalInline
-            | EntryKind::Delta => {}
-        }
+    for body in bodies.iter().flatten() {
+        w.write_all(body)?;
     }
 
     // Delta body section: raw concatenated delta blobs. Addressed by
@@ -831,21 +884,7 @@ pub fn write_segment_full(
 
     w.flush()?;
     w.get_ref().sync_data()?;
-    Ok(body_section_start)
-}
-
-/// Drop `data` from every non-inline entry.
-///
-/// Called after a segment write commits: body bytes are addressable on
-/// disk via `stored_offset`, and apply phases read `data` only for
-/// inline entries, so holding Data bodies in the returned entries pins
-/// the whole written segment in heap for no reader.
-pub fn drop_written_bodies(entries: &mut [SegmentEntry]) {
-    for entry in entries.iter_mut() {
-        if !entry.kind.is_inline() {
-            entry.data = None;
-        }
-    }
+    Ok((body_section_start, entries))
 }
 
 /// Assign `stored_offset` for each entry and return section sizes.
@@ -1443,7 +1482,7 @@ fn parse_index_section(
             kind,
             stored_offset,
             stored_length,
-            data: None,
+            inline: None,
             delta_options: Vec::new(),
         });
     }
@@ -1603,43 +1642,50 @@ fn parse_delta_table(
 pub fn read_extent_bodies(
     path: &Path,
     body_section_start: u64,
-    entries: &mut [SegmentEntry],
+    entries: Vec<SegmentEntry>,
     inline_bytes: &[u8],
-) -> io::Result<()> {
-    read_body_section_bodies(path, body_section_start, entries)?;
-    populate_inline_bodies(entries, inline_bytes)?;
-    Ok(())
+) -> io::Result<Vec<PendingEntry>> {
+    let mut entries = entries;
+    populate_inline_bodies(&mut entries, inline_bytes)?;
+    read_body_section_bodies(path, body_section_start, entries)
 }
 
-/// Populate `entry.data` for `Data` / `CanonicalData` entries by reading
-/// the body section of `path`. Entries of other kinds, and entries with
-/// `stored_length == 0`, are skipped. No file I/O beyond the body section
-/// reads.
+/// Pair each `Data` / `CanonicalData` entry with its body bytes read from
+/// the body section of `path`, producing build-form [`PendingEntry`]s.
+/// Entries of other kinds, and entries with `stored_length == 0`, are
+/// paired with no body. No file I/O beyond the body section reads.
 pub fn read_body_section_bodies(
     path: &Path,
     body_section_start: u64,
-    entries: &mut [SegmentEntry],
-) -> io::Result<()> {
+    entries: Vec<SegmentEntry>,
+) -> io::Result<Vec<PendingEntry>> {
     use std::os::unix::fs::FileExt;
-    if !entries
+    let needs_file = entries
         .iter()
-        .any(|e| e.kind.is_data() && e.stored_length > 0)
-    {
-        return Ok(());
+        .any(|e| e.kind.is_data() && e.stored_length > 0);
+    let f = if needs_file {
+        Some(fs::File::open(path)?)
+    } else {
+        None
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let body = if entry.stored_length > 0
+            && entry.kind.is_data()
+            && let Some(f) = &f
+        {
+            let mut buf = vec![0u8; entry.stored_length as usize];
+            f.read_exact_at(&mut buf, body_section_start + entry.stored_offset)?;
+            Some(buf)
+        } else {
+            None
+        };
+        out.push(PendingEntry { entry, body });
     }
-    let f = fs::File::open(path)?;
-    for entry in entries.iter_mut() {
-        if entry.stored_length == 0 || !entry.kind.is_data() {
-            continue;
-        }
-        let mut buf = vec![0u8; entry.stored_length as usize];
-        f.read_exact_at(&mut buf, body_section_start + entry.stored_offset)?;
-        entry.data = Some(buf);
-    }
-    Ok(())
+    Ok(out)
 }
 
-/// Populate `entry.data` for `Inline` / `CanonicalInline` entries by
+/// Populate `entry.inline` for `Inline` / `CanonicalInline` entries by
 /// slicing `inline_bytes`. No file I/O — `inline_bytes` is the inline
 /// section already in memory (see `read_inline_section`).
 ///
@@ -1677,7 +1723,7 @@ pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8])
                 ),
             ));
         }
-        entry.data = Some(inline_bytes[start..end].to_vec());
+        entry.inline = Some(inline_bytes[start..end].into());
     }
     Ok(())
 }
@@ -1775,14 +1821,14 @@ pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
 pub fn write_and_commit(
     pending_dir: &Path,
     ulid: ulid::Ulid,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let ulid_str = ulid.to_string();
     let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
     let final_path = pending_dir.join(&ulid_str);
 
-    let body_section_start = write_segment(&tmp_path, entries, signer)?;
+    let (body_section_start, entries) = write_segment(&tmp_path, entries, signer)?;
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
@@ -1790,7 +1836,7 @@ pub fn write_and_commit(
     // on the committed segment.
     fsync_dir(&final_path)?;
 
-    Ok(body_section_start)
+    Ok((body_section_start, entries))
 }
 
 /// Promote a WAL to a committed local segment and delete the WAL file.
@@ -1803,13 +1849,13 @@ pub fn promote(
     wal_path: &Path,
     ulid: ulid::Ulid,
     pending_dir: &Path,
-    entries: &mut [SegmentEntry],
+    entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
-) -> io::Result<u64> {
-    let body_section_start = write_and_commit(pending_dir, ulid, entries, signer)?;
+) -> io::Result<(u64, Vec<SegmentEntry>)> {
+    let written = write_and_commit(pending_dir, ulid, entries, signer)?;
     // WAL is now redundant; segment is the sole copy.
     fs::remove_file(wal_path)?;
-    Ok(body_section_start)
+    Ok(written)
 }
 
 // --- filesystem helpers ---
@@ -2595,14 +2641,14 @@ mod tests {
         let data = vec![0x42u8; 8192];
         let hash = blake3::hash(&data);
 
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             10,
             2,
             SegmentFlags::empty(),
             data.clone(),
         )];
-        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (bss2, read_entries, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(bss, bss2);
@@ -2627,14 +2673,14 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x11u8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             data,
         )];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
         let (_, _, inputs) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert!(inputs.is_empty());
         fs::remove_file(&path).unwrap();
@@ -2648,7 +2694,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x33u8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -2656,7 +2702,7 @@ mod tests {
             data,
         )];
         let inputs_in = vec![ulid::Ulid::new(), ulid::Ulid::new(), ulid::Ulid::new()];
-        write_gc_segment(&path, &mut entries, &inputs_in, signer.as_ref()).unwrap();
+        write_gc_segment(&path, entries, &inputs_in, signer.as_ref()).unwrap();
 
         let (_, read_back, inputs_out) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -2677,7 +2723,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x44u8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -2685,7 +2731,7 @@ mod tests {
             data,
         )];
         let inputs_in = vec![ulid::Ulid::new()];
-        write_gc_segment(&path, &mut entries, &inputs_in, signer.as_ref()).unwrap();
+        write_gc_segment(&path, entries, &inputs_in, signer.as_ref()).unwrap();
 
         // Flip one byte inside the inputs region (tail of index section).
         let mut bytes = fs::read(&path).unwrap();
@@ -2707,7 +2753,7 @@ mod tests {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let mut entries: Vec<SegmentEntry> = (0..4u64)
+        let entries: Vec<PendingEntry> = (0..4u64)
             .map(|i| {
                 let data = vec![i as u8; 4096];
                 let hash = blake3::hash(&data);
@@ -2715,7 +2761,7 @@ mod tests {
             })
             .collect();
 
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 4);
@@ -2736,8 +2782,10 @@ mod tests {
         let (signer, vk) = test_signer();
         let hash = blake3::hash(b"existing extent");
 
-        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 5, 3)];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
+            hash, 5, 3,
+        ))];
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -2763,13 +2811,13 @@ mod tests {
         let ref_hash = blake3::hash(b"some ancestor extent");
 
         let data2 = b"x".repeat(8192);
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data),
-            SegmentEntry::new_dedup_ref(ref_hash, 2, 1),
+            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(ref_hash, 2, 1)),
             SegmentEntry::new_data(blake3::hash(&data2), 10, 2, SegmentFlags::empty(), data2),
         ];
 
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 3);
@@ -2798,14 +2846,14 @@ mod tests {
         let data = vec![0xCDu8; 2048]; // "compressed" payload
         let hash = blake3::hash(&data);
 
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             20,
             1,
             SegmentFlags::COMPRESSED,
             data,
         )];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -2828,12 +2876,12 @@ mod tests {
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
 
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(h1, 0, 2, SegmentFlags::empty(), data1.clone()),
             SegmentEntry::new_data(h2, 2, 2, SegmentFlags::empty(), data2.clone()),
         ];
 
-        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (bss2, index, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(bss, bss2);
@@ -2905,18 +2953,18 @@ mod tests {
         }
 
         let (signer, vk) = test_signer();
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             payload.to_vec(),
         )];
-        let bss = promote(
+        let (bss, entries) = promote(
             &wal_path,
             ulid,
             &base.join("pending"),
-            &mut entries,
+            entries,
             signer.as_ref(),
         )
         .unwrap();
@@ -3164,7 +3212,7 @@ mod tests {
 
         let data = vec![0xAAu8; 4096];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
@@ -3173,7 +3221,7 @@ mod tests {
         )];
         let (signer, vk) = test_signer();
         let path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         assert_eq!(read_entry_count(&path).unwrap(), 1);
 
@@ -3197,16 +3245,16 @@ mod tests {
         let data = vec![0x42u8; 100]; // well below 256-byte threshold
         let hash = blake3::hash(&data);
 
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             data.clone(),
         )];
-        assert_eq!(entries[0].kind, EntryKind::Inline);
+        assert_eq!(entries[0].entry.kind, EntryKind::Inline);
 
-        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
         let (bss2, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(bss, bss2);
         assert_eq!(read_back.len(), 1);
@@ -3239,14 +3287,14 @@ mod tests {
         let small_hash = blake3::hash(&small);
         let large_hash = blake3::hash(&large);
 
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(small_hash, 0, 1, SegmentFlags::empty(), small.clone()),
             SegmentEntry::new_data(large_hash, 1, 2, SegmentFlags::empty(), large.clone()),
         ];
-        assert_eq!(entries[0].kind, EntryKind::Inline);
-        assert_eq!(entries[1].kind, EntryKind::Data);
+        assert_eq!(entries[0].entry.kind, EntryKind::Inline);
+        assert_eq!(entries[1].entry.kind, EntryKind::Data);
 
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&path, entries, signer.as_ref()).unwrap();
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
 
         assert_eq!(read_back[0].kind, EntryKind::Inline);
@@ -3259,17 +3307,18 @@ mod tests {
         assert_eq!(inline_bytes, small);
 
         // Body data is readable via read_extent_bodies.
-        let (bss, mut entries2, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_body_section_bodies(&path, bss, &mut entries2).unwrap();
-        assert_eq!(entries2[1].data.as_deref(), Some(large.as_slice()));
-        // Inline entry data is NOT populated by body read (empty inline_bytes).
-        assert!(entries2[0].data.is_none());
+        let (bss, entries2, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        let entries2 = read_body_section_bodies(&path, bss, entries2).unwrap();
+        assert_eq!(entries2[1].body.as_deref(), Some(large.as_slice()));
+        // Inline entry data is NOT populated by body read.
+        assert!(entries2[0].body.is_none());
+        assert!(entries2[0].entry.inline.is_none());
 
         // Now read with inline bytes too.
-        let (_, mut entries3, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        read_extent_bodies(&path, bss, &mut entries3, &inline_bytes).unwrap();
-        assert_eq!(entries3[0].data.as_deref(), Some(small.as_slice()));
-        assert_eq!(entries3[1].data.as_deref(), Some(large.as_slice()));
+        let (_, entries3, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        let entries3 = read_extent_bodies(&path, bss, entries3, &inline_bytes).unwrap();
+        assert_eq!(entries3[0].entry.inline.as_deref(), Some(small.as_slice()));
+        assert_eq!(entries3[1].body.as_deref(), Some(large.as_slice()));
 
         fs::remove_file(&path).unwrap();
     }
@@ -3282,13 +3331,13 @@ mod tests {
 
         let d1 = vec![0x11u8; 32];
         let d2 = vec![0x22u8; 64];
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(blake3::hash(&d1), 0, 1, SegmentFlags::empty(), d1.clone()),
             SegmentEntry::new_data(blake3::hash(&d2), 1, 1, SegmentFlags::empty(), d2.clone()),
         ];
-        assert!(entries.iter().all(|e| e.kind == EntryKind::Inline));
+        assert!(entries.iter().all(|e| e.entry.kind == EntryKind::Inline));
 
-        let bss = write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
 
         // File size == bss (no body section).
         let file_len = fs::metadata(&path).unwrap().len();
@@ -3318,14 +3367,14 @@ mod tests {
 
         let data = vec![0xFFu8; 200];
         let hash = blake3::hash(&data);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             data.clone(),
         )];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Extract .idx from the full segment.
         extract_idx(&seg_path, &idx_path).unwrap();
@@ -3356,11 +3405,11 @@ mod tests {
         let data2 = vec![0xBBu8; 4096];
         let hash1 = blake3::hash(&data1);
         let hash2 = blake3::hash(&data2);
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(hash1, 0, 2, SegmentFlags::empty(), data1),
             SegmentEntry::new_data(hash2, 2, 1, SegmentFlags::empty(), data2),
         ];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Fake delta blob and source hash.
         let source_hash = blake3::hash(b"source-extent");
@@ -3405,10 +3454,9 @@ mod tests {
         assert!(e1.delta_options.is_empty());
 
         // Body data should still be readable.
-        let mut read_back = read_entries;
-        read_body_section_bodies(&delta_path, bss, &mut read_back).unwrap();
-        assert_eq!(read_back[0].data.as_deref(), Some(&[0xAAu8; 8192][..]));
-        assert_eq!(read_back[1].data.as_deref(), Some(&[0xBBu8; 4096][..]));
+        let read_back = read_body_section_bodies(&delta_path, bss, read_entries).unwrap();
+        assert_eq!(read_back[0].body.as_deref(), Some(&[0xAAu8; 8192][..]));
+        assert_eq!(read_back[1].body.as_deref(), Some(&[0xBBu8; 4096][..]));
 
         // Verify delta_length in header by reading raw bytes.
         let raw_header = fs::read(&delta_path).unwrap();
@@ -3452,11 +3500,16 @@ mod tests {
             delta_hash: blake3::hash(b"delta-blob-bytes"),
         };
 
-        let mut entries = vec![
+        let entries = vec![
             SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data_body.clone()),
-            SegmentEntry::new_delta(delta_content_hash, 10, 3, vec![delta_option.clone()]),
+            PendingEntry::from_entry(SegmentEntry::new_delta(
+                delta_content_hash,
+                10,
+                3,
+                vec![delta_option.clone()],
+            )),
         ];
-        let bss = write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // body_length must include only the Data entry's bytes; the Delta
         // entry must reserve none.
@@ -3527,8 +3580,13 @@ mod tests {
             },
         ];
 
-        let mut entries = vec![SegmentEntry::new_delta(content_hash, 0, 1, options.clone())];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            content_hash,
+            0,
+            1,
+            options.clone(),
+        ))];
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&seg_path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
@@ -3558,14 +3616,14 @@ mod tests {
         let (signer, _vk) = test_signer();
 
         let data = vec![0xA5u8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
             SegmentFlags::empty(),
             data,
         )];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Tamper: bump stored_length on the sole entry from 4096 to 8192.
         // Signature will no longer verify, but `read_segment_index` (the
@@ -3601,8 +3659,10 @@ mod tests {
 
         // A DedupRef entry — thin by construction.
         let hash = blake3::hash(b"canonical");
-        let mut entries = vec![SegmentEntry::new_dedup_ref(hash, 0, 1)];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
+            hash, 0, 1,
+        ))];
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Tamper: give the DedupRef a nonzero stored_length.
         let mut raw = fs::read(&seg_path).unwrap();
@@ -3630,14 +3690,14 @@ mod tests {
         let (signer, _vk) = test_signer();
 
         let data = vec![0xB5u8; 4096];
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             blake3::hash(&data),
             0,
             1,
             SegmentFlags::empty(),
             data,
         )];
-        write_segment(&seg_path, &mut entries, signer.as_ref()).unwrap();
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
         // Tamper: set stored_offset = u64::MAX - 3 and stored_length = 10.
         let mut raw = fs::read(&seg_path).unwrap();
@@ -3739,17 +3799,17 @@ mod tests {
     fn verify_body_hash_accepts_matching_uncompressed_body() {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data.clone());
-        assert!(verify_body_hash(&entry, &data).is_ok());
+        let pending = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data.clone());
+        assert!(verify_body_hash(&pending.entry, &data).is_ok());
     }
 
     #[test]
     fn verify_body_hash_rejects_zero_filled_body() {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data);
+        let pending = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data);
         let zeros = vec![0u8; 4096];
-        let err = verify_body_hash(&entry, &zeros).unwrap_err();
+        let err = verify_body_hash(&pending.entry, &zeros).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("hash mismatch"));
     }
@@ -3759,9 +3819,9 @@ mod tests {
         let data = vec![0x55u8; 4096];
         let hash = blake3::hash(&data);
         let compressed = lz4_flex::compress_prepend_size(&data);
-        let entry =
+        let pending =
             SegmentEntry::new_data(hash, 0, 1, SegmentFlags::COMPRESSED, compressed.clone());
-        assert!(verify_body_hash(&entry, &compressed).is_ok());
+        assert!(verify_body_hash(&pending.entry, &compressed).is_ok());
     }
 
     #[test]
@@ -3770,14 +3830,14 @@ mod tests {
         let declared_hash = blake3::hash(&declared_data);
         let other_data = vec![0xAAu8; 4096];
         let other_compressed = lz4_flex::compress_prepend_size(&other_data);
-        let entry = SegmentEntry::new_data(
+        let pending = SegmentEntry::new_data(
             declared_hash,
             0,
             1,
             SegmentFlags::COMPRESSED,
             other_compressed.clone(),
         );
-        let err = verify_body_hash(&entry, &other_compressed).unwrap_err();
+        let err = verify_body_hash(&pending.entry, &other_compressed).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -3797,14 +3857,14 @@ mod tests {
         let (signer_b, vk_b) = test_signer();
         let body = vec![0xABu8; INLINE_THRESHOLD + 100];
         let hash = blake3::hash(&body);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             0,
             1,
             SegmentFlags::empty(),
             body,
         )];
-        write_segment(&path, &mut entries, signer_a.as_ref()).unwrap();
+        write_segment(&path, entries, signer_a.as_ref()).unwrap();
         let original = fs::read(&path).unwrap();
         verify_segment_bytes(&original, "seg", &vk_a).unwrap();
 

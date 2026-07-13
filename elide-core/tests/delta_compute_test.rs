@@ -64,14 +64,14 @@ fn write_single_entry_segment(
 ) -> Ulid {
     let seg_ulid = Ulid::new();
     let seg_path = vol_dir.join("pending").join(seg_ulid.to_string());
-    let mut entries = vec![SegmentEntry::new_data(
+    let entries = vec![SegmentEntry::new_data(
         hash,
         start_lba,
         lba_length,
         SegmentFlags::empty(),
         body,
     )];
-    write_segment(&seg_path, &mut entries, signer).unwrap();
+    write_segment(&seg_path, entries, signer).unwrap();
     seg_ulid
 }
 
@@ -224,20 +224,15 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
         make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
     let source_seg_ulid = Ulid::new();
     let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
-    let mut source_entries = vec![SegmentEntry::new_data(
+    let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         2,
         SegmentFlags::COMPRESSED,
         parent_stored,
     )];
-    assert_eq!(source_entries[0].kind, EntryKind::Data);
-    write_segment(
-        &source_seg_path,
-        &mut source_entries,
-        source_signer.as_ref(),
-    )
-    .unwrap();
+    assert_eq!(source_entries[0].entry.kind, EntryKind::Data);
+    write_segment(&source_seg_path, source_entries, source_signer.as_ref()).unwrap();
     write_snapshot_and_filemap(
         &source_dir,
         source_signer.as_ref(),
@@ -318,20 +313,15 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
         make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
     let source_seg_ulid = Ulid::new();
     let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
-    let mut source_entries = vec![SegmentEntry::new_data(
+    let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         2,
         SegmentFlags::COMPRESSED,
         parent_stored,
     )];
-    assert_eq!(source_entries[0].kind, EntryKind::Data);
-    write_segment(
-        &source_seg_path,
-        &mut source_entries,
-        source_signer.as_ref(),
-    )
-    .unwrap();
+    assert_eq!(source_entries[0].entry.kind, EntryKind::Data);
+    write_segment(&source_seg_path, source_entries, source_signer.as_ref()).unwrap();
     write_snapshot_and_filemap(
         &source_dir,
         source_signer.as_ref(),
@@ -419,20 +409,15 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     // form exactly. `new_data` promotes to Inline when data.len() < 256.
     let source_seg_ulid = Ulid::new();
     let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
-    let mut source_entries = vec![SegmentEntry::new_data(
+    let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         1,
         SegmentFlags::COMPRESSED,
         parent_stored,
     )];
-    assert_eq!(source_entries[0].kind, EntryKind::Inline);
-    write_segment(
-        &source_seg_path,
-        &mut source_entries,
-        source_signer.as_ref(),
-    )
-    .unwrap();
+    assert_eq!(source_entries[0].entry.kind, EntryKind::Inline);
+    write_segment(&source_seg_path, source_entries, source_signer.as_ref()).unwrap();
     write_snapshot_and_filemap(
         &source_dir,
         source_signer.as_ref(),

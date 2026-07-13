@@ -167,23 +167,26 @@ impl std::fmt::Debug for SegmentIndexCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::{EntryKind, SegmentEntry, write_segment};
+    use crate::segment::{EntryKind, PendingEntry, SegmentEntry, write_segment};
 
     fn signer_pair() -> (Arc<dyn crate::segment::SegmentSigner>, VerifyingKey) {
         crate::signing::generate_ephemeral_signer()
     }
 
-    fn dummy_entry(lba: u64) -> SegmentEntry {
-        SegmentEntry {
-            hash: blake3::hash(&lba.to_le_bytes()),
-            start_lba: lba,
-            lba_length: 1,
-            compressed: false,
-            stored_offset: 0,
-            stored_length: 8,
-            kind: EntryKind::Data,
-            data: Some(vec![0xAB; 8]),
-            delta_options: Vec::new(),
+    fn dummy_entry(lba: u64) -> PendingEntry {
+        PendingEntry {
+            entry: SegmentEntry {
+                hash: blake3::hash(&lba.to_le_bytes()),
+                start_lba: lba,
+                lba_length: 1,
+                compressed: false,
+                stored_offset: 0,
+                stored_length: 8,
+                kind: EntryKind::Data,
+                inline: None,
+                delta_options: Vec::new(),
+            },
+            body: Some(vec![0xAB; 8]),
         }
     }
 
@@ -192,8 +195,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("seg");
         let (signer, vk) = signer_pair();
-        let mut entries = vec![dummy_entry(0)];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![dummy_entry(0)];
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let cache = SegmentIndexCache::new(16);
         let a = cache.read_and_verify(&path, &vk).unwrap();
@@ -207,16 +210,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("seg");
         let (signer, vk) = signer_pair();
-        let mut entries = vec![dummy_entry(0)];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![dummy_entry(0)];
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let cache = SegmentIndexCache::new(16);
         let a = cache.read_and_verify(&path, &vk).unwrap();
 
         // Rewrite with different entries → different signature → miss.
         std::fs::remove_file(&path).unwrap();
-        let mut entries2 = vec![dummy_entry(0), dummy_entry(1)];
-        write_segment(&path, &mut entries2, signer.as_ref()).unwrap();
+        let entries2 = vec![dummy_entry(0), dummy_entry(1)];
+        write_segment(&path, entries2, signer.as_ref()).unwrap();
 
         let b = cache.read_and_verify(&path, &vk).unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
@@ -228,8 +231,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("seg");
         let (signer, vk) = signer_pair();
-        let mut entries = vec![dummy_entry(0)];
-        write_segment(&path, &mut entries, signer.as_ref()).unwrap();
+        let entries = vec![dummy_entry(0)];
+        write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let cache = SegmentIndexCache::new(16);
         let a = cache.read_and_verify(&path, &vk).unwrap();
@@ -239,8 +242,8 @@ mod tests {
         // alone is sufficient.
         std::fs::remove_file(&path).unwrap();
         let (signer2, vk2) = signer_pair();
-        let mut entries2 = vec![dummy_entry(0)];
-        write_segment(&path, &mut entries2, signer2.as_ref()).unwrap();
+        let entries2 = vec![dummy_entry(0)];
+        write_segment(&path, entries2, signer2.as_ref()).unwrap();
 
         let b = cache.read_and_verify(&path, &vk2).unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
@@ -258,8 +261,8 @@ mod tests {
         let path = tmp.path().join("seg");
         let (signer, vk) = signer_pair();
 
-        let mut entries_a = vec![dummy_entry(0), dummy_entry(1)];
-        write_segment(&path, &mut entries_a, signer.as_ref()).unwrap();
+        let entries_a = vec![dummy_entry(0), dummy_entry(1)];
+        write_segment(&path, entries_a, signer.as_ref()).unwrap();
         let len_a = std::fs::metadata(&path).unwrap().len();
 
         let cache = SegmentIndexCache::new(16);
@@ -268,8 +271,8 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         // Different LBAs → different hashes → different signature, but
         // identical entry count and body shape → identical file length.
-        let mut entries_b = vec![dummy_entry(2), dummy_entry(3)];
-        write_segment(&path, &mut entries_b, signer.as_ref()).unwrap();
+        let entries_b = vec![dummy_entry(2), dummy_entry(3)];
+        write_segment(&path, entries_b, signer.as_ref()).unwrap();
         let len_b = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
             len_a, len_b,
