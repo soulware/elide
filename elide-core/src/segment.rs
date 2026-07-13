@@ -834,6 +834,20 @@ pub fn write_segment_full(
     Ok(body_section_start)
 }
 
+/// Drop `data` from every non-inline entry.
+///
+/// Called after a segment write commits: body bytes are addressable on
+/// disk via `stored_offset`, and apply phases read `data` only for
+/// inline entries, so holding Data bodies in the returned entries pins
+/// the whole written segment in heap for no reader.
+pub fn drop_written_bodies(entries: &mut [SegmentEntry]) {
+    for entry in entries.iter_mut() {
+        if !entry.kind.is_inline() {
+            entry.data = None;
+        }
+    }
+}
+
 /// Assign `stored_offset` for each entry and return section sizes.
 ///
 /// Modifies entries in-place; `stored_offset` is meaningful only after this call.

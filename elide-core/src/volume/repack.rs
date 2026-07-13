@@ -1610,4 +1610,175 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
     }
+
+    // --- worker-result body retention tests ---
+    //
+    // Worker results cross back to the actor after the output segment is
+    // on disk, so Data bodies in them are reachable but unread; only
+    // inline entries' `data` feeds apply (`InlineSource::EntryData`).
+    // Each test asserts the execute-phase result carries no Data bodies,
+    // then runs apply + read-back to prove nothing needed them.
+
+    /// Distinct, incompressible 4 KiB block per seed (splitmix64 stream).
+    /// `unique_block` above lz4-compresses below `INLINE_THRESHOLD` for
+    /// some seeds; these tests need entries that stay `Data` kind.
+    fn incompressible_block(seed: u32) -> Vec<u8> {
+        let mut x = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut out = Vec::with_capacity(4096);
+        for _ in 0..512 {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn repack_result_strips_written_data_bodies() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Two small pending segments so bin-pack merges them into one
+        // output. The constant-fill block compresses below
+        // INLINE_THRESHOLD, giving the output an Inline entry.
+        vol.write(0, &incompressible_block(1)).unwrap();
+        vol.write(1, &[7u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+        promote_segment_with_blocks(&mut vol, 2, 2, 2);
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let result = crate::actor::execute_repack(job).unwrap();
+
+        let (mut saw_data, mut saw_inline) = (false, false);
+        for bucket in &result.buckets {
+            let out = bucket.output.as_ref().expect("merge output");
+            for e in &out.out_entries {
+                if e.kind.is_inline() {
+                    saw_inline = true;
+                    assert!(e.data.is_some(), "inline entry lost its apply data");
+                } else {
+                    saw_data |= e.kind == EntryKind::Data;
+                    assert!(
+                        e.data.is_none(),
+                        "{:?} entry retains body bytes in RepackResult",
+                        e.kind
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_data && saw_inline,
+            "setup must yield Data + Inline entries"
+        );
+
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
+
+        assert_eq!(vol.read(0, 1).unwrap(), incompressible_block(1));
+        assert_eq!(vol.read(1, 1).unwrap(), [7u8; 4096]);
+        assert_eq!(
+            vol.read(2, 1).unwrap(),
+            unique_block(2u32.wrapping_mul(0x10001))
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn promote_result_strips_written_data_bodies() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &incompressible_block(9)).unwrap();
+        vol.write(1, &[3u8; 4096]).unwrap();
+
+        let job = vol.prepare_promote().unwrap().expect("promote job");
+        let result = crate::actor::execute_promote(job).unwrap();
+
+        let (mut saw_data, mut saw_inline) = (false, false);
+        for e in &result.entries {
+            if e.kind.is_inline() {
+                saw_inline = true;
+                assert!(e.data.is_some(), "inline entry lost its apply data");
+            } else {
+                saw_data |= e.kind == EntryKind::Data;
+                assert!(
+                    e.data.is_none(),
+                    "{:?} entry retains body bytes in PromoteResult",
+                    e.kind
+                );
+            }
+        }
+        assert!(
+            saw_data && saw_inline,
+            "setup must yield Data + Inline entries"
+        );
+
+        vol.apply_promote(&result);
+
+        assert_eq!(vol.read(0, 1).unwrap(), incompressible_block(9));
+        assert_eq!(vol.read(1, 1).unwrap(), [3u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn delta_repack_result_strips_written_data_bodies() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let prior = incompressible_block(21);
+        vol.write(100, &prior).unwrap();
+        vol.promote_for_test().unwrap();
+        let _snap = vol.snapshot().unwrap();
+
+        // Same-LBA rewrite delta-compresses against the sealed prior
+        // (converted to Delta); the block at 300 has no prior and stays
+        // Data with its body loaded for the rewrite.
+        let mut updated = prior.clone();
+        updated[0] ^= 0xFF;
+        vol.write(100, &updated).unwrap();
+        vol.write(300, &incompressible_block(22)).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let job = vol
+            .prepare_delta_repack()
+            .unwrap()
+            .expect("delta repack job");
+        let result = crate::actor::execute_delta_repack(job).unwrap();
+        assert!(!result.segments.is_empty(), "segment must be rewritten");
+
+        let (mut saw_data, mut saw_delta) = (false, false);
+        for seg in &result.segments {
+            for item in &seg.rewrite.entries {
+                let post = &item.post;
+                if post.kind.is_inline() {
+                    assert!(post.data.is_some(), "inline entry lost its apply data");
+                } else {
+                    saw_data |= post.kind == EntryKind::Data;
+                    saw_delta |= post.kind == EntryKind::Delta;
+                    assert!(
+                        post.data.is_none(),
+                        "{:?} entry retains body bytes in DeltaRepackResult",
+                        post.kind
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_data && saw_delta,
+            "setup must yield Data + Delta entries"
+        );
+
+        let (_stats, consumed) = vol.apply_delta_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
+
+        assert_eq!(vol.read(100, 1).unwrap(), updated);
+        assert_eq!(vol.read(300, 1).unwrap(), incompressible_block(22));
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }

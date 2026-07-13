@@ -2080,6 +2080,7 @@ pub(crate) fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> 
         &mut job.entries,
         job.signer.as_ref(),
     )?;
+    segment::drop_written_bodies(&mut job.entries);
     Ok(PromoteResult {
         segment_ulid: job.segment_ulid,
         old_wal_ulid: job.old_wal_ulid,
@@ -2591,6 +2592,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         segment::fsync_dir(&final_path)?;
         stats.new_segments += 1;
         stats.bytes_freed += bucket_bytes_freed;
+
+        // Result buckets accumulate until the job returns — without this
+        // the job retains every bucket's body bytes, ~the volume's whole
+        // pending backlog at once.
+        segment::drop_written_bodies(&mut out_entries);
 
         result_buckets.push(crate::volume::RepackedBucket {
             inputs: bucket_inputs,
