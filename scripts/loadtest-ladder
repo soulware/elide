@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Load-test ladder for an elide host: escalating rungs of parallel-cp
+# workload against mounted volumes, with liveness and integrity
+# checkpoints between every phase.
+#
+# Runs ON the target host as root (copy it over with `fly ssh sftp`).
+#
+# Usage:
+#   loadtest-ladder rung1        # 1 volume,  1 writer
+#   loadtest-ladder rung2        # 2 volumes, 2 concurrent writers
+#   loadtest-ladder rung3        # 8 volumes, 4 concurrent writers (two waves)
+#   loadtest-ladder all          # every rung in order, stop at first failure
+#
+# Env overrides (all optional):
+#   SEED_MB        seed file size per volume in MiB (default 256)
+#   DRAIN_TIMEOUT  seconds to wait for PENDING to clear (default 900)
+#   MNT_ROOT       mountpoint parent (default /mnt)
+#   OUT_ROOT       evidence directory (default /data/loadtest — must be on
+#                  persistent storage so evidence survives an OOM kill)
+#
+# Each rung, per volume:
+#   prepare  mount if needed, delete leftover top-level files, fstrim
+#   seed     write an incompressible seed from /dev/urandom, record sha256
+#   copy     cp seed -> blob at the rung's concurrency
+#   drain    sync, then poll `elide volume list` until PENDING clears
+#   verify   umount, e2fsck -fn (any FS error fails the rung), remount,
+#            sha256(blob) read cold off the device must match the seed
+#
+# A sampler logs memory pressure, D-state count, and elide RSS every 5s to
+# $OUT_ROOT/<stamp>-<rung>/sample.log; dmesg is dumped there at the end.
+# Workers are waited on by PID — a bare `wait` would also wait on the
+# sampler, which never exits.
+set -euo pipefail
+
+SEED_MB="${SEED_MB:-256}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-900}"
+MNT_ROOT="${MNT_ROOT:-/mnt}"
+OUT_ROOT="${OUT_ROOT:-/data/loadtest}"
+
+RUN_DIR=""
+SAMPLER_PID=""
+
+log() {
+    local line
+    line="$(date -u +%H:%M:%S) $*"
+    echo "$line"
+    if [[ -n $RUN_DIR ]]; then
+        echo "$line" >>"$RUN_DIR/run.log"
+    fi
+}
+
+dump_state() {
+    if [[ -z $RUN_DIR ]]; then
+        return
+    fi
+    dmesg >"$RUN_DIR/dmesg.txt" 2>/dev/null || true
+    {
+        elide volume list
+        ps axo pid,stat,rss,comm
+    } >"$RUN_DIR/state.txt" 2>&1 || true
+}
+
+die() {
+    log "FAIL: $*"
+    dump_state
+    exit 1
+}
+
+pending_clear() { # $@ = volume names; 0 iff PENDING is "-" for all of them
+    local out v
+    out=$(elide volume list)
+    for v in "$@"; do
+        if [[ $(awk -v v="$v" '$1 == v {print $6}' <<<"$out") != "-" ]]; then
+            return 1
+        fi
+    done
+}
+
+wait_drain() { # $@ = volume names
+    local deadline=$((SECONDS + DRAIN_TIMEOUT))
+    until pending_clear "$@"; do
+        if ((SECONDS >= deadline)); then
+            die "drain did not clear within ${DRAIN_TIMEOUT}s"
+        fi
+        sleep 5
+    done
+}
+
+start_sampler() {
+    (
+        while :; do
+            {
+                printf '%s ' "$(date -u +%H:%M:%S)"
+                awk '/^MemAvailable:|^Dirty:|^Writeback:/ {printf "%s%skB ", $1, $2}' /proc/meminfo
+                printf 'dstate=%s ' "$(ps -eo stat= | grep -c '^D' || true)"
+                printf 'elide_rss_kb=%s\n' "$(ps -eo rss=,comm= | awk '$2 ~ /^elide/ {s += $1} END {print s + 0}')"
+            } >>"$RUN_DIR/sample.log"
+            sleep 5
+        done
+    ) &
+    SAMPLER_PID=$!
+}
+
+stop_sampler() {
+    if [[ -n $SAMPLER_PID ]]; then
+        kill "$SAMPLER_PID" 2>/dev/null || true
+        SAMPLER_PID=""
+    fi
+}
+
+run_waves() { # $1 = per-volume function, $2 = concurrency, $3.. = volume names
+    local fn=$1 conc=$2
+    shift 2
+    local vols=("$@")
+    local i=0 v p pids
+    while ((i < ${#vols[@]})); do
+        pids=()
+        for v in "${vols[@]:i:conc}"; do
+            "$fn" "$v" &
+            pids+=($!)
+        done
+        for p in "${pids[@]}"; do
+            if ! wait "$p"; then
+                die "$fn worker (pid $p) failed"
+            fi
+        done
+        ((i += conc))
+    done
+}
+
+prepare_one() {
+    local v=$1 mnt="$MNT_ROOT/$1"
+    mkdir -p "$mnt"
+    mountpoint -q "$mnt" || mount "/dev/elide/$v" "$mnt"
+    find "$mnt" -maxdepth 1 -type f -delete
+    fstrim "$mnt"
+}
+
+seed_one() {
+    local v=$1 mnt="$MNT_ROOT/$1"
+    dd if=/dev/urandom of="$mnt/seed" bs=1M count="$SEED_MB" status=none
+    sync -f "$mnt/seed"
+    sha256sum "$mnt/seed" >"$RUN_DIR/$v.seed.sha256"
+}
+
+copy_one() {
+    local v=$1 mnt="$MNT_ROOT/$1"
+    cp "$mnt/seed" "$mnt/blob"
+    sync -f "$mnt/blob"
+}
+
+verify_one() {
+    local v=$1 mnt="$MNT_ROOT/$1"
+    umount "$mnt"
+    if ! e2fsck -fn "/dev/elide/$v" >"$RUN_DIR/$v.fsck.txt" 2>&1; then
+        mount "/dev/elide/$v" "$mnt"
+        echo "fsck found errors on $v (see $RUN_DIR/$v.fsck.txt)" >&2
+        exit 1
+    fi
+    mount "/dev/elide/$v" "$mnt"
+    local want got
+    want=$(awk '{print $1}' "$RUN_DIR/$v.seed.sha256")
+    got=$(sha256sum "$mnt/blob" | awk '{print $1}')
+    if [[ $got != "$want" ]]; then
+        echo "sha256 mismatch on $v: want $want got $got" >&2
+        exit 1
+    fi
+}
+
+run_rung() { # $1 = rung name, $2 = concurrency, $3.. = volume names
+    local rung=$1 conc=$2
+    shift 2
+    local vols=("$@")
+    RUN_DIR="$OUT_ROOT/$(date -u +%Y%m%d-%H%M%SZ)-$rung"
+    mkdir -p "$RUN_DIR"
+    log "=== $rung: volumes ${vols[*]}, concurrency $conc, seed ${SEED_MB}MiB, evidence $RUN_DIR ==="
+    start_sampler
+    run_waves prepare_one "$conc" "${vols[@]}"
+    wait_drain "${vols[@]}"
+    log "checkpoint: prepared + drained"
+    run_waves seed_one "$conc" "${vols[@]}"
+    wait_drain "${vols[@]}"
+    log "checkpoint: seeded + drained"
+    run_waves copy_one "$conc" "${vols[@]}"
+    wait_drain "${vols[@]}"
+    log "checkpoint: copied + drained"
+    run_waves verify_one "$conc" "${vols[@]}"
+    log "checkpoint: fsck clean, sha256 verified"
+    stop_sampler
+    dump_state
+    log "=== $rung PASS ==="
+}
+
+if [[ $EUID -ne 0 ]]; then
+    echo "must run as root" >&2
+    exit 2
+fi
+command -v elide >/dev/null || {
+    echo "elide not on PATH" >&2
+    exit 2
+}
+mkdir -p "$OUT_ROOT"
+trap stop_sampler EXIT
+
+case "${1:-}" in
+rung1) run_rung rung1 1 vol1 ;;
+rung2) run_rung rung2 2 vol1 vol2 ;;
+rung3) run_rung rung3 4 vol1 vol2 vol3 vol4 vol5 vol6 vol7 vol8 ;;
+all)
+    for r in rung1 rung2 rung3; do
+        "$0" "$r"
+    done
+    ;;
+*)
+    echo "usage: loadtest-ladder rung1|rung2|rung3|all" >&2
+    exit 2
+    ;;
+esac
