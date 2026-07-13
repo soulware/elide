@@ -551,7 +551,7 @@ pub fn scan_via_reader(image_size: u64, mut reader: Box<dyn Ext4Read>) -> io::Re
             Some(p) => p,
             None => continue, // orphan inode (deleted file still in table)
         };
-        for (i, part) in inode.parts.into_iter().enumerate() {
+        for ((part, body), hash) in inode.parts.into_iter().zip(inode.bodies).zip(inode.hashes) {
             mark_coverage(
                 &mut file_lba_coverage,
                 total_lbas,
@@ -564,8 +564,8 @@ pub fn scan_via_reader(image_size: u64, mut reader: Box<dyn Ext4Read>) -> io::Re
                 lba_start: part.lba_start,
                 lba_length: part.lba_length,
                 byte_count: part.byte_count,
-                hash: inode.hashes[i],
-                body: inode.bodies[i].clone(),
+                hash,
+                body,
             });
         }
     }
