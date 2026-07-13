@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
@@ -44,7 +45,7 @@ impl ObjectStoreRangeFetcher {
 }
 
 impl RangeFetcher for ObjectStoreRangeFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
         let path = StorePath::from(key);
         let range = (start as usize)..(end_exclusive as usize);
         let store = self.store.clone();
@@ -52,7 +53,7 @@ impl RangeFetcher for ObjectStoreRangeFetcher {
             .handle
             .block_on(async move { store.get_range(&path, range).await });
         match result {
-            Ok(bytes) => Ok(bytes.to_vec()),
+            Ok(bytes) => Ok(bytes),
             Err(object_store::Error::NotFound { .. }) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{key} not found"),
@@ -108,7 +109,7 @@ impl PerOwnerObjectStoreFetcher {
 }
 
 impl RangeFetcher for PerOwnerObjectStoreFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
         let owner = owner_from_key(key)?;
         self.fetcher_for(owner).get_range(key, start, end_exclusive)
     }

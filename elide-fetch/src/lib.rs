@@ -37,6 +37,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use s3::Bucket;
 use s3::creds::Credentials;
@@ -177,7 +178,7 @@ impl FetchConfig {
 /// not exist. The fetcher walks the ancestry chain on `NotFound` and treats
 /// any other error as fatal.
 pub trait RangeFetcher: Send + Sync {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>>;
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes>;
 }
 
 /// `RangeFetcher` over a local directory tree. The key is appended to `root`
@@ -194,14 +195,14 @@ impl LocalRangeFetcher {
 }
 
 impl RangeFetcher for LocalRangeFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
         let path = self.root.join(key);
         let mut f = std::fs::File::open(&path)?;
         f.seek(SeekFrom::Start(start))?;
         let len = end_exclusive.saturating_sub(start) as usize;
         let mut buf = vec![0u8; len];
         f.read_exact(&mut buf)?;
-        Ok(buf)
+        Ok(buf.into())
     }
 }
 
@@ -261,7 +262,7 @@ impl S3RangeFetcher {
 }
 
 impl RangeFetcher for S3RangeFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
         // rust-s3 panics inside `get_object_range` when `start > end_inclusive`;
         // reject the empty-range case up front so the caller gets an error
         // rather than a dead thread.
@@ -277,7 +278,7 @@ impl RangeFetcher for S3RangeFetcher {
             .get_object_range(key, start, Some(end_inclusive))
             .map_err(|e| io::Error::other(format!("s3 get_range {key}: {e}")))?;
         match resp.status_code() {
-            200 | 206 => Ok(resp.as_slice().to_vec()),
+            200 | 206 => Ok(resp.into_bytes()),
             404 => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{key} not found"),
@@ -1916,7 +1917,7 @@ mod tests {
         put_local(tmp.path(), "a/b/c", b"0123456789");
         let f = LocalRangeFetcher::new(tmp.path().to_path_buf());
         let bytes = f.get_range("a/b/c", 2, 6).unwrap();
-        assert_eq!(&bytes, b"2345");
+        assert_eq!(bytes.as_ref(), b"2345");
     }
 
     // --- coalescer unit tests ---
@@ -2042,7 +2043,7 @@ mod tests {
             delay: Duration,
         }
         impl RangeFetcher for CountingFetcher {
-            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(self.delay);
                 self.inner.get_range(key, start, end_exclusive)
@@ -2210,7 +2211,7 @@ mod tests {
             counter: std::sync::atomic::AtomicU32,
         }
         impl RangeFetcher for BarrierFetcher {
-            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+            fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
                 self.barrier.wait();
                 let n = self
                     .counter

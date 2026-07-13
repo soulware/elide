@@ -1164,6 +1164,7 @@ name = "elide"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "crossbeam-channel",
@@ -1295,6 +1296,7 @@ name = "elide-fetch"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "chrono",
  "elide-core",
  "rust-s3",

@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+bytes      = "1"
 chrono     = { version = "0.4", default-features = false, features = ["clock"] }
 elide-core = { path = "../elide-core" }
 rust-s3    = { version = "0.37", default-features = false, features = ["sync-rustls-tls"] }
