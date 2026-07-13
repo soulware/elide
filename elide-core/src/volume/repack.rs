@@ -285,16 +285,10 @@ impl Volume {
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
         for bucket in &buckets {
-            let carried_hashes: std::collections::HashSet<blake3::Hash> = bucket
+            let carried_hashes = bucket
                 .output
                 .as_ref()
-                .map(|o| {
-                    o.out_entries
-                        .iter()
-                        .filter(|e| e.kind != EntryKind::DedupRef)
-                        .map(|e| e.hash)
-                        .collect()
-                })
+                .map(|o| extentindex::ExtentIndex::carried_hashes(&o.out_entries))
                 .unwrap_or_default();
 
             let bucket_input_ulids: std::collections::HashSet<Ulid> =
@@ -318,16 +312,11 @@ impl Volume {
                 // output as the disk rebuild would, gated on the
                 // current owner being any of the bucket's inputs.
                 if let Some(out) = &bucket.output {
-                    let delta_body_source =
-                        if out.out_entries.iter().any(|e| e.kind == EntryKind::Delta) {
-                            let out_path = pending_dir.join(out.new_ulid.to_string());
-                            Some(extentindex::DeltaBodySource::Full {
-                                body_section_start: out.new_body_section_start,
-                                body_length: segment::read_segment_layout(&out_path)?.body_length,
-                            })
-                        } else {
-                            None
-                        };
+                    let delta_body_source = extentindex::DeltaBodySource::full_for_segment(
+                        &pending_dir.join(out.new_ulid.to_string()),
+                        &out.out_entries,
+                        out.new_body_section_start,
+                    )?;
                     let ctx = extentindex::SegmentRegistrationCtx {
                         segment_id: out.new_ulid,
                         body_section_start: out.new_body_section_start,
