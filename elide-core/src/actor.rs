@@ -163,6 +163,21 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<ReclaimOutcome>>,
     },
     Shutdown,
+    /// Test seam: dispatch a [`WorkerJob::Barrier`] through the normal
+    /// worker-dispatch path.
+    #[cfg(test)]
+    TestDispatchBarrier {
+        hold: crossbeam_channel::Receiver<()>,
+    },
+    /// Test seam: block inside this handler until `park` fires, then
+    /// dispatch one [`WorkerJob::Barrier`] per entry of `holds` without
+    /// returning to the select loop — so a test can drive a dispatch
+    /// while worker results are provably queued undrained.
+    #[cfg(test)]
+    TestParkThenDispatchBarriers {
+        park: crossbeam_channel::Receiver<()>,
+        holds: Vec<crossbeam_channel::Receiver<()>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -538,16 +553,14 @@ impl VolumeActor {
                 return;
             }
         };
-        if let Some(tx) = &self.worker_tx {
-            let old_wal_path = job.old_wal_path.clone();
-            if let Err(e) = tx.send(WorkerJob::Promote(job)) {
-                warn!("worker channel closed: {e}");
-                return;
-            }
-            self.pipeline.promotes_in_flight += 1;
-            self.pipeline.promote_gen += 1;
-            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+        let old_wal_path = job.old_wal_path.clone();
+        if let Err(e) = self.send_worker_job(WorkerJob::Promote(job)) {
+            warn!("promote dispatch failed: {e}");
+            return;
         }
+        self.pipeline.promotes_in_flight += 1;
+        self.pipeline.promote_gen += 1;
+        self.pipeline.inflight_old_wals.push_back(old_wal_path);
     }
 
     /// Run the GC checkpoint prep and dispatch the promote to the worker.
@@ -579,21 +592,17 @@ impl VolumeActor {
                 u_flush,
                 reply,
             });
-            if let Some(tx) = &self.worker_tx {
-                let old_wal_path = job.old_wal_path.clone();
-                if let Err(e) = tx.send(WorkerJob::Promote(job)) {
-                    warn!("worker channel closed during gc_checkpoint: {e}");
-                    if let Some(parked) = self.pipeline.parked_gc.take() {
-                        let _ = parked.reply.send(Err(io::Error::other(
-                            "worker channel closed during gc_checkpoint",
-                        )));
-                    }
-                    return;
+            let old_wal_path = job.old_wal_path.clone();
+            if let Err(e) = self.send_worker_job(WorkerJob::Promote(job)) {
+                warn!("gc_checkpoint promote dispatch failed: {e}");
+                if let Some(parked) = self.pipeline.parked_gc.take() {
+                    let _ = parked.reply.send(Err(e));
                 }
-                self.pipeline.promotes_in_flight += 1;
-                self.pipeline.promote_gen += 1;
-                self.pipeline.inflight_old_wals.push_back(old_wal_path);
+                return;
             }
+            self.pipeline.promotes_in_flight += 1;
+            self.pipeline.promote_gen += 1;
+            self.pipeline.inflight_old_wals.push_back(old_wal_path);
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
@@ -682,18 +691,10 @@ impl VolumeActor {
                     return HandoffDispatch::Finished;
                 }
             };
-            let Some(tx) = &self.worker_tx else {
-                warn!("gc plan dispatch skipped: worker channel absent");
+            if let Err(e) = self.send_worker_job(WorkerJob::GcPlan(job)) {
+                warn!("gc plan dispatch failed: {e}");
                 if let Some(reply) = parked.reply.take() {
-                    let _ = reply.send(Err(io::Error::other("worker channel closed")));
-                }
-                return HandoffDispatch::Finished;
-            };
-            if let Err(e) = tx.send(WorkerJob::GcPlan(job)) {
-                warn!("worker channel closed during gc plan dispatch: {e}");
-                if let Some(reply) = parked.reply.take() {
-                    let _ =
-                        reply.send(Err(io::Error::other(format!("worker channel closed: {e}"))));
+                    let _ = reply.send(Err(e));
                 }
                 return HandoffDispatch::Finished;
             }
@@ -728,16 +729,12 @@ impl VolumeActor {
         // republish so readers don't resolve hashes through the
         // pre-flush snapshot into a deleted WAL.
         self.publish_snapshot();
-        if let Some(tx) = &self.worker_tx {
-            if let Err(e) = tx.send(WorkerJob::Repack(job)) {
-                warn!("worker channel closed during repack: {e}");
-                let _ = reply.send(Err(io::Error::other("worker channel closed during repack")));
-                return;
-            }
-            self.parked.repack = Some(reply);
-        } else {
-            let _ = reply.send(Err(io::Error::other("worker not running")));
+        if let Err(e) = self.send_worker_job(WorkerJob::Repack(job)) {
+            warn!("repack dispatch failed: {e}");
+            let _ = reply.send(Err(e));
+            return;
         }
+        self.parked.repack = Some(reply);
     }
 
     /// Run the delta_repack prep on the actor and dispatch the heavy
@@ -764,18 +761,12 @@ impl VolumeActor {
         // Republish so readers don't resolve hashes through a deleted
         // WAL.
         self.publish_snapshot();
-        if let Some(tx) = &self.worker_tx {
-            if let Err(e) = tx.send(WorkerJob::DeltaRepack(job)) {
-                warn!("worker channel closed during delta_repack: {e}");
-                let _ = reply.send(Err(io::Error::other(
-                    "worker channel closed during delta_repack",
-                )));
-                return;
-            }
-            self.parked.delta_repack = Some(reply);
-        } else {
-            let _ = reply.send(Err(io::Error::other("worker not running")));
+        if let Err(e) = self.send_worker_job(WorkerJob::DeltaRepack(job)) {
+            warn!("delta_repack dispatch failed: {e}");
+            let _ = reply.send(Err(e));
+            return;
         }
+        self.parked.delta_repack = Some(reply);
     }
 
     /// Run the reclaim prep on the actor and dispatch the heavy middle
@@ -802,18 +793,12 @@ impl VolumeActor {
         // WAL file. Republish so readers don't resolve hashes through
         // the pre-flush snapshot into a deleted WAL.
         self.publish_snapshot();
-        if let Some(tx) = &self.worker_tx {
-            if let Err(e) = tx.send(WorkerJob::Reclaim(job)) {
-                warn!("worker channel closed during reclaim: {e}");
-                let _ = reply.send(Err(io::Error::other(
-                    "worker channel closed during reclaim",
-                )));
-                return;
-            }
-            self.parked.reclaim = Some(reply);
-        } else {
-            let _ = reply.send(Err(io::Error::other("worker not running")));
+        if let Err(e) = self.send_worker_job(WorkerJob::Reclaim(job)) {
+            warn!("reclaim dispatch failed: {e}");
+            let _ = reply.send(Err(e));
+            return;
         }
+        self.parked.reclaim = Some(reply);
     }
 
     /// Run the snapshot-manifest prep on the actor and dispatch the
@@ -830,17 +815,47 @@ impl VolumeActor {
         let job = self
             .lock_volume()
             .prepare_sign_snapshot_manifest_kind(snap_ulid, kind);
-        if let Some(tx) = &self.worker_tx {
-            if let Err(e) = tx.send(WorkerJob::SignSnapshotManifest(job)) {
-                warn!("worker channel closed during sign_snapshot_manifest: {e}");
-                let _ = reply.send(Err(io::Error::other(
-                    "worker channel closed during sign_snapshot_manifest",
-                )));
-                return;
+        if let Err(e) = self.send_worker_job(WorkerJob::SignSnapshotManifest(job)) {
+            warn!("sign_snapshot_manifest dispatch failed: {e}");
+            let _ = reply.send(Err(e));
+            return;
+        }
+        self.parked.sign_snapshot_manifest = Some(reply);
+    }
+
+    /// Hand a job to the worker without ever blocking while results back
+    /// up. Both worker channels are bounded, so a plain blocking `send`
+    /// can deadlock the pair: the worker parks sending a result the
+    /// actor isn't draining, and stops taking jobs — the send never
+    /// completes and the whole volume (IO + IPC) wedges. When the job
+    /// queue is full, drain and apply one result instead, then retry:
+    /// the worker frees a job slot right after each result send lands.
+    ///
+    /// `handle_worker_result` can re-enter this function (a completed GC
+    /// plan dispatches the next handoff in its batch). The nesting is
+    /// bounded: GC plans are single-flight, so the drained queue can
+    /// hold at most one further GcPlan result.
+    fn send_worker_job(&mut self, job: WorkerJob) -> io::Result<()> {
+        let Some(tx) = self.worker_tx.clone() else {
+            return Err(io::Error::other("worker not running"));
+        };
+        let mut job = job;
+        loop {
+            match tx.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::TrySendError::Full(j)) => {
+                    job = j;
+                    match self.worker_rx.recv() {
+                        Ok(result) => self.handle_worker_result(result),
+                        Err(_) => {
+                            return Err(io::Error::other("worker result channel closed"));
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Err(io::Error::other("worker channel closed"));
+                }
             }
-            self.parked.sign_snapshot_manifest = Some(reply);
-        } else {
-            let _ = reply.send(Err(io::Error::other("worker not running")));
         }
     }
 
@@ -1023,6 +1038,8 @@ impl VolumeActor {
                     let _ = reply.send(outcome);
                 }
             }
+            #[cfg(test)]
+            WorkerResult::Barrier => {}
         }
     }
 
@@ -1098,18 +1115,17 @@ impl VolumeActor {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
                                     let old_wal_path = job.old_wal_path.clone();
-                                    if let Some(tx) = &self.worker_tx {
-                                        if let Err(e) = tx.send(WorkerJob::Promote(job)) {
-                                            let _ = reply.send(Err(io::Error::other(
-                                                format!("worker channel closed: {e}"),
-                                            )));
-                                        } else {
+                                    match self.send_worker_job(WorkerJob::Promote(job)) {
+                                        Ok(()) => {
                                             self.pipeline.promotes_in_flight += 1;
                                             self.pipeline.promote_gen += 1;
                                             self.pipeline.inflight_old_wals.push_back(old_wal_path);
                                             self.pipeline.parked_promote_wal.push(
                                                 ParkedPromoteWal { segment_ulid: ulid, reply },
                                             );
+                                        }
+                                        Err(e) => {
+                                            let _ = reply.send(Err(e));
                                         }
                                     }
                                 }
@@ -1161,24 +1177,16 @@ impl VolumeActor {
                                     let _ = reply.send(Ok(()));
                                 }
                                 Ok(PromoteSegmentPrep::Job(job)) => {
-                                    if let Some(tx) = &self.worker_tx {
-                                        match tx.send(WorkerJob::PromoteSegment(*job)) {
-                                            Ok(()) => {
-                                                self.pipeline.promote_segments_in_flight += 1;
-                                                self.pipeline.parked_promote_segments.push(
-                                                    ParkedPromoteSegment { ulid, reply },
-                                                );
-                                            }
-                                            Err(e) => {
-                                                let _ = reply.send(Err(io::Error::other(
-                                                    format!("worker channel closed: {e}"),
-                                                )));
-                                            }
+                                    match self.send_worker_job(WorkerJob::PromoteSegment(*job)) {
+                                        Ok(()) => {
+                                            self.pipeline.promote_segments_in_flight += 1;
+                                            self.pipeline.parked_promote_segments.push(
+                                                ParkedPromoteSegment { ulid, reply },
+                                            );
                                         }
-                                    } else {
-                                        let _ = reply.send(Err(io::Error::other(
-                                            "worker channel closed",
-                                        )));
+                                        Err(e) => {
+                                            let _ = reply.send(Err(e));
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1221,6 +1229,21 @@ impl VolumeActor {
                         VolumeRequest::Shutdown => {
                             self.shutdown_worker();
                             return;
+                        }
+                        #[cfg(test)]
+                        VolumeRequest::TestDispatchBarrier { hold } => {
+                            if let Err(e) = self.send_worker_job(WorkerJob::Barrier(hold)) {
+                                warn!("test barrier dispatch failed: {e}");
+                            }
+                        }
+                        #[cfg(test)]
+                        VolumeRequest::TestParkThenDispatchBarriers { park, holds } => {
+                            let _ = park.recv();
+                            for hold in holds {
+                                if let Err(e) = self.send_worker_job(WorkerJob::Barrier(hold)) {
+                                    warn!("test barrier dispatch failed: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -1463,6 +1486,27 @@ impl VolumeClient {
         reply_rx
             .recv()
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Test seam: dispatch a worker barrier job through the normal
+    /// dispatch path. Fire-and-forget.
+    #[cfg(test)]
+    pub(crate) fn test_dispatch_barrier(&self, hold: crossbeam_channel::Receiver<()>) {
+        let _ = self.tx.send(VolumeRequest::TestDispatchBarrier { hold });
+    }
+
+    /// Test seam: park the actor in-handler until `park` fires, then
+    /// dispatch one barrier job per hold without returning to the
+    /// select loop. Fire-and-forget.
+    #[cfg(test)]
+    pub(crate) fn test_park_then_dispatch_barriers(
+        &self,
+        park: crossbeam_channel::Receiver<()>,
+        holds: Vec<crossbeam_channel::Receiver<()>>,
+    ) {
+        let _ = self
+            .tx
+            .send(VolumeRequest::TestParkThenDispatchBarriers { park, holds });
     }
 
     /// Rewrite every pending segment with any hash-dead body bytes.
@@ -1770,6 +1814,11 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
             WorkerJob::Reclaim(job) => WorkerResult::Reclaim(execute_reclaim(job)),
+            #[cfg(test)]
+            WorkerJob::Barrier(hold) => {
+                let _ = hold.recv();
+                WorkerResult::Barrier
+            }
         };
         if result_tx.send(msg).is_err() {
             break;
@@ -3499,5 +3548,88 @@ mod tests {
             .read_with_snapshot(&stale, 0, &mut buf)
             .expect("read of live data through a pre-repack snapshot");
         assert_eq!(buf, block_a, "read must return the live block contents");
+    }
+
+    /// Deterministic reconstruction of the 2026-07-13 field wedge: the
+    /// worker blocked sending into a full result queue while the actor
+    /// dispatched into a full job queue. A blocking dispatch deadlocks
+    /// here — the volume stops serving IO and IPC permanently. The
+    /// drain-and-retry dispatch must complete and leave the volume
+    /// responsive.
+    ///
+    /// The sleeps only give threads time to reach states they are
+    /// already committed to (a dequeue, a blocked send); no ordering
+    /// depends on winning a race.
+    #[test]
+    fn dispatch_into_full_queues_stays_live() {
+        let dir = temp_dir();
+        let vol = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(vol);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        // B1 occupies the worker; give it time to dequeue before
+        // filling the job queue exactly to capacity with B2..B5.
+        let (h1_tx, h1_rx) = bounded::<()>(1);
+        client.test_dispatch_barrier(h1_rx);
+        std::thread::sleep(Duration::from_millis(300));
+        let mut early = vec![h1_tx];
+        for _ in 0..4 {
+            let (tx, rx) = bounded::<()>(1);
+            client.test_dispatch_barrier(rx);
+            early.push(tx);
+        }
+
+        // The next request parks the actor in-handler, then dispatches
+        // five more barriers without returning to the select loop — so
+        // nothing can drain worker results between those dispatches.
+        let (park_tx, park_rx) = bounded::<()>(1);
+        let mut late = Vec::new();
+        let mut late_holds = Vec::new();
+        for _ in 0..5 {
+            let (tx, rx) = bounded::<()>(1);
+            // Pre-fire the hold so the job completes the moment the
+            // worker dequeues it — the deadlock under test lives in the
+            // queues, not in job execution time.
+            tx.send(()).unwrap();
+            late.push(tx);
+            late_holds.push(rx);
+        }
+        client.test_park_then_dispatch_barriers(park_rx, late_holds);
+        std::thread::sleep(Duration::from_millis(200));
+
+        // With the actor parked, complete all five early jobs: results
+        // 1-4 fill the result queue and the worker blocks sending the
+        // fifth.
+        for h in &early {
+            let _ = h.send(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Unpark. The handler now dispatches five jobs back to back;
+        // the fifth lands on a full job queue while the worker is still
+        // wedged on the result queue — the field deadlock shape.
+        park_tx.send(()).unwrap();
+
+        // Liveness probe: flush answers only once the actor has made it
+        // through all five dispatches.
+        let (done_tx, done_rx) = bounded(1);
+        {
+            let c = client.clone();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(c.flush());
+            });
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("actor wedged dispatching into full worker queues")
+            .expect("flush after dispatch flood");
+        drop(late);
+
+        // Let the actor drain the late results before shutdown joins
+        // the worker.
+        std::thread::sleep(Duration::from_millis(500));
+        client.shutdown();
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
