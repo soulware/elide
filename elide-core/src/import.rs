@@ -21,6 +21,7 @@
 // upfront, there is no WAL involved, and segments are written via the
 // standard tmp-rename commit pattern.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -73,7 +74,7 @@ fn make_entry(
     hash: blake3::Hash,
     start_lba: u64,
     lba_length: u32,
-    body: &[u8],
+    body: Cow<'_, [u8]>,
     parent_extent_index: Option<&ExtentIndex>,
 ) -> EmittedEntry {
     let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
@@ -85,13 +86,14 @@ fn make_entry(
             raw_bytes: 0,
         };
     }
-    let (flags, data) = match crate::volume::maybe_compress(body) {
+    let raw_bytes = body.len();
+    let (flags, data) = match crate::volume::maybe_compress(&body) {
         Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
-        None => (SegmentFlags::empty(), body.to_vec()),
+        None => (SegmentFlags::empty(), body.into_owned()),
     };
     EmittedEntry {
         entry: SegmentEntry::new_data(hash, start_lba, lba_length, flags, data),
-        raw_bytes: body.len(),
+        raw_bytes,
     }
 }
 
@@ -188,7 +190,13 @@ pub fn import_image(
         if frag_start_here {
             let f: FileFragment = frag_iter.next().expect("peeked");
             let lba_len = f.lba_length;
-            let emitted = make_entry(f.hash, f.lba_start, lba_len, &f.body, parent_extent_index);
+            let emitted = make_entry(
+                f.hash,
+                f.lba_start,
+                lba_len,
+                Cow::Owned(f.body),
+                parent_extent_index,
+            );
             entries.push(emitted.entry);
             batch_raw_bytes += emitted.raw_bytes;
             filemap_rows.push(FilemapRow {
@@ -215,7 +223,7 @@ pub fn import_image(
 
             if block != ZERO_BLOCK {
                 let hash = blake3::hash(&block);
-                let emitted = make_entry(hash, lba, 1, &block, parent_extent_index);
+                let emitted = make_entry(hash, lba, 1, Cow::Borrowed(&block), parent_extent_index);
                 entries.push(emitted.entry);
                 batch_raw_bytes += emitted.raw_bytes;
             }
