@@ -489,6 +489,12 @@ pub struct SegmentsView<'a> {
     vol_ulid: Ulid,
 }
 
+/// Multipart-upload parts in flight per segment PUT. Two is enough to
+/// hide one request's handshake latency without bursting the upload
+/// link, and bounds each upload's resident memory to
+/// `(MAX_CONCURRENT_PARTS + 1) × part_size`.
+const MAX_CONCURRENT_PARTS: usize = 2;
+
 impl SegmentsView<'_> {
     /// Build the canonical segment key. The date partition is
     /// derived from the segment ULID's timestamp, so keys are stable
@@ -510,16 +516,52 @@ impl SegmentsView<'_> {
     /// boot via [`crate::upload::set_part_size_bytes`]. Two parts
     /// in flight is enough to hide one request's handshake latency
     /// without bursting the upload link.
+    ///
+    /// The file is read one part at a time, so resident memory is
+    /// bounded by the in-flight parts, not the segment size —
+    /// several volumes can drain concurrently without each pinning
+    /// a whole segment in memory.
     pub async fn put_from_file(
         &self,
         seg_ulid: Ulid,
         path: &std::path::Path,
     ) -> Result<(), SegmentsError> {
-        let data = std::fs::read(path).map_err(|e| SegmentsError::ReadFile {
+        use std::io::Read;
+
+        let read_err = |e| SegmentsError::ReadFile {
             path: path.to_path_buf(),
             source: e,
-        })?;
-        self.put_bytes(seg_ulid, Bytes::from(data)).await
+        };
+        let mut f = std::fs::File::open(path).map_err(read_err)?;
+        let key = self.segment_key(seg_ulid);
+        let part_size = crate::upload::part_size_bytes();
+        let upload = self
+            .store
+            .put_multipart(&key)
+            .await
+            .map_err(SegmentsError::Put)?;
+        let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
+        loop {
+            let mut buf = vec![0u8; part_size];
+            let mut filled = 0;
+            while filled < buf.len() {
+                match f.read(&mut buf[filled..]).map_err(read_err)? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            writer
+                .wait_for_capacity(MAX_CONCURRENT_PARTS)
+                .await
+                .map_err(SegmentsError::Put)?;
+            writer.put(Bytes::from(buf));
+        }
+        writer.finish().await.map_err(SegmentsError::Put)?;
+        Ok(())
     }
 
     /// GET the whole segment object. Used by forced-claim tail
@@ -537,8 +579,6 @@ impl SegmentsView<'_> {
     /// forced-claim tail re-own, which composes the object in memory
     /// (re-signed head + copied body).
     pub async fn put_bytes(&self, seg_ulid: Ulid, mut bytes: Bytes) -> Result<(), SegmentsError> {
-        const MAX_CONCURRENT_PARTS: usize = 2;
-
         let key = self.segment_key(seg_ulid);
         let part_size = crate::upload::part_size_bytes();
         let upload = self
