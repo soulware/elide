@@ -658,6 +658,11 @@ pub fn rewrite_post_snapshot_with_prior(
     fs::rename(&tmp_path, output_path)?;
     segment::fsync_dir(output_path)?;
 
+    // One RewrittenSegment per input accumulates in the delta-repack
+    // result — without this the job retains every rewritten segment's
+    // body bytes at once.
+    segment::drop_written_bodies(&mut entries);
+
     // Delta region starts at `new_body_section_start + delta_region_body_length`.
     // Compute it from post-rewrite stored_length on Data entries; that's the
     // same sum `write_segment_with_delta_body` used when laying out the
