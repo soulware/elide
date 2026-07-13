@@ -205,6 +205,18 @@ pub struct VolumeActor {
     /// library callers): the divergence is logged and the plan left on
     /// disk, nothing exits.
     divergence_exit: Option<Box<dyn Fn() + Send>>,
+    /// Promote-durability bookkeeping and replies parked on specific
+    /// promotes.
+    pipeline: PromotePipeline,
+    /// Reply slots for the at-most-one-in-flight worker operations.
+    parked: ParkedOps,
+}
+
+/// Promote-pipeline bookkeeping: dispatch/completion generations for
+/// the flush-durability barrier, plus replies parked on specific
+/// promotes.
+#[derive(Default)]
+struct PromotePipeline {
     /// Number of promote jobs dispatched but not yet applied.
     promotes_in_flight: usize,
     /// Monotonic counter, incremented on every `WorkerJob::Promote`
@@ -244,31 +256,34 @@ pub struct VolumeActor {
     parked_promote_segments: Vec<ParkedPromoteSegment>,
     /// Number of `promote_segment` jobs dispatched but not yet applied.
     promote_segments_in_flight: usize,
+}
+
+/// Reply slots for worker operations that admit at most one in flight:
+/// each holds the parked reply sender while its job runs on the worker,
+/// and a concurrent request is rejected while the slot is occupied.
+#[derive(Default)]
+struct ParkedOps {
     /// In-progress GC plan handoff batch. At most one batch at a time.
-    parked_handoffs: Option<ParkedGcHandoffs>,
+    handoffs: Option<ParkedGcHandoffs>,
     /// Whether a GC plan handoff job is currently on the worker thread.
     handoff_in_flight: bool,
     /// Reply channel for an in-flight `Repack` request, parked while
-    /// the worker thread executes the repack.  `None` when no repack
-    /// is in progress; concurrent `Repack` requests are rejected with
-    /// an error.
-    parked_repack: Option<Sender<io::Result<CompactionStats>>>,
+    /// the worker thread executes the repack.
+    repack: Option<Sender<io::Result<CompactionStats>>>,
     /// Reply channel for an in-flight `DeltaRepackPostSnapshot`
     /// request, parked while the worker thread executes the delta
-    /// rewrite.  `None` when no delta_repack is in progress;
-    /// concurrent requests are rejected with an error.
-    parked_delta_repack: Option<Sender<io::Result<DeltaRepackStats>>>,
+    /// rewrite.
+    delta_repack: Option<Sender<io::Result<DeltaRepackStats>>>,
     /// Reply channel for an in-flight `SignSnapshotManifest` request,
     /// parked while the worker thread enumerates `index/`, signs, and
-    /// writes the manifest + marker.  `None` when none is in flight;
-    /// concurrent requests are rejected (the coordinator's per-volume
-    /// snapshot lock already prevents them in production).
-    parked_sign_snapshot_manifest: Option<Sender<io::Result<()>>>,
+    /// writes the manifest + marker.  Concurrent requests are rejected
+    /// (the coordinator's per-volume snapshot lock already prevents
+    /// them in production).
+    sign_snapshot_manifest: Option<Sender<io::Result<()>>>,
     /// Reply channel for an in-flight `Reclaim` request, parked while
     /// the worker thread reads live bytes, rehashes, and assembles the
-    /// output segment. `None` when no reclaim is in progress;
-    /// concurrent `Reclaim` requests are rejected with an error.
-    parked_reclaim: Option<Sender<io::Result<ReclaimOutcome>>>,
+    /// output segment.
+    reclaim: Option<Sender<io::Result<ReclaimOutcome>>>,
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
@@ -279,7 +294,7 @@ struct ParkedPromoteWal {
 
 /// State stashed while a `Flush` waits for an in-flight promote's
 /// old-WAL fsync to complete on the worker.  Released when
-/// `VolumeActor::completed_gen >= needed_gen`.
+/// `PromotePipeline::completed_gen >= needed_gen`.
 struct ParkedFlush {
     needed_gen: u64,
     reply: Sender<io::Result<()>>,
@@ -312,7 +327,7 @@ struct ParkedGcHandoffs {
 /// Outcome of a single call to [`VolumeActor::dispatch_next_handoff`].
 enum HandoffDispatch {
     /// A job was sent to the worker; the caller must retain the parked
-    /// batch in `self.parked_handoffs` so the worker result can drive it.
+    /// batch in `self.parked.handoffs` so the worker result can drive it.
     Dispatched,
     /// The batch is complete — either every entry was skipped, the last
     /// worker result fired the reply, or an error fired the reply. The
@@ -420,11 +435,11 @@ impl VolumeActor {
     /// immediately or must wait for an in-flight promote's old-WAL
     /// fsync on the worker.
     fn park_or_resolve_flush(&mut self, reply: Sender<io::Result<()>>) {
-        if self.completed_gen >= self.promote_gen {
+        if self.pipeline.completed_gen >= self.pipeline.promote_gen {
             let _ = reply.send(Ok(()));
         } else {
-            self.parked_flushes.push(ParkedFlush {
-                needed_gen: self.promote_gen,
+            self.pipeline.parked_flushes.push(ParkedFlush {
+                needed_gen: self.pipeline.promote_gen,
                 reply,
             });
         }
@@ -441,8 +456,8 @@ impl VolumeActor {
     /// housekeeping state (old WAL deleted, new snapshot published)
     /// and not just the durability barrier.
     fn on_promote_success(&mut self) {
-        self.inflight_old_wals.pop_front();
-        self.completed_gen += 1;
+        self.pipeline.inflight_old_wals.pop_front();
+        self.pipeline.completed_gen += 1;
         self.resolve_parked_flushes(Ok(()));
     }
 
@@ -452,7 +467,7 @@ impl VolumeActor {
     /// to guarantee that `completed_gen` advancing implies durability
     /// of every write that was in the old WAL at dispatch time.
     fn on_promote_failure(&mut self) {
-        let outcome = if let Some(path) = self.inflight_old_wals.pop_front() {
+        let outcome = if let Some(path) = self.pipeline.inflight_old_wals.pop_front() {
             match std::fs::File::open(&path).and_then(|f| f.sync_data()) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -468,7 +483,7 @@ impl VolumeActor {
             // fsync" which is vacuously durable.
             Ok(())
         };
-        self.completed_gen += 1;
+        self.pipeline.completed_gen += 1;
         self.resolve_parked_flushes(outcome);
     }
 
@@ -476,11 +491,11 @@ impl VolumeActor {
     /// satisfied by `completed_gen`, delivering `outcome` to each.
     /// Entries whose `needed_gen` is still in the future stay parked.
     fn resolve_parked_flushes(&mut self, outcome: io::Result<()>) {
-        let done = self.completed_gen;
+        let done = self.pipeline.completed_gen;
         let mut i = 0;
-        while i < self.parked_flushes.len() {
-            if self.parked_flushes[i].needed_gen <= done {
-                let parked = self.parked_flushes.swap_remove(i);
+        while i < self.pipeline.parked_flushes.len() {
+            if self.pipeline.parked_flushes[i].needed_gen <= done {
+                let parked = self.pipeline.parked_flushes.swap_remove(i);
                 let reply_outcome = match &outcome {
                     Ok(()) => Ok(()),
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
@@ -499,11 +514,12 @@ impl VolumeActor {
     /// the segment is fully promoted and the extent index is up to date).
     fn reply_parked_promote_segment(&mut self, ulid: Ulid, result: io::Result<()>) {
         if let Some(idx) = self
+            .pipeline
             .parked_promote_segments
             .iter()
             .position(|p| p.ulid == ulid)
         {
-            let parked = self.parked_promote_segments.swap_remove(idx);
+            let parked = self.pipeline.parked_promote_segments.swap_remove(idx);
             let _ = parked.reply.send(result);
         }
     }
@@ -528,9 +544,9 @@ impl VolumeActor {
                 warn!("worker channel closed: {e}");
                 return;
             }
-            self.promotes_in_flight += 1;
-            self.promote_gen += 1;
-            self.inflight_old_wals.push_back(old_wal_path);
+            self.pipeline.promotes_in_flight += 1;
+            self.pipeline.promote_gen += 1;
+            self.pipeline.inflight_old_wals.push_back(old_wal_path);
         }
     }
 
@@ -558,7 +574,7 @@ impl VolumeActor {
 
         if let Some(job) = job {
             // Dispatch to worker, park the reply.
-            self.parked_gc = Some(ParkedGcCheckpoint {
+            self.pipeline.parked_gc = Some(ParkedGcCheckpoint {
                 u_buckets,
                 u_flush,
                 reply,
@@ -567,16 +583,16 @@ impl VolumeActor {
                 let old_wal_path = job.old_wal_path.clone();
                 if let Err(e) = tx.send(WorkerJob::Promote(job)) {
                     warn!("worker channel closed during gc_checkpoint: {e}");
-                    if let Some(parked) = self.parked_gc.take() {
+                    if let Some(parked) = self.pipeline.parked_gc.take() {
                         let _ = parked.reply.send(Err(io::Error::other(
                             "worker channel closed during gc_checkpoint",
                         )));
                     }
                     return;
                 }
-                self.promotes_in_flight += 1;
-                self.promote_gen += 1;
-                self.inflight_old_wals.push_back(old_wal_path);
+                self.pipeline.promotes_in_flight += 1;
+                self.pipeline.promote_gen += 1;
+                self.pipeline.inflight_old_wals.push_back(old_wal_path);
             }
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
@@ -597,7 +613,7 @@ impl VolumeActor {
     /// IPC callers are told to retry; internal callers (idle tick) silently
     /// defer — the running batch will cover whatever is on disk.
     fn start_gc_handoffs(&mut self, reply: Option<Sender<io::Result<usize>>>) {
-        if self.parked_handoffs.is_some() {
+        if self.parked.handoffs.is_some() {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(io::Error::other(
                     "apply_gc_handoffs already in progress",
@@ -638,14 +654,14 @@ impl VolumeActor {
             self.dispatch_next_handoff(&mut parked),
             HandoffDispatch::Dispatched
         ) {
-            self.parked_handoffs = Some(parked);
+            self.parked.handoffs = Some(parked);
         }
     }
 
     /// Pop the next plan handoff from the parked batch and dispatch it.
     ///
     /// Returns [`HandoffDispatch::Dispatched`] when a job is on the worker
-    /// and the caller should retain `parked` in `self.parked_handoffs`.
+    /// and the caller should retain `parked` in `self.parked.handoffs`.
     /// Returns [`HandoffDispatch::Finished`] when the batch is done — every
     /// remaining entry was skipped (`prepare_plan_apply` returned `None`)
     /// or a fatal error fired the reply — and the caller must drop `parked`.
@@ -681,7 +697,7 @@ impl VolumeActor {
                 }
                 return HandoffDispatch::Finished;
             }
-            self.handoff_in_flight = true;
+            self.parked.handoff_in_flight = true;
             return HandoffDispatch::Dispatched;
         }
         // No more plans — finalise the batch.
@@ -718,7 +734,7 @@ impl VolumeActor {
                 let _ = reply.send(Err(io::Error::other("worker channel closed during repack")));
                 return;
             }
-            self.parked_repack = Some(reply);
+            self.parked.repack = Some(reply);
         } else {
             let _ = reply.send(Err(io::Error::other("worker not running")));
         }
@@ -756,7 +772,7 @@ impl VolumeActor {
                 )));
                 return;
             }
-            self.parked_delta_repack = Some(reply);
+            self.parked.delta_repack = Some(reply);
         } else {
             let _ = reply.send(Err(io::Error::other("worker not running")));
         }
@@ -794,7 +810,7 @@ impl VolumeActor {
                 )));
                 return;
             }
-            self.parked_reclaim = Some(reply);
+            self.parked.reclaim = Some(reply);
         } else {
             let _ = reply.send(Err(io::Error::other("worker not running")));
         }
@@ -822,9 +838,191 @@ impl VolumeActor {
                 )));
                 return;
             }
-            self.parked_sign_snapshot_manifest = Some(reply);
+            self.parked.sign_snapshot_manifest = Some(reply);
         } else {
             let _ = reply.send(Err(io::Error::other("worker not running")));
+        }
+    }
+
+    /// Whether any worker job is dispatched but not yet resolved.
+    fn work_in_flight(&self) -> bool {
+        self.pipeline.promotes_in_flight > 0
+            || self.pipeline.promote_segments_in_flight > 0
+            || self.parked.handoff_in_flight
+            || self.parked.repack.is_some()
+            || self.parked.delta_repack.is_some()
+            || self.parked.sign_snapshot_manifest.is_some()
+            || self.parked.reclaim.is_some()
+    }
+
+    /// Apply one worker result: bookkeeping, volume apply, snapshot
+    /// publish, and resolution of any parked replies.  Called from the
+    /// main select loop and the shutdown drain.
+    fn handle_worker_result(&mut self, result: WorkerResult) {
+        match result {
+            WorkerResult::Promote(Ok(result)) => {
+                self.pipeline.promotes_in_flight -= 1;
+                let ulid = result.segment_ulid;
+                self.lock_volume().apply_promote(&result);
+                self.publish_snapshot();
+                // Resolve parked flushes only after apply + publish
+                // so the caller observes the old WAL deleted and the
+                // new snapshot visible — not just the durability barrier.
+                self.on_promote_success();
+
+                // Complete any parked operations waiting for this ULID.
+                // GC checkpoint.
+                if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
+                    let _ = parked.reply.send(Ok(parked.u_buckets));
+                }
+                // PromoteWal callers.
+                let mut i = 0;
+                while i < self.pipeline.parked_promote_wal.len() {
+                    if self.pipeline.parked_promote_wal[i].segment_ulid == ulid {
+                        let parked = self.pipeline.parked_promote_wal.swap_remove(i);
+                        let _ = parked.reply.send(Ok(()));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            WorkerResult::Promote(Err(e)) => {
+                self.pipeline.promotes_in_flight -= 1;
+                warn!("worker promote failed: {e}");
+                self.on_promote_failure();
+            }
+            WorkerResult::GcPlan(Ok(result)) => {
+                self.parked.handoff_in_flight = false;
+                let applied = self.lock_volume().apply_plan_apply_result(result);
+                match applied {
+                    Ok(crate::volume::StagedApply::Applied) => {
+                        self.publish_snapshot();
+                        if let Some(ref mut parked) = self.parked.handoffs {
+                            parked.applied_count += 1;
+                        }
+                    }
+                    Ok(crate::volume::StagedApply::Cancelled) => {
+                        // Cancelled in worker or stale-liveness in
+                        // apply; plan/tmp already cleaned up inside.
+                    }
+                    Ok(crate::volume::StagedApply::Diverged) => {
+                        self.on_divergence();
+                        // No hook (tests): drop the rest of the
+                        // batch — every remaining plan is suspect
+                        // against the same read state.
+                        if let Some(parked) = self.parked.handoffs.as_mut() {
+                            parked.remaining.clear();
+                        }
+                    }
+                    Err(e) => {
+                        warn!("gc plan apply failed: {e}");
+                        if let Some(parked) = self.parked.handoffs.take()
+                            && let Some(reply) = parked.reply
+                        {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                // Dispatch next plan in this batch, or complete.
+                if let Some(mut parked) = self.parked.handoffs.take() {
+                    if parked.remaining.is_empty() {
+                        if let Some(reply) = parked.reply {
+                            let _ = reply.send(Ok(parked.applied_count));
+                        }
+                    } else if matches!(
+                        self.dispatch_next_handoff(&mut parked),
+                        HandoffDispatch::Dispatched
+                    ) {
+                        self.parked.handoffs = Some(parked);
+                    }
+                }
+            }
+            WorkerResult::GcPlan(Err(e)) => {
+                self.parked.handoff_in_flight = false;
+                warn!("worker gc plan apply failed: {e}");
+                if let Some(parked) = self.parked.handoffs.take()
+                    && let Some(reply) = parked.reply
+                {
+                    let _ = reply.send(Err(e));
+                }
+            }
+            WorkerResult::PromoteSegment { ulid, result } => {
+                self.pipeline.promote_segments_in_flight -= 1;
+                match result {
+                    Ok(r) => {
+                        let apply_result = self.lock_volume().apply_promote_segment_result(r);
+                        if apply_result.is_ok() {
+                            self.publish_snapshot();
+                        }
+                        self.reply_parked_promote_segment(ulid, apply_result);
+                    }
+                    Err(e) => {
+                        warn!("worker promote_segment for {ulid} failed: {e}");
+                        self.reply_parked_promote_segment(ulid, Err(e));
+                    }
+                }
+            }
+            WorkerResult::Repack(result) => {
+                let reply = self.parked.repack.take();
+                let outcome = match result {
+                    Ok(r) => self.apply_repack_and_publish(r),
+                    Err(e) => {
+                        warn!("worker repack failed: {e}");
+                        Err(e)
+                    }
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
+            WorkerResult::DeltaRepack(result) => {
+                let reply = self.parked.delta_repack.take();
+                let outcome = match result {
+                    Ok(r) => self.apply_delta_repack_and_publish(r),
+                    Err(e) => {
+                        warn!("worker delta_repack failed: {e}");
+                        Err(e)
+                    }
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
+            WorkerResult::SignSnapshotManifest(result) => {
+                let reply = self.parked.sign_snapshot_manifest.take();
+                let outcome = match result {
+                    Ok(r) => {
+                        self.lock_volume().apply_sign_snapshot_manifest_result(r);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("worker sign_snapshot_manifest failed: {e}");
+                        Err(e)
+                    }
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
+            WorkerResult::Reclaim(result) => {
+                let reply = self.parked.reclaim.take();
+                let outcome = match result {
+                    Ok(r) => {
+                        let apply_result = self.lock_volume().apply_reclaim_result(r);
+                        if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
+                            self.publish_snapshot();
+                        }
+                        apply_result
+                    }
+                    Err(e) => {
+                        warn!("worker reclaim failed: {e}");
+                        Err(e)
+                    }
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
+            }
         }
     }
 
@@ -839,117 +1037,9 @@ impl VolumeActor {
         self.worker_tx.take();
 
         // Drain remaining results.
-        while self.promotes_in_flight > 0
-            || self.handoff_in_flight
-            || self.promote_segments_in_flight > 0
-            || self.parked_repack.is_some()
-            || self.parked_delta_repack.is_some()
-            || self.parked_sign_snapshot_manifest.is_some()
-            || self.parked_reclaim.is_some()
-        {
+        while self.work_in_flight() {
             match self.worker_rx.recv() {
-                Ok(WorkerResult::Promote(Ok(result))) => {
-                    self.promotes_in_flight -= 1;
-                    self.lock_volume().apply_promote(&result);
-                    self.publish_snapshot();
-                    self.on_promote_success();
-                }
-                Ok(WorkerResult::Promote(Err(e))) => {
-                    self.promotes_in_flight -= 1;
-                    warn!("worker promote failed during shutdown: {e}");
-                    self.on_promote_failure();
-                }
-                Ok(WorkerResult::GcPlan(Ok(result))) => {
-                    self.handoff_in_flight = false;
-                    let applied = self.lock_volume().apply_plan_apply_result(result);
-                    match applied {
-                        Ok(crate::volume::StagedApply::Applied) => self.publish_snapshot(),
-                        Ok(crate::volume::StagedApply::Diverged) => self.on_divergence(),
-                        Ok(crate::volume::StagedApply::Cancelled) | Err(_) => {}
-                    }
-                }
-                Ok(WorkerResult::GcPlan(Err(e))) => {
-                    self.handoff_in_flight = false;
-                    warn!("worker gc plan apply failed during shutdown: {e}");
-                }
-                Ok(WorkerResult::PromoteSegment { ulid, result }) => {
-                    self.promote_segments_in_flight -= 1;
-                    match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_promote_segment_result(r);
-                            if apply_result.is_ok() {
-                                self.publish_snapshot();
-                            }
-                            self.reply_parked_promote_segment(ulid, apply_result);
-                        }
-                        Err(e) => {
-                            warn!("worker promote_segment for {ulid} failed during shutdown: {e}");
-                            self.reply_parked_promote_segment(ulid, Err(e));
-                        }
-                    }
-                }
-                Ok(WorkerResult::Repack(result)) => {
-                    let reply = self.parked_repack.take();
-                    let outcome = match result {
-                        Ok(r) => self.apply_repack_and_publish(r),
-                        Err(e) => {
-                            warn!("worker repack failed during shutdown: {e}");
-                            Err(e)
-                        }
-                    };
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
-                }
-                Ok(WorkerResult::DeltaRepack(result)) => {
-                    let reply = self.parked_delta_repack.take();
-                    let outcome = match result {
-                        Ok(r) => self.apply_delta_repack_and_publish(r),
-                        Err(e) => {
-                            warn!("worker delta_repack failed during shutdown: {e}");
-                            Err(e)
-                        }
-                    };
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
-                }
-                Ok(WorkerResult::SignSnapshotManifest(result)) => {
-                    let reply = self.parked_sign_snapshot_manifest.take();
-                    let outcome = match result {
-                        Ok(r) => {
-                            self.lock_volume().apply_sign_snapshot_manifest_result(r);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            warn!("worker sign_snapshot_manifest failed during shutdown: {e}");
-                            Err(e)
-                        }
-                    };
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
-                }
-                Ok(WorkerResult::Reclaim(result)) => {
-                    let reply = self.parked_reclaim.take();
-                    let outcome = match result {
-                        Ok(r) => {
-                            let apply_result = self.lock_volume().apply_reclaim_result(r);
-                            if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0)
-                            {
-                                self.publish_snapshot();
-                            }
-                            apply_result
-                        }
-                        Err(e) => {
-                            warn!("worker reclaim failed during shutdown: {e}");
-                            Err(e)
-                        }
-                    };
-                    if let Some(reply) = reply {
-                        let _ = reply.send(outcome);
-                    }
-                }
+                Ok(result) => self.handle_worker_result(result),
                 Err(_) => {
                     // Channel closed — worker exited unexpectedly.
                     break;
@@ -1014,10 +1104,10 @@ impl VolumeActor {
                                                 format!("worker channel closed: {e}"),
                                             )));
                                         } else {
-                                            self.promotes_in_flight += 1;
-                                            self.promote_gen += 1;
-                                            self.inflight_old_wals.push_back(old_wal_path);
-                                            self.parked_promote_wal.push(
+                                            self.pipeline.promotes_in_flight += 1;
+                                            self.pipeline.promote_gen += 1;
+                                            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+                                            self.pipeline.parked_promote_wal.push(
                                                 ParkedPromoteWal { segment_ulid: ulid, reply },
                                             );
                                         }
@@ -1033,7 +1123,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::Repack { reply } => {
-                            if self.parked_repack.is_some() {
+                            if self.parked.repack.is_some() {
                                 let _ = reply
                                     .send(Err(io::Error::other("concurrent repack not allowed")));
                             } else {
@@ -1041,7 +1131,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::DeltaRepackPostSnapshot { reply } => {
-                            if self.parked_delta_repack.is_some() {
+                            if self.parked.delta_repack.is_some() {
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent delta_repack not allowed",
                                 )));
@@ -1053,7 +1143,7 @@ impl VolumeActor {
                             self.start_gc_handoffs(Some(reply));
                         }
                         VolumeRequest::GcCheckpoint { max_buckets, reply } => {
-                            if self.parked_gc.is_some() {
+                            if self.pipeline.parked_gc.is_some() {
                                 // Concurrent GC checkpoint is an error.
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent gc_checkpoint not allowed",
@@ -1074,8 +1164,8 @@ impl VolumeActor {
                                     if let Some(tx) = &self.worker_tx {
                                         match tx.send(WorkerJob::PromoteSegment(*job)) {
                                             Ok(()) => {
-                                                self.promote_segments_in_flight += 1;
-                                                self.parked_promote_segments.push(
+                                                self.pipeline.promote_segments_in_flight += 1;
+                                                self.pipeline.parked_promote_segments.push(
                                                     ParkedPromoteSegment { ulid, reply },
                                                 );
                                             }
@@ -1104,7 +1194,7 @@ impl VolumeActor {
                             kind,
                             reply,
                         } => {
-                            if self.parked_sign_snapshot_manifest.is_some() {
+                            if self.parked.sign_snapshot_manifest.is_some() {
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent sign_snapshot_manifest not allowed",
                                 )));
@@ -1120,7 +1210,7 @@ impl VolumeActor {
                             lba_length,
                             reply,
                         } => {
-                            if self.parked_reclaim.is_some() {
+                            if self.parked.reclaim.is_some() {
                                 let _ = reply.send(Err(io::Error::other(
                                     "concurrent reclaim not allowed",
                                 )));
@@ -1137,174 +1227,7 @@ impl VolumeActor {
                 // Worker thread results (promote completions, GC handoffs).
                 recv(self.worker_rx) -> msg => {
                     match msg {
-                        Ok(WorkerResult::GcPlan(Ok(result))) => {
-                            self.handoff_in_flight = false;
-                            let applied = self.lock_volume().apply_plan_apply_result(result);
-                            match applied {
-                                Ok(crate::volume::StagedApply::Applied) => {
-                                    self.publish_snapshot();
-                                    if let Some(ref mut parked) = self.parked_handoffs {
-                                        parked.applied_count += 1;
-                                    }
-                                }
-                                Ok(crate::volume::StagedApply::Cancelled) => {
-                                    // Cancelled in worker or stale-liveness in
-                                    // apply; plan/tmp already cleaned up inside.
-                                }
-                                Ok(crate::volume::StagedApply::Diverged) => {
-                                    self.on_divergence();
-                                    // No hook (tests): drop the rest of the
-                                    // batch — every remaining plan is suspect
-                                    // against the same read state.
-                                    if let Some(parked) = self.parked_handoffs.as_mut() {
-                                        parked.remaining.clear();
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("gc plan apply failed: {e}");
-                                    if let Some(parked) = self.parked_handoffs.take()
-                                        && let Some(reply) = parked.reply
-                                    {
-                                        let _ = reply.send(Err(e));
-                                    }
-                                }
-                            }
-                            // Dispatch next plan in this batch, or complete.
-                            if let Some(mut parked) = self.parked_handoffs.take() {
-                                if parked.remaining.is_empty() {
-                                    if let Some(reply) = parked.reply {
-                                        let _ = reply.send(Ok(parked.applied_count));
-                                    }
-                                } else if matches!(
-                                    self.dispatch_next_handoff(&mut parked),
-                                    HandoffDispatch::Dispatched
-                                ) {
-                                    self.parked_handoffs = Some(parked);
-                                }
-                            }
-                        }
-                        Ok(WorkerResult::GcPlan(Err(e))) => {
-                            self.handoff_in_flight = false;
-                            warn!("worker gc plan apply failed: {e}");
-                            if let Some(parked) = self.parked_handoffs.take()
-                                && let Some(reply) = parked.reply
-                            {
-                                let _ = reply.send(Err(e));
-                            }
-                        }
-                        Ok(WorkerResult::Promote(Ok(result))) => {
-                            self.promotes_in_flight -= 1;
-                            let ulid = result.segment_ulid;
-                            self.lock_volume().apply_promote(&result);
-                            self.publish_snapshot();
-                            // Resolve parked flushes only after apply + publish
-                            // so the caller observes the old WAL deleted and the
-                            // new snapshot visible — not just the durability barrier.
-                            self.on_promote_success();
-
-                            // Complete any parked operations waiting for this ULID.
-                            // GC checkpoint.
-                            if let Some(parked) =
-                                self.parked_gc.take_if(|p| ulid == p.u_flush)
-                            {
-                                let _ = parked.reply.send(Ok(parked.u_buckets));
-                            }
-                            // PromoteWal callers.
-                            let mut i = 0;
-                            while i < self.parked_promote_wal.len() {
-                                if self.parked_promote_wal[i].segment_ulid == ulid {
-                                    let parked = self.parked_promote_wal.swap_remove(i);
-                                    let _ = parked.reply.send(Ok(()));
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                        }
-                        Ok(WorkerResult::Promote(Err(e))) => {
-                            self.promotes_in_flight -= 1;
-                            warn!("worker promote failed: {e}");
-                            self.on_promote_failure();
-                        }
-                        Ok(WorkerResult::PromoteSegment { ulid, result }) => {
-                            self.promote_segments_in_flight -= 1;
-                            match result {
-                                Ok(r) => {
-                                    let apply_result =
-                                        self.lock_volume().apply_promote_segment_result(r);
-                                    if apply_result.is_ok() {
-                                        self.publish_snapshot();
-                                    }
-                                    self.reply_parked_promote_segment(ulid, apply_result);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "worker promote_segment for {ulid} failed: {e}"
-                                    );
-                                    self.reply_parked_promote_segment(ulid, Err(e));
-                                }
-                            }
-                        }
-                        Ok(WorkerResult::Repack(result)) => {
-                            let reply = self.parked_repack.take();
-                            let outcome = match result {
-                                Ok(r) => self.apply_repack_and_publish(r),
-                                Err(e) => {
-                                    warn!("worker repack failed: {e}");
-                                    Err(e)
-                                }
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
-                        }
-                        Ok(WorkerResult::DeltaRepack(result)) => {
-                            let reply = self.parked_delta_repack.take();
-                            let outcome = match result {
-                                Ok(r) => self.apply_delta_repack_and_publish(r),
-                                Err(e) => {
-                                    warn!("worker delta_repack failed: {e}");
-                                    Err(e)
-                                }
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
-                        }
-                        Ok(WorkerResult::SignSnapshotManifest(result)) => {
-                            let reply = self.parked_sign_snapshot_manifest.take();
-                            let outcome = match result {
-                                Ok(r) => {
-                                    self.lock_volume().apply_sign_snapshot_manifest_result(r);
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    warn!("worker sign_snapshot_manifest failed: {e}");
-                                    Err(e)
-                                }
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
-                        }
-                        Ok(WorkerResult::Reclaim(result)) => {
-                            let reply = self.parked_reclaim.take();
-                            let outcome = match result {
-                                Ok(r) => {
-                                    let apply_result = self.lock_volume().apply_reclaim_result(r);
-                                    if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
-                                        self.publish_snapshot();
-                                    }
-                                    apply_result
-                                }
-                                Err(e) => {
-                                    warn!("worker reclaim failed: {e}");
-                                    Err(e)
-                                }
-                            };
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
-                        }
+                        Ok(result) => self.handle_worker_result(result),
                         Err(_) => {
                             warn!("worker result channel closed unexpectedly");
                         }
@@ -2972,21 +2895,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         worker_rx: worker_result_rx,
         worker_handle: Some(worker_handle),
         divergence_exit: None,
-        promotes_in_flight: 0,
-        promote_gen: 0,
-        completed_gen: 0,
-        inflight_old_wals: VecDeque::new(),
-        parked_flushes: Vec::new(),
-        parked_gc: None,
-        parked_promote_wal: Vec::new(),
-        parked_promote_segments: Vec::new(),
-        promote_segments_in_flight: 0,
-        parked_handoffs: None,
-        handoff_in_flight: false,
-        parked_repack: None,
-        parked_delta_repack: None,
-        parked_sign_snapshot_manifest: None,
-        parked_reclaim: None,
+        pipeline: PromotePipeline::default(),
+        parked: ParkedOps::default(),
     };
 
     let client = VolumeClient {
