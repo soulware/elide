@@ -160,6 +160,117 @@ pub(crate) fn materialise_pending_bodies(
     Ok(())
 }
 
+/// Snapshot the CAS precondition tokens for a promote: the `body_offset`
+/// each body-bearing entry currently has in the extent index. These gate
+/// the apply loop in [`apply_promoted_entries`] — an entry is only
+/// rewritten if it still points at `(wal_ulid, snapshotted_offset)`.
+/// `None` for kinds with no extent-index body (DedupRef, Zero, Delta).
+///
+/// Must run before `segment::write_and_commit` rewrites `stored_offset`
+/// from WAL-relative to segment-relative.
+fn snapshot_pre_promote_offsets(
+    entries: &[segment::SegmentEntry],
+    extent_index: &extentindex::ExtentIndex,
+) -> Vec<Option<u64>> {
+    entries
+        .iter()
+        .map(|e| match e.kind {
+            EntryKind::Data
+            | EntryKind::Inline
+            | EntryKind::CanonicalData
+            | EntryKind::CanonicalInline => extent_index.lookup(&e.hash).map(|loc| loc.body_offset),
+            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+        })
+        .collect()
+}
+
+/// Apply a committed promote to the in-memory maps: CAS each body-bearing
+/// entry in the extent index from its WAL-relative location to the new
+/// segment (skipping entries a concurrent write or GC handoff has
+/// superseded), bump lbamap claimants from the WAL ULID to the segment
+/// ULID, and log the entry counts.
+fn apply_promoted_entries(
+    extent_index: &mut extentindex::ExtentIndex,
+    lbamap: &mut lbamap::LbaMap,
+    entries: &[segment::SegmentEntry],
+    pre_promote_offsets: &[Option<u64>],
+    old_wal_ulid: Ulid,
+    segment_ulid: Ulid,
+    body_section_start: u64,
+) {
+    for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
+        match entry.kind {
+            EntryKind::Data
+            | EntryKind::Inline
+            | EntryKind::CanonicalData
+            | EntryKind::CanonicalInline => {}
+            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+        }
+        let Some(old_wal_offset) = old_wal_offset else {
+            // No prior extent index entry for this hash. write_commit
+            // always inserts a Data/Inline hash before pushing the
+            // SegmentEntry, so this is only possible if something
+            // removed the entry out-of-band between the write and the
+            // flush — treat it like a failed CAS and leave it alone.
+            continue;
+        };
+        let idata = if entry.kind.is_inline() {
+            entry.data.clone().map(Vec::into_boxed_slice)
+        } else {
+            None
+        };
+        extent_index.replace_if_matches(
+            entry.hash,
+            old_wal_ulid,
+            old_wal_offset,
+            extentindex::ExtentLocation {
+                segment_id: segment_ulid,
+                body_offset: entry.stored_offset,
+                body_length: entry.stored_length,
+                compressed: entry.compressed,
+                body_source: BodySource::Local,
+                body_section_start,
+                inline_data: idata,
+            },
+        );
+    }
+    // Bump lbamap claimants for every entry that still represents this
+    // WAL's claim — every non-canonical entry, including DedupRef and
+    // Zero (which have no extent_index entry but do hold an lbamap
+    // claim). The strict-newer guard inside `set_claimant_if_matches`
+    // skips entries a concurrent writer has already re-claimed at a
+    // higher ULID.
+    for entry in entries {
+        if entry.kind.is_canonical_only() {
+            continue;
+        }
+        let claim_hash = if entry.kind == EntryKind::Zero {
+            ZERO_HASH
+        } else {
+            entry.hash
+        };
+        lbamap.set_claimant_if_matches(entry.start_lba, entry.lba_length, claim_hash, segment_ulid);
+    }
+    let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for e in entries {
+        match e.kind {
+            EntryKind::Data => data += 1,
+            EntryKind::DedupRef => refs += 1,
+            EntryKind::Zero => zero += 1,
+            EntryKind::Inline => inline += 1,
+            EntryKind::Delta => delta += 1,
+            EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
+        }
+    }
+    let _ = canonical;
+    log::info!(
+        "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
+         {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
+        entries.len()
+    );
+}
+
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedApply {
@@ -456,93 +567,37 @@ impl Volume {
             let wal::WalReplay {
                 ulid: old_wal_ulid,
                 valid_size: _,
-                mut pending_entries,
+                pending_entries,
                 body_offsets,
             } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
             if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
             }
-            // Materialise body bytes into entry.data — the WAL is about to
-            // be deleted, so write_and_commit needs the body in memory.
-            materialise_pending_bodies(&wal_path, &mut pending_entries, &body_offsets)?;
-            // Snapshot pre-promote WAL offsets for the CAS apply, matching
-            // `flush_wal_to_pending_as`.
-            let pre_promote_offsets: Vec<Option<u64>> = pending_entries
-                .iter()
-                .map(|e| match e.kind {
-                    EntryKind::Data
-                    | EntryKind::Inline
-                    | EntryKind::CanonicalData
-                    | EntryKind::CanonicalInline => {
-                        extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
-                    }
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
-                })
-                .collect();
-            let segment_ulid = mint.next();
-            let body_section_start = segment::write_and_commit(
-                &pending_dir,
-                segment_ulid,
-                &mut pending_entries,
-                signer.as_ref(),
-            )?;
-            for (entry, old_wal_offset) in pending_entries
-                .iter()
-                .zip(pre_promote_offsets.iter().copied())
-            {
-                match entry.kind {
-                    EntryKind::Data
-                    | EntryKind::Inline
-                    | EntryKind::CanonicalData
-                    | EntryKind::CanonicalInline => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
-                }
-                let Some(old_wal_offset) = old_wal_offset else {
-                    continue;
-                };
-                let idata = if entry.kind.is_inline() {
-                    entry.data.clone().map(Vec::into_boxed_slice)
-                } else {
-                    None
-                };
-                extent_index.replace_if_matches(
-                    entry.hash,
-                    old_wal_ulid,
-                    old_wal_offset,
-                    extentindex::ExtentLocation {
-                        segment_id: segment_ulid,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        compressed: entry.compressed,
-                        body_source: BodySource::Local,
-                        body_section_start,
-                        inline_data: idata,
-                    },
-                );
-            }
-            // Bump lbamap claimants from wal_ulid to segment_ulid;
-            // mirrors the same loop in `flush_wal_to_pending_as`.
-            for entry in &pending_entries {
-                if entry.kind.is_canonical_only() {
-                    continue;
-                }
-                let claim_hash = if entry.kind == EntryKind::Zero {
-                    ZERO_HASH
-                } else {
-                    entry.hash
-                };
-                lbamap.set_claimant_if_matches(
-                    entry.start_lba,
-                    entry.lba_length,
-                    claim_hash,
-                    segment_ulid,
-                );
-            }
+            let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
+            let result = crate::actor::execute_promote(PromoteJob {
+                segment_ulid: mint.next(),
+                old_wal_ulid,
+                old_wal_path: wal_path.clone(),
+                entries: pending_entries,
+                pre_promote_offsets,
+                body_offsets,
+                signer: Arc::clone(&signer),
+                pending_dir: pending_dir.clone(),
+            })?;
+            apply_promoted_entries(
+                &mut extent_index,
+                &mut lbamap,
+                &result.entries,
+                &result.pre_promote_offsets,
+                result.old_wal_ulid,
+                result.segment_ulid,
+                result.body_section_start,
+            );
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers this recovery-promoted segment.
-            if last_segment_ulid < Some(segment_ulid) {
-                last_segment_ulid = Some(segment_ulid);
+            if last_segment_ulid < Some(result.segment_ulid) {
+                last_segment_ulid = Some(result.segment_ulid);
             }
             fs::remove_file(&wal_path)?;
         }
@@ -2097,169 +2152,18 @@ impl Volume {
         &mut self,
         segment_ulid: Ulid,
     ) -> io::Result<()> {
-        let Some(mut open) = self.wal.take() else {
+        if self.wal.is_none() {
             return Ok(());
-        };
-        open.wal.fsync()?;
+        }
         if self.pending_entries.is_empty() {
-            fs::remove_file(&open.path)?;
+            if let Some(open) = self.wal.take() {
+                fs::remove_file(&open.path)?;
+            }
             return Ok(());
         }
-        self.has_new_segments = true;
-        self.last_segment_ulid = Some(segment_ulid);
-        // Snapshot the WAL-relative body offsets for every Data/Inline entry
-        // before `segment::write_and_commit` rewrites `stored_offset` to
-        // segment-relative. These become the CAS precondition tokens in the
-        // apply loop below: we only rewrite an extent index entry if it still
-        // points at (wal_ulid, original_wal_offset). Any later writer or GC
-        // handoff that has already superseded the entry leaves the CAS failing
-        // and its placement intact.
-        //
-        // Today the promote runs on the actor thread, so no concurrent writer
-        // can interpose between snapshot and apply — the CAS always succeeds.
-        // The machinery is wired in now so the upcoming off-actor apply phase
-        // inherits the correct precondition check.
-        let old_wal_ulid = open.ulid;
-        let old_wal_path = open.path;
-        // Materialise body bytes from the WAL so write_and_commit can
-        // write the segment. Body bytes for Data / Inline entries written
-        // via `write_commit` live only in the WAL between commit and
-        // promote — `pending_body_offsets[i]` records the offset for each.
-        materialise_pending_bodies(
-            &old_wal_path,
-            &mut self.pending_entries,
-            &self.pending_body_offsets,
-        )?;
-        let pre_promote_offsets: Vec<Option<u64>> = self
-            .pending_entries
-            .iter()
-            .map(|e| match e.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {
-                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
-                }
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
-            })
-            .collect();
-        let body_section_start = segment::write_and_commit(
-            &self.base_dir.join("pending"),
-            segment_ulid,
-            &mut self.pending_entries,
-            self.signer.as_ref(),
-        )?;
-        // Update the extent index: replace temporary WAL offsets with
-        // body-relative offsets into the committed segment file.
-        // Thin DedupRef entries have no body in this segment — the extent
-        // index already points to the canonical segment. Zero extents are
-        // not indexed.
-        for (entry, old_wal_offset) in self
-            .pending_entries
-            .iter()
-            .zip(pre_promote_offsets.iter().copied())
-        {
-            match entry.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {}
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
-            }
-            let Some(old_wal_offset) = old_wal_offset else {
-                // No prior extent index entry for this hash. write_commit
-                // always inserts a Data/Inline hash before pushing the
-                // SegmentEntry, so this is only possible if something
-                // removed the entry out-of-band between the write and the
-                // flush — treat it like a failed CAS and leave it alone.
-                continue;
-            };
-            let idata = if entry.kind.is_inline() {
-                entry.data.clone().map(Vec::into_boxed_slice)
-            } else {
-                None
-            };
-            Arc::make_mut(&mut self.extent_index).replace_if_matches(
-                entry.hash,
-                old_wal_ulid,
-                old_wal_offset,
-                extentindex::ExtentLocation {
-                    segment_id: segment_ulid,
-                    body_offset: entry.stored_offset,
-                    body_length: entry.stored_length,
-                    compressed: entry.compressed,
-                    body_source: BodySource::Local,
-                    body_section_start,
-                    inline_data: idata,
-                },
-            );
-        }
-        // Bump lbamap claimants from wal_ulid to segment_ulid for every
-        // entry that still represents this WAL's claim — every
-        // non-canonical pending entry, including DedupRef and Zero
-        // (which have no extent_index entry but do hold an lbamap
-        // claim). The strict-newer guard inside `set_claimant_if_matches`
-        // skips entries a concurrent writer has already re-claimed at
-        // a higher ULID.
-        {
-            let lbamap = Arc::make_mut(&mut self.lbamap);
-            for entry in &self.pending_entries {
-                if entry.kind.is_canonical_only() {
-                    continue;
-                }
-                let claim_hash = if entry.kind == EntryKind::Zero {
-                    ZERO_HASH
-                } else {
-                    entry.hash
-                };
-                lbamap.set_claimant_if_matches(
-                    entry.start_lba,
-                    entry.lba_length,
-                    claim_hash,
-                    segment_ulid,
-                );
-            }
-        }
-        {
-            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
-                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-            for e in &self.pending_entries {
-                match e.kind {
-                    EntryKind::Data => data += 1,
-                    EntryKind::DedupRef => refs += 1,
-                    EntryKind::Zero => zero += 1,
-                    EntryKind::Inline => inline += 1,
-                    EntryKind::Delta => delta += 1,
-                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
-                }
-            }
-            let _ = canonical; // unused in this flush-path log (user writes never produce canonicals); present to keep the match exhaustive.
-            log::info!(
-                "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
-                 {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
-                self.pending_entries.len()
-            );
-        }
-        self.pending_entries.clear();
-        self.pending_body_offsets.clear();
-        // index/<ulid>.idx is written later by the promote_segment IPC handler,
-        // after the coordinator confirms S3 upload. Until then pending/<ulid>
-        // is the authoritative body source for both reads and crash recovery.
-        //
-        // Delete the old WAL file. `segment::write_and_commit` leaves the WAL
-        // alone so the off-actor worker (Landing 3) can defer this delete
-        // until after the actor's publish_snapshot; on the current actor-
-        // inline path we just delete immediately. With a fresh segment ULID
-        // (not reusing `old_wal_ulid`), a stale cold-cache reader that still
-        // holds the pre-promote snapshot either finds `wal/<old_wal_ulid>`
-        // at its expected path (before this unlink) or gets NotFound (after)
-        // — never a silent read of wrong bytes through `pending/<same_ulid>`.
-        fs::remove_file(&old_wal_path)?;
-        // Evict any cached fd for the deleted WAL so subsequent lookups of
-        // `old_wal_ulid` re-open rather than reuse a handle to the deleted
-        // inode. The cache is keyed by the path that was open, so we pass
-        // the WAL's original ULID — not `segment_ulid`.
-        self.evict_cached_segment(old_wal_ulid);
+        let job = self.take_wal_into_promote_job(segment_ulid)?;
+        let result = crate::actor::execute_promote(job)?;
+        self.apply_promote(&result);
         Ok(())
     }
 
@@ -2638,44 +2542,33 @@ impl Volume {
         // durability contract while letting the actor keep processing
         // writes in the meantime.
 
-        // pending_entries non-empty implies wal is Some (write path only
-        // ever appends entries after opening the WAL).
+        let segment_ulid = self.mint.next();
+        Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
+    }
+
+    /// Take the open WAL and pending entries into a [`PromoteJob`] targeting
+    /// `segment_ulid`. Snapshots the CAS precondition tokens before
+    /// `write_and_commit` rewrites `stored_offset` to segment-relative.
+    ///
+    /// Errors if no WAL is open — callers check `pending_entries` is
+    /// non-empty first, and the write path only ever appends entries after
+    /// opening the WAL.
+    fn take_wal_into_promote_job(&mut self, segment_ulid: Ulid) -> io::Result<PromoteJob> {
         let open = self.wal.take().ok_or_else(|| {
             io::Error::other("internal: pending_entries non-empty but wal absent")
         })?;
-        let old_wal_ulid = open.ulid;
-        let old_wal_path = open.path;
-
-        // Snapshot CAS tokens before write_and_commit rewrites stored_offset.
-        let pre_promote_offsets: Vec<Option<u64>> = self
-            .pending_entries
-            .iter()
-            .map(|e| match e.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {
-                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
-                }
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
-            })
-            .collect();
-
-        let entries = std::mem::take(&mut self.pending_entries);
-        let body_offsets = std::mem::take(&mut self.pending_body_offsets);
-        let segment_ulid = self.mint.next();
-        let pending_dir = self.base_dir.join("pending");
-
-        Ok(Some(PromoteJob {
+        let pre_promote_offsets =
+            snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
+        Ok(PromoteJob {
             segment_ulid,
-            old_wal_ulid,
-            old_wal_path,
-            entries,
+            old_wal_ulid: open.ulid,
+            old_wal_path: open.path,
+            entries: std::mem::take(&mut self.pending_entries),
             pre_promote_offsets,
-            body_offsets,
+            body_offsets: std::mem::take(&mut self.pending_body_offsets),
             signer: Arc::clone(&self.signer),
-            pending_dir,
-        }))
+            pending_dir: self.base_dir.join("pending"),
+        })
     }
 
     /// Apply phase of the off-actor promote.  Runs on the actor thread
@@ -2688,90 +2581,15 @@ impl Volume {
         self.has_new_segments = true;
         self.last_segment_ulid = Some(result.segment_ulid);
 
-        // CAS loop: rewrite extent index entries from WAL-relative to
-        // segment-relative offsets, but only if the entry hasn't been
-        // superseded by a concurrent write or GC handoff.
-        for (entry, old_wal_offset) in result
-            .entries
-            .iter()
-            .zip(result.pre_promote_offsets.iter().copied())
-        {
-            match entry.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {}
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
-            }
-            let Some(old_wal_offset) = old_wal_offset else {
-                continue;
-            };
-            let idata = if entry.kind.is_inline() {
-                entry.data.clone().map(Vec::into_boxed_slice)
-            } else {
-                None
-            };
-            Arc::make_mut(&mut self.extent_index).replace_if_matches(
-                entry.hash,
-                result.old_wal_ulid,
-                old_wal_offset,
-                extentindex::ExtentLocation {
-                    segment_id: result.segment_ulid,
-                    body_offset: entry.stored_offset,
-                    body_length: entry.stored_length,
-                    compressed: entry.compressed,
-                    body_source: BodySource::Local,
-                    body_section_start: result.body_section_start,
-                    inline_data: idata,
-                },
-            );
-        }
-
-        // Bump lbamap claimants from wal_ulid to segment_ulid; mirrors
-        // the same loop in `flush_wal_to_pending_as`.
-        {
-            let lbamap = Arc::make_mut(&mut self.lbamap);
-            for entry in &result.entries {
-                if entry.kind.is_canonical_only() {
-                    continue;
-                }
-                let claim_hash = if entry.kind == EntryKind::Zero {
-                    ZERO_HASH
-                } else {
-                    entry.hash
-                };
-                lbamap.set_claimant_if_matches(
-                    entry.start_lba,
-                    entry.lba_length,
-                    claim_hash,
-                    result.segment_ulid,
-                );
-            }
-        }
-
-        // Log entry counts.
-        {
-            let (mut data, mut refs, mut zero, mut inline, mut delta, mut canonical) =
-                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-            for e in &result.entries {
-                match e.kind {
-                    EntryKind::Data => data += 1,
-                    EntryKind::DedupRef => refs += 1,
-                    EntryKind::Zero => zero += 1,
-                    EntryKind::Inline => inline += 1,
-                    EntryKind::Delta => delta += 1,
-                    EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
-                }
-            }
-            let _ = canonical;
-            log::info!(
-                "flush {} (from WAL {}): {data} data, {inline} inline, {refs} dedup-ref, \
-                 {zero} zero, {delta} delta ({} entries total)",
-                result.segment_ulid,
-                result.old_wal_ulid,
-                result.entries.len()
-            );
-        }
+        apply_promoted_entries(
+            Arc::make_mut(&mut self.extent_index),
+            Arc::make_mut(&mut self.lbamap),
+            &result.entries,
+            &result.pre_promote_offsets,
+            result.old_wal_ulid,
+            result.segment_ulid,
+            result.body_section_start,
+        );
 
         // Delete old WAL — only after the extent index is updated.
         if let Err(e) = fs::remove_file(&result.old_wal_path) {
@@ -2826,45 +2644,10 @@ impl Volume {
             });
         }
 
-        // pending_entries non-empty implies wal is Some (write path only
-        // ever appends entries after opening the WAL).
-        let open = self.wal.take().ok_or_else(|| {
-            io::Error::other("internal: pending_entries non-empty but wal absent")
-        })?;
-        let old_wal_ulid = open.ulid;
-        let old_wal_path = open.path;
-
-        let pre_promote_offsets: Vec<Option<u64>> = self
-            .pending_entries
-            .iter()
-            .map(|e| match e.kind {
-                EntryKind::Data
-                | EntryKind::Inline
-                | EntryKind::CanonicalData
-                | EntryKind::CanonicalInline => {
-                    self.extent_index.lookup(&e.hash).map(|loc| loc.body_offset)
-                }
-                EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
-            })
-            .collect();
-
-        let entries = std::mem::take(&mut self.pending_entries);
-        let body_offsets = std::mem::take(&mut self.pending_body_offsets);
-        let pending_dir = self.base_dir.join("pending");
-
         Ok(GcCheckpointPrep {
             u_buckets,
             u_flush,
-            job: Some(PromoteJob {
-                segment_ulid: u_flush,
-                old_wal_ulid,
-                old_wal_path,
-                entries,
-                pre_promote_offsets,
-                body_offsets,
-                signer: Arc::clone(&self.signer),
-                pending_dir,
-            }),
+            job: Some(self.take_wal_into_promote_job(u_flush)?),
         })
     }
 }

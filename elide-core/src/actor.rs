@@ -2056,7 +2056,13 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
     }
 }
 
-fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
+/// Execute a promote job: fsync the old WAL, materialise pending bodies
+/// from it, and write + commit the pending segment.
+///
+/// Also reachable from the inline (on-actor) `Volume::flush_wal_to_pending_as`
+/// path and the startup recovery promote in `Volume::open_impl`, so all
+/// three execution sites share one write pass.
+pub(crate) fn execute_promote(mut job: PromoteJob) -> io::Result<PromoteResult> {
     std::fs::File::open(&job.old_wal_path)?.sync_data()?;
 
     // Body bytes for entries written via `write_commit` live only in the
