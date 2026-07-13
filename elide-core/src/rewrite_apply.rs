@@ -14,6 +14,7 @@
 //! impl walks the volume's self + ancestor dirs and the demand fetcher;
 //! tests can mock the trait against an in-memory tree.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -450,8 +451,7 @@ fn emit_canonical(
             // Partial-death Delta with external ref: reconstruct the
             // composite body and emit as a canonical full-body entry (not
             // re-encoded as a Delta), so dedup reads resolve in O(1).
-            let mut cache: HashMap<(Ulid, u32), Vec<u8>> = HashMap::new();
-            let composite = resolve_composite_body(input_ulid, entry_idx, ctx, &mut cache)?;
+            let composite = compute_composite_body(input_ulid, entry_idx, ctx)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, SegmentFlags::empty(), composite);
             out_entries.push(built.into_canonical());
         }
@@ -509,32 +509,43 @@ fn emit_run(
     Ok(())
 }
 
-/// Resolve the uncompressed composite body for an input entry, caching by
-/// `(input, entry_idx)`. Dispatches on the input entry's kind:
-/// - Data / Inline: read stored bytes (+ decompress)
-/// - DedupRef: resolve the composite hash via the merged extent index
-/// - Delta: resolve base + delta blob + `apply_delta`
-fn resolve_composite_body(
+/// Cache-fronted [`compute_composite_body`]: on a hit, borrow the cached
+/// body; on a miss, compute, insert, and borrow the inserted body.
+fn resolve_composite_body<'c>(
     input_ulid: Ulid,
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
-    cache: &mut HashMap<(Ulid, u32), Vec<u8>>,
-) -> Result<Vec<u8>, MaterialiseOutcome> {
-    if let Some(body) = cache.get(&(input_ulid, entry_idx)) {
-        return Ok(body.clone());
+    cache: &'c mut HashMap<(Ulid, u32), Vec<u8>>,
+) -> Result<&'c [u8], MaterialiseOutcome> {
+    use std::collections::hash_map::Entry;
+    match cache.entry((input_ulid, entry_idx)) {
+        Entry::Occupied(e) => Ok(e.into_mut()),
+        Entry::Vacant(v) => Ok(v.insert(compute_composite_body(input_ulid, entry_idx, ctx)?)),
     }
+}
+
+/// Resolve the uncompressed composite body for an input entry. Dispatches
+/// on the input entry's kind:
+/// - Data / Inline: read stored bytes (+ decompress)
+/// - DedupRef: resolve the composite hash via the merged extent index
+/// - Delta: resolve base + delta blob + `apply_delta`
+fn compute_composite_body(
+    input_ulid: Ulid,
+    entry_idx: u32,
+    ctx: &MaterialiseCtx<'_>,
+) -> Result<Vec<u8>, MaterialiseOutcome> {
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     let body: Vec<u8> = match entry.kind {
         EntryKind::Data => {
             let stored =
                 read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
             verify_body_hash(entry, &stored)?;
-            decompress_if_needed(&stored, entry.compressed)?
+            decompress_if_needed(Cow::Owned(stored), entry.compressed)?
         }
         EntryKind::Inline => {
             let stored = read_input_inline_stored_bytes(state, entry)?;
             verify_body_hash(entry, stored)?;
-            decompress_if_needed(stored, entry.compressed)?
+            decompress_if_needed(Cow::Borrowed(stored), entry.compressed)?
         }
         EntryKind::DedupRef => resolve_body_by_hash_decompressed(&entry.hash, ctx)?,
         EntryKind::Delta => {
@@ -597,7 +608,6 @@ fn resolve_composite_body(
         ))
         .into());
     }
-    cache.insert((input_ulid, entry_idx), body.clone());
     Ok(body)
 }
 
@@ -609,15 +619,18 @@ fn compression_flags(entry: &SegmentEntry) -> SegmentFlags {
     }
 }
 
-fn decompress_if_needed(stored: &[u8], compressed: bool) -> Result<Vec<u8>, MaterialiseOutcome> {
+fn decompress_if_needed(
+    stored: Cow<'_, [u8]>,
+    compressed: bool,
+) -> Result<Vec<u8>, MaterialiseOutcome> {
     if compressed {
-        lz4_flex::decompress_size_prepended(stored).map_err(|e| {
+        lz4_flex::decompress_size_prepended(&stored).map_err(|e| {
             MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!(
                 "lz4 decompress failed: {e}"
             )))
         })
     } else {
-        Ok(stored.to_vec())
+        Ok(stored.into_owned())
     }
 }
 
@@ -639,7 +652,7 @@ fn resolve_body_by_hash_decompressed(
         .clone();
 
     if let Some(idata) = &loc.inline_data {
-        return decompress_if_needed(idata, loc.compressed);
+        return decompress_if_needed(Cow::Borrowed(idata), loc.compressed);
     }
 
     let (path, layout) =
@@ -649,7 +662,7 @@ fn resolve_body_by_hash_decompressed(
     let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
     f.read_exact_at(&mut buf, seek)?;
-    decompress_if_needed(&buf, loc.compressed)
+    decompress_if_needed(Cow::Owned(buf), loc.compressed)
 }
 
 /// Read the stored (possibly compressed) bytes for a Data-kind entry in an
