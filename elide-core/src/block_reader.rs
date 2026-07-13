@@ -12,6 +12,7 @@
 //   Phase 4 filemap generation to parse the ext4 filesystem exactly as it
 //   existed at snapshot time, with no WAL replay and no `pending/` state.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -40,6 +41,11 @@ pub struct BlockReader {
     /// Demand-fetcher for evicted segment bodies. `None` for local-only volumes
     /// or when no object store is configured.
     fetcher: Option<Box<dyn SegmentFetcher>>,
+    /// The last fully-materialised extent (content hash -> plaintext body).
+    /// `Ext4Read::read` calls `read_block` per 4 KiB, so a sequential read
+    /// of an N-block compressed or Delta extent would otherwise re-read and
+    /// re-decompress the whole extent N times.
+    materialised: RefCell<Option<(blake3::Hash, Vec<u8>)>>,
 }
 
 impl BlockReader {
@@ -128,6 +134,7 @@ impl BlockReader {
             lbamap,
             extent_index,
             fetcher,
+            materialised: RefCell::new(None),
         })
     }
 
@@ -221,6 +228,7 @@ impl BlockReader {
             lbamap,
             extent_index,
             fetcher,
+            materialised: RefCell::new(None),
         })
     }
 
@@ -253,8 +261,11 @@ impl BlockReader {
         if hash == volume::ZERO_HASH {
             return Ok([0u8; 4096]);
         }
+        if let Some(block) = self.materialised_block(&hash, block_offset) {
+            return Ok(block);
+        }
         if let Some(loc) = self.extent_index.lookup(&hash) {
-            return self.read_data_block(&loc.clone(), block_offset);
+            return self.read_data_block(&hash, &loc.clone(), block_offset);
         }
         if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
             return self.read_delta_block(&delta_loc.clone(), block_offset, &hash);
@@ -265,18 +276,57 @@ impl BlockReader {
         )))
     }
 
+    /// Slice a 4 KiB block out of the materialised-extent cache, if the
+    /// cached extent is the one holding `hash` and covers the offset.
+    fn materialised_block(&self, hash: &blake3::Hash, block_offset: u32) -> Option<[u8; 4096]> {
+        let cached = self.materialised.borrow();
+        let (h, body) = cached.as_ref()?;
+        if h != hash {
+            return None;
+        }
+        let src = block_offset as usize * 4096;
+        let slice = body.get(src..src + 4096)?;
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(slice);
+        Some(block)
+    }
+
+    /// Cache `body` as the materialised extent for `hash` and return the
+    /// 4 KiB block at `block_offset`.
+    fn remember_and_slice(
+        &self,
+        hash: blake3::Hash,
+        body: Vec<u8>,
+        block_offset: u32,
+    ) -> io::Result<[u8; 4096]> {
+        let src = block_offset as usize * 4096;
+        let slice = body.get(src..src + 4096).ok_or_else(|| {
+            io::Error::other(format!(
+                "extent body too short: got {} bytes, need {}",
+                body.len(),
+                src + 4096
+            ))
+        })?;
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(slice);
+        *self.materialised.borrow_mut() = Some((hash, body));
+        Ok(block)
+    }
+
     /// Read a 4 KiB block from a Data or Inline extent location.
-    fn read_data_block(&self, loc: &ExtentLocation, block_offset: u32) -> io::Result<[u8; 4096]> {
+    fn read_data_block(
+        &self,
+        hash: &blake3::Hash,
+        loc: &ExtentLocation,
+        block_offset: u32,
+    ) -> io::Result<[u8; 4096]> {
         if let Some(ref idata) = loc.inline_data {
             let raw = if loc.compressed {
                 lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
             } else {
                 idata.to_vec()
             };
-            let src = block_offset as usize * 4096;
-            let mut block = [0u8; 4096];
-            block.copy_from_slice(&raw[src..src + 4096]);
-            return Ok(block);
+            return self.remember_and_slice(*hash, raw, block_offset);
         }
 
         self.ensure_extent_present(loc)?;
@@ -284,17 +334,15 @@ impl BlockReader {
         let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let seek = layout.body_seek(loc);
         let f = fs::File::open(path)?;
-        let mut block = [0u8; 4096];
         if loc.compressed {
             let mut buf = vec![0u8; loc.body_length as usize];
             f.read_exact_at(&mut buf, seek)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?;
-            let src = block_offset as usize * 4096;
-            block.copy_from_slice(&decompressed[src..src + 4096]);
-        } else {
-            f.read_exact_at(&mut block, seek + block_offset as u64 * 4096)?;
+            return self.remember_and_slice(*hash, decompressed, block_offset);
         }
+        let mut block = [0u8; 4096];
+        f.read_exact_at(&mut block, seek + block_offset as u64 * 4096)?;
         Ok(block)
     }
 
@@ -349,18 +397,7 @@ impl BlockReader {
             )));
         }
 
-        let src = block_offset as usize * 4096;
-        let src_end = src + 4096;
-        if decompressed.len() < src_end {
-            return Err(io::Error::other(format!(
-                "delta decompressed payload too short: got {} bytes, need {}",
-                decompressed.len(),
-                src_end
-            )));
-        }
-        let mut block = [0u8; 4096];
-        block.copy_from_slice(&decompressed[src..src_end]);
-        Ok(block)
+        self.remember_and_slice(*expected_hash, decompressed, block_offset)
     }
 
     /// Read the delta blob bytes for a single delta option.

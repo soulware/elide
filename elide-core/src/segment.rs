@@ -1941,15 +1941,12 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let (body_section_start, _, _, header) = read_segment_header(segment_path)?;
-    let index_inline_len = body_section_start as usize - HEADER_LEN as usize;
     let mut f = fs::File::open(segment_path)?;
     use std::io::{Read, Seek, SeekFrom};
     f.seek(SeekFrom::Start(HEADER_LEN))?;
-    let mut index_inline = vec![0u8; index_inline_len];
-    f.read_exact(&mut index_inline)?;
-    let mut buf = Vec::with_capacity(body_section_start as usize);
-    buf.extend_from_slice(&header);
-    buf.extend_from_slice(&index_inline);
+    let mut buf = vec![0u8; body_section_start as usize];
+    buf[..header.len()].copy_from_slice(&header);
+    f.read_exact(&mut buf[header.len()..])?;
     write_file_atomic(idx_path, &buf)
 }
 

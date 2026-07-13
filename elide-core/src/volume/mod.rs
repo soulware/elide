@@ -1900,17 +1900,18 @@ impl Volume {
         let PromoteSegmentResult {
             ulid,
             is_drain,
-            body_section_start,
-            entries,
-            inputs,
+            parsed,
             inline,
             tombstone,
         } = result;
+        let entries = &parsed.entries;
+        let inputs = &parsed.inputs;
+        let body_section_start = parsed.body_section_start;
         let index_dir = self.base_dir.join("index");
         self.own_segments.insert(ulid);
 
         if tombstone {
-            for old_ulid in &inputs {
+            for old_ulid in inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
                 self.own_segments.remove(old_ulid);
             }
@@ -1932,7 +1933,7 @@ impl Volume {
             // which is too late for live drains.
             Arc::make_mut(&mut self.extent_index).set_segment_presence(
                 ulid,
-                Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
+                Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
             );
 
             for (i, entry) in entries.iter().enumerate() {
@@ -1995,7 +1996,7 @@ impl Volume {
             fs::remove_file(&pending_path)?;
         } else {
             // GC carried path: delete each consumed input's idx.
-            for old_ulid in &inputs {
+            for old_ulid in inputs {
                 let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
                 self.own_segments.remove(old_ulid);
             }
@@ -2008,7 +2009,7 @@ impl Volume {
             // without consulting `.present` on disk.
             Arc::make_mut(&mut self.extent_index).set_segment_presence(
                 ulid,
-                Arc::new(extentindex::SegmentPresence::from_data_kinds(&entries)),
+                Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
             );
 
             // Carried Delta entries: the delta blob now lives in the
