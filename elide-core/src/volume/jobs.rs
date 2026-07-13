@@ -185,10 +185,10 @@ pub struct PromoteSegmentJob {
 pub struct PromoteSegmentResult {
     pub ulid: Ulid,
     pub is_drain: bool,
-    pub body_section_start: u64,
-    pub entries: Vec<segment::SegmentEntry>,
-    /// Consumed input ULIDs for the GC path. Empty on drain.
-    pub inputs: Vec<Ulid>,
+    /// Parsed segment index, shared with the segment-index cache. Carries
+    /// the entries, consumed input ULIDs (empty on drain), and
+    /// `body_section_start`.
+    pub parsed: Arc<segment_cache::ParsedIndex>,
     /// Inline section bytes. Populated only when the drain path has
     /// Inline entries; empty otherwise.
     pub inline: Vec<u8>,

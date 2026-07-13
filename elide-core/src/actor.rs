@@ -2018,7 +2018,6 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     let parsed = job
         .segment_cache
         .read_and_verify(&job.src_path, &job.verifying_key)?;
-    let bss = parsed.body_section_start;
 
     // Tombstone shortcut: GC output with zero entries + non-empty inputs
     // exists only to acknowledge that the input segments are safe to
@@ -2028,9 +2027,7 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
         return Ok(PromoteSegmentResult {
             ulid: job.ulid,
             is_drain: job.is_drain,
-            body_section_start: bss,
-            entries: parsed.entries.clone(),
-            inputs: parsed.inputs.clone(),
+            parsed,
             inline: Vec::new(),
             tombstone: true,
         });
@@ -2063,9 +2060,7 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     Ok(PromoteSegmentResult {
         ulid: job.ulid,
         is_drain: job.is_drain,
-        body_section_start: bss,
-        entries: parsed.entries.clone(),
-        inputs: parsed.inputs.clone(),
+        parsed,
         inline,
         tombstone: false,
     })
@@ -2134,7 +2129,8 @@ pub(crate) fn invalidate_promote_siblings(
 struct RepackCandidate {
     seg_path: PathBuf,
     seg_ulid: Ulid,
-    entries: Vec<segment::SegmentEntry>,
+    /// Parsed segment index, shared with the segment-index cache.
+    parsed: Arc<crate::segment_cache::ParsedIndex>,
     classifications: Vec<crate::segment_classify::EntryClassification>,
     /// Approximate live `Data + Inline` body bytes after classification.
     live_bytes: u64,
@@ -2222,7 +2218,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let entries = parsed.entries.clone();
+        let entries = &parsed.entries;
 
         let total_bytes: u64 = entries
             .iter()
@@ -2300,7 +2296,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         candidates.push(RepackCandidate {
             seg_path: seg_path.clone(),
             seg_ulid,
-            entries,
+            parsed,
             classifications,
             live_bytes,
             dead_bytes,
@@ -2367,8 +2363,12 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let mut bucket_bytes_freed: u64 = 0;
         for &i in &bucket_idxs {
             let c = &candidates[i];
-            for (entry_idx, (_entry, action)) in
-                c.entries.iter().zip(c.classifications.iter()).enumerate()
+            for (entry_idx, (_entry, action)) in c
+                .parsed
+                .entries
+                .iter()
+                .zip(c.classifications.iter())
+                .enumerate()
             {
                 let entry_idx = entry_idx as u32;
                 match action {
@@ -2417,10 +2417,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
                 }
             }
+            let c = &mut candidates[i];
             bucket_inputs.push(crate::volume::RepackedInput {
                 input_ulid: c.seg_ulid,
-                input_path: c.seg_path.clone(),
-                owned_hashes: c.owned_hashes.clone(),
+                input_path: std::mem::take(&mut c.seg_path),
+                owned_hashes: std::mem::take(&mut c.owned_hashes),
             });
             bucket_bytes_freed += c.dead_bytes;
             stats.segments_compacted += 1;

@@ -220,6 +220,9 @@ fn scan_file_extents_with_full_hash(
 ) -> io::Result<Vec<InodeExtents>> {
     let mut results = Vec::new();
     let mut inode_buf = vec![0u8; sb.inode_size];
+    // Grow-only extent read buffer, reused across all extents so a
+    // whole-image scan does one allocation, not one per extent.
+    let mut buf: Vec<u8> = Vec::new();
 
     for group in 0..sb.num_block_groups {
         let table_block = inode_table_block(f, sb, group)?;
@@ -275,16 +278,19 @@ fn scan_file_extents_with_full_hash(
                 bytes_remaining = bytes_remaining.saturating_sub(byte_count);
 
                 let disk_start_byte = phys_block * sb.block_size;
-                let mut buf = vec![0u8; byte_count as usize];
+                if buf.len() < byte_count as usize {
+                    buf.resize(byte_count as usize, 0);
+                }
+                let buf = &mut buf[..byte_count as usize];
                 f.seek(SeekFrom::Start(disk_start_byte))?;
-                f.read_exact(&mut buf)?;
+                f.read_exact(buf)?;
 
-                full_hasher.update(&buf);
+                full_hasher.update(buf);
                 extent_entries.push((
                     disk_start_byte,
                     file_logical_offset,
                     byte_count,
-                    blake3::hash(&buf),
+                    blake3::hash(buf),
                 ));
             }
 
@@ -403,7 +409,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<ExtentEntry>> {
     let mut results = Vec::new();
     let mut inode_buf = vec![0u8; sb.inode_size];
-    let mut block_buf: Vec<u8>;
+    let mut block_buf: Vec<u8> = Vec::new();
 
     for group in 0..sb.num_block_groups {
         let table_block = inode_table_block(f, sb, group)?;
@@ -452,12 +458,15 @@ fn scan_file_extents(f: &mut File, sb: &Superblock) -> io::Result<Vec<ExtentEntr
                 let to_read = allocated.min(bytes_remaining);
                 bytes_remaining = bytes_remaining.saturating_sub(to_read);
 
-                block_buf = vec![0u8; to_read as usize];
+                if block_buf.len() < to_read as usize {
+                    block_buf.resize(to_read as usize, 0);
+                }
+                let block_buf = &mut block_buf[..to_read as usize];
                 f.seek(SeekFrom::Start(start_block * sb.block_size))?;
-                f.read_exact(&mut block_buf)?;
+                f.read_exact(block_buf)?;
 
                 results.push(ExtentEntry {
-                    hash: blake3::hash(&block_buf),
+                    hash: blake3::hash(block_buf),
                     byte_count: to_read,
                 });
             }
