@@ -34,7 +34,7 @@ Manually:
 4. `fly deploy` — runs the newest elide release; the first deploy creates the
    `elide_data` state volume (`initial_size` in the template). To deploy a
    specific release, `./deploy.sh v0.1.2` verifies the tag's assets exist and
-   passes its path as the `ELIDE_RELEASE` build arg.
+   passes the tag as the `ELIDE_RELEASE` build arg.
 
 The coordinator comes up serving immediately — there is no enrollment step. If
 the keypair secrets are unset it fails loudly at startup (`AWS_ACCESS_KEY_ID not

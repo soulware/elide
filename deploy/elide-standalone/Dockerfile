@@ -7,9 +7,8 @@
 # AWS_SECRET_ACCESS_KEY in its environment (Fly secrets).
 #
 # Build args:
-#   ELIDE_RELEASE  path under the GitHub releases/ URL to fetch binaries from:
-#                  latest/download (the default) is the newest release;
-#                  download/<tag> pins one (deploy.sh passes this).
+#   ELIDE_RELEASE  release tag to fetch binaries from, e.g. v0.1.11 (deploy.sh
+#                  passes this); empty (the default) fetches the newest release.
 #   DATA_BUCKET    the Tigris bucket the keypair has read/write on; baked into
 #                  coord.toml [store].bucket.
 
@@ -22,12 +21,15 @@ WORKDIR /app
 
 # HTTPS covers the transfer. The three binaries share a directory: the
 # coordinator spawns `elide` and `elide-import` as siblings.
-ARG ELIDE_RELEASE=latest/download
+ARG ELIDE_RELEASE
 ARG ELIDE_TARGET=x86_64-unknown-linux-gnu
 ARG ELIDE_BASE=https://github.com/soulware/elide/releases
-ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_RELEASE}/elide-${ELIDE_TARGET}             /usr/local/bin/elide
-ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_RELEASE}/elide-coordinator-${ELIDE_TARGET} /usr/local/bin/elide-coordinator
-ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_RELEASE}/elide-import-${ELIDE_TARGET}      /usr/local/bin/elide-import
+# GitHub serves a pinned tag at download/<tag>/<asset> but the newest release
+# at latest/download/<asset>; the expansions pick the shape ELIDE_RELEASE needs.
+ARG ELIDE_PATH=${ELIDE_RELEASE:+download/}${ELIDE_RELEASE:-latest/download}
+ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_PATH}/elide-${ELIDE_TARGET}             /usr/local/bin/elide
+ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_PATH}/elide-coordinator-${ELIDE_TARGET} /usr/local/bin/elide-coordinator
+ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_PATH}/elide-import-${ELIDE_TARGET}      /usr/local/bin/elide-import
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY coord.toml /app/coord.toml

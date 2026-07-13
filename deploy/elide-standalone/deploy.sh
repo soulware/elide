@@ -12,7 +12,7 @@
 # below instead of silently deploying the previous release.
 #
 # Resolves the version to a concrete tag, checks the release assets exist, and
-# passes the tag's release path as the ELIDE_RELEASE build-arg. Any extra
+# passes the tag as the ELIDE_RELEASE build-arg. Any extra
 # arguments pass through to `fly deploy`.
 set -euo pipefail
 
@@ -43,4 +43,4 @@ for asset in "${assets[@]}"; do
 done
 
 echo "deploying elide ${version}"
-exec fly deploy --build-arg "ELIDE_RELEASE=download/${version}" "$@"
+exec fly deploy --build-arg "ELIDE_RELEASE=${version}" "$@"
