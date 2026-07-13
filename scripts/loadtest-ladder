@@ -93,7 +93,9 @@ start_sampler() {
                 printf '%s ' "$(date -u +%H:%M:%S)"
                 awk '/^MemAvailable:|^Dirty:|^Writeback:/ {printf "%s%skB ", $1, $2}' /proc/meminfo
                 printf 'dstate=%s ' "$(ps -eo stat= | grep -c '^D' || true)"
-                printf 'elide_rss_kb=%s\n' "$(ps -eo rss=,comm= | awk '$2 ~ /^elide/ {s += $1} END {print s + 0}')"
+                ps -eo pid=,rss=,comm= | awk '
+                    $3 ~ /^elide/ {s += $2; procs = procs sep $1 "/" $3 "/" $2 "kB"; sep = ","}
+                    END {printf "elide_rss_kb=%d procs=%s\n", s, procs}'
             } >>"$RUN_DIR/sample.log"
             sleep 5
         done
@@ -173,6 +175,7 @@ run_rung() { # $1 = rung name, $2 = concurrency, $3.. = volume names
     local vols=("$@")
     RUN_DIR="$OUT_ROOT/$(date -u +%Y%m%d-%H%M%SZ)-$rung"
     mkdir -p "$RUN_DIR"
+    elide volume list >"$RUN_DIR/volumes-start.txt"
     log "=== $rung: volumes ${vols[*]}, concurrency $conc, seed ${SEED_MB}MiB, evidence $RUN_DIR ==="
     start_sampler
     run_waves prepare_one "$conc" "${vols[@]}"
