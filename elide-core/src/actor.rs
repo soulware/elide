@@ -3492,6 +3492,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     };
     fs::rename(&tmp_path, &final_path)?;
     segment::fsync_dir(&final_path)?;
+    segment::drop_written_bodies(&mut entries);
 
     // body_length = sum of stored_length over entries that contribute
     // to the body section (Data + CanonicalData). Delta, DedupRef, and

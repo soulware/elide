@@ -558,6 +558,52 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// Worker results cross back to the actor after the output segment
+    /// is on disk; only inline entries' `data` feeds apply. Mirror of
+    /// the repack/promote retention tests: the reclaim result must
+    /// carry no Data bodies, and apply + read-back must succeed
+    /// without them.
+    #[test]
+    fn reclaim_result_strips_written_data_bodies() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let big = reclaim_payload(0xB2, 8);
+        vol.write(400, &big).unwrap();
+        let hole = [0x33u8; 4096];
+        vol.write(403, &hole).unwrap();
+
+        let mut expected = vec![0u8; 8 * 4096];
+        expected[..3 * 4096].copy_from_slice(&big[..3 * 4096]);
+        expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
+        expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
+
+        let job = vol.prepare_reclaim(400, 8).unwrap();
+        let result = crate::actor::execute_reclaim(job).unwrap();
+        assert!(result.segment_written);
+        let mut saw_data = false;
+        for re in &result.entries {
+            if re.entry.kind.is_inline() {
+                assert!(re.entry.data.is_some(), "inline entry lost its apply data");
+            } else {
+                saw_data |= re.entry.kind == segment::EntryKind::Data;
+                assert!(
+                    re.entry.data.is_none(),
+                    "{:?} entry retains body bytes in ReclaimResult",
+                    re.entry.kind
+                );
+            }
+        }
+        assert!(saw_data, "test needs at least one Data output entry");
+
+        let outcome = vol.apply_reclaim_result(result).unwrap();
+        assert!(!outcome.discarded);
+        assert_eq!(outcome.runs_rewritten, 2);
+        assert_eq!(vol.read(400, 8).unwrap(), expected);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     /// Zero extents carry no body and must never be rewritten by alias-merge.
     #[test]
     fn reclaim_alias_merge_skips_zero_extents() {
