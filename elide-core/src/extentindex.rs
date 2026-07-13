@@ -126,6 +126,25 @@ pub enum DeltaBodySource {
     Cached,
 }
 
+impl DeltaBodySource {
+    /// The `Full` location for the segment file at `path`, or `None`
+    /// when `entries` has no `Delta` — the layout header is read only
+    /// when a Delta entry needs it.
+    pub fn full_for_segment(
+        path: &std::path::Path,
+        entries: &[segment::SegmentEntry],
+        body_section_start: u64,
+    ) -> io::Result<Option<Self>> {
+        if !entries.iter().any(|e| e.kind == EntryKind::Delta) {
+            return Ok(None);
+        }
+        Ok(Some(DeltaBodySource::Full {
+            body_section_start,
+            body_length: segment::read_segment_layout(path)?.body_length,
+        }))
+    }
+}
+
 /// Location of a thin Delta entry. Separate from `ExtentLocation`
 /// because Delta entries are materialised lazily at read time by
 /// fetching a delta blob from their owning segment's delta body
@@ -451,44 +470,6 @@ impl ExtentIndex {
         }
     }
 
-    /// Migrate a Delta entry's `DeltaBodySource::Full` location to a
-    /// new segment ULID with refreshed `body_section_start` and
-    /// `body_length`. Only applied if the hash is present, points at
-    /// `expected_segment_id`, and is currently in the `Full` shape.
-    /// Returns `true` if the migration happened.
-    ///
-    /// Used by `Volume::redact_segment` after rewriting `pending/<ulid>`
-    /// under a fresh ULID: surviving Delta entries' locations must be
-    /// re-pointed at the new segment, and both fields of the `Full`
-    /// shape (`bss` and `body_length`) shift because the index and
-    /// body sections in front of the delta region change size.
-    pub fn migrate_delta_full_location_if_matches(
-        &mut self,
-        hash: &blake3::Hash,
-        expected_segment_id: Ulid,
-        new_segment_id: Ulid,
-        new_body_section_start: u64,
-        new_body_length: u64,
-    ) -> bool {
-        match self.deltas.get_mut(hash) {
-            Some(loc) if loc.segment_id == expected_segment_id => {
-                if let DeltaBodySource::Full {
-                    body_section_start,
-                    body_length,
-                } = &mut loc.body_source
-                {
-                    loc.segment_id = new_segment_id;
-                    *body_section_start = new_body_section_start;
-                    *body_length = new_body_length;
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
     /// Remove the entry for `hash`, if present.
     pub fn remove(&mut self, hash: &blake3::Hash) {
         self.inner.remove(hash);
@@ -692,6 +673,20 @@ impl ExtentIndex {
         self.register_entry(entry, raw_idx, ctx, Admission::ConsumingInputs(inputs))
     }
 
+    /// The set of hashes `entries` carries forward — every entry hash
+    /// except DedupRef (a thin reference to a body owned elsewhere).
+    /// The `carried` protect-set for
+    /// [`remove_input_owned`](Self::remove_input_owned).
+    pub fn carried_hashes(
+        entries: &[segment::SegmentEntry],
+    ) -> std::collections::HashSet<blake3::Hash> {
+        entries
+            .iter()
+            .filter(|e| e.kind != EntryKind::DedupRef)
+            .map(|e| e.hash)
+            .collect()
+    }
+
     /// Drop `input`'s ownership of every hash in `owned` that `carried`
     /// does not re-register, covering both maps. The removal dual of
     /// [`register_entry_consuming_inputs`](Self::register_entry_consuming_inputs):
@@ -840,16 +835,8 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             // `cache/<ulid>.delta` file and demand-fetches if missing.
             let (body_tier, delta_body_source) = match sref.tier {
                 segment::SegmentTier::Pending | segment::SegmentTier::GcApplied => {
-                    // Capture body_length for DeltaBodySource::Full; only
-                    // needed if Delta entries are present.
-                    let delta = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
-                        Some(DeltaBodySource::Full {
-                            body_section_start,
-                            body_length: segment::read_segment_layout(path)?.body_length,
-                        })
-                    } else {
-                        None
-                    };
+                    let delta =
+                        DeltaBodySource::full_for_segment(path, &entries, body_section_start)?;
                     (RegistrationBodyTier::Local, delta)
                 }
                 segment::SegmentTier::Index => {

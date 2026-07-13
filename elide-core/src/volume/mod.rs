@@ -1241,11 +1241,7 @@ impl Volume {
         }
 
         let live = self.lbamap.lba_referenced_hashes();
-        let carried_hashes: std::collections::HashSet<blake3::Hash> = entries
-            .iter()
-            .filter(|e| e.kind != EntryKind::DedupRef)
-            .map(|e| e.hash)
-            .collect();
+        let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
@@ -1304,14 +1300,8 @@ impl Volume {
         // file (still at `tmp_path` until the rename below, hence the
         // layout read); the gc-carried promote flips them to `Cached`.
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
-        let delta_body_source = if entries.iter().any(|e| e.kind == EntryKind::Delta) {
-            Some(extentindex::DeltaBodySource::Full {
-                body_section_start: new_bss,
-                body_length: segment::read_segment_layout(&tmp_path)?.body_length,
-            })
-        } else {
-            None
-        };
+        let delta_body_source =
+            extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: new_ulid,
             body_section_start: new_bss,
