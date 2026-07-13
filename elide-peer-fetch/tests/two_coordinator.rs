@@ -284,7 +284,12 @@ impl RecordingInner {
     }
 }
 impl RangeFetcher for RecordingInner {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> std::io::Result<Vec<u8>> {
+    fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_exclusive: u64,
+    ) -> std::io::Result<bytes::Bytes> {
         self.calls
             .lock()
             .unwrap()

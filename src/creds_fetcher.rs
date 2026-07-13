@@ -188,7 +188,7 @@ impl LazyCredsFetcher {
 }
 
 impl RangeFetcher for LazyCredsFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<bytes::Bytes> {
         self.touch();
         let f = self.acquire()?;
         match f.get_range(key, start, end_exclusive) {
@@ -271,7 +271,7 @@ impl PerOwnerCredsFetcher {
 }
 
 impl RangeFetcher for PerOwnerCredsFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<bytes::Bytes> {
         let owner = owner_from_key(key)?;
         self.fetcher_for(owner).get_range(key, start, end_exclusive)
     }
@@ -547,7 +547,7 @@ mod tests {
     }
 
     impl RangeFetcher for DenyingFetcher {
-        fn get_range(&self, _key: &str, _start: u64, _end: u64) -> io::Result<Vec<u8>> {
+        fn get_range(&self, _key: &str, _start: u64, _end: u64) -> io::Result<bytes::Bytes> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 Err(io::Error::new(
@@ -555,7 +555,7 @@ mod tests {
                     "stale creds",
                 ))
             } else {
-                Ok(vec![1, 2, 3, 4])
+                Ok(bytes::Bytes::from_static(&[1, 2, 3, 4]))
             }
         }
     }

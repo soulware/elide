@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use elide_fetch::RangeFetcher;
 use ulid::Ulid;
 
@@ -167,7 +168,7 @@ impl PeerRangeFetcher {
 }
 
 impl RangeFetcher for PeerRangeFetcher {
-    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+    fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
         // The peer only serves body ranges. Everything else falls
         // through unconditionally.
         let parsed = parse_segment_key(key);
@@ -198,7 +199,7 @@ impl RangeFetcher for PeerRangeFetcher {
                                 body_len,
                                 "body range served from peer"
                             );
-                            return Ok(bytes.to_vec());
+                            return Ok(bytes);
                         }
                         if got > 0 && got < body_len {
                             // Partial coverage. The peer covered
@@ -226,7 +227,7 @@ impl RangeFetcher for PeerRangeFetcher {
                                 store_len = body_len - got,
                                 "body range served partial peer + store remainder"
                             );
-                            return Ok(combined);
+                            return Ok(combined.into());
                         }
                         // got == 0: nothing useful from peer; fall through.
                     }
@@ -382,7 +383,7 @@ mod tests {
         }
     }
     impl RangeFetcher for RecordingInner {
-        fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Vec<u8>> {
+        fn get_range(&self, key: &str, start: u64, end_exclusive: u64) -> io::Result<Bytes> {
             self.calls
                 .lock()
                 .unwrap()
