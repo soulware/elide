@@ -3194,8 +3194,8 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                         body.len()
                     )));
                 }
-                let bytes = body[start..end].to_vec();
-                let new_hash = blake3::hash(&bytes);
+                let bytes = &body[start..end];
+                let new_hash = blake3::hash(bytes);
 
                 // If the new hash is already canonical somewhere, emit a thin
                 // DedupRef — cheapest possible output, strictly beats any Delta.
@@ -3255,7 +3255,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                             .map_err(|e| {
                                 io::Error::other(format!("reclaim zstd compressor init: {e}"))
                             })?
-                            .compress(&bytes)
+                            .compress(bytes)
                             .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
                     if delta_blob.len() < bytes.len() {
                         let delta_offset = delta_body.len() as u64;
@@ -3282,9 +3282,9 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     // delta_blob wasn't smaller — fall through to Data.
                 }
 
-                let (stored_body, flags) = match crate::volume::maybe_compress(&bytes) {
+                let (stored_body, flags) = match crate::volume::maybe_compress(bytes) {
                     Some(c) => (c, segment::SegmentFlags::COMPRESSED),
-                    None => (bytes.clone(), segment::SegmentFlags::empty()),
+                    None => (bytes.to_vec(), segment::SegmentFlags::empty()),
                 };
                 entries.push(segment::SegmentEntry::new_data(
                     new_hash,
