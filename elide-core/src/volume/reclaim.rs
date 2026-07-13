@@ -8,11 +8,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::{
-    extentindex::{self, BodySource},
-    lbamap,
-    segment::{self, EntryKind},
-};
+use crate::{extentindex, lbamap, segment};
 
 use super::{Volume, ZERO_HASH, latest_snapshot};
 
@@ -400,95 +396,19 @@ impl Volume {
 
         let lbamap = Arc::make_mut(&mut self.lbamap);
         let extent_index = Arc::make_mut(&mut self.extent_index);
+        let ctx = extentindex::SegmentRegistrationCtx {
+            segment_id: result.segment_ulid,
+            body_section_start: result.body_section_start,
+            body_tier: extentindex::RegistrationBodyTier::Local,
+            delta_body_source: Some(extentindex::DeltaBodySource::Full {
+                body_section_start: result.body_section_start,
+                body_length: result.body_length,
+            }),
+            inline: extentindex::InlineSource::EntryData,
+        };
         for (raw_idx, re) in result.entries.iter().enumerate() {
-            let entry = &re.entry;
-            match entry.kind {
-                EntryKind::Data => {
-                    lbamap.insert(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        result.segment_ulid,
-                    );
-                    extent_index.insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: result.segment_ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            body_source: BodySource::Local,
-                            body_section_start: result.body_section_start,
-                            inline_data: None,
-                        },
-                    );
-                }
-                EntryKind::Inline => {
-                    lbamap.insert(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        result.segment_ulid,
-                    );
-                    extent_index.insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: result.segment_ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            body_source: BodySource::Local,
-                            body_section_start: result.body_section_start,
-                            inline_data: entry.data.clone().map(Vec::into_boxed_slice),
-                        },
-                    );
-                }
-                EntryKind::DedupRef => {
-                    // Canonical body already indexed — nothing to insert
-                    // in extent_index; lbamap just claims the LBA run.
-                    lbamap.insert(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        result.segment_ulid,
-                    );
-                }
-                EntryKind::Delta => {
-                    // Thin Delta: claim the LBA run with its source
-                    // list attached (so GC's `lba_referenced_hashes`
-                    // fold keeps the source alive), and register the
-                    // delta in the extent_index. `body_length` is the
-                    // tail of the body section; the delta region
-                    // begins at `body_section_start + body_length`.
-                    let source_hashes: Arc<[blake3::Hash]> =
-                        entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.insert_delta(
-                        entry.start_lba,
-                        entry.lba_length,
-                        entry.hash,
-                        result.segment_ulid,
-                        source_hashes,
-                    );
-                    extent_index.insert_delta_if_absent(
-                        entry.hash,
-                        extentindex::DeltaLocation {
-                            segment_id: result.segment_ulid,
-                            entry_idx: raw_idx as u32,
-                            body_source: extentindex::DeltaBodySource::Full {
-                                body_section_start: result.body_section_start,
-                                body_length: result.body_length,
-                            },
-                            options: entry.delta_options.clone(),
-                        },
-                    );
-                }
-                EntryKind::CanonicalData | EntryKind::CanonicalInline | EntryKind::Zero => {
-                    unreachable!(
-                        "reclaim output produces only Data/Inline/DedupRef/Delta, got {:?}",
-                        entry.kind
-                    );
-                }
-            }
+            lbamap.register_entry(&re.entry, result.segment_ulid);
+            extent_index.register_entry_unconditional(&re.entry, raw_idx as u32, &ctx)?;
         }
 
         let mut outcome = ReclaimOutcome::default();
