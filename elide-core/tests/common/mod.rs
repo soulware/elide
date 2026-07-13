@@ -161,7 +161,7 @@ pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
     let signer = signing::load_signer(fork_dir, signing::VOLUME_KEY_FILE).unwrap();
     let data = vec![seed; 4096];
     let hash = blake3::hash(&data);
-    let mut entries = vec![segment::SegmentEntry::new_data(
+    let entries = vec![segment::SegmentEntry::new_data(
         hash,
         lba,
         1,
@@ -171,7 +171,7 @@ pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
 
     // Write a complete segment to a temp file, then split into the two-directory format.
     let tmp = cache_dir.join(format!("{ulid}.tmp"));
-    let bss = segment::write_segment(&tmp, &mut entries, signer.as_ref()).unwrap();
+    let (bss, _) = segment::write_segment(&tmp, entries, signer.as_ref()).unwrap();
     let bytes = fs::read(&tmp).unwrap();
     fs::remove_file(&tmp).unwrap();
 

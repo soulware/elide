@@ -1092,7 +1092,8 @@ mod tests {
     // --- .body route tests ---
 
     use elide_core::segment::{
-        SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, set_present_bit, write_segment,
+        PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, set_present_bit,
+        write_segment,
     };
     use std::path::Path as StdPath;
 
@@ -1114,7 +1115,7 @@ mod tests {
         data_dir: &StdPath,
         vol_ulid: Ulid,
         seg_ulid: Ulid,
-        mut entries: Vec<SegmentEntry>,
+        entries: Vec<PendingEntry>,
         signing_key: &SigningKey,
     ) {
         let by_id = data_dir.join("by_id").join(vol_ulid.to_string());
@@ -1128,7 +1129,7 @@ mod tests {
         // production).
         let staging = data_dir.join(format!("staging_{seg_ulid}"));
         let signer = TestSegSigner(signing_key.clone());
-        write_segment(&staging, &mut entries, &signer).unwrap();
+        let (_bss, entries) = write_segment(&staging, entries, &signer).unwrap();
 
         // Generate cache/<seg>.body + cache/<seg>.present.
         let body_path = cache.join(format!("{seg_ulid}.body"));

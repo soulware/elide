@@ -30,7 +30,7 @@ use ulid::Ulid;
 use crate::ext4_scan::{self, Ext4Scan, FileFragment};
 use crate::extentindex::ExtentIndex;
 use crate::filemap::{self, FilemapRow};
-use crate::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
+use crate::segment::{self, PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
 const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
@@ -48,7 +48,7 @@ const IMPORT_SEGMENT_BYTES: usize = 32 * 1024 * 1024; // 32 MiB raw
 /// was nothing to write.
 fn flush_segment(
     segments_dir: &Path,
-    entries: &mut Vec<SegmentEntry>,
+    entries: &mut Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
 ) -> io::Result<Option<String>> {
     if entries.is_empty() {
@@ -57,16 +57,15 @@ fn flush_segment(
     let ulid = Ulid::new().to_string();
     let tmp = segments_dir.join(format!("{ulid}.tmp"));
     let final_path = segments_dir.join(&ulid);
-    segment::write_segment(&tmp, entries, signer)?;
+    segment::write_segment(&tmp, std::mem::take(entries), signer)?;
     fs::rename(&tmp, &final_path)?;
     segment::fsync_dir(&final_path)?;
-    entries.clear();
     Ok(Some(ulid))
 }
 
 /// One emitted extent plus its filemap contribution (if any).
 struct EmittedEntry {
-    entry: SegmentEntry,
+    entry: PendingEntry,
     raw_bytes: usize,
 }
 
@@ -80,7 +79,9 @@ fn make_entry(
     let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
     if parent_hit.is_some() {
         return EmittedEntry {
-            entry: SegmentEntry::new_dedup_ref(hash, start_lba, lba_length),
+            entry: PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
+                hash, start_lba, lba_length,
+            )),
             raw_bytes: 0,
         };
     }
@@ -151,7 +152,7 @@ pub fn import_image(
 
     let mut image = fs::File::open(image_path)?;
     let mut block = [0u8; LBA_SIZE];
-    let mut entries: Vec<SegmentEntry> = Vec::new();
+    let mut entries: Vec<PendingEntry> = Vec::new();
     let mut batch_raw_bytes: usize = 0;
     let mut all_segment_ulids: Vec<Ulid> = Vec::new();
     let mut last_segment_ulid: Option<String> = None;

@@ -350,7 +350,7 @@ mod tests {
 
         let seg_ulid = Ulid::new();
         let body_size: usize = 1024;
-        let mut entries: Vec<SegmentEntry> = (0..entry_count)
+        let entries: Vec<_> = (0..entry_count)
             .map(|i| {
                 let data = vec![i as u8; body_size];
                 SegmentEntry::new_data(
@@ -364,7 +364,7 @@ mod tests {
             .collect();
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
         let seg_path = owner_dir.join(format!("{seg_ulid}.tmp-full"));
-        write_segment(&seg_path, &mut entries, signer.as_ref())?;
+        write_segment(&seg_path, entries, signer.as_ref())?;
 
         // Strip the body section to leave just header + index + inline.
         let layout = elide_core::segment::read_segment_layout(&seg_path)?;

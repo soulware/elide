@@ -24,7 +24,9 @@ use ulid::Ulid;
 
 use crate::extentindex::{BodySource, ExtentIndex};
 use crate::rewrite_plan::{PlanOutput, RewritePlan};
-use crate::segment::{self, BoxFetcher, EntryKind, SegmentBodyLayout, SegmentEntry, SegmentFlags};
+use crate::segment::{
+    self, BoxFetcher, EntryKind, PendingEntry, SegmentBodyLayout, SegmentEntry, SegmentFlags,
+};
 
 /// Block size in bytes (4 KiB).
 pub const BLOCK_BYTES: u64 = 4096;
@@ -41,7 +43,7 @@ struct InputState {
 /// output segment and the concatenated delta body bytes (empty when no Delta
 /// entries are carried forward).
 pub struct Materialised {
-    pub entries: Vec<SegmentEntry>,
+    pub entries: Vec<PendingEntry>,
     pub delta_body: Vec<u8>,
 }
 
@@ -212,7 +214,7 @@ pub fn materialise_plan(
     plan: &RewritePlan,
     ctx: &MaterialiseCtx<'_>,
 ) -> Result<Materialised, MaterialiseOutcome> {
-    let mut out_entries: Vec<SegmentEntry> = Vec::new();
+    let mut out_entries: Vec<PendingEntry> = Vec::new();
     let mut delta_body: Vec<u8> = Vec::new();
     // Cache of uncompressed composite bodies, keyed by (input, entry_idx).
     // Consecutive `Run` records for the same entry share the resolved body.
@@ -237,7 +239,7 @@ pub fn materialise_plan(
 fn apply_one_output(
     output: &PlanOutput,
     ctx: &MaterialiseCtx<'_>,
-    out_entries: &mut Vec<SegmentEntry>,
+    out_entries: &mut Vec<PendingEntry>,
     delta_body: &mut Vec<u8>,
     composite_cache: &mut HashMap<(Ulid, u32), Vec<u8>>,
 ) -> Result<(), MaterialiseOutcome> {
@@ -313,20 +315,23 @@ fn emit_keep(
     input_ulid: Ulid,
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
-    out_entries: &mut Vec<SegmentEntry>,
+    out_entries: &mut Vec<PendingEntry>,
     delta_body: &mut Vec<u8>,
 ) -> Result<(), MaterialiseOutcome> {
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     match entry.kind {
         EntryKind::Zero => {
-            out_entries.push(SegmentEntry::new_zero(entry.start_lba, entry.lba_length));
+            out_entries.push(PendingEntry::from_entry(SegmentEntry::new_zero(
+                entry.start_lba,
+                entry.lba_length,
+            )));
         }
         EntryKind::DedupRef => {
-            out_entries.push(SegmentEntry::new_dedup_ref(
+            out_entries.push(PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
                 entry.hash,
                 entry.start_lba,
                 entry.lba_length,
-            ));
+            )));
         }
         EntryKind::Data => {
             let bytes =
@@ -386,12 +391,12 @@ fn emit_keep(
                 new_opt.delta_offset = new_offset;
                 new_options.push(new_opt);
             }
-            out_entries.push(SegmentEntry::new_delta(
+            out_entries.push(PendingEntry::from_entry(SegmentEntry::new_delta(
                 entry.hash,
                 entry.start_lba,
                 entry.lba_length,
                 new_options,
-            ));
+            )));
         }
     }
     Ok(())
@@ -403,7 +408,7 @@ fn emit_zero_split(
     start_lba: u64,
     lba_length: u32,
     ctx: &MaterialiseCtx<'_>,
-    out_entries: &mut Vec<SegmentEntry>,
+    out_entries: &mut Vec<PendingEntry>,
 ) -> Result<(), MaterialiseOutcome> {
     let (_, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     if entry.kind != EntryKind::Zero {
@@ -413,7 +418,9 @@ fn emit_zero_split(
         ))
         .into());
     }
-    out_entries.push(SegmentEntry::new_zero(start_lba, lba_length));
+    out_entries.push(PendingEntry::from_entry(SegmentEntry::new_zero(
+        start_lba, lba_length,
+    )));
     Ok(())
 }
 
@@ -421,7 +428,7 @@ fn emit_canonical(
     input_ulid: Ulid,
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
-    out_entries: &mut Vec<SegmentEntry>,
+    out_entries: &mut Vec<PendingEntry>,
 ) -> Result<(), MaterialiseOutcome> {
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     match entry.kind {
@@ -470,7 +477,7 @@ fn emit_run(
     start_lba: u64,
     lba_length: u32,
     ctx: &MaterialiseCtx<'_>,
-    out_entries: &mut Vec<SegmentEntry>,
+    out_entries: &mut Vec<PendingEntry>,
     composite_cache: &mut HashMap<(Ulid, u32), Vec<u8>>,
 ) -> Result<(), MaterialiseOutcome> {
     if lba_length == 0 {
@@ -860,14 +867,14 @@ mod tests {
         let ulid = Ulid::new();
         let path = dir.join(ulid.to_string());
         let hash = blake3::hash(body);
-        let mut entries = vec![SegmentEntry::new_data(
+        let entries = vec![SegmentEntry::new_data(
             hash,
             100,
             (body.len() / BLOCK_BYTES as usize) as u32,
             SegmentFlags::empty(),
             body.to_vec(),
         )];
-        let bss = segment::write_segment(&path, &mut entries, ephemeral_signer().as_ref()).unwrap();
+        let (bss, _) = segment::write_segment(&path, entries, ephemeral_signer().as_ref()).unwrap();
         (ulid, path, bss, hash)
     }
 
@@ -909,11 +916,11 @@ mod tests {
         let out = materialise_plan(&plan, &ctx).unwrap();
         assert_eq!(out.entries.len(), 1);
         let e = &out.entries[0];
-        assert_eq!(e.kind, EntryKind::Data);
-        assert_eq!(e.hash, hash);
-        assert_eq!(e.start_lba, 100);
-        assert_eq!(e.lba_length, 1);
-        assert_eq!(e.data.as_deref(), Some(body.as_slice()));
+        assert_eq!(e.entry.kind, EntryKind::Data);
+        assert_eq!(e.entry.hash, hash);
+        assert_eq!(e.entry.start_lba, 100);
+        assert_eq!(e.entry.lba_length, 1);
+        assert_eq!(e.body.as_deref(), Some(body.as_slice()));
         assert!(out.delta_body.is_empty());
     }
 
@@ -925,8 +932,10 @@ mod tests {
 
         let input_ulid = Ulid::new();
         let idx_path = base.join("index").join(format!("{input_ulid}.idx"));
-        let mut entries = vec![SegmentEntry::new_zero(0, 1000)];
-        segment::write_segment(&idx_path, &mut entries, ephemeral_signer().as_ref()).unwrap();
+        let entries = vec![segment::PendingEntry::from_entry(SegmentEntry::new_zero(
+            0, 1000,
+        ))];
+        segment::write_segment(&idx_path, entries, ephemeral_signer().as_ref()).unwrap();
 
         let resolver = MockResolver {
             files: HashMap::new(),
@@ -947,9 +956,9 @@ mod tests {
         let out = materialise_plan(&plan, &ctx).unwrap();
         assert_eq!(out.entries.len(), 1);
         let e = &out.entries[0];
-        assert_eq!(e.kind, EntryKind::Zero);
-        assert_eq!(e.start_lba, 200);
-        assert_eq!(e.lba_length, 50);
+        assert_eq!(e.entry.kind, EntryKind::Zero);
+        assert_eq!(e.entry.start_lba, 200);
+        assert_eq!(e.entry.lba_length, 50);
     }
 
     #[test]

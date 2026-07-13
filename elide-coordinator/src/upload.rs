@@ -780,25 +780,25 @@ mod tests {
 
         let data1 = vec![0xABu8; 4096];
         let h1 = blake3::hash(&data1);
-        let mut entries1 = vec![SegmentEntry::new_data(
+        let entries1 = vec![SegmentEntry::new_data(
             h1,
             0,
             1,
             SegmentFlags::empty(),
             data1,
         )];
-        write_segment(&pending_dir.join(&ulid1), &mut entries1, signer.as_ref()).unwrap();
+        write_segment(&pending_dir.join(&ulid1), entries1, signer.as_ref()).unwrap();
 
         let data2 = vec![0xCDu8; 4096];
         let h2 = blake3::hash(&data2);
-        let mut entries2 = vec![SegmentEntry::new_data(
+        let entries2 = vec![SegmentEntry::new_data(
             h2,
             1,
             1,
             SegmentFlags::empty(),
             data2,
         )];
-        write_segment(&pending_dir.join(&ulid2), &mut entries2, signer.as_ref()).unwrap();
+        write_segment(&pending_dir.join(&ulid2), entries2, signer.as_ref()).unwrap();
 
         // .tmp files must be left in place.
         std::fs::write(pending_dir.join(format!("{ulid1}.tmp")), b"incomplete").unwrap();

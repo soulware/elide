@@ -1565,7 +1565,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
         let seed = 128u8;
         let pop_data = vec![seed; 4096];
         let pop_hash = blake3::hash(&pop_data);
-        let mut entries = vec![segment::SegmentEntry::new_data(
+        let entries = vec![segment::SegmentEntry::new_data(
             pop_hash,
             0,
             1,
@@ -1576,7 +1576,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
         let signer =
             crate::signing::load_signer(&fork_dir, crate::signing::VOLUME_KEY_FILE).unwrap();
         let tmp = cache_dir.join(format!("{pop_ulid}.tmp"));
-        let bss = segment::write_segment(&tmp, &mut entries, signer.as_ref()).unwrap();
+        let (bss, _) = segment::write_segment(&tmp, entries, signer.as_ref()).unwrap();
         let bytes = fs::read(&tmp).unwrap();
         fs::remove_file(&tmp).unwrap();
 
@@ -3135,18 +3135,20 @@ fn delta_materialisation_hash_mismatch_errors() {
         .unwrap();
     let delta_ulid = ulid::Ulid::new();
     let pending = base.join("pending").join(delta_ulid.to_string());
-    let mut entries = vec![segment::SegmentEntry::new_delta(
-        wrong_hash,
-        100,
-        1,
-        vec![segment::DeltaOption {
-            source_hash: parent_hash,
-            delta_offset: 0,
-            delta_length: blob.len() as u32,
-            delta_hash: blake3::hash(&blob),
-        }],
+    let entries = vec![segment::PendingEntry::from_entry(
+        segment::SegmentEntry::new_delta(
+            wrong_hash,
+            100,
+            1,
+            vec![segment::DeltaOption {
+                source_hash: parent_hash,
+                delta_offset: 0,
+                delta_length: blob.len() as u32,
+                delta_hash: blake3::hash(&blob),
+            }],
+        ),
     )];
-    segment::write_segment_with_delta_body(&pending, &mut entries, &blob, signer.as_ref()).unwrap();
+    segment::write_segment_with_delta_body(&pending, entries, &blob, signer.as_ref()).unwrap();
 
     // Reopen so the rebuild registers the hand-written pending segment.
     let vol = Volume::open(&base, &base).unwrap();

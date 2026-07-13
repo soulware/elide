@@ -989,7 +989,7 @@ mod tests {
             kind,
             stored_offset: 0,
             stored_length: 0,
-            data: None,
+            inline: None,
             delta_options: Vec::new(),
         }
     }
@@ -1208,7 +1208,7 @@ mod tests {
 
         // Segment 1 (ULID "01A..."): covers [0, 10) → hash_1.
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 h(1),
                 0,
                 10,
@@ -1217,7 +1217,7 @@ mod tests {
             )];
             segment::write_segment(
                 &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-                &mut entries,
+                entries,
                 signer.as_ref(),
             )
             .unwrap();
@@ -1225,7 +1225,7 @@ mod tests {
 
         // Segment 2 (ULID "01B..."): overwrites [5, 10) → hash_2.
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 h(2),
                 5,
                 5,
@@ -1234,7 +1234,7 @@ mod tests {
             )];
             segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
-                &mut entries,
+                entries,
                 signer.as_ref(),
             )
             .unwrap();
@@ -1275,7 +1275,7 @@ mod tests {
 
         // Ancestor: LBA 0..10 → h(1)
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 h(1),
                 0,
                 10,
@@ -1284,14 +1284,14 @@ mod tests {
             )];
             segment::write_segment(
                 &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-                &mut entries,
+                entries,
                 ancestor_signer.as_ref(),
             )
             .unwrap();
         }
         // Live node: LBA 5..10 → h(2) (shadows ancestor)
         {
-            let mut entries = vec![SegmentEntry::new_data(
+            let entries = vec![SegmentEntry::new_data(
                 h(2),
                 5,
                 5,
@@ -1300,7 +1300,7 @@ mod tests {
             )];
             segment::write_segment(
                 &live.join("pending").join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
-                &mut entries,
+                entries,
                 live_signer.as_ref(),
             )
             .unwrap();
@@ -1352,10 +1352,15 @@ mod tests {
             },
         ];
 
-        let mut entries = vec![SegmentEntry::new_delta(content_hash, 0, 1, options)];
+        let entries = vec![segment::PendingEntry::from_entry(SegmentEntry::new_delta(
+            content_hash,
+            0,
+            1,
+            options,
+        ))];
         segment::write_segment(
             &base.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
-            &mut entries,
+            entries,
             signer.as_ref(),
         )
         .unwrap();

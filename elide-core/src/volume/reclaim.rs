@@ -404,7 +404,7 @@ impl Volume {
                 body_section_start: result.body_section_start,
                 body_length: result.body_length,
             }),
-            inline: extentindex::InlineSource::EntryData,
+            inline: extentindex::InlineSource::EntryInline,
         };
         for (raw_idx, re) in result.entries.iter().enumerate() {
             lbamap.register_entry(&re.entry, result.segment_ulid);
@@ -558,13 +558,12 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    /// Worker results cross back to the actor after the output segment
-    /// is on disk; only inline entries' `data` feeds apply. Mirror of
-    /// the repack/promote retention tests: the reclaim result must
-    /// carry no Data bodies, and apply + read-back must succeed
-    /// without them.
+    /// Worker results cross back to the actor as body-less metas; only
+    /// inline entries carry bytes for apply. Mirror of the
+    /// repack/promote tests: apply + read-back must succeed on metas
+    /// alone.
     #[test]
-    fn reclaim_result_strips_written_data_bodies() {
+    fn reclaim_result_applies_body_less_metas() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -584,14 +583,12 @@ mod tests {
         let mut saw_data = false;
         for re in &result.entries {
             if re.entry.kind.is_inline() {
-                assert!(re.entry.data.is_some(), "inline entry lost its apply data");
+                assert!(
+                    re.entry.inline.is_some(),
+                    "inline entry lost its apply bytes"
+                );
             } else {
                 saw_data |= re.entry.kind == segment::EntryKind::Data;
-                assert!(
-                    re.entry.data.is_none(),
-                    "{:?} entry retains body bytes in ReclaimResult",
-                    re.entry.kind
-                );
             }
         }
         assert!(saw_data, "test needs at least one Data output entry");

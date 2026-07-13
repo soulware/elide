@@ -322,7 +322,7 @@ impl Volume {
                         body_section_start: out.new_body_section_start,
                         body_tier: extentindex::RegistrationBodyTier::Local,
                         delta_body_source,
-                        inline: extentindex::InlineSource::EntryData,
+                        inline: extentindex::InlineSource::EntryInline,
                     };
                     for (raw_idx, e) in out.out_entries.iter().enumerate() {
                         index.register_entry_consuming_inputs(
@@ -544,7 +544,7 @@ impl Volume {
                     body_section_start: new_bss,
                     body_length: delta_region_body_length,
                 }),
-                inline: extentindex::InlineSource::EntryData,
+                inline: extentindex::InlineSource::EntryInline,
             };
             let ei = Arc::make_mut(&mut self.extent_index);
             let lm = Arc::make_mut(&mut self.lbamap);
@@ -586,7 +586,7 @@ impl Volume {
                                 compressed: post.compressed,
                                 body_source: BodySource::Local,
                                 body_section_start: new_bss,
-                                inline_data: post.data.clone().map(Vec::into_boxed_slice),
+                                inline_data: post.inline.clone(),
                             },
                         );
                         lm.set_claimant_consuming_input(
@@ -1611,13 +1611,12 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    // --- worker-result body retention tests ---
+    // --- worker-result body tests ---
     //
-    // Worker results cross back to the actor after the output segment is
-    // on disk, so Data bodies in them are reachable but unread; only
-    // inline entries' `data` feeds apply (`InlineSource::EntryData`).
-    // Each test asserts the execute-phase result carries no Data bodies,
-    // then runs apply + read-back to prove nothing needed them.
+    // Worker results carry body-less `SegmentEntry` metas: the type has
+    // no Data body field, so bodies are excluded structurally. Inline
+    // entries hand their bytes to apply on `entry.inline`. These tests
+    // cover that inline handoff plus apply + read-back.
 
     /// Distinct, incompressible 4 KiB block per seed (splitmix64 stream).
     /// `unique_block` above lz4-compresses below `INLINE_THRESHOLD` for
@@ -1637,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn repack_result_strips_written_data_bodies() {
+    fn repack_result_carries_inline_bytes() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1652,27 +1651,17 @@ mod tests {
         let job = vol.prepare_repack().unwrap().expect("repack job");
         let result = crate::actor::execute_repack(job).unwrap();
 
-        let (mut saw_data, mut saw_inline) = (false, false);
+        let mut saw_inline = false;
         for bucket in &result.buckets {
             let out = bucket.output.as_ref().expect("merge output");
             for e in &out.out_entries {
                 if e.kind.is_inline() {
                     saw_inline = true;
-                    assert!(e.data.is_some(), "inline entry lost its apply data");
-                } else {
-                    saw_data |= e.kind == EntryKind::Data;
-                    assert!(
-                        e.data.is_none(),
-                        "{:?} entry retains body bytes in RepackResult",
-                        e.kind
-                    );
+                    assert!(e.inline.is_some(), "inline entry lost its apply bytes");
                 }
             }
         }
-        assert!(
-            saw_data && saw_inline,
-            "setup must yield Data + Inline entries"
-        );
+        assert!(saw_inline, "setup must yield an Inline entry");
 
         let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
         vol.remove_consumed_inputs(&consumed).unwrap();
@@ -1688,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_result_strips_written_data_bodies() {
+    fn promote_result_carries_inline_bytes() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1698,24 +1687,14 @@ mod tests {
         let job = vol.prepare_promote().unwrap().expect("promote job");
         let result = crate::actor::execute_promote(job).unwrap();
 
-        let (mut saw_data, mut saw_inline) = (false, false);
+        let mut saw_inline = false;
         for e in &result.entries {
             if e.kind.is_inline() {
                 saw_inline = true;
-                assert!(e.data.is_some(), "inline entry lost its apply data");
-            } else {
-                saw_data |= e.kind == EntryKind::Data;
-                assert!(
-                    e.data.is_none(),
-                    "{:?} entry retains body bytes in PromoteResult",
-                    e.kind
-                );
+                assert!(e.inline.is_some(), "inline entry lost its apply bytes");
             }
         }
-        assert!(
-            saw_data && saw_inline,
-            "setup must yield Data + Inline entries"
-        );
+        assert!(saw_inline, "setup must yield an Inline entry");
 
         vol.apply_promote(&result);
 
@@ -1726,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_repack_result_strips_written_data_bodies() {
+    fn delta_repack_result_applies_body_less_metas() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -1754,18 +1733,8 @@ mod tests {
         let (mut saw_data, mut saw_delta) = (false, false);
         for seg in &result.segments {
             for item in &seg.rewrite.entries {
-                let post = &item.post;
-                if post.kind.is_inline() {
-                    assert!(post.data.is_some(), "inline entry lost its apply data");
-                } else {
-                    saw_data |= post.kind == EntryKind::Data;
-                    saw_delta |= post.kind == EntryKind::Delta;
-                    assert!(
-                        post.data.is_none(),
-                        "{:?} entry retains body bytes in DeltaRepackResult",
-                        post.kind
-                    );
-                }
+                saw_data |= item.post.kind == EntryKind::Data;
+                saw_delta |= item.post.kind == EntryKind::Delta;
             }
         }
         assert!(

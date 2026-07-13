@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use elide_core::extentindex::DeltaBodySource;
 use elide_core::segment::{
-    DeltaOption, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner, write_segment,
+    DeltaOption, EntryKind, PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner, write_segment,
     write_segment_with_delta_body,
 };
 use elide_core::signing;
@@ -89,14 +89,14 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
-    let mut parent_entries = vec![SegmentEntry::new_data(
+    let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         8,
         SegmentFlags::empty(),
         parent_bytes.clone(),
     )];
-    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+    write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     // --- Delta segment, ULID strictly greater so rebuild applies it after. ---
     let delta_ulid = mint.next();
@@ -107,19 +107,14 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
         delta_length: delta_blob.len() as u32,
         delta_hash: blake3::hash(&delta_blob),
     };
-    let mut delta_entries = vec![SegmentEntry::new_delta(
+    let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
         10,
         8,
         vec![delta_option],
-    )];
-    write_segment_with_delta_body(
-        &delta_path,
-        &mut delta_entries,
-        &delta_blob,
-        signer.as_ref(),
-    )
-    .unwrap();
+    ))];
+    write_segment_with_delta_body(&delta_path, delta_entries, &delta_blob, signer.as_ref())
+        .unwrap();
 
     // Signed snapshot manifest so the rebuild sees a floor (not
     // strictly required for reclaim, but matches production shape).
@@ -323,19 +318,19 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
-    let mut parent_entries = vec![SegmentEntry::new_data(
+    let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         8,
         SegmentFlags::empty(),
         parent_bytes.clone(),
     )];
-    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+    write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     // --- Unrelated Delta segment at LBA 50 (source = parent_hash). ---
     let delta50_ulid = mint.next();
     let delta50_path = vol_dir.join(format!("pending/{delta50_ulid}"));
-    let mut delta50_entries = vec![SegmentEntry::new_delta(
+    let delta50_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child50_hash,
         50,
         1,
@@ -345,10 +340,10 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
             delta_length: delta50_blob.len() as u32,
             delta_hash: blake3::hash(&delta50_blob),
         }],
-    )];
+    ))];
     write_segment_with_delta_body(
         &delta50_path,
-        &mut delta50_entries,
+        delta50_entries,
         &delta50_blob,
         signer.as_ref(),
     )
@@ -480,14 +475,14 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
 
     let parent_ulid = Ulid::new();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
-    let mut parent_entries = vec![SegmentEntry::new_data(
+    let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         8,
         SegmentFlags::empty(),
         parent_bytes.clone(),
     )];
-    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+    write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     // Snapshot manifest AT parent_ulid — H's segment is now snapshot-pinned.
     elide_core::signing::write_snapshot_manifest(
@@ -583,18 +578,18 @@ fn scanner_surfaces_bloated_delta_hash() {
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_ulid = mint.next();
     let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
-    let mut parent_entries = vec![SegmentEntry::new_data(
+    let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
         8,
         SegmentFlags::empty(),
         parent_bytes.clone(),
     )];
-    write_segment(&parent_path, &mut parent_entries, signer.as_ref()).unwrap();
+    write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     let delta_ulid = mint.next();
     let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
-    let mut delta_entries = vec![SegmentEntry::new_delta(
+    let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
         10,
         8,
@@ -604,14 +599,9 @@ fn scanner_surfaces_bloated_delta_hash() {
             delta_length: delta_blob.len() as u32,
             delta_hash: blake3::hash(&delta_blob),
         }],
-    )];
-    write_segment_with_delta_body(
-        &delta_path,
-        &mut delta_entries,
-        &delta_blob,
-        signer.as_ref(),
-    )
-    .unwrap();
+    ))];
+    write_segment_with_delta_body(&delta_path, delta_entries, &delta_blob, signer.as_ref())
+        .unwrap();
     elide_core::signing::write_snapshot_manifest(
         &vol_dir,
         signer.as_ref(),
