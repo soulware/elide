@@ -26,8 +26,12 @@
 #   verify   umount, e2fsck -fn (any FS error fails the rung), remount,
 #            sha256(blob) read cold off the device must match the seed
 #
-# A sampler logs memory pressure, D-state count, and elide RSS every 5s to
-# $OUT_ROOT/<stamp>-<rung>/sample.log; dmesg is dumped there at the end.
+# A sampler logs memory pressure, D-state count, and per-elide-process
+# RSS + RssAnon every 5s; at each checkpoint the harness signals SIGUSR1
+# to elide processes that carry the malloc_info dump hook (detected via
+# their blocked-signal mask, so older binaries are never signalled) and
+# collects the per-arena XML into the run dir. Everything goes under
+# $OUT_ROOT/<stamp>-<rung>/; dmesg is dumped there at the end.
 # Workers are waited on by PID — a bare `wait` would also wait on the
 # sampler, which never exits.
 set -euo pipefail
@@ -86,6 +90,10 @@ wait_drain() { # $@ = volume names
     done
 }
 
+elide_pids() {
+    ps -eo pid=,comm= | awk '$2 ~ /^elide/ {print $1}'
+}
+
 start_sampler() {
     (
         while :; do
@@ -93,14 +101,46 @@ start_sampler() {
                 printf '%s ' "$(date -u +%H:%M:%S)"
                 awk '/^MemAvailable:|^Dirty:|^Writeback:/ {printf "%s%skB ", $1, $2}' /proc/meminfo
                 printf 'dstate=%s ' "$(ps -eo stat= | grep -c '^D' || true)"
-                ps -eo pid=,rss=,comm= | awk '
-                    $3 ~ /^elide/ {s += $2; procs = procs sep $1 "/" $3 "/" $2 "kB"; sep = ","}
-                    END {printf "elide_rss_kb=%d procs=%s\n", s, procs}'
+                total=0 procs=""
+                for pid in $(elide_pids); do
+                    line=$(awk '/^Name:/ {c=$2} /^VmRSS:/ {r=$2} /^RssAnon:/ {a=$2} END {print c, r+0, a+0}' \
+                        "/proc/$pid/status" 2>/dev/null)
+                    read -r comm rss anon <<<"$line"
+                    [[ -n ${rss:-} ]] || continue
+                    total=$((total + rss))
+                    procs="$procs${procs:+,}$pid/$comm/${rss}kB/${anon}kBanon"
+                done
+                printf 'elide_rss_kb=%s procs=%s\n' "$total" "$procs"
             } >>"$RUN_DIR/sample.log"
             sleep 5
         done
     ) &
     SAMPLER_PID=$!
+}
+
+sigusr1_blocked() { # $1 = pid; 0 iff the process blocks SIGUSR1 (has the malloc_info hook)
+    local m
+    m=$(awk '/^SigBlk:/ {print $2}' "/proc/$1/status" 2>/dev/null)
+    [[ -n $m ]] || return 1
+    m=${m: -3}
+    (((16#$m >> 9) & 1))
+}
+
+dump_malloc_info() { # $1 = checkpoint label
+    local pid any=0
+    for pid in $(elide_pids); do
+        if sigusr1_blocked "$pid"; then
+            rm -f "/tmp/malloc_info.$pid.xml"
+            kill -USR1 "$pid" 2>/dev/null && any=1
+        fi
+    done
+    ((any)) || return 0
+    sleep 1
+    for pid in $(elide_pids); do
+        if [[ -s "/tmp/malloc_info.$pid.xml" ]]; then
+            cp "/tmp/malloc_info.$pid.xml" "$RUN_DIR/malloc-$1-$pid.xml"
+        fi
+    done
 }
 
 stop_sampler() {
@@ -178,17 +218,22 @@ run_rung() { # $1 = rung name, $2 = concurrency, $3.. = volume names
     elide volume list >"$RUN_DIR/volumes-start.txt"
     log "=== $rung: volumes ${vols[*]}, concurrency $conc, seed ${SEED_MB}MiB, evidence $RUN_DIR ==="
     start_sampler
+    dump_malloc_info start
     run_waves prepare_one "$conc" "${vols[@]}"
     wait_drain "${vols[@]}"
     log "checkpoint: prepared + drained"
+    dump_malloc_info prepared
     run_waves seed_one "$conc" "${vols[@]}"
     wait_drain "${vols[@]}"
     log "checkpoint: seeded + drained"
+    dump_malloc_info seeded
     run_waves copy_one "$conc" "${vols[@]}"
     wait_drain "${vols[@]}"
     log "checkpoint: copied + drained"
+    dump_malloc_info copied
     run_waves verify_one "$conc" "${vols[@]}"
     log "checkpoint: fsck clean, sha256 verified"
+    dump_malloc_info verified
     stop_sampler
     dump_state
     log "=== $rung PASS ==="
