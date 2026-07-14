@@ -111,6 +111,7 @@ fn parse_humantime(s: &str) -> Result<std::time::Duration, String> {
 
 #[tokio::main]
 async fn main() {
+    elide_core::malloc_policy::pin_mmap_threshold();
     if let Err(e) = run().await {
         tracing::error!("{e:#}");
         process::exit(1);
