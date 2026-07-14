@@ -1120,6 +1120,19 @@ mod imp {
         length: u64,
         buf: &mut [u8],
     ) -> i32 {
+        // FLUSH carries no position: the kernel's flush machinery reuses a
+        // shared flush request whose start_sector is stale garbage, so it
+        // must not reach the alignment asserts below.
+        if op == UBLK_IO_OP_FLUSH {
+            return match reader.flush() {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!("[ublk flush error: {e}]");
+                    -libc::EIO
+                }
+            };
+        }
+
         // ublk SET_PARAMS pinned logical_bs_shift=12, so offset and length
         // are always 4K-aligned — no RMW path needed.
         debug_assert!(offset.is_multiple_of(BLOCK));
@@ -1151,13 +1164,6 @@ mod imp {
                     }
                 }
             }
-            UBLK_IO_OP_FLUSH => match reader.flush() {
-                Ok(()) => 0,
-                Err(e) => {
-                    tracing::error!("[ublk flush error: {e}]");
-                    -libc::EIO
-                }
-            },
             // DISCARD / WRITE_ZEROES report 0 on success: a 10 GiB discard
             // doesn't fit i32 if we returned the byte count.
             UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count, fua) {
@@ -1653,11 +1659,14 @@ mod imp {
             std::fs::remove_dir_all(dir).unwrap();
         }
 
+        /// The kernel's shared flush request carries a stale, arbitrary
+        /// start_sector — a 4K-unaligned position must not trip the data-op
+        /// alignment asserts. Reproduces the 2026-07-14 CI worker panic.
         #[test]
-        fn dispatch_flush_returns_zero() {
+        fn dispatch_flush_ignores_unaligned_position() {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_FLUSH, false, 0, 0, &mut buf);
+            let res = dispatch(&reader, UBLK_IO_OP_FLUSH, false, 4608, 0, &mut buf);
             assert_eq!(res, 0);
             drop(reader);
             client.shutdown();
