@@ -284,3 +284,103 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
         &parent_bytes[12288..16384]
     );
 }
+
+/// A stale plan whose output re-plants a DedupRef claim for a hash whose
+/// DATA entry the same plan folds away must be refused at the pre-commit
+/// check, not applied.
+///
+/// The shape reproduces the vol3 claimant-loss incident: segment A owns
+/// DATA hash H (LBA 0), segment B claims LBA 1 via a DedupRef to H, and
+/// later overwrites of both LBAs make H unreferenced in the live lbamap.
+/// A plan drawn against the pre-overwrite state drops A and keeps B's
+/// DedupRef entry. The stale-liveness loop reads the pre-merge lbamap
+/// (H not live → no cancel), then the merge plants LBA 1 → H from the
+/// output's DedupRef with the fold's ULID as claimant, overriding the
+/// overwrite's claim — an LBA claim with no body location. The apply
+/// must detect this after the merge and refuse: plan and tmp removed,
+/// in-memory state and reads unchanged.
+#[test]
+fn plan_orphaning_dedup_ref_claim_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    // Segment A: DATA entry for H at LBA 0.
+    vol.write(0, &[0xAA; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+
+    // Segment B: same bytes at LBA 1 → dedups to a DedupRef claim on H.
+    vol.write(1, &[0xAA; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+
+    // Segment C: overwrite both LBAs so H is no longer lbamap-live.
+    vol.write(0, &[0xCC; 4096]).unwrap();
+    vol.write(1, &[0xDD; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+
+    let index_dir = fork_dir.join("index");
+    let gc_dir = fork_dir.join("gc");
+    fs::create_dir_all(&gc_dir).unwrap();
+
+    let mut input_ulids: Vec<Ulid> = fs::read_dir(&index_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".idx")?;
+            Ulid::from_string(stem).ok()
+        })
+        .collect();
+    input_ulids.sort();
+    assert_eq!(input_ulids.len(), 3, "expected three committed segments");
+    let (seg_a, seg_b) = (input_ulids[0], input_ulids[1]);
+
+    // Precondition for the scenario: B's entry 0 is a DedupRef to H.
+    let (_, b_entries, _) =
+        elide_core::segment::read_segment_index(&index_dir.join(format!("{seg_b}.idx"))).unwrap();
+    assert_eq!(
+        b_entries[0].kind,
+        elide_core::segment::EntryKind::DedupRef,
+        "write of duplicate bytes must dedup to a DedupRef entry"
+    );
+
+    let new_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let plan = RewritePlan {
+        new_ulid,
+        outputs: vec![
+            PlanOutput::Drop { input: seg_a },
+            PlanOutput::Keep {
+                input: seg_b,
+                entry_idx: 0,
+            },
+        ],
+    };
+    let plan_path = gc_dir.join(format!("{new_ulid}.plan"));
+    plan.write_atomic(&plan_path).unwrap();
+
+    let applied = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(applied, 0, "refused plan must not count as applied");
+    assert!(!plan_path.exists(), "refused plan must be removed");
+    assert!(
+        !gc_dir.join(new_ulid.to_string()).exists(),
+        "no bare output may be committed for a refused plan"
+    );
+    assert!(
+        !gc_dir.join(format!("{new_ulid}.tmp")).exists(),
+        "materialised tmp must be removed for a refused plan"
+    );
+
+    // In-memory state restored: reads return the overwrite bytes.
+    assert_eq!(vol.read(0, 1).unwrap().as_slice(), &[0xCC; 4096]);
+    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xDD; 4096]);
+
+    // Disk untouched: a rebuild reads the same bytes.
+    drop(vol);
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap().as_slice(), &[0xCC; 4096]);
+    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xDD; 4096]);
+}
