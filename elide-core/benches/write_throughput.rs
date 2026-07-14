@@ -94,7 +94,7 @@ impl VolumeFixture {
 
         for i in 0..n as u64 {
             let buf = incompressible_block(i);
-            handle.write(i, &buf).unwrap();
+            handle.write(i, &buf, false).unwrap();
         }
         // Promote any pending WAL contents so the bench starts with a
         // fresh, empty WAL — the per-iter timings shouldn't include
@@ -124,7 +124,7 @@ fn bench_single_thread(c: &mut Criterion) {
                     (lba, incompressible_block(lba))
                 },
                 |(lba, buf)| {
-                    fixture.handle.write(lba, &buf).unwrap();
+                    fixture.handle.write(lba, &buf, false).unwrap();
                 },
                 BatchSize::SmallInput,
             );
@@ -163,7 +163,7 @@ fn bench_multi_thread(c: &mut Criterion) {
                                     for _ in 0..WRITES_PER_THREAD {
                                         let lba = counter.fetch_add(1, Ordering::Relaxed);
                                         let buf = incompressible_block(lba);
-                                        f.handle.write(lba, &buf).unwrap();
+                                        f.handle.write(lba, &buf, false).unwrap();
                                     }
                                 });
                             }

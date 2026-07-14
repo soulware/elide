@@ -1413,7 +1413,11 @@ impl VolumeClient {
     /// or a dedup-REF write computes lz4 output it then throws away —
     /// fine for real ublk traffic, where the kernel page cache filters
     /// unchanged pages and dedup hits are a small fraction of writes.
-    pub fn write(&self, lba: u64, data: &[u8]) -> io::Result<()> {
+    ///
+    /// `fua` fsyncs the WAL inside the same critical section as the
+    /// append, so a concurrent promote can't rotate the WAL between the
+    /// two — the write is durable when this returns.
+    pub fn write(&self, lba: u64, data: &[u8], fua: bool) -> io::Result<()> {
         let hash = blake3::hash(data);
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
@@ -1421,6 +1425,9 @@ impl VolumeClient {
             let mut guard = lock_volume(&volume);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
             publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            if fua {
+                guard.wal_fsync()?;
+            }
             guard.needs_promote()
         };
         if needs_promote {
@@ -1433,12 +1440,15 @@ impl VolumeClient {
     /// [`VolumeClient::write`] for the lock/snapshot/signal pattern.
     /// Writes a single zero-extent WAL record — no hashing, no data payload.
     /// See [`Volume::write_zeroes`] for details.
-    pub fn write_zeroes(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+    pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         let volume = self.volume()?;
         let needs_promote = {
             let mut guard = lock_volume(&volume);
             guard.write_zeroes(start_lba, lba_count)?;
             publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            if fua {
+                guard.wal_fsync()?;
+            }
             guard.needs_promote()
         };
         if needs_promote {
@@ -1448,8 +1458,8 @@ impl VolumeClient {
     }
 
     /// Trim (discard) `lba_count` blocks starting at `lba`.
-    pub fn trim(&self, start_lba: u64, lba_count: u32) -> io::Result<()> {
-        self.write_zeroes(start_lba, lba_count)
+    pub fn trim(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
+        self.write_zeroes(start_lba, lba_count, fua)
     }
 
     /// Fetch the current no-op write skip counters from the actor.
@@ -3509,6 +3519,29 @@ mod tests {
         out
     }
 
+    /// A FUA write fsyncs the WAL in the same critical section as the
+    /// append: the WAL bytes are on disk when `write` returns, so a
+    /// recovery open of the same directory sees the data with no flush
+    /// or promote in between.
+    #[test]
+    fn fua_write_is_durable_without_flush() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        let block = unique_block(7);
+        client.write(3, &block, true).unwrap();
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+
+        let recovered = Volume::open(&dir, &dir).unwrap();
+        assert_eq!(recovered.read(3, 1).unwrap(), block);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A reader whose snapshot predates a repack must still resolve reads
     /// after the repack unlinks its input segments — the data is live, only
     /// its location changed. Reproduces the 2026-07-11 field EIO ("segment
@@ -3524,14 +3557,14 @@ mod tests {
             .unwrap();
 
         let block_a = unique_block(1);
-        client.write(0, &block_a).unwrap();
-        client.write(1, &unique_block(2)).unwrap();
-        client.write(2, &unique_block(3)).unwrap();
+        client.write(0, &block_a, false).unwrap();
+        client.write(1, &unique_block(2), false).unwrap();
+        client.write(2, &unique_block(3), false).unwrap();
         client.promote_wal().unwrap();
 
         // Overwrite one LBA in a second segment so the first has dead
         // bytes and is a repack candidate.
-        client.write(1, &unique_block(4)).unwrap();
+        client.write(1, &unique_block(4), false).unwrap();
         client.promote_wal().unwrap();
 
         // A reader's view captured before the repack.
