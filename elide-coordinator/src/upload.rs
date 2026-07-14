@@ -279,7 +279,7 @@ pub async fn drain_pending(
     let mut promote_failed = 0usize;
     let mut uploaded_ulids: Vec<Ulid> = Vec::new();
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
-    let segments = vd.segments();
+    let mut segments = vd.segments();
 
     let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
         .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;

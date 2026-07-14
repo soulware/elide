@@ -32,7 +32,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use object_store::path::Path as StorePath;
 use object_store::{ObjectMeta, ObjectStore, UpdateVersion, WriteMultipart};
 use ulid::Ulid;
@@ -92,6 +92,7 @@ impl VolumeData {
         SegmentsView {
             store: &self.store,
             vol_ulid: self.vol_ulid,
+            part_bufs: Vec::new(),
         }
     }
 }
@@ -487,6 +488,11 @@ impl SnapshotsView<'_> {
 pub struct SegmentsView<'a> {
     store: &'a Arc<dyn ObjectStore>,
     vol_ulid: Ulid,
+    /// Part buffers recycled across this view's multipart PUTs. Each
+    /// entry keeps a handle on an allocation whose bytes may still be
+    /// referenced by an in-flight part; `try_reclaim` recovers it for
+    /// reuse once the upload side has dropped its `Bytes`.
+    part_bufs: Vec<BytesMut>,
 }
 
 /// Multipart-upload parts in flight per segment PUT. Two is enough to
@@ -522,7 +528,7 @@ impl SegmentsView<'_> {
     /// several volumes can drain concurrently without each pinning
     /// a whole segment in memory.
     pub async fn put_from_file(
-        &self,
+        &mut self,
         seg_ulid: Ulid,
         path: &std::path::Path,
     ) -> Result<(), SegmentsError> {
@@ -542,7 +548,8 @@ impl SegmentsView<'_> {
             .map_err(SegmentsError::Put)?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
         loop {
-            let mut buf = vec![0u8; part_size];
+            let mut buf = self.checkout_part_buf(part_size);
+            buf.resize(part_size, 0);
             let mut filled = 0;
             while filled < buf.len() {
                 match f.read(&mut buf[filled..]).map_err(read_err)? {
@@ -551,6 +558,7 @@ impl SegmentsView<'_> {
                 }
             }
             if filled == 0 {
+                self.checkin_part_buf(buf);
                 break;
             }
             buf.truncate(filled);
@@ -558,10 +566,30 @@ impl SegmentsView<'_> {
                 .wait_for_capacity(MAX_CONCURRENT_PARTS)
                 .await
                 .map_err(SegmentsError::Put)?;
-            writer.put(Bytes::from(buf));
+            writer.put(buf.split().freeze());
+            self.checkin_part_buf(buf);
         }
         writer.finish().await.map_err(SegmentsError::Put)?;
         Ok(())
+    }
+
+    /// Hand out a part buffer, recycling a pooled allocation when its
+    /// in-flight `Bytes` have all been dropped.
+    fn checkout_part_buf(&mut self, part_size: usize) -> BytesMut {
+        for i in 0..self.part_bufs.len() {
+            if self.part_bufs[i].try_reclaim(part_size) {
+                let mut buf = self.part_bufs.swap_remove(i);
+                buf.clear();
+                return buf;
+            }
+        }
+        BytesMut::with_capacity(part_size)
+    }
+
+    fn checkin_part_buf(&mut self, buf: BytesMut) {
+        if self.part_bufs.len() <= MAX_CONCURRENT_PARTS {
+            self.part_bufs.push(buf);
+        }
     }
 
     /// GET the whole segment object. Used by forced-claim tail
@@ -1218,6 +1246,47 @@ mod tests {
 
         let got = vd.segments().get_range(seg, 0..body.len()).await.unwrap();
         assert_eq!(got.as_ref(), body);
+    }
+
+    #[tokio::test]
+    async fn segments_put_from_file_multipart_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_s, vd) = vd();
+        let seg = mint().next();
+        // Two full parts plus a short tail, so the read loop cycles
+        // buffers through checkout/checkin across part boundaries.
+        let part = crate::upload::part_size_bytes();
+        let len = 2 * part + 4096;
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let path = tmp.path().join(seg.to_string());
+        std::fs::write(&path, &body).unwrap();
+
+        vd.segments().put_from_file(seg, &path).await.unwrap();
+
+        let got = vd.segments().get_range(seg, 0..len).await.unwrap();
+        assert_eq!(got.as_ref(), &body[..]);
+    }
+
+    #[tokio::test]
+    async fn segments_part_buf_pool_recycles_after_bytes_drop() {
+        let (_s, vd) = vd();
+        let mut segments = vd.segments();
+
+        let mut buf = segments.checkout_part_buf(64);
+        buf.resize(64, 7);
+        let ptr = buf.as_ptr();
+        let frozen = buf.split().freeze();
+        segments.checkin_part_buf(buf);
+
+        // The pooled allocation is still referenced by `frozen`, so a
+        // checkout must hand out a different allocation.
+        let other = segments.checkout_part_buf(64);
+        assert_ne!(other.as_ptr(), ptr);
+        segments.checkin_part_buf(other);
+
+        drop(frozen);
+        let recycled = segments.checkout_part_buf(64);
+        assert_eq!(recycled.as_ptr(), ptr);
     }
 
     #[tokio::test]
