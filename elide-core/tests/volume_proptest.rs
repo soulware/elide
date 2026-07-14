@@ -211,6 +211,16 @@ enum SimOp {
     /// compact, apply handoffs. Requires a prior GcCheckpoint; no-ops if
     /// no checkpoint is pending.
     GcApply { n: usize },
+    /// Plan emission alone: compact the stashed checkpoint into
+    /// `gc/<ulid>.plan` without applying it. Ops between this and the
+    /// matching GcHandoffApply land inside the plan-staleness window,
+    /// and a plan on disk survives Crash — the next incarnation applies
+    /// a plan drawn against pre-crash state.
+    GcPlan { n: usize },
+    /// Apply staged plans left by GcPlan. A plan's input files are
+    /// deleted only when its bare output committed; a cancelled or
+    /// refused plan keeps its inputs live.
+    GcHandoffApply,
     /// Simulate a crash: drop the Volume, reopen it (triggering WAL recovery),
     /// and assert all oracle LBAs read back their last-written values.
     Crash,
@@ -388,6 +398,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::GcCheckpoint),
         (2usize..=5).prop_map(|n| SimOp::GcApply { n }),
+        (2usize..=5).prop_map(|n| SimOp::GcPlan { n }),
+        Just(SimOp::GcHandoffApply),
         Just(SimOp::Crash),
         Just(SimOp::ReadUnwritten),
         Just(SimOp::Snapshot),
@@ -693,6 +705,9 @@ proptest! {
         let mut snapshot_floor: Option<Ulid> = None;
         // Pending GcCheckpoint ULIDs awaiting GcApply.
         let mut pending_gc: Option<Ulid> = None;
+        // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
+        // input files to delete once its bare output commits).
+        let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
 
         for op in &ops {
             let ulids_before = all_segment_ulids(fork_dir);
@@ -864,6 +879,31 @@ proptest! {
                             }
                         }
                     }
+                }
+                SimOp::GcPlan { n } => {
+                    if let Some(gc_ulid) = pending_gc.take()
+                        && let Some((_, new_ulid, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                    {
+                        staged_plans.push((new_ulid, paths));
+                    }
+                }
+                SimOp::GcHandoffApply => {
+                    let _ = vol.apply_gc_handoffs();
+                    let gc_dir = fork_dir.join("gc");
+                    staged_plans.retain(|(plan_ulid, paths)| {
+                        let applied = gc_dir.join(plan_ulid.to_string()).exists();
+                        if applied {
+                            for path in paths {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        // Drop applied plans (inputs deleted above) and
+                        // cancelled ones (plan gone, no bare output —
+                        // inputs stay live); keep any plan the apply pass
+                        // has not decided yet.
+                        !applied && gc_dir.join(format!("{plan_ulid}.plan")).exists()
+                    });
                 }
                 SimOp::Crash => {
                     drop(vol);
@@ -1084,6 +1124,9 @@ proptest! {
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
+        // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
+        // input files to delete once its bare output commits).
+        let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
 
         for op in &ops {
             match op {
@@ -1151,6 +1194,31 @@ proptest! {
                             }
                         }
                     }
+                }
+                SimOp::GcPlan { n } => {
+                    if let Some(gc_ulid) = pending_gc.take()
+                        && let Some((_, new_ulid, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                    {
+                        staged_plans.push((new_ulid, paths));
+                    }
+                }
+                SimOp::GcHandoffApply => {
+                    let _ = vol.apply_gc_handoffs();
+                    let gc_dir = fork_dir.join("gc");
+                    staged_plans.retain(|(plan_ulid, paths)| {
+                        let applied = gc_dir.join(plan_ulid.to_string()).exists();
+                        if applied {
+                            for path in paths {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        // Drop applied plans (inputs deleted above) and
+                        // cancelled ones (plan gone, no bare output —
+                        // inputs stay live); keep any plan the apply pass
+                        // has not decided yet.
+                        !applied && gc_dir.join(format!("{plan_ulid}.plan")).exists()
+                    });
                 }
                 SimOp::Crash => {
                     drop(vol);
@@ -1378,6 +1446,9 @@ proptest! {
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
+        // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
+        // input files to delete once its bare output commits).
+        let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
 
         for op in &ops {
             match op {
@@ -1445,6 +1516,31 @@ proptest! {
                             }
                         }
                     }
+                }
+                SimOp::GcPlan { n } => {
+                    if let Some(gc_ulid) = pending_gc.take()
+                        && let Some((_, new_ulid, paths)) =
+                            common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
+                    {
+                        staged_plans.push((new_ulid, paths));
+                    }
+                }
+                SimOp::GcHandoffApply => {
+                    let _ = vol.apply_gc_handoffs();
+                    let gc_dir = fork_dir.join("gc");
+                    staged_plans.retain(|(plan_ulid, paths)| {
+                        let applied = gc_dir.join(plan_ulid.to_string()).exists();
+                        if applied {
+                            for path in paths {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        // Drop applied plans (inputs deleted above) and
+                        // cancelled ones (plan gone, no bare output —
+                        // inputs stay live); keep any plan the apply pass
+                        // has not decided yet.
+                        !applied && gc_dir.join(format!("{plan_ulid}.plan")).exists()
+                    });
                 }
                 SimOp::Crash => {
                     drop(vol);

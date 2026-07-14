@@ -223,3 +223,185 @@ fn concurrent_apply_gc_handoffs_does_not_drop_replies() {
     handle.shutdown();
     actor_thread.join().unwrap();
 }
+
+/// `SegmentFetcher` that parks the worker thread inside its first
+/// `fetch_extent` call: sends on `stalled`, then blocks on `release`
+/// until the test drops the paired sender, after which every call
+/// passes straight through to the wrapped `CapturedBodyFetcher`.
+struct GatedFetcher {
+    inner: common::CapturedBodyFetcher,
+    stalled: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl elide_core::segment::SegmentFetcher for GatedFetcher {
+    fn fetch_extent(
+        &self,
+        segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
+        index_dir: &std::path::Path,
+        body_dir: &std::path::Path,
+        extent: &elide_core::segment::ExtentFetch,
+        presence: Option<Arc<elide_core::extentindex::SegmentPresence>>,
+    ) -> std::io::Result<()> {
+        let _ = self.stalled.send(());
+        let _ = self.release.lock().unwrap().recv();
+        self.inner.fetch_extent(
+            segment_id,
+            owner_vol_id,
+            index_dir,
+            body_dir,
+            extent,
+            presence,
+        )
+    }
+
+    fn fetch_delta_body(
+        &self,
+        segment_id: ulid::Ulid,
+        owner_vol_id: ulid::Ulid,
+        index_dir: &std::path::Path,
+        body_dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.inner
+            .fetch_delta_body(segment_id, owner_vol_id, index_dir, body_dir)
+    }
+}
+
+/// 4 KiB of keyed-BLAKE3 output — never compresses below the inline
+/// threshold, so writes land as body entries whose bytes a GC apply
+/// must materialise (and demand-fetch once the cache body is evicted).
+fn incompressible_block(seed: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let key = [seed; 32];
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        chunk.copy_from_slice(&hash.as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    buf
+}
+
+/// The coordinator's timeout-abandon-replan sequence, driven for real:
+/// a handoff apply is parked mid-materialise on the worker thread while
+/// an impatient coordinator retries the apply, checkpoints, and emits a
+/// second plan over the same inputs.
+///
+/// Pinned properties: the volume rejects the concurrent apply with
+/// "already in progress" instead of interleaving; the checkpoint served
+/// mid-apply carries an own-segment commitment that matches the disk
+/// scan (the apply commits atomically on the actor, so no torn state is
+/// observable); and once both plans have been processed every LBA reads
+/// its oracle value, live and across a reopen.
+#[test]
+fn plan_emitted_during_inflight_apply_is_safe() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = tmp.path().join(ulid::Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    common::write_test_keypair(&fork_dir);
+    let store_dir = tmp.path().join("_store");
+
+    // Seed two committed segments of incompressible (body-entry) data,
+    // then evict both cache bodies so the apply must go through the
+    // gated fetcher.
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    let mut oracle: HashMap<u64, Vec<u8>> = HashMap::new();
+    for lba in 0u64..4 {
+        let data = incompressible_block(lba as u8);
+        vol.write(lba, &data).unwrap();
+        oracle.insert(lba, data);
+    }
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    for lba in 4u64..8 {
+        let data = incompressible_block(0x40 + lba as u8);
+        vol.write(lba, &data).unwrap();
+        oracle.insert(lba, data);
+    }
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    assert!(common::capture_and_evict_cache_body(&vol, &fork_dir, &store_dir).is_some());
+    assert!(common::capture_and_evict_cache_body(&vol, &fork_dir, &store_dir).is_some());
+
+    let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    vol.set_fetcher(Arc::new(GatedFetcher {
+        inner: common::CapturedBodyFetcher {
+            store_dir: store_dir.clone(),
+        },
+        stalled: stalled_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let (actor, handle) = spawn(vol);
+    let actor_thread = thread::spawn(move || actor.run());
+
+    // Plan P1 over both segments and start its apply; the worker parks
+    // inside the first demand-fetch.
+    let p1 = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
+    let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, p1, 2).unwrap();
+    let apply_handle = handle.clone();
+    let first_apply = thread::spawn(move || apply_handle.apply_gc_handoffs());
+    stalled_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("apply never reached the fetcher");
+
+    // Impatient coordinator, mid-apply. Collect outcomes and release the
+    // gate before asserting so a failure can't leave the worker parked.
+    let concurrent_apply = handle.apply_gc_handoffs();
+    let checkpoint2 = handle.gc_checkpoint(1);
+    let disk_commitment_mid_apply = elide_core::volume_ipc::SegmentSetCommitment::from_ulids(
+        elide_core::segment::committed_tier_ulids(&fork_dir).unwrap(),
+    );
+    let p2_emitted = checkpoint2.as_ref().ok().map(|reply| {
+        // Production's planner bails while a .plan is pending; emitting
+        // anyway models the TOCTOU race where the apply's commit removes
+        // the plan file between that check and emission.
+        common::simulate_coord_gc_local(&fork_dir, reply.bucket_ulids[0], 2)
+    });
+    drop(release_tx);
+
+    assert_eq!(first_apply.join().unwrap().unwrap(), 1, "P1 must apply");
+    let err = concurrent_apply.expect_err("concurrent apply must be rejected, not interleaved");
+    assert!(
+        err.to_string().contains("already in progress"),
+        "unexpected rejection: {err}"
+    );
+    let checkpoint2 = checkpoint2.expect("checkpoint must stay available mid-apply");
+    assert_eq!(
+        checkpoint2.own_segments,
+        Some(disk_commitment_mid_apply),
+        "mid-apply commitment must match the disk scan — applies commit atomically"
+    );
+
+    // Process P2 (drawn against pre-P1 state, over the same inputs).
+    // The volume's commit-point guards decide it; whatever the verdict,
+    // the plan must be consumed and reads must hold.
+    let (_, p2_ulid, _) = p2_emitted
+        .expect("checkpoint2 must succeed")
+        .expect("both inputs are still committed mid-apply, so P2 must be plannable");
+    handle.apply_gc_handoffs().unwrap();
+    assert!(
+        !fork_dir.join("gc").join(format!("{p2_ulid}.plan")).exists(),
+        "second plan must be consumed (applied or cancelled)"
+    );
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let reader = handle.reader();
+    for (lba, expected) in &oracle {
+        let actual = reader.read(*lba, 1).unwrap();
+        assert_eq!(actual, *expected, "lba {lba} wrong after overlapping GC");
+    }
+
+    handle.shutdown();
+    actor_thread.join().unwrap();
+
+    let vol = common::open_with_captured_body_fetcher(&fork_dir, &store_dir);
+    for (lba, expected) in &oracle {
+        let actual = vol.read(*lba, 1).unwrap();
+        assert_eq!(actual, *expected, "lba {lba} wrong after reopen");
+    }
+}

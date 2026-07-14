@@ -618,7 +618,9 @@ impl GcCycleOrchestrator {
     /// Reap step: walk HEAD's `Superseded` edges, DELETE the input
     /// objects whose `since + retention_window <= now`, and update
     /// `head` via `apply_reap`. Returns `true` if any input was
-    /// reaped (the caller PUTs HEAD only when mutated).
+    /// reaped (the caller PUTs HEAD only when mutated). An expired
+    /// input still present in the local committed tier is excluded
+    /// and logged instead of deleted.
     ///
     /// Crash ordering (`docs/design/segment-index.md` *Writers and
     /// crash ordering*): DELETE the object first, *then* PUT HEAD
@@ -639,12 +641,43 @@ impl GcCycleOrchestrator {
                 return false;
             }
         };
-        let to_reap: Vec<Ulid> = head
+        let expired: Vec<Ulid> = head
             .superseded
             .iter()
             .filter(|(_, edge)| edge.since + retention <= now)
             .map(|(input, _)| *input)
             .collect();
+        if expired.is_empty() {
+            return false;
+        }
+
+        // Liveness backstop: never DELETE an object the local committed
+        // tier still contains. A `Superseded` edge normally outlives the
+        // input's `index/<ulid>.idx` by the whole retention window, so a
+        // still-present member here means the fold's supersede was
+        // recorded while the volume still serves from the input —
+        // deleting the bytes would turn that divergence into permanent
+        // loss. Skip the member (the edge stays, so it is re-examined
+        // next tick) and say so loudly.
+        let local_tier = match elide_core::segment::committed_tier_ulids(&self.fork_dir) {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(
+                    "[reap {}] committed-tier scan failed: {e}; skipping reap pass",
+                    self.vol_ulid
+                );
+                return false;
+            }
+        };
+        let (still_local, to_reap): (Vec<Ulid>, Vec<Ulid>) =
+            expired.into_iter().partition(|u| local_tier.contains(u));
+        for input in &still_local {
+            error!(
+                "[reap {}] {input} is past retention in HEAD but present in the \
+                 local committed tier; refusing to delete it",
+                self.vol_ulid
+            );
+        }
         if to_reap.is_empty() {
             return false;
         }
@@ -1127,6 +1160,73 @@ mod tests {
             "fresh edge retained until its retention window elapses"
         );
         assert!(!head.tombstoned.contains(&input_fresh));
+    }
+
+    #[tokio::test]
+    async fn reap_refuses_input_still_in_local_committed_tier() {
+        // Two expired Superseded edges; one input's `index/<ulid>.idx`
+        // is still present in the fork dir. The backstop must exclude
+        // that input — S3 object retained, edge kept, no tombstone —
+        // while the other input reaps normally.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let input_local = m.next();
+        let input_gone = m.next();
+        let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            let index = fork.join("index");
+            std::fs::create_dir_all(&index).unwrap();
+            std::fs::write(index.join(format!("{input_local}.idx")), b"idx").unwrap();
+        });
+        orch.last_reap = std::time::Instant::now()
+            - orch.gc_config.reaper_cadence()
+            - std::time::Duration::from_secs(1);
+
+        let local_key = crate::upload::segment_key(vol_ulid(), input_local);
+        let gone_key = crate::upload::segment_key(vol_ulid(), input_gone);
+        for key in [&local_key, &gone_key] {
+            store
+                .put(key, bytes::Bytes::from_static(b"body").into())
+                .await
+                .unwrap();
+        }
+
+        let mut head = segment_head::SegmentHead::empty(None);
+        head.added.insert(output);
+        let expired_since = Utc::now()
+            - chrono::Duration::from_std(orch.gc_config.retention_window).unwrap()
+            - chrono::Duration::seconds(1);
+        for input in [input_local, input_gone] {
+            head.superseded.insert(
+                input,
+                Supersession {
+                    output,
+                    since: expired_since,
+                },
+            );
+        }
+        put_head_via(&store, &head).await;
+
+        orch.publish_head_delta().await;
+
+        assert!(
+            store.head(&local_key).await.is_ok(),
+            "input in the local committed tier must not be deleted"
+        );
+        assert!(
+            matches!(
+                store.head(&gone_key).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "input absent from the local tier reaps normally"
+        );
+        let head = read_head_via(&store).await;
+        assert!(
+            head.superseded.contains_key(&input_local),
+            "refused input keeps its edge for the next pass"
+        );
+        assert!(!head.tombstoned.contains(&input_local));
+        assert!(head.tombstoned.contains(&input_gone));
     }
 
     #[tokio::test]

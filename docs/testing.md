@@ -62,6 +62,10 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 | `Repack` | `vol.repack(0.9)` density pass on `pending/` + S3-confirmed |
 | `DrainLocal` | simulates coordinator upload: `pending/` → `index/` + `cache/` |
 | `CoordGcLocal { n }` | coordinator-style GC on S3-confirmed segments, `n` in 2–5 |
+| `GcCheckpoint` | drain, then mint GC output ULIDs (stashes them for the apply ops) |
+| `GcApply { n }` | plan + apply in one op against a stashed checkpoint |
+| `GcPlan { n }` | plan emission only — writes `gc/<ulid>.plan` without applying |
+| `GcHandoffApply` | applies staged plans; deletes a plan's inputs only if its bare output committed |
 | `Crash` | drops the `Volume` and reopens it (full rebuild) |
 | `Snapshot` | `vol.snapshot()` — sets the snapshot floor |
 | `PopulateFetched` | writes 3-file demand-fetch cache format (`.idx` + `.body` + `.present`) |
@@ -220,6 +224,8 @@ Key additions over the volume-level proptest:
 **The invariant:** the coordinator must not delete old local segment files until the volume has renamed `gc/<ulid>.staged` to bare `gc/<ulid>` (the atomic commit point of the self-describing handoff). The bare file's appearance is the volume's signal that its extent index now points at the new segment, and the bare file itself is what the coordinator's `apply_done_handoffs` walks.
 
 The test seeds two segments, then runs a reader thread (500 read-all iterations) concurrently with a coordinator thread running one GC pass, asserting the reader's error list stays empty. The failure mode was confirmed by running once with inline deletion (before handoff apply), which reproduced `segment not found` for cold LBAs; the fix — returning paths for deferred deletion — made it pass.
+
+`plan_emitted_during_inflight_apply_is_safe` drives the coordinator's timeout-abandon-replan sequence for real: a gated `SegmentFetcher` parks a handoff apply mid-materialise on the worker thread while the test retries the apply, checkpoints, and emits a second plan over the same inputs. Pinned properties: the concurrent apply is rejected with "already in progress" rather than interleaved; the checkpoint reply served mid-apply carries an own-segment commitment matching the disk scan (applies commit atomically on the actor); and after both plans are processed, every LBA reads its oracle value live and across a reopen.
 
 ## Formal model: TLA+ specs
 
