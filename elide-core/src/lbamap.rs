@@ -768,6 +768,22 @@ impl LbaMap {
             .map(|(&lba, e)| (lba, e.lba_length, e.hash, e.payload_block_offset))
     }
 
+    /// Diagnostic: every entry as
+    /// `(start_lba, lba_length, hash, payload_block_offset, claimant)`.
+    pub fn iter_entries_with_claimant(
+        &self,
+    ) -> impl Iterator<Item = (u64, u32, blake3::Hash, u32, Ulid)> + '_ {
+        self.inner.iter().map(|(&lba, e)| {
+            (
+                lba,
+                e.lba_length,
+                e.hash,
+                e.payload_block_offset,
+                e.claimant_ulid,
+            )
+        })
+    }
+
     /// Return all (start_lba, lba_length) ranges whose hash equals `target`.
     ///
     /// Used for diagnostics only (linear scan).

@@ -20,11 +20,15 @@
 #
 # Each rung, per volume:
 #   prepare  mount if needed, delete leftover top-level files, fstrim
-#   seed     write an incompressible seed from /dev/urandom, record sha256
+#   seed     write an incompressible seed from /dev/urandom, recording a
+#            per-4KiB-block blake3 manifest from the same byte stream (tee)
+#            so it is write-time ground truth, not a read-back
 #   copy     cp seed -> blob at the rung's concurrency
 #   drain    sync, then poll `elide volume list` until PENDING clears
-#   verify   umount, e2fsck -fn (any FS error fails the rung), remount,
-#            sha256(blob) read cold off the device must match the seed
+#   verify   umount, e2fsck -fn (any FS error fails the rung), remount, then
+#            cold per-block read of seed and blob compared to the manifest;
+#            any differing block is mapped to its device LBA via filefrag so
+#            the failure names the exact LBAs to chase in `elide dump-lbamap`
 #
 # A sampler logs memory pressure, D-state count, and per-elide-process
 # RSS + RssAnon every 5s; at each checkpoint the harness signals SIGUSR1
@@ -180,15 +184,78 @@ prepare_one() {
 
 seed_one() {
     local v=$1 mnt="$MNT_ROOT/$1"
-    dd if=/dev/urandom of="$mnt/seed" bs=1M count="$SEED_MB" status=none
+    # tee the generated stream to the file and to the block hasher from the
+    # same bytes: the manifest is write-time ground truth, independent of any
+    # read-back through elide. pipefail makes a block-hash failure fail seed.
+    dd if=/dev/urandom bs=1M count="$SEED_MB" status=none \
+        | tee "$mnt/seed" \
+        | elide block-hash - >"$RUN_DIR/$v.seed.blockhashes"
     sync -f "$mnt/seed"
-    sha256sum "$mnt/seed" >"$RUN_DIR/$v.seed.sha256"
 }
 
 copy_one() {
     local v=$1 mnt="$MNT_ROOT/$1"
     cp "$mnt/seed" "$mnt/blob"
     sync -f "$mnt/blob"
+}
+
+# Map bad file-offset blocks to device LBAs via the filefrag extent map, so a
+# mismatch names the exact device LBA whose claimant + landing segment can then
+# be read out of `elide dump-lbamap`. filefrag -b4096 reports physical blocks in
+# 4096-byte units, which is the elide device LBA unit. $1 = filefrag -e output,
+# $2 = sorted bad-block-index file; prints `<file_block> <device_lba>` per line.
+device_lba_for_blocks() {
+    awk -v badf="$2" '
+        BEGIN { ne=0; nb=0; while ((getline b < badf) > 0) if (b!="") badlist[nb++]=b }
+        /^[[:space:]]*[0-9]+:/ {
+            line=$0; gsub(/\.\./, " ", line); gsub(/:/, " ", line)
+            n=split(line, f, /[[:space:]]+/); j=0
+            for (i=1;i<=n;i++) if (f[i] != "") { j++; g[j]=f[i] }
+            ext_ls[ne]=g[2]; ext_ps[ne]=g[4]; ext_len[ne]=g[6]; ne++
+        }
+        END {
+            for (i=0;i<nb;i++) {
+                b=badlist[i]; placed=0
+                for (e=0;e<ne;e++)
+                    if (b>=ext_ls[e] && b<ext_ls[e]+ext_len[e]) {
+                        printf "%s %d\n", b, ext_ps[e]+(b-ext_ls[e]); placed=1; break
+                    }
+                if (!placed) printf "%s ?\n", b
+            }
+        }
+    ' "$1"
+}
+
+# Compare one file's cold-read block manifest to the seed's write-time manifest.
+# $1 = volume, $2 = file (seed|blob). 0 iff every block matches. On mismatch,
+# writes the bad file blocks and their device LBAs into the run dir and logs a
+# summary. The manifests share identical block ordering (0..N-1), so paste
+# aligns them line-for-line without a numeric join.
+diff_blocks() {
+    local v=$1 f=$2 mnt="$MNT_ROOT/$1"
+    local want="$RUN_DIR/$v.seed.blockhashes"
+    local got="$RUN_DIR/$v.$f.blockhashes"
+    elide block-hash "$mnt/$f" >"$got"
+    local nw ng
+    nw=$(wc -l <"$want")
+    ng=$(wc -l <"$got")
+    local bad="$RUN_DIR/$v.$f.badblocks"
+    paste "$want" "$got" | awk '$2 != $4 {print $1}' | sort -n >"$bad"
+    if [[ $nw == "$ng" && ! -s $bad ]]; then
+        rm -f "$bad"
+        return 0
+    fi
+    if [[ $nw != "$ng" ]]; then
+        echo "block-count mismatch on $v/$f: seed $nw blocks, read-back $ng" >&2
+    fi
+    local n
+    n=$(wc -l <"$bad")
+    echo "block mismatch on $v/$f: $n of $nw blocks differ from write-time seed manifest" >&2
+    filefrag -b4096 -e "$mnt/$f" >"$RUN_DIR/$v.$f.filefrag" 2>/dev/null || true
+    device_lba_for_blocks "$RUN_DIR/$v.$f.filefrag" "$bad" >"$RUN_DIR/$v.$f.badlba"
+    echo "first bad blocks on $v/$f (file_block device_lba):" >&2
+    head -20 "$RUN_DIR/$v.$f.badlba" >&2
+    return 1
 }
 
 verify_one() {
@@ -200,13 +267,14 @@ verify_one() {
         exit 1
     fi
     mount "/dev/elide/$v" "$mnt"
-    local want got
-    want=$(awk '{print $1}' "$RUN_DIR/$v.seed.sha256")
-    got=$(sha256sum "$mnt/blob" | awk '{print $1}')
-    if [[ $got != "$want" ]]; then
-        echo "sha256 mismatch on $v: want $want got $got" >&2
-        exit 1
-    fi
+    # cold per-block read of both files against the seed's write-time manifest.
+    # cp makes blob a byte copy of seed, so both must match it. Check both and
+    # only fail after localizing each, so one run captures all bad LBAs.
+    local rc=0 f
+    for f in seed blob; do
+        diff_blocks "$v" "$f" || rc=1
+    done
+    ((rc == 0)) || exit 1
 }
 
 run_rung() { # $1 = rung name, $2 = concurrency, $3.. = volume names
@@ -245,6 +313,10 @@ if [[ $EUID -ne 0 ]]; then
 fi
 command -v elide >/dev/null || {
     echo "elide not on PATH" >&2
+    exit 2
+}
+printf '\n' | elide block-hash - >/dev/null 2>&1 || {
+    echo "installed elide lacks 'block-hash' — deploy the diag build" >&2
     exit 2
 }
 mkdir -p "$OUT_ROOT"

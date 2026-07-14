@@ -32,6 +32,46 @@ use crate::{extentindex, lbamap, segment, signing, volume, writelog};
 /// `RemoteFetcher`) must reverse locally.
 pub type FetcherFactory<'a> = dyn FnOnce(&[PathBuf]) -> Option<Box<dyn SegmentFetcher>> + 'a;
 
+/// Result of a [`BlockReader::verify_content`] scan.
+pub struct ContentVerifyReport {
+    /// Distinct non-zero content hashes the lbamap references.
+    pub distinct_hashes: usize,
+    /// Hashes whose materialised plaintext hashed to the claimed value.
+    pub verified: usize,
+    /// Hashes that failed verification, sorted by lowest claiming LBA.
+    pub findings: Vec<ContentFinding>,
+}
+
+/// One content hash that failed verification.
+pub struct ContentFinding {
+    pub hash: blake3::Hash,
+    /// Every `(start_lba, lba_length)` run claiming this hash, sorted.
+    pub runs: Vec<(u64, u32)>,
+    pub kind: FindingKind,
+}
+
+pub enum FindingKind {
+    /// The stored bytes decompress and read fine but hash to `got`.
+    Mismatch {
+        got: blake3::Hash,
+        segment_id: ulid::Ulid,
+        inline: bool,
+        body_length: u32,
+    },
+    /// A Delta entry failed to materialise or failed its hash check.
+    DeltaError {
+        segment_id: ulid::Ulid,
+        error: String,
+    },
+    /// In the lbamap but in neither the data nor the delta index.
+    Unresolvable,
+    /// Body bytes could not be read (evicted, missing file).
+    Unreadable {
+        segment_id: ulid::Ulid,
+        error: String,
+    },
+}
+
 /// Block-level reader over a volume's merged fork + ancestor state.
 pub struct BlockReader {
     /// Search path for segment files: fork dir first, then ancestors.
@@ -359,6 +399,17 @@ impl BlockReader {
         block_offset: u32,
         expected_hash: &blake3::Hash,
     ) -> io::Result<[u8; 4096]> {
+        let decompressed = self.materialise_delta_extent(delta_loc, expected_hash)?;
+        self.remember_and_slice(*expected_hash, decompressed, block_offset)
+    }
+
+    /// Materialise the full plaintext of a Delta extent and verify it
+    /// hashes to `expected_hash`.
+    fn materialise_delta_extent(
+        &self,
+        delta_loc: &DeltaLocation,
+        expected_hash: &blake3::Hash,
+    ) -> io::Result<Vec<u8>> {
         let mut picked = None;
         for opt in &delta_loc.options {
             if let Some(source_loc) = self.extent_index.lookup(&opt.source_hash) {
@@ -397,7 +448,7 @@ impl BlockReader {
             )));
         }
 
-        self.remember_and_slice(*expected_hash, decompressed, block_offset)
+        Ok(decompressed)
     }
 
     /// Read the delta blob bytes for a single delta option.
@@ -547,6 +598,85 @@ impl BlockReader {
             .ok_or_else(|| io::Error::other(format!("extent {hash} not in index")))?
             .clone();
         self.read_extent_body_at(&loc)
+    }
+
+    /// Dump every LBA-map entry as `(start_lba, lba_length, hash,
+    /// payload_block_offset, claimant)`, sorted by `start_lba`.
+    pub fn dump_lbamap(&self) -> Vec<(u64, u32, blake3::Hash, u32, ulid::Ulid)> {
+        self.lbamap.iter_entries_with_claimant().collect()
+    }
+
+    /// Verify every content hash the LBA map claims: materialise each
+    /// distinct extent through the same resolution the read path uses and
+    /// BLAKE3-compare the plaintext against the claimed hash.
+    ///
+    /// Read-only. Bodies that cannot be read (evicted with no fetcher,
+    /// missing files) are reported as findings rather than aborting the
+    /// scan, so one bad extent never hides the rest.
+    pub fn verify_content(&self) -> ContentVerifyReport {
+        let mut runs_by_hash: std::collections::HashMap<blake3::Hash, Vec<(u64, u32)>> =
+            std::collections::HashMap::new();
+        for (lba, len, hash, _off) in self.lbamap.iter_entries() {
+            if hash == volume::ZERO_HASH {
+                continue;
+            }
+            runs_by_hash.entry(hash).or_default().push((lba, len));
+        }
+        let distinct_hashes = runs_by_hash.len();
+
+        let mut items: Vec<(blake3::Hash, Vec<(u64, u32)>)> = runs_by_hash.into_iter().collect();
+        for (_, runs) in items.iter_mut() {
+            runs.sort_unstable();
+        }
+        items.sort_by_key(|(_, runs)| runs.first().map(|r| r.0).unwrap_or(u64::MAX));
+
+        let mut verified = 0usize;
+        let mut findings = Vec::new();
+        for (hash, runs) in items {
+            let kind = if let Some(loc) = self.extent_index.lookup(&hash) {
+                let loc = loc.clone();
+                match self.read_extent_body_at(&loc) {
+                    Ok(bytes) => {
+                        let got = blake3::hash(&bytes);
+                        if got == hash {
+                            verified += 1;
+                            continue;
+                        }
+                        FindingKind::Mismatch {
+                            got,
+                            segment_id: loc.segment_id,
+                            inline: loc.inline_data.is_some(),
+                            body_length: loc.body_length,
+                        }
+                    }
+                    Err(e) => FindingKind::Unreadable {
+                        segment_id: loc.segment_id,
+                        error: e.to_string(),
+                    },
+                }
+            } else if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
+                let delta_loc = delta_loc.clone();
+                match self.materialise_delta_extent(&delta_loc, &hash) {
+                    Ok(_) => {
+                        verified += 1;
+                        continue;
+                    }
+                    Err(e) => FindingKind::DeltaError {
+                        segment_id: delta_loc.segment_id,
+                        error: e.to_string(),
+                    },
+                }
+            } else {
+                FindingKind::Unresolvable
+            };
+            findings.push(ContentFinding { hash, runs, kind });
+        }
+
+        ContentVerifyReport {
+            distinct_hashes,
+            verified,
+            findings,
+        }
     }
 
     /// Find the (owner_vol_id, index_dir, cache_dir) for a segment by

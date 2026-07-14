@@ -135,13 +135,14 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             EntryKind::CanonicalInline => "canon-inline",
         };
         println!(
-            "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {}",
+            "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {:<8}  {}",
             kind_str,
             format!("[{}+{})", e.start_lba, e.lba_length),
             e.stored_offset,
             e.stored_length,
             if e.compressed { "yes" } else { "no" },
             status,
+            e.hash.to_hex(),
         );
     }
 
