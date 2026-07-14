@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 arc-swap       = "1"
+libc           = "0.2"
 bitflags       = "2"
 blake3         = "1"
 chrono         = { version = "0.4", default-features = false, features = ["clock", "serde"] }

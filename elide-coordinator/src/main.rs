@@ -109,9 +109,16 @@ fn parse_humantime(s: &str) -> Result<std::time::Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration {s:?}: {e}"))
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    // Must precede runtime construction: the hook blocks SIGUSR1
+    // process-wide, and every thread spawned afterwards (including
+    // tokio workers) inherits the mask.
+    elide_core::malloc_debug::install_sigusr1_dump();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    if let Err(e) = rt.block_on(run()) {
         tracing::error!("{e:#}");
         process::exit(1);
     }

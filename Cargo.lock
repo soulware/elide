@@ -1276,6 +1276,7 @@ dependencies = [
  "ed25519-dalek",
  "ext4-view",
  "imbl",
+ "libc",
  "log",
  "lru",
  "lz4_flex",
