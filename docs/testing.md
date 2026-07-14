@@ -62,6 +62,10 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 | `Repack` | `vol.repack(0.9)` density pass on `pending/` + S3-confirmed |
 | `DrainLocal` | simulates coordinator upload: `pending/` → `index/` + `cache/` |
 | `CoordGcLocal { n }` | coordinator-style GC on S3-confirmed segments, `n` in 2–5 |
+| `GcCheckpoint` | drain, then mint GC output ULIDs (stashes them for the apply ops) |
+| `GcApply { n }` | plan + apply in one op against a stashed checkpoint |
+| `GcPlan { n }` | plan emission only — writes `gc/<ulid>.plan` without applying |
+| `GcHandoffApply` | applies staged plans; deletes a plan's inputs only if its bare output committed |
 | `Crash` | drops the `Volume` and reopens it (full rebuild) |
 | `Snapshot` | `vol.snapshot()` — sets the snapshot floor |
 | `PopulateFetched` | writes 3-file demand-fetch cache format (`.idx` + `.body` + `.present`) |
@@ -180,6 +184,7 @@ Open gaps in simulation coverage, documented so they are not forgotten:
 - **`ReadonlyVolume` proptest.** Only fixed-sequence tests exist. A proptest opening a `ReadonlyVolume` after arbitrary writes/flushes/drains/GC would explore GC-after-open (the `ReadonlyVolume` has no `apply_gc_handoffs` path, so its extent index can reference a deleted segment).
 - **Concurrent `.present` RMW.** `FetchCoalescer` serialises the read-modify-write of `<seg>.present` via a per-segment `Mutex<()>` (PR #226) — the bug was lost bits when concurrent disjoint coalescer leases on the same segment ORed against a stale on-disk image. The deterministic reproducer landed alongside #226. The single-threaded proptest cannot exercise interleavings; the appropriate vehicle is a dedicated multi-threaded test or a loom model. (The cleared-bit fall-through to the `SegmentFetcher` *is* now covered by `SimOp::EvictCacheBody` paired with `CapturedBodyFetcher`.)
 - **WAL truncated-tail recovery.** The `Crash` SimOp always drops a clean `Volume`, so `recover_wal()`'s partial-tail truncation branch is never triggered at the cross-layer level. Covered by unit tests in `writelog.rs` only.
+- **Overlapping plan apply.** The single-threaded proptest applies plans to completion inside one op, so it cannot interleave a second plan emission *while* an apply is executing on the worker thread — the shape behind the coordinator's 120s-timeout abandon in the vol3 incident (the coordinator-side guard now skips planning on an unknown apply outcome, and the volume serialises applies behind the actor, but no test drives the timeout-abandon-replan interleaving itself). The `GcPlan`/`GcHandoffApply` split covers plan *staleness* across writes and crashes; the concurrent-execution shape needs a threaded test in the style of `concurrent_test.rs`.
 
 ## Actor-layer proptest
 
