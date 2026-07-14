@@ -149,7 +149,7 @@ proptest! {
             match op {
                 ActorOp::Write { lba, seed } => {
                     let data = [*seed; 4096];
-                    if handle.write(*lba as u64, &data).is_ok() {
+                    if handle.write(*lba as u64, &data, false).is_ok() {
                         let expected = [*seed; 4096];
                         // Read-your-writes: snapshot must reflect this write
                         // immediately, before any flush to pending/.
@@ -184,7 +184,7 @@ proptest! {
                     let Ok(gc_ulids) = handle.gc_checkpoint(1) else {
                         continue;
                     };
-                    let gc_ulid = gc_ulids[0];
+                    let gc_ulid = gc_ulids.bucket_ulids[0];
                     // Simulate one coordinator GC pass (writes gc/<new>.plan).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.
@@ -387,19 +387,19 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
     // Step 1: Write{lba:7, seed:0}
-    handle.write(7, &[0u8; 4096]).unwrap();
+    handle.write(7, &[0u8; 4096], false).unwrap();
     oracle.insert(7, [0u8; 4096]);
 
     // Step 2: Flush — WAL → pending/S1 with DATA(lba:7, hash0)
     handle.flush().unwrap();
 
     // Step 3: Write{lba:0, seed:0} — same hash0 → DEDUP_REF in WAL
-    handle.write(0, &[0u8; 4096]).unwrap();
+    handle.write(0, &[0u8; 4096], false).unwrap();
     oracle.insert(0, [0u8; 4096]);
 
     // Step 4: CoordGcLocal{2} — gc_checkpoint flushes DEDUP_REF to pending/u_flush1;
     //   index/ is empty so simulate_coord_gc_local returns None (no candidates yet).
-    let gc_ulid = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -412,11 +412,11 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     common::drain_via_handle(&handle, fork_dir);
 
     // Step 6: Write{lba:1, seed:0} — same hash0 → DEDUP_REF in WAL
-    handle.write(1, &[0u8; 4096]).unwrap();
+    handle.write(1, &[0u8; 4096], false).unwrap();
     oracle.insert(1, [0u8; 4096]);
 
     // Step 7: Write{lba:7, seed:1} — new hash1 → DATA in WAL; oracle updated
-    handle.write(7, &[1u8; 4096]).unwrap();
+    handle.write(7, &[1u8; 4096], false).unwrap();
     oracle.insert(7, [1u8; 4096]);
 
     // Step 8: CoordGcLocal{2}
@@ -426,7 +426,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     //   apply_gc_handoffs materialises the plan: writes gc/u_repack2.staged,
     //   renames to bare gc/u_repack2; updates extent_index.
     //   to_delete removes index/S1.idx + index/u_flush1.idx.
-    let gc_ulid2 = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid2 = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -511,12 +511,12 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
     // Step 1: Write{lba:0, seed:0} → WAL DATA(lba:0, hash0)
-    handle.write(0, &[0u8; 4096]).unwrap();
+    handle.write(0, &[0u8; 4096], false).unwrap();
     oracle.insert(0, [0u8; 4096]);
 
     // Step 2: CoordGcLocal{2} — gc_checkpoint flushes WAL → pending/u_flush_a;
     //   index/ empty, simulate returns None; apply_gc_handoffs no-op.
-    let gc_ulid = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -526,11 +526,11 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     }
 
     // Step 3: Write{lba:1, seed:1} → WAL DATA(lba:1, hash1)
-    handle.write(1, &[1u8; 4096]).unwrap();
+    handle.write(1, &[1u8; 4096], false).unwrap();
     oracle.insert(1, [1u8; 4096]);
 
     // Step 4: Write{lba:4, seed:2} → WAL DATA(lba:4, hash2)
-    handle.write(4, &[2u8; 4096]).unwrap();
+    handle.write(4, &[2u8; 4096], false).unwrap();
     oracle.insert(4, [2u8; 4096]);
 
     // Step 5: Reclaim{start_lba:0, lba_count:1} — reclaim_alias_merge over
@@ -541,7 +541,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
 
     // Step 6: Write{lba:4, seed:0} — hash0 already indexed → WAL
     //   DEDUP_REF(lba:4, hash0).
-    handle.write(4, &[0u8; 4096]).unwrap();
+    handle.write(4, &[0u8; 4096], false).unwrap();
     oracle.insert(4, [0u8; 4096]);
 
     // Step 7: SweepPending — merges the two small pending segments into
@@ -565,7 +565,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     //   index/, so simulate_coord_gc_local returns None and this is a
     //   no-op for the bug — the corruption already happened in step 8,
     //   the proptest assertion just happens to fire here.
-    let gc_ulid2 = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid2 = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();

@@ -58,26 +58,28 @@ pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackSt
 
 /// Call gc_checkpoint on the volume process for `fork_dir`.
 ///
-/// Returns `Some(bucket_ulids)` on success — `bucket_ulids.len() ==
+/// Returns the full reply on success — `bucket_ulids.len() ==
 /// max_buckets`, with each ULID strictly ordered below the post-flush
-/// WAL ULID. The coordinator picks one per emitted plan and discards
-/// the rest. Returns `None` and logs a warning if the socket is absent
-/// (volume not running) or if the call fails for any reason.
-pub async fn gc_checkpoint(fork_dir: &Path, max_buckets: usize) -> Option<Vec<Ulid>> {
+/// WAL ULID, plus the daemon's own-segment commitment for the
+/// divergence check. The coordinator picks one bucket ULID per emitted
+/// plan and discards the rest. Returns `None` and logs a warning if
+/// the socket is absent (volume not running) or if the call fails for
+/// any reason.
+pub async fn gc_checkpoint(fork_dir: &Path, max_buckets: usize) -> Option<GcCheckpointReply> {
     let max_buckets = u32::try_from(max_buckets).unwrap_or(u32::MAX);
-    let reply: GcCheckpointReply =
-        call_typed(fork_dir, &VolumeRequest::GcCheckpoint { max_buckets }).await?;
-    Some(reply.bucket_ulids)
+    call_typed(fork_dir, &VolumeRequest::GcCheckpoint { max_buckets }).await
 }
 
 /// Apply staged GC handoffs on the volume process for `fork_dir`.
 ///
-/// Returns the number of handoffs processed.  Returns 0 if the socket is
-/// absent or the call fails (non-fatal: the next idle tick will retry).
-pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
-    let reply: Option<ApplyGcHandoffsReply> =
-        call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await;
-    reply.map(|r| r.processed as usize).unwrap_or(0)
+/// Returns `Some(n)` with the number of handoffs processed. Returns
+/// `None` if the socket is absent, the call times out, or the volume
+/// replies with an error — in the timeout and error cases the volume
+/// may still be running the apply, so the caller must treat the
+/// outcome as unknown, not as "nothing happened".
+pub async fn apply_gc_handoffs(fork_dir: &Path) -> Option<usize> {
+    let reply: ApplyGcHandoffsReply = call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await?;
+    Some(reply.processed as usize)
 }
 
 /// Sign and write a snapshot manifest plus the snapshot marker.

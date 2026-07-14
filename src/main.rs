@@ -385,6 +385,7 @@ enum ImportSubcommand {
 }
 
 fn main() {
+    elide_core::malloc_policy::pin_mmap_threshold();
     elide_core::malloc_debug::install_sigusr1_dump();
     // rustls 0.23 requires a process-level default `CryptoProvider` to be
     // installed before any TLS connection is made. Feature-flag auto-detect

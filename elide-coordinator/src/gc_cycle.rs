@@ -730,13 +730,63 @@ impl GcCycleOrchestrator {
     async fn run_gc_pass(&mut self) {
         let vol_ulid = self.vol_ulid;
         let max_buckets = self.gc_config.max_buckets_per_tick.max(1);
-        let Some(bucket_ulids) = control::gc_checkpoint(&self.fork_dir, max_buckets).await else {
+        let Some(checkpoint) = control::gc_checkpoint(&self.fork_dir, max_buckets).await else {
             return;
         };
+        let bucket_ulids = checkpoint.bucket_ulids;
 
-        let handoffs_applied = control::apply_gc_handoffs(&self.fork_dir).await;
+        // Divergence check (docs/design/read-state-divergence-check.md):
+        // the daemon's committed-tier commitment must match this
+        // coordinator's disk scan before a new plan is drawn against
+        // that disk. Compared here, before the handoff apply below,
+        // because an apply moves both views. A mismatch can be a benign
+        // race with a concurrent drain promote, so the response is to
+        // skip plan emission for this tick — staged handoffs still
+        // apply (the volume revalidates every plan at its commit
+        // point), and the next tick re-asks.
+        let diverged = match &checkpoint.own_segments {
+            None => false,
+            Some(daemon) => match own_segments_commitment_from_disk(&self.fork_dir) {
+                Ok(ref disk) if disk == daemon => false,
+                Ok(disk) => {
+                    warn!(
+                        "[gc {vol_ulid}] own-segment divergence: daemon commits \
+                         count={} xor={}, disk scan count={} xor={}; skipping \
+                         plan emission this tick",
+                        daemon.count, daemon.xor, disk.count, disk.xor
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "[gc {vol_ulid}] own-segment disk scan failed: {e}; \
+                         skipping plan emission this tick"
+                    );
+                    true
+                }
+            },
+        };
+
+        // An apply whose outcome is unknown (timeout, error reply) may
+        // still be running volume-side; emitting a plan now would race
+        // it against state the plan has not seen. Defer to a later tick,
+        // which re-asks and only plans after a confirmed apply pass.
+        let handoffs_applied = match control::apply_gc_handoffs(&self.fork_dir).await {
+            Some(n) => n,
+            None => {
+                warn!(
+                    "[gc {vol_ulid}] apply-gc-handoffs outcome unknown; \
+                     skipping plan emission this tick"
+                );
+                return;
+            }
+        };
         if handoffs_applied > 0 {
             info!("[gc {vol_ulid}] volume applied {handoffs_applied} GC handoff(s)");
+        }
+
+        if diverged {
+            return;
         }
 
         let gc_result = {
@@ -794,6 +844,18 @@ impl GcCycleOrchestrator {
             Err(e) => error!("[gc {vol_ulid}] error: {e:#}"),
         }
     }
+}
+
+/// Commitment over the committed-tier segment set as this coordinator
+/// sees it on disk, from the same `segment::committed_tier_ulids` scan
+/// that seeds the daemon's `own_segments` at open — the two sides of
+/// the divergence check share one set definition.
+fn own_segments_commitment_from_disk(
+    fork_dir: &Path,
+) -> std::io::Result<elide_core::volume_ipc::SegmentSetCommitment> {
+    Ok(elide_core::volume_ipc::SegmentSetCommitment::from_ulids(
+        elide_core::segment::committed_tier_ulids(fork_dir)?,
+    ))
 }
 
 /// Local-fs preflight: does this fork hold work a previous run left

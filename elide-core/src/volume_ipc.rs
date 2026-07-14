@@ -82,6 +82,39 @@ pub struct DeltaRepackReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcCheckpointReply {
     pub bucket_ulids: Vec<Ulid>,
+    /// Commitment to the daemon's committed-tier own-segment set at
+    /// checkpoint time, for the coordinator's divergence check
+    /// (`docs/design/read-state-divergence-check.md`). `None` when the
+    /// daemon predates the field (tolerant schema for rolling
+    /// upgrades); the coordinator then plans without the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_segments: Option<SegmentSetCommitment>,
+}
+
+/// Order-independent commitment to a set of segment ULIDs: entry
+/// count plus the XOR of the 128-bit ULID values, hex-encoded. Equal
+/// commitments mean equal sets for divergence-detection purposes —
+/// any single missing or extra segment changes `xor`, and count
+/// disambiguates the empty set from self-cancelling pairs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentSetCommitment {
+    pub count: u64,
+    pub xor: String,
+}
+
+impl SegmentSetCommitment {
+    pub fn from_ulids<I: IntoIterator<Item = Ulid>>(ulids: I) -> Self {
+        let mut count = 0u64;
+        let mut xor = 0u128;
+        for u in ulids {
+            count += 1;
+            xor ^= u.0;
+        }
+        Self {
+            count,
+            xor: format!("{xor:032x}"),
+        }
+    }
 }
 
 fn default_max_buckets() -> u32 {
@@ -115,4 +148,49 @@ pub struct ReclaimReply {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConnectedReply {
     pub connected: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_set_commitment_is_order_independent() {
+        let a = Ulid::from_parts(1, 11);
+        let b = Ulid::from_parts(2, 22);
+        let c = Ulid::from_parts(3, 33);
+        assert_eq!(
+            SegmentSetCommitment::from_ulids([a, b, c]),
+            SegmentSetCommitment::from_ulids([c, a, b]),
+        );
+    }
+
+    #[test]
+    fn segment_set_commitment_detects_a_missing_member() {
+        let a = Ulid::from_parts(1, 11);
+        let b = Ulid::from_parts(2, 22);
+        let full = SegmentSetCommitment::from_ulids([a, b]);
+        let partial = SegmentSetCommitment::from_ulids([a]);
+        assert_ne!(full, partial);
+        assert_eq!(SegmentSetCommitment::from_ulids([]).count, 0);
+    }
+
+    #[test]
+    fn gc_checkpoint_reply_parses_without_commitment_field() {
+        // A reply from a daemon that predates the field must still parse.
+        let reply: GcCheckpointReply = serde_json::from_str(r#"{"bucket_ulids":[]}"#).unwrap();
+        assert!(reply.own_segments.is_none());
+    }
+
+    #[test]
+    fn gc_checkpoint_reply_commitment_round_trips() {
+        let reply = GcCheckpointReply {
+            bucket_ulids: vec![Ulid::from_parts(4, 44)],
+            own_segments: Some(SegmentSetCommitment::from_ulids([Ulid::from_parts(5, 55)])),
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        let parsed: GcCheckpointReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.own_segments, reply.own_segments);
+        assert_eq!(parsed.bucket_ulids, reply.bucket_ulids);
+    }
 }

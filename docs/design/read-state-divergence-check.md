@@ -103,6 +103,38 @@ single-writer rule. The rejected plan's inputs are never marked
 `Superseded` in HEAD, so the reaper cannot delete the unseen
 segments' bytes regardless of how long the condition persists.
 
+## The tick-cadence commitment check
+
+The commit-point check validates only the segments a plan consumes; a
+divergence involving a segment outside the plan's inputs — for
+example an on-disk DedupRef claimant the daemon never loaded — passes
+it. The second direction runs at tick cadence and compares whole
+sets: the `gc_checkpoint` reply carries a commitment to the daemon's
+`own_segments` set (`SegmentSetCommitment`: entry count plus the XOR
+of the 128-bit ULIDs, hex-encoded), and the coordinator compares it
+against its own disk scan before emitting any plan.
+
+Both sides derive from one set definition,
+`segment::committed_tier_ulids` (`index/*.idx` stems ∪ bare `gc/`
+outputs) — the same scan that seeds `own_segments` at open — so the
+comparison cannot drift by construction. The daemon computes the
+commitment under the volume lock when the checkpoint reply is built;
+the coordinator scans the fork directory immediately after the reply
+and before the handoff apply, since an apply moves both views
+together.
+
+On mismatch the coordinator logs both commitments at WARN and skips
+plan emission for the tick. Staged handoffs still apply — the volume
+revalidates every plan at its commit point. A mismatch can be a
+benign race (the drain lane can promote a segment between the reply
+and the scan), so a skipped tick, retried at the next cadence, is the
+whole response; persistent divergence presents as GC standstill with
+a recurring warning, never as a plan drawn against unseen state.
+
+The reply field is tolerant-schema (`Option` + `serde(default)`): a
+daemon that predates the field replies without it and the coordinator
+plans without the check, so rolling upgrades hold in both directions.
+
 ## Testing
 
 - `gc_plan_with_unknown_input_diverges_and_reopen_recovers`: a
@@ -118,15 +150,13 @@ segments' bytes regardless of how long the condition persists.
   synchronous lifecycle, rather than in the runtime invariants
   umbrella — the worker protocol makes disk transiently lead the set
   mid-promote, so runtime equality would false-panic.
+- `own_segments_commitment_matches_disk_scan_through_lifecycle`: the
+  daemon-side commitment equals the coordinator-side disk-scan
+  commitment at every settled point of the same lifecycle.
+- `volume_ipc` tests cover commitment order-independence,
+  missing-member sensitivity, and reply parsing without the field.
 
 ## Open questions
 
 - Should the fail-stop also emit an `events/<name>` journal entry so
   the divergence is recorded bucket-side, not only in host logs?
-- A second direction at tick cadence: the `gc_checkpoint` reply could
-  carry a commitment (count + XOR of ULIDs) of the daemon's set for
-  the coordinator to compare against its disk scan each tick,
-  catching disk-behind-daemon divergence too. Needs a
-  tolerant-schema `volume_ipc` addition (rolling upgrades keep old
-  daemons under new coordinators), so it is deliberately not part of
-  the first cut.

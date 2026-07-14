@@ -110,6 +110,7 @@ fn parse_humantime(s: &str) -> Result<std::time::Duration, String> {
 }
 
 fn main() {
+    elide_core::malloc_policy::pin_mmap_threshold();
     // Must precede runtime construction: the hook blocks SIGUSR1
     // process-wide, and every thread spawned afterwards (including
     // tokio workers) inherits the mask.
