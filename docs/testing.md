@@ -184,7 +184,6 @@ Open gaps in simulation coverage, documented so they are not forgotten:
 - **`ReadonlyVolume` proptest.** Only fixed-sequence tests exist. A proptest opening a `ReadonlyVolume` after arbitrary writes/flushes/drains/GC would explore GC-after-open (the `ReadonlyVolume` has no `apply_gc_handoffs` path, so its extent index can reference a deleted segment).
 - **Concurrent `.present` RMW.** `FetchCoalescer` serialises the read-modify-write of `<seg>.present` via a per-segment `Mutex<()>` (PR #226) — the bug was lost bits when concurrent disjoint coalescer leases on the same segment ORed against a stale on-disk image. The deterministic reproducer landed alongside #226. The single-threaded proptest cannot exercise interleavings; the appropriate vehicle is a dedicated multi-threaded test or a loom model. (The cleared-bit fall-through to the `SegmentFetcher` *is* now covered by `SimOp::EvictCacheBody` paired with `CapturedBodyFetcher`.)
 - **WAL truncated-tail recovery.** The `Crash` SimOp always drops a clean `Volume`, so `recover_wal()`'s partial-tail truncation branch is never triggered at the cross-layer level. Covered by unit tests in `writelog.rs` only.
-- **Overlapping plan apply.** The single-threaded proptest applies plans to completion inside one op, so it cannot interleave a second plan emission *while* an apply is executing on the worker thread — the shape behind the coordinator's 120s-timeout abandon in the vol3 incident (the coordinator-side guard now skips planning on an unknown apply outcome, and the volume serialises applies behind the actor, but no test drives the timeout-abandon-replan interleaving itself). The `GcPlan`/`GcHandoffApply` split covers plan *staleness* across writes and crashes; the concurrent-execution shape needs a threaded test in the style of `concurrent_test.rs`.
 
 ## Actor-layer proptest
 
@@ -225,6 +224,8 @@ Key additions over the volume-level proptest:
 **The invariant:** the coordinator must not delete old local segment files until the volume has renamed `gc/<ulid>.staged` to bare `gc/<ulid>` (the atomic commit point of the self-describing handoff). The bare file's appearance is the volume's signal that its extent index now points at the new segment, and the bare file itself is what the coordinator's `apply_done_handoffs` walks.
 
 The test seeds two segments, then runs a reader thread (500 read-all iterations) concurrently with a coordinator thread running one GC pass, asserting the reader's error list stays empty. The failure mode was confirmed by running once with inline deletion (before handoff apply), which reproduced `segment not found` for cold LBAs; the fix — returning paths for deferred deletion — made it pass.
+
+`plan_emitted_during_inflight_apply_is_safe` drives the coordinator's timeout-abandon-replan sequence for real: a gated `SegmentFetcher` parks a handoff apply mid-materialise on the worker thread while the test retries the apply, checkpoints, and emits a second plan over the same inputs. Pinned properties: the concurrent apply is rejected with "already in progress" rather than interleaved; the checkpoint reply served mid-apply carries an own-segment commitment matching the disk scan (applies commit atomically on the actor); and after both plans are processed, every LBA reads its oracle value live and across a reopen.
 
 ## Formal model: TLA+ specs
 
