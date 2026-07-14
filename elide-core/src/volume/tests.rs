@@ -3219,3 +3219,47 @@ fn invariant_catches_stale_location_at_deleted_segment() {
 
     vol.assert_volume_invariants("stale_location_test");
 }
+
+#[test]
+fn own_segments_commitment_matches_disk_scan_through_lifecycle() {
+    // Both sides of the gc-tick divergence check derive from the same
+    // committed-tier definition: the daemon's live set must produce the
+    // same commitment as a `committed_tier_ulids` disk scan at every
+    // settled lifecycle point.
+    let base = keyed_temp_dir();
+    let scan = |base: &std::path::Path| {
+        crate::volume_ipc::SegmentSetCommitment::from_ulids(
+            segment::committed_tier_ulids(base).unwrap(),
+        )
+    };
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.own_segments_commitment(), scan(&base));
+    assert_eq!(vol.own_segments_commitment().count, 0);
+
+    let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    assert_eq!(
+        vol.own_segments_commitment(),
+        scan(&base),
+        "pending tier is outside the commitment on both sides"
+    );
+
+    simulate_upload(&mut vol);
+    assert_eq!(vol.own_segments_commitment(), scan(&base));
+    assert_eq!(vol.own_segments_commitment().count, 1);
+    let old_ulid = *vol.own_segments.iter().next().unwrap();
+
+    let new_ulid_str = simulate_coord_gc_staged(&mut vol, &base, &old_ulid.to_string());
+    let new_ulid = Ulid::from_string(&new_ulid_str).unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    assert_eq!(vol.own_segments_commitment(), scan(&base));
+
+    vol.promote_segment(new_ulid).unwrap();
+    assert_eq!(vol.own_segments_commitment(), scan(&base));
+
+    vol.finalize_gc_handoff(new_ulid).unwrap();
+    assert_eq!(vol.own_segments_commitment(), scan(&base));
+
+    fs::remove_dir_all(base).unwrap();
+}

@@ -2330,6 +2330,34 @@ pub fn collect_idx_files(index_dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
+/// ULIDs of the committed-tier own layer: `index/*.idx` stems plus
+/// bare `gc/` outputs. The set `Volume::open` seeds `own_segments`
+/// from, and both sides of the gc-tick divergence check
+/// (`docs/design/read-state-divergence-check.md`) derive their
+/// commitments from this definition.
+pub fn committed_tier_ulids(base_dir: &Path) -> io::Result<std::collections::BTreeSet<ulid::Ulid>> {
+    let mut set = std::collections::BTreeSet::new();
+    for p in collect_idx_files(&base_dir.join("index"))? {
+        if let Some(ulid) = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        {
+            set.insert(ulid);
+        }
+    }
+    for p in collect_gc_applied_segment_files(base_dir)? {
+        if let Some(ulid) = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| ulid::Ulid::from_string(s).ok())
+        {
+            set.insert(ulid);
+        }
+    }
+    Ok(set)
+}
+
 // --- .present bitset helpers ---
 
 /// Read `entry_count` from the 96-byte header of a segment or `.idx` file.

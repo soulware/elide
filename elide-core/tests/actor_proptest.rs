@@ -184,7 +184,7 @@ proptest! {
                     let Ok(gc_ulids) = handle.gc_checkpoint(1) else {
                         continue;
                     };
-                    let gc_ulid = gc_ulids[0];
+                    let gc_ulid = gc_ulids.bucket_ulids[0];
                     // Simulate one coordinator GC pass (writes gc/<new>.plan).
                     // Returns paths to delete — we hold them until after the
                     // handoff is applied, matching the real coordinator's ordering.
@@ -399,7 +399,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
 
     // Step 4: CoordGcLocal{2} — gc_checkpoint flushes DEDUP_REF to pending/u_flush1;
     //   index/ is empty so simulate_coord_gc_local returns None (no candidates yet).
-    let gc_ulid = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -426,7 +426,7 @@ fn lbamap_rebuild_gc_applied_lower_priority_than_index() {
     //   apply_gc_handoffs materialises the plan: writes gc/u_repack2.staged,
     //   renames to bare gc/u_repack2; updates extent_index.
     //   to_delete removes index/S1.idx + index/u_flush1.idx.
-    let gc_ulid2 = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid2 = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -516,7 +516,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
 
     // Step 2: CoordGcLocal{2} — gc_checkpoint flushes WAL → pending/u_flush_a;
     //   index/ empty, simulate returns None; apply_gc_handoffs no-op.
-    let gc_ulid = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
@@ -565,7 +565,7 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     //   index/, so simulate_coord_gc_local returns None and this is a
     //   no-op for the bug — the corruption already happened in step 8,
     //   the proptest assertion just happens to fire here.
-    let gc_ulid2 = handle.gc_checkpoint(1).unwrap()[0];
+    let gc_ulid2 = handle.gc_checkpoint(1).unwrap().bucket_ulids[0];
     let to_delete2 = common::simulate_coord_gc_local(fork_dir, gc_ulid2, 2)
         .map(|(_, _, paths)| paths)
         .unwrap_or_default();
