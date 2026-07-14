@@ -600,6 +600,12 @@ impl BlockReader {
         self.read_extent_body_at(&loc)
     }
 
+    /// Dump every LBA-map entry as `(start_lba, lba_length, hash,
+    /// payload_block_offset, claimant)`, sorted by `start_lba`.
+    pub fn dump_lbamap(&self) -> Vec<(u64, u32, blake3::Hash, u32, ulid::Ulid)> {
+        self.lbamap.iter_entries_with_claimant().collect()
+    }
+
     /// Verify every content hash the LBA map claims: materialise each
     /// distinct extent through the same resolution the read path uses and
     /// BLAKE3-compare the plaintext against the claimed hash.

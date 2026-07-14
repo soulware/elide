@@ -96,6 +96,10 @@ enum Command {
     #[command(hide = true)]
     VerifyContent { fork_dir: PathBuf },
 
+    /// Print the rebuilt LBA map: lba, length, hash, payload_block_offset
+    #[command(hide = true)]
+    DumpLbamap { fork_dir: PathBuf },
+
     /// Print all records in a WAL file (diagnostic)
     #[command(hide = true)]
     InspectWal { path: PathBuf },
@@ -995,6 +999,15 @@ fn main() {
 
         Command::InspectSegment { path } => {
             inspect_files::inspect_segment(&path).expect("inspect-segment failed");
+        }
+
+        Command::DumpLbamap { fork_dir } => {
+            let reader =
+                elide_core::block_reader::BlockReader::open_live(&fork_dir, Box::new(|_dirs| None))
+                    .expect("open_live failed");
+            for (lba, len, hash, off, claimant) in reader.dump_lbamap() {
+                println!("{lba} {len} {} {off} {claimant}", hash.to_hex());
+            }
         }
 
         Command::VerifyContent { fork_dir } => {
