@@ -220,6 +220,7 @@ mod imp {
     const UBLK_IO_OP_FLUSH: u32 = libublk::sys::UBLK_IO_OP_FLUSH;
     const UBLK_IO_OP_DISCARD: u32 = libublk::sys::UBLK_IO_OP_DISCARD;
     const UBLK_IO_OP_WRITE_ZEROES: u32 = libublk::sys::UBLK_IO_OP_WRITE_ZEROES;
+    const UBLK_IO_F_FUA: u32 = libublk::sys::UBLK_IO_F_FUA;
 
     /// Startup decision: what the serve should do given the persisted
     /// volume↔device binding and whether a live kernel device exists at
@@ -840,12 +841,18 @@ mod imp {
 
     /// Populate device params so the kernel issues only 4K-aligned I/O and
     /// advertises DISCARD / WRITE_ZEROES support to the blk-mq layer.
+    ///
+    /// `VOLATILE_CACHE | FUA` declares a volatile write cache: completed
+    /// writes are durable only after a FLUSH (or when FUA-flagged), so the
+    /// block layer delivers FLUSH ops and passes REQ_FUA through instead of
+    /// stripping both as it does for a write-through device.
     fn set_params(dev: &mut UblkDev, size_bytes: u64) {
         let tgt = &mut dev.tgt;
         tgt.dev_size = size_bytes;
         tgt.params = libublk::sys::ublk_params {
             types: libublk::sys::UBLK_PARAM_TYPE_BASIC | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
             basic: libublk::sys::ublk_param_basic {
+                attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE | libublk::sys::UBLK_ATTR_FUA,
                 logical_bs_shift: LOGICAL_BS_SHIFT,
                 physical_bs_shift: PHYSICAL_BS_SHIFT,
                 io_opt_shift: IO_OPT_SHIFT,
@@ -877,6 +884,7 @@ mod imp {
     /// rather than a pointer type so `Job` is trivially `Send`.
     struct Job {
         op: u32,
+        fua: bool,
         off: u64,
         bytes: u64,
         buf_ptr: usize,
@@ -979,6 +987,7 @@ mod imp {
         loop {
             let iod = *q.get_iod(tag);
             let op = iod.op_flags & 0xff;
+            let fua = iod.op_flags & UBLK_IO_F_FUA != 0;
             let off = iod.start_sector << 9;
             let bytes: u64 = (iod.nr_sectors as u64) << 9;
 
@@ -988,6 +997,7 @@ mod imp {
                 result.store(0, Ordering::Relaxed);
                 let job = Job {
                     op,
+                    fua,
                     off,
                     bytes,
                     buf_ptr: buf_slice.as_ptr() as usize,
@@ -1040,11 +1050,12 @@ mod imp {
             let slice: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(job.buf_ptr as *mut u8, job.buf_len) };
             let res = if !op_carries_payload(job.op) {
-                dispatch(&reader, job.op, job.off, job.bytes, &mut [])
+                dispatch(&reader, job.op, job.fua, job.off, job.bytes, &mut [])
             } else if (job.bytes as usize) <= slice.len() {
                 dispatch(
                     &reader,
                     job.op,
+                    job.fua,
                     job.off,
                     job.bytes,
                     &mut slice[..job.bytes as usize],
@@ -1101,7 +1112,27 @@ mod imp {
     /// Translate one ublk I/O into a `VolumeReader` / `VolumeClient` call.
     /// Returns the kernel completion status: bytes on success, negative errno
     /// on failure.
-    fn dispatch(reader: &VolumeReader, op: u32, offset: u64, length: u64, buf: &mut [u8]) -> i32 {
+    fn dispatch(
+        reader: &VolumeReader,
+        op: u32,
+        fua: bool,
+        offset: u64,
+        length: u64,
+        buf: &mut [u8],
+    ) -> i32 {
+        // FLUSH carries no position: the kernel's flush machinery reuses a
+        // shared flush request whose start_sector is stale garbage, so it
+        // must not reach the alignment asserts below.
+        if op == UBLK_IO_OP_FLUSH {
+            return match reader.flush() {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!("[ublk flush error: {e}]");
+                    -libc::EIO
+                }
+            };
+        }
+
         // ublk SET_PARAMS pinned logical_bs_shift=12, so offset and length
         // are always 4K-aligned — no RMW path needed.
         debug_assert!(offset.is_multiple_of(BLOCK));
@@ -1125,7 +1156,7 @@ mod imp {
                 // Direct write path: ublk thread acquires the volume mutex and
                 // appends to the WAL on this thread.  The kernel I/O buffer is
                 // passed by reference — no per-write allocation.
-                match reader.write(start_lba, &buf[..length as usize]) {
+                match reader.write(start_lba, &buf[..length as usize], fua) {
                     Ok(()) => length as i32,
                     Err(e) => {
                         tracing::error!("[ublk write error offset={offset} len={length}: {e}]");
@@ -1133,23 +1164,16 @@ mod imp {
                     }
                 }
             }
-            UBLK_IO_OP_FLUSH => match reader.flush() {
-                Ok(()) => 0,
-                Err(e) => {
-                    tracing::error!("[ublk flush error: {e}]");
-                    -libc::EIO
-                }
-            },
             // DISCARD / WRITE_ZEROES report 0 on success: a 10 GiB discard
             // doesn't fit i32 if we returned the byte count.
-            UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count) {
+            UBLK_IO_OP_DISCARD => match reader.trim(start_lba, lba_count, fua) {
                 Ok(()) => 0,
                 Err(e) => {
                     tracing::error!("[ublk discard error offset={offset} len={length}: {e}]");
                     -libc::EIO
                 }
             },
-            UBLK_IO_OP_WRITE_ZEROES => match reader.write_zeroes(start_lba, lba_count) {
+            UBLK_IO_OP_WRITE_ZEROES => match reader.write_zeroes(start_lba, lba_count, fua) {
                 Ok(()) => 0,
                 Err(e) => {
                     tracing::error!("[ublk write-zeroes error offset={offset} len={length}: {e}]");
@@ -1591,7 +1615,7 @@ mod imp {
         fn dispatch_unwritten_read_returns_zeros() {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0xabu8; BLOCK as usize];
-            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut buf);
+            let res = dispatch(&reader, UBLK_IO_OP_READ, false, 0, BLOCK, &mut buf);
             assert_eq!(res, BLOCK as i32);
             assert!(buf.iter().all(|&b| b == 0));
             drop(reader);
@@ -1604,11 +1628,11 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let data: Vec<u8> = (0..BLOCK as u16).map(|i| (i & 0xff) as u8).collect();
             let mut wbuf = data.clone();
-            let res = dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE, false, 0, BLOCK, &mut wbuf);
             assert_eq!(res, BLOCK as i32);
 
             let mut rbuf = vec![0u8; BLOCK as usize];
-            let res = dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_READ, false, 0, BLOCK, &mut rbuf);
             assert_eq!(res, BLOCK as i32);
             assert_eq!(rbuf, data);
 
@@ -1618,10 +1642,31 @@ mod imp {
         }
 
         #[test]
-        fn dispatch_flush_returns_zero() {
+        fn dispatch_fua_write_then_read_roundtrip() {
+            let (dir, client, reader) = spawn_volume();
+            let data: Vec<u8> = (0..BLOCK as u16).map(|i| (i & 0xff) as u8).collect();
+            let mut wbuf = data.clone();
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE, true, 0, BLOCK, &mut wbuf);
+            assert_eq!(res, BLOCK as i32);
+
+            let mut rbuf = vec![0u8; BLOCK as usize];
+            let res = dispatch(&reader, UBLK_IO_OP_READ, false, 0, BLOCK, &mut rbuf);
+            assert_eq!(res, BLOCK as i32);
+            assert_eq!(rbuf, data);
+
+            drop(reader);
+            client.shutdown();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// The kernel's shared flush request carries a stale, arbitrary
+        /// start_sector — a 4K-unaligned position must not trip the data-op
+        /// alignment asserts. Reproduces the 2026-07-14 CI worker panic.
+        #[test]
+        fn dispatch_flush_ignores_unaligned_position() {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_FLUSH, 0, 0, &mut buf);
+            let res = dispatch(&reader, UBLK_IO_OP_FLUSH, false, 4608, 0, &mut buf);
             assert_eq!(res, 0);
             drop(reader);
             client.shutdown();
@@ -1633,17 +1678,17 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut wbuf = vec![0xcdu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf),
+                dispatch(&reader, UBLK_IO_OP_WRITE, false, 0, BLOCK, &mut wbuf),
                 BLOCK as i32
             );
 
             let mut dbuf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, BLOCK, &mut dbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, false, 0, BLOCK, &mut dbuf);
             assert_eq!(res, 0);
 
             let mut rbuf = vec![0xffu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf),
+                dispatch(&reader, UBLK_IO_OP_READ, false, 0, BLOCK, &mut rbuf),
                 BLOCK as i32
             );
             assert!(rbuf.iter().all(|&b| b == 0));
@@ -1658,17 +1703,17 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut wbuf = vec![0xcdu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_WRITE, 0, BLOCK, &mut wbuf),
+                dispatch(&reader, UBLK_IO_OP_WRITE, false, 0, BLOCK, &mut wbuf),
                 BLOCK as i32
             );
 
             let mut zbuf = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK, &mut zbuf);
+            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, false, 0, BLOCK, &mut zbuf);
             assert_eq!(res, 0);
 
             let mut rbuf = vec![0xffu8; BLOCK as usize];
             assert_eq!(
-                dispatch(&reader, UBLK_IO_OP_READ, 0, BLOCK, &mut rbuf),
+                dispatch(&reader, UBLK_IO_OP_READ, false, 0, BLOCK, &mut rbuf),
                 BLOCK as i32
             );
             assert!(rbuf.iter().all(|&b| b == 0));
@@ -1688,10 +1733,17 @@ mod imp {
             assert!(bytes > u32::MAX as u64);
 
             let mut empty = [0u8; 0];
-            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, 0, bytes, &mut empty);
+            let res = dispatch(&reader, UBLK_IO_OP_DISCARD, false, 0, bytes, &mut empty);
             assert_eq!(res, 0);
 
-            let res = dispatch(&reader, UBLK_IO_OP_WRITE_ZEROES, 0, bytes, &mut empty);
+            let res = dispatch(
+                &reader,
+                UBLK_IO_OP_WRITE_ZEROES,
+                false,
+                0,
+                bytes,
+                &mut empty,
+            );
             assert_eq!(res, 0);
 
             drop(reader);
@@ -1704,7 +1756,7 @@ mod imp {
             let (dir, client, reader) = spawn_volume();
             let mut buf = [0u8; BLOCK as usize];
             // 0xff is not any of the UBLK_IO_OP_* values we handle.
-            let res = dispatch(&reader, 0xff, 0, BLOCK, &mut buf);
+            let res = dispatch(&reader, 0xff, false, 0, BLOCK, &mut buf);
             assert_eq!(res, -libc::EINVAL);
             drop(reader);
             client.shutdown();

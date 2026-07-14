@@ -318,8 +318,8 @@ fn evict_reopen_demand_fetch_via_actor() {
         let (actor, handle) = elide_core::actor::spawn(vol);
         let actor_thread = std::thread::spawn(move || actor.run());
 
-        handle.write(0, &block_a).unwrap();
-        handle.write(1, &block_b).unwrap();
+        handle.write(0, &block_a, false).unwrap();
+        handle.write(1, &block_b, false).unwrap();
         handle.promote_wal().unwrap();
 
         // Copy pending segments to store before drain deletes them.

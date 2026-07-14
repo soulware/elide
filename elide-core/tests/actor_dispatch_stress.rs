@@ -67,7 +67,7 @@ fn actor_survives_dispatch_flood() {
                 let lba = w * 4096 + (i % 512) * 4;
                 for b in 0..4u64 {
                     let block = incompressible_block(w * 1_000_003 + i * 7 + b);
-                    let _ = h.write(lba + b, &block);
+                    let _ = h.write(lba + b, &block, false);
                 }
                 if i % 32 == 0 {
                     let _ = h.flush();
