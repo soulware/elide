@@ -91,6 +91,11 @@ enum Command {
     #[command(hide = true)]
     InspectSegment { path: PathBuf },
 
+    /// Materialise every lbamap-referenced extent through the read path and
+    /// check it hashes to the claimed hash (diagnostic)
+    #[command(hide = true)]
+    VerifyContent { fork_dir: PathBuf },
+
     /// Print all records in a WAL file (diagnostic)
     #[command(hide = true)]
     InspectWal { path: PathBuf },
@@ -990,6 +995,49 @@ fn main() {
 
         Command::InspectSegment { path } => {
             inspect_files::inspect_segment(&path).expect("inspect-segment failed");
+        }
+
+        Command::VerifyContent { fork_dir } => {
+            let reader =
+                elide_core::block_reader::BlockReader::open_live(&fork_dir, Box::new(|_dirs| None))
+                    .expect("open_live failed");
+            let report = reader.verify_content();
+            println!(
+                "{} distinct hash(es): {} verified, {} finding(s)",
+                report.distinct_hashes,
+                report.verified,
+                report.findings.len()
+            );
+            for f in &report.findings {
+                use elide_core::block_reader::FindingKind;
+                let runs: Vec<String> = f
+                    .runs
+                    .iter()
+                    .map(|(lba, len)| format!("[{lba}+{len})"))
+                    .collect();
+                let detail = match &f.kind {
+                    FindingKind::Mismatch {
+                        got,
+                        segment_id,
+                        inline,
+                        body_length,
+                    } => format!(
+                        "MISMATCH got={} segment={segment_id} inline={inline} body_length={body_length}",
+                        got.to_hex()
+                    ),
+                    FindingKind::DeltaError { segment_id, error } => {
+                        format!("DELTA-ERROR segment={segment_id}: {error}")
+                    }
+                    FindingKind::Unresolvable => "UNRESOLVABLE (in lbamap, in no index)".to_owned(),
+                    FindingKind::Unreadable { segment_id, error } => {
+                        format!("UNREADABLE segment={segment_id}: {error}")
+                    }
+                };
+                println!("{} lbas={} {detail}", f.hash.to_hex(), runs.join(","));
+            }
+            if !report.findings.is_empty() {
+                std::process::exit(1);
+            }
         }
 
         Command::InspectWal { path } => {
