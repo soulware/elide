@@ -24,6 +24,7 @@ pub fn install_sigusr1_dump() {
         let _ = std::thread::Builder::new()
             .name("malloc-info".into())
             .spawn(move || {
+                set_io_flusher();
                 let mut sig: libc::c_int = 0;
                 loop {
                     if libc::sigwait(&set, &mut sig) != 0 {
@@ -34,6 +35,24 @@ pub fn install_sigusr1_dump() {
             });
     }
 }
+
+/// Mark this thread an IO_FLUSHER. `malloc_info` holds arena locks
+/// while streaming the dump, so a buffered write parked in
+/// `balance_dirty_pages` against the global dirty pool (which can
+/// include a ublk device only this process drains) would deadlock any
+/// thread calling malloc. Best-effort: requires `CAP_SYS_RESOURCE`.
+#[cfg(all(unix, target_env = "gnu", target_os = "linux"))]
+fn set_io_flusher() {
+    // From `include/uapi/linux/prctl.h`; the libc crate exports this
+    // constant only for Android.
+    const PR_SET_IO_FLUSHER: libc::c_int = 57;
+    // SAFETY: PR_SET_IO_FLUSHER only sets flags on the calling task;
+    // no pointers are passed.
+    unsafe { libc::prctl(PR_SET_IO_FLUSHER, 1u64, 0u64, 0u64, 0u64) };
+}
+
+#[cfg(all(unix, target_env = "gnu", not(target_os = "linux")))]
+fn set_io_flusher() {}
 
 #[cfg(all(unix, target_env = "gnu"))]
 fn dump() {
