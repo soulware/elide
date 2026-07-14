@@ -509,37 +509,17 @@ impl Volume {
                 last_segment_ulid = Some(ulid);
             }
         }
-        // Collect index/*.idx ULIDs (uploaded segments; file stem is the ULID).
-        // These and the bare gc/ outputs below form the committed-tier
-        // `own_segments` set the divergence check compares GC plan inputs
-        // against.
-        let mut own_segments = std::collections::BTreeSet::new();
-        for p in segment::collect_idx_files(&base_dir.join("index"))? {
-            if let Some(ulid) = p
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .and_then(|s| Ulid::from_string(s).ok())
-            {
-                own_segments.insert(ulid);
-                if last_segment_ulid < Some(ulid) {
-                    last_segment_ulid = Some(ulid);
-                }
-            }
-        }
-        // A volume-applied GC output (bare `gc/<ulid>`) carries a ULID
-        // minted by the volume's own `UlidMint` via `gc_checkpoint` —
-        // include it so the mint floor advances past it on restart.
-        for p in segment::collect_gc_applied_segment_files(base_dir)? {
-            if let Some(ulid) = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|s| Ulid::from_string(s).ok())
-            {
-                own_segments.insert(ulid);
-                if last_segment_ulid < Some(ulid) {
-                    last_segment_ulid = Some(ulid);
-                }
-            }
+        // The committed-tier `own_segments` set (index/*.idx ULIDs plus
+        // volume-applied bare gc/ outputs) that the divergence check
+        // compares GC plan inputs against. Every member also advances
+        // the mint floor: a bare gc/ output carries a ULID minted by the
+        // volume's own `UlidMint` via `gc_checkpoint`, so the floor must
+        // pass it on restart.
+        let own_segments = segment::committed_tier_ulids(base_dir)?;
+        if let Some(&max_ulid) = own_segments.last()
+            && last_segment_ulid < Some(max_ulid)
+        {
+            last_segment_ulid = Some(max_ulid);
         }
 
         // Compute the mint floor: max of the highest segment ULID and the
@@ -2681,6 +2661,13 @@ impl Volume {
             u_flush,
             job: Some(self.take_wal_into_promote_job(u_flush)?),
         })
+    }
+
+    /// Commitment to the current committed-tier `own_segments` set,
+    /// carried in the `gc_checkpoint` reply for the coordinator's
+    /// divergence check.
+    pub fn own_segments_commitment(&self) -> crate::volume_ipc::SegmentSetCommitment {
+        crate::volume_ipc::SegmentSetCommitment::from_ulids(self.own_segments.iter().copied())
     }
 }
 

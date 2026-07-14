@@ -161,9 +161,8 @@ fn dispatch(
         },
         VolumeRequest::GcCheckpoint { max_buckets } => {
             match handle.gc_checkpoint(max_buckets as usize) {
-                Ok(bucket_ulids) => {
-                    let _ =
-                        write_envelope(writer, &Envelope::ok(GcCheckpointReply { bucket_ulids }));
+                Ok(reply) => {
+                    let _ = write_envelope(writer, &Envelope::ok(reply));
                 }
                 Err(e) => {
                     let _ = write_envelope::<GcCheckpointReply>(

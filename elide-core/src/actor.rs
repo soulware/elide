@@ -133,7 +133,7 @@ pub(crate) enum VolumeRequest {
         /// discarded. Mint is a free `u128` counter so over-reserving
         /// has no cost.
         max_buckets: usize,
-        reply: Sender<io::Result<Vec<Ulid>>>,
+        reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
     },
     Promote {
         ulid: Ulid,
@@ -325,7 +325,7 @@ struct ParkedPromoteSegment {
 struct ParkedGcCheckpoint {
     u_buckets: Vec<Ulid>,
     u_flush: Ulid,
-    reply: Sender<io::Result<Vec<Ulid>>>,
+    reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
 }
 
 /// State for an in-progress batch of GC plan handoff applications.
@@ -570,7 +570,11 @@ impl VolumeActor {
     /// immediately.  The reply is parked until `PromoteComplete` for
     /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
     /// the coordinator runs `gc_fork`.
-    fn start_gc_checkpoint(&mut self, max_buckets: usize, reply: Sender<io::Result<Vec<Ulid>>>) {
+    fn start_gc_checkpoint(
+        &mut self,
+        max_buckets: usize,
+        reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
+    ) {
         let prep = match self.lock_volume().prepare_gc_checkpoint(max_buckets) {
             Ok(prep) => prep,
             Err(e) => {
@@ -606,7 +610,11 @@ impl VolumeActor {
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
-            let _ = reply.send(Ok(u_buckets));
+            let own_segments = Some(self.lock_volume().own_segments_commitment());
+            let _ = reply.send(Ok(crate::volume_ipc::GcCheckpointReply {
+                bucket_ulids: u_buckets,
+                own_segments,
+            }));
         }
     }
 
@@ -888,7 +896,11 @@ impl VolumeActor {
                 // Complete any parked operations waiting for this ULID.
                 // GC checkpoint.
                 if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
-                    let _ = parked.reply.send(Ok(parked.u_buckets));
+                    let own_segments = Some(self.lock_volume().own_segments_commitment());
+                    let _ = parked.reply.send(Ok(crate::volume_ipc::GcCheckpointReply {
+                        bucket_ulids: parked.u_buckets,
+                        own_segments,
+                    }));
                 }
                 // PromoteWal callers.
                 let mut i = 0;
@@ -1565,7 +1577,10 @@ impl VolumeClient {
     /// The coordinator picks at most `max_buckets` of the returned ULIDs
     /// for the plans it emits this tick; unused ULIDs are simply
     /// discarded (the volume's mint advances past them anyway).
-    pub fn gc_checkpoint(&self, max_buckets: usize) -> io::Result<Vec<Ulid>> {
+    pub fn gc_checkpoint(
+        &self,
+        max_buckets: usize,
+    ) -> io::Result<crate::volume_ipc::GcCheckpointReply> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::GcCheckpoint {
