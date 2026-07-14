@@ -1192,10 +1192,12 @@ impl Volume {
     ///
     /// Re-derives the to-remove and stale-cancel sets against the **current**
     /// extent index and lbamap (which may have diverged while the worker was
-    /// running), updates the extent index for carried entries, then commits
-    /// via `rename(<tmp>, <bare>)` as the atomic commit point. Cancelled
-    /// materialisations skip the commit — the plan was already removed by
-    /// the worker and any stale `.tmp` will be swept on the next apply tick.
+    /// running), applies the fold to the in-memory extent index and lbamap,
+    /// refuses it if that would leave any lbamap-referenced hash without a
+    /// body location, then commits via `rename(<tmp>, <bare>)` as the atomic
+    /// commit point. Cancelled materialisations skip the commit — the plan
+    /// was already removed by the worker and any stale `.tmp` will be swept
+    /// on the next apply tick.
     pub fn apply_plan_apply_result(
         &mut self,
         result: GcPlanApplyResult,
@@ -1319,21 +1321,76 @@ impl Volume {
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
         };
+        let pre_apply_index = Arc::clone(&self.extent_index);
+        let pre_apply_lbamap = Arc::clone(&self.lbamap);
         {
             let index = Arc::make_mut(&mut self.extent_index);
             for (i, e) in entries.iter().enumerate() {
                 index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
             }
+            for (hash, old_ulid) in &to_remove {
+                // `remove_owner_at` covers both `inner` and `deltas`. Plain
+                // `lookup` only checks `inner`, so a Delta-canonical hash
+                // would be left dangling — phantom entry pointing at a
+                // deleted input segment. Caught by
+                // `assert_extent_index_consistent` on
+                // `gc_delta_partial_death_compaction`.
+                index.remove_owner_at(hash, *old_ulid);
+            }
         }
 
-        for (hash, old_ulid) in &to_remove {
-            // `remove_owner_at` covers both `inner` and `deltas`. Plain
-            // `lookup` only checks `inner`, so a Delta-canonical hash
-            // would be left dangling — phantom entry pointing at a
-            // deleted input segment. Caught by
-            // `assert_extent_index_consistent` on
-            // `gc_delta_partial_death_compaction`.
-            Arc::make_mut(&mut self.extent_index).remove_owner_at(hash, *old_ulid);
+        // Merge the GC output into self.lbamap by per-entry conditional
+        // insert. `insert_consuming_inputs` skips any sub-range whose
+        // existing claimant ULID is >= `new_ulid` AND is not one of the
+        // inputs being consumed — exactly the post-checkpoint live writes
+        // whose WAL/segment ULID is above gc_checkpoint's mint. A
+        // claimant that *is* a consumed input is overridable: that
+        // segment is being torn down on disk by this apply, so its
+        // lbamap claim is stale. See `docs/design/lbamap-claimant-tracking.md`,
+        // `docs/finding-sweep-flush-claimant-bug.md`, and
+        // `gc_output_loses_to_live_write_applied_after_gc`.
+        {
+            let lbamap = Arc::make_mut(&mut self.lbamap);
+            for e in &entries {
+                lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+            }
+        }
+
+        // Pre-commit refusal: with the full in-memory apply done (extent
+        // index and lbamap), every lbamap-referenced hash must resolve
+        // through the extent index — the read path's lookup. A miss here
+        // means committing this fold would strand an LBA claim with no
+        // body location: permanent read EIO that a rebuild reproduces
+        // once the inputs are unlinked. The claim can arrive via the
+        // output's own DedupRef entries during the merge above, so only
+        // this post-merge check sees it — the stale-liveness loop reads
+        // the pre-merge lbamap. Runs unconditionally in production.
+        let orphaned = self.unresolvable_lbamap_hashes(8);
+        if !orphaned.is_empty() {
+            let detail = orphaned
+                .iter()
+                .map(
+                    |(lba, hash)| match to_remove.iter().find(|(h, _)| h == hash) {
+                        Some((_, input)) => {
+                            format!("lba={lba} hash={} was-at={input}", hash.to_hex())
+                        }
+                        None => format!("lba={lba} hash={}", hash.to_hex()),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::error!(
+                "plan {new_ulid}: refusing fold — {} lbamap-referenced hash(es) would \
+                 be unresolvable through the extent index after apply: [{detail}]; \
+                 dropping output and plan",
+                orphaned.len(),
+            );
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&plan_path);
+            self.assert_volume_invariants("apply_plan_apply_result_refused");
+            return Ok(StagedApply::Cancelled);
         }
 
         let pending_dir = self.base_dir.join("pending");
@@ -1341,8 +1398,17 @@ impl Volume {
             let _ = fs::remove_file(pending_dir.join(input.to_string()));
         }
 
+        // Commit point. On a crash above this rename no fold exists on
+        // disk and restart's rebuild never sees the output; the
+        // in-memory registrations die with the process. On a crash
+        // after it, the rebuild walks the same on-disk segments and
+        // produces the same claimant ULIDs as the in-memory merge.
         let bare_path = gc_dir.join(new_ulid.to_string());
-        fs::rename(&tmp_path, &bare_path)?;
+        if let Err(e) = fs::rename(&tmp_path, &bare_path) {
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            return Err(e);
+        }
         let _ = fs::remove_file(&plan_path);
         self.own_segments.insert(new_ulid);
         // Bump last_segment_ulid so a snapshot taken after this apply
@@ -1356,24 +1422,6 @@ impl Volume {
             self.last_segment_ulid = Some(new_ulid);
         }
 
-        // Merge the GC output into self.lbamap by per-entry conditional
-        // insert. `insert_consuming_inputs` skips any sub-range whose
-        // existing claimant ULID is >= `new_ulid` AND is not one of the
-        // inputs being consumed — exactly the post-checkpoint live writes
-        // whose WAL/segment ULID is above gc_checkpoint's mint. A
-        // claimant that *is* a consumed input is overridable: that
-        // segment is being torn down on disk by this apply, so its
-        // lbamap claim is stale. See `docs/design/lbamap-claimant-tracking.md`,
-        // `docs/finding-sweep-flush-claimant-bug.md`, and
-        // `gc_output_loses_to_live_write_applied_after_gc`.
-        //
-        // Crash ordering: on a crash between rename and the in-memory
-        // merge, restart's `Volume::open` rebuild walks the same on-disk
-        // segments and produces the same claimant ULIDs.
-        let lbamap = Arc::make_mut(&mut self.lbamap);
-        for e in &entries {
-            lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
-        }
         self.assert_volume_invariants("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
@@ -1711,23 +1759,22 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_extent_index_consistent(&self, _caller: &'static str) {}
 
-    /// Stress-only invariant: every non-zero hash in `self.lbamap` must
-    /// be resolvable through `self.extent_index` (either as a DATA-style
-    /// owner or a Delta-canonical owner). An unresolvable hash means a
-    /// future read of that LBA would fail at the extent_index lookup —
-    /// silent data unavailability waiting to surface.
+    /// Collect up to `limit` lbamap entries whose hash resolves through
+    /// neither the extent index's DATA-style map nor its Delta-canonical
+    /// map — the two lookups the read path performs. An unresolvable
+    /// hash means a read of that LBA fails at the extent_index lookup.
     ///
-    /// Pure in-memory check (no disk rebuild), so cheap relative to the
-    /// other invariants — linear in lbamap entry count, two HashMap
-    /// lookups per entry. Catches the bug class "lbamap retains a hash
-    /// claim while extent_index lost the body location" — typically an
-    /// apply path that removed from extent_index without also pruning
-    /// the lbamap claim.
+    /// Pure in-memory check (no disk rebuild) — linear in lbamap entry
+    /// count, two HashMap lookups per entry. Catches the bug class
+    /// "lbamap retains a hash claim while extent_index lost the body
+    /// location" — typically an apply path that removed from
+    /// extent_index without also pruning the lbamap claim. Backs both
+    /// the pre-commit refusal in `apply_plan_apply_result` and the
+    /// stress invariant below.
     ///
     /// `ZERO_HASH` is a sentinel meaning "this LBA reads as all zeros";
     /// it never resolves through extent_index by design. Skipped here.
-    #[cfg(feature = "volume-invariants")]
-    pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, caller: &'static str) {
+    fn unresolvable_lbamap_hashes(&self, limit: usize) -> Vec<(u64, blake3::Hash)> {
         let mut unresolved: Vec<(u64, blake3::Hash)> = Vec::new();
         for (lba, _len, hash, _anchor) in self.lbamap.iter_entries() {
             if hash == ZERO_HASH {
@@ -1740,10 +1787,18 @@ impl Volume {
                 continue;
             }
             unresolved.push((lba, hash));
-            if unresolved.len() >= 8 {
+            if unresolved.len() >= limit {
                 break;
             }
         }
+        unresolved
+    }
+
+    /// Stress-only invariant: panic if [`Self::unresolvable_lbamap_hashes`]
+    /// finds any entry after a structural op.
+    #[cfg(feature = "volume-invariants")]
+    pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, caller: &'static str) {
+        let unresolved = self.unresolvable_lbamap_hashes(8);
         if !unresolved.is_empty() {
             let mut msg = format!(
                 "lbamap-hashes-resolvable invariant violation after [{caller}]: \

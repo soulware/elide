@@ -734,7 +734,20 @@ impl GcCycleOrchestrator {
             return;
         };
 
-        let handoffs_applied = control::apply_gc_handoffs(&self.fork_dir).await;
+        // An apply whose outcome is unknown (timeout, error reply) may
+        // still be running volume-side; emitting a plan now would race
+        // it against state the plan has not seen. Defer to a later tick,
+        // which re-asks and only plans after a confirmed apply pass.
+        let handoffs_applied = match control::apply_gc_handoffs(&self.fork_dir).await {
+            Some(n) => n,
+            None => {
+                warn!(
+                    "[gc {vol_ulid}] apply-gc-handoffs outcome unknown; \
+                     skipping plan emission this tick"
+                );
+                return;
+            }
+        };
         if handoffs_applied > 0 {
             info!("[gc {vol_ulid}] volume applied {handoffs_applied} GC handoff(s)");
         }

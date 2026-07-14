@@ -72,12 +72,14 @@ pub async fn gc_checkpoint(fork_dir: &Path, max_buckets: usize) -> Option<Vec<Ul
 
 /// Apply staged GC handoffs on the volume process for `fork_dir`.
 ///
-/// Returns the number of handoffs processed.  Returns 0 if the socket is
-/// absent or the call fails (non-fatal: the next idle tick will retry).
-pub async fn apply_gc_handoffs(fork_dir: &Path) -> usize {
-    let reply: Option<ApplyGcHandoffsReply> =
-        call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await;
-    reply.map(|r| r.processed as usize).unwrap_or(0)
+/// Returns `Some(n)` with the number of handoffs processed. Returns
+/// `None` if the socket is absent, the call times out, or the volume
+/// replies with an error — in the timeout and error cases the volume
+/// may still be running the apply, so the caller must treat the
+/// outcome as unknown, not as "nothing happened".
+pub async fn apply_gc_handoffs(fork_dir: &Path) -> Option<usize> {
+    let reply: ApplyGcHandoffsReply = call_typed(fork_dir, &VolumeRequest::ApplyGcHandoffs).await?;
+    Some(reply.processed as usize)
 }
 
 /// Sign and write a snapshot manifest plus the snapshot marker.
