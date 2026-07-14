@@ -100,6 +100,17 @@ enum Command {
     #[command(hide = true)]
     DumpLbamap { fork_dir: PathBuf },
 
+    /// Emit a per-block blake3 manifest of a file (or `-` for stdin), one
+    /// `<block_index> <hex>` line per block (diagnostic)
+    #[command(hide = true)]
+    BlockHash {
+        /// File to hash, or `-` to read from stdin
+        path: String,
+        /// Block size in bytes
+        #[arg(long, default_value_t = 4096)]
+        block_bytes: usize,
+    },
+
     /// Print all records in a WAL file (diagnostic)
     #[command(hide = true)]
     InspectWal { path: PathBuf },
@@ -1008,6 +1019,10 @@ fn main() {
             for (lba, len, hash, off, claimant) in reader.dump_lbamap() {
                 println!("{lba} {len} {} {off} {claimant}", hash.to_hex());
             }
+        }
+
+        Command::BlockHash { path, block_bytes } => {
+            block_hash(&path, block_bytes).expect("block-hash failed");
         }
 
         Command::VerifyContent { fork_dir } => {
@@ -2218,6 +2233,51 @@ fn resolve_local_volume_ulid(data_dir: &Path, name: &str) -> Option<String> {
 /// ULID is the fork directory's basename. When the env var is unset
 /// (standalone `elide serve-volume` invocation with no coordinator),
 /// fall back to `FetchConfig::load` from the volume directory.
+/// Stream `path` (or stdin when `path` is `-`) in `block_bytes` chunks and
+/// print one `<block_index> <blake3-hex>` line per block. The final block may
+/// be short; it is hashed as-is. Used by the load-test harness to capture a
+/// write-time ground-truth manifest (via `tee`) and to name the exact blocks
+/// that later read back wrong.
+fn block_hash(path: &str, block_bytes: usize) -> std::io::Result<()> {
+    use std::io::{BufWriter, Read, Write};
+
+    if block_bytes == 0 {
+        return Err(std::io::Error::other("block_bytes must be non-zero"));
+    }
+
+    let mut src: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(std::io::BufReader::new(std::fs::File::open(path)?))
+    };
+
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    let mut buf = vec![0u8; block_bytes];
+    let mut index: u64 = 0;
+
+    loop {
+        let mut filled = 0;
+        while filled < block_bytes {
+            let n = src.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        let hash = blake3::hash(&buf[..filled]);
+        writeln!(out, "{index} {}", hash.to_hex())?;
+        index += 1;
+        if filled < block_bytes {
+            break;
+        }
+    }
+
+    out.flush()
+}
+
 fn resolve_volume_fetch_config(fork_dir: &Path) -> std::io::Result<VolumeFetchInputs> {
     if let Ok(sock) = std::env::var("ELIDE_COORDINATOR_SOCKET") {
         let coord = coordinator_client::Client::new(&sock);
