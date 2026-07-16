@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod bins;
 pub mod bucket_position;
 pub mod config;
