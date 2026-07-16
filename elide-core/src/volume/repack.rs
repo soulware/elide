@@ -868,71 +868,66 @@ mod tests {
     }
 
     #[test]
-    fn repack_keeps_all_dead_input_when_dedup_ref_minted_in_worker_window() {
-        // All-dead-bucket variant of the worker-window race: with no
-        // rewrite output the worker used to unlink the input files
-        // itself, off the actor thread — destroying the only copy of a
-        // body a mid-window DedupRef claims. The worker must leave the
-        // files alone and the apply-time gate must refuse the bucket.
+    fn apply_gates_all_dead_bucket_and_defers_its_unlink() {
+        // Apply-side contract for `output: None` buckets, which the
+        // worker hands over with the input files untouched. The bucket
+        // is synthesized directly: bin-packing folds an all-dead
+        // candidate into the first live bucket, so the worker only
+        // emits `output: None` when every candidate is dead — a
+        // geometry ordered drains don't produce, but the branch must
+        // still gate on current-lbamap resolvability.
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
         let recurring = vec![0x11u8; 4096];
-        let other = vec![0x22u8; 4096];
+        let interim = vec![0x22u8; 4096];
 
-        // `other` lands in cache/ so its claims never touch pending/.
-        vol.write(0, &other).unwrap();
-        vol.promote_for_test().unwrap();
-        simulate_upload(&mut vol);
-
-        // The recurring content becomes the sole pending segment...
         vol.write(0, &recurring).unwrap();
         vol.promote_for_test().unwrap();
-        let recurring_seg = {
-            let mut ulids: Vec<Ulid> = fs::read_dir(base.join("pending"))
+        let (input_ulid, input_path) = {
+            let mut paths: Vec<PathBuf> = fs::read_dir(base.join("pending"))
                 .unwrap()
-                .map(|e| Ulid::from_string(&e.unwrap().file_name().into_string().unwrap()).unwrap())
+                .map(|e| e.unwrap().path())
                 .collect();
-            assert_eq!(ulids.len(), 1);
-            ulids.pop().unwrap()
+            assert_eq!(paths.len(), 1);
+            let path = paths.pop().unwrap();
+            let ulid = Ulid::from_string(path.file_name().unwrap().to_str().unwrap()).unwrap();
+            (ulid, path)
+        };
+        let all_dead_bucket = || RepackResult {
+            stats: CompactionStats::default(),
+            buckets: vec![RepackedBucket {
+                inputs: vec![RepackedInput {
+                    input_ulid,
+                    input_path: input_path.clone(),
+                    owned_hashes: vec![blake3::hash(&recurring)],
+                }],
+                output: None,
+                bytes_freed: 4096,
+            }],
         };
 
-        // ...and dies: this write dedups against the cached `other`,
-        // and its segment is uploaded so only the recurring segment
-        // stays pending.
-        vol.write(0, &other).unwrap();
-        vol.promote_for_test().unwrap();
-        for entry in fs::read_dir(base.join("pending")).unwrap() {
-            let ulid =
-                Ulid::from_string(&entry.unwrap().file_name().into_string().unwrap()).unwrap();
-            if ulid != recurring_seg {
-                vol.promote_segment(ulid).unwrap();
-            }
-        }
-
-        let job = vol.prepare_repack().unwrap().expect("repack job");
-
-        // Worker window: the recurring content returns as a DedupRef
-        // against the all-dead pending input.
-        vol.write(0, &recurring).unwrap();
-
-        let result = crate::actor::execute_repack(job).unwrap();
-
-        let pending_count = fs::read_dir(base.join("pending")).unwrap().count();
-        assert_eq!(pending_count, 1, "worker must not unlink all-dead inputs");
-
-        let (stats, consumed) = vol.apply_repack_result(result).unwrap();
+        // LBA 0 still claims the recurring hash, so removing the
+        // input's extent entry must be refused and the file kept.
+        let (stats, consumed) = vol.apply_repack_result(all_dead_bucket()).unwrap();
         assert_eq!(stats.buckets_refused, 1);
         assert!(consumed.is_empty(), "refused bucket must keep its inputs");
+        assert!(input_path.exists());
         assert_eq!(vol.read(0, 1).unwrap(), recurring);
 
-        let stats = vol.repack().unwrap();
+        // Once the claim moves off the recurring hash the same bucket
+        // applies, and the input unlinks through the deferred path.
+        vol.write(0, &interim).unwrap();
+        let (stats, consumed) = vol.apply_repack_result(all_dead_bucket()).unwrap();
         assert_eq!(stats.buckets_refused, 0);
-        assert_eq!(vol.read(0, 1).unwrap(), recurring);
-
-        drop(vol);
-        let vol = Volume::open(&base, &base).unwrap();
-        assert_eq!(vol.read(0, 1).unwrap(), recurring);
+        assert_eq!(consumed, vec![input_path.clone()]);
+        assert!(
+            input_path.exists(),
+            "unlink is deferred to remove_consumed_inputs"
+        );
+        vol.remove_consumed_inputs(&consumed).unwrap();
+        assert!(!input_path.exists());
+        assert_eq!(vol.read(0, 1).unwrap(), interim);
 
         fs::remove_dir_all(base).unwrap();
     }
