@@ -128,7 +128,7 @@ fn coordinator_gc_does_not_create_read_failures() {
     assert!(
         errors.is_empty(),
         "reads failed during concurrent GC: {:?}",
-        &*errors
+        *errors
     );
 
     // Full oracle check after everything settles.
