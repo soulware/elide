@@ -289,12 +289,17 @@ pub async fn drain_pending(
         let segment_path = pending_dir.join(&upload_name);
 
         let started = Instant::now();
+        let size_bytes = std::fs::metadata(&segment_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         match segments.put_from_file(ulid, &segment_path).await {
             Ok(()) => {
+                let elapsed = started.elapsed();
+                let mib = size_bytes as f64 / (1024.0 * 1024.0);
                 info!(
-                    "[upload] {} in {:.2?}",
+                    "[upload] {} {mib:.1}MiB in {elapsed:.2?} ({:.1}MiB/s)",
                     segments.segment_key(ulid),
-                    started.elapsed()
+                    mib / elapsed.as_secs_f64().max(f64::EPSILON),
                 );
                 // Segment confirmed in S3; promote IPC tells the controlling
                 // process (volume or import in serve phase) to write index/ +
