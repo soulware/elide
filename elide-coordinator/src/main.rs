@@ -29,7 +29,7 @@ mod supervisor;
 
 // Re-use the library's shared modules so types are identical across the
 // lib and bin compilation units.
-use elide_coordinator::{config, portable};
+use elide_coordinator::{bench, config, portable};
 
 use std::path::PathBuf;
 use std::process;
@@ -102,6 +102,38 @@ enum Command {
         /// Override the data_dir from the config file
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Micro-benchmark the segment upload path against the configured
+    /// object store, in isolation from the daemon (diagnostic).
+    #[command(hide = true)]
+    Bench {
+        #[arg(long, default_value = "coordinator.toml", env = "ELIDE_COORD_CONFIG")]
+        config: PathBuf,
+        /// Override the data_dir from the config file (source file is
+        /// written here)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Object size in MiB
+        #[arg(long, default_value_t = 32)]
+        size_mb: usize,
+        /// Timed iterations; the report is their median
+        #[arg(long, default_value_t = 3)]
+        iters: usize,
+        /// Concurrent uploads per iteration (reproduces N volumes
+        /// draining at once on one runtime)
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
+        /// Worker threads for the benchmark runtime (0 = tokio default,
+        /// one per CPU — the coordinator's setting)
+        #[arg(long, default_value_t = 0)]
+        worker_threads: usize,
+        /// Leave uploaded objects in place instead of deleting them
+        #[arg(long)]
+        keep: bool,
+        /// Object-key prefix confining probe objects in a shared bucket
+        #[arg(long, default_value = "elide-throughput-probe/s3bench")]
+        key_prefix: String,
     },
 }
 
@@ -362,6 +394,34 @@ async fn run() -> Result<()> {
                 .with_context(|| format!("creating data dir: {}", config.data_dir.display()))?;
             let _coord_lock = pidfile::lock_instance(&config.data_dir)?;
             attest::run(config).await
+        }
+        Command::Bench {
+            config,
+            data_dir,
+            size_mb,
+            iters,
+            parallel,
+            worker_threads,
+            keep,
+            key_prefix,
+        } => {
+            let mut config = config::load(&config)?;
+            if let Some(dir) = data_dir {
+                config.data_dir = dir;
+            }
+            let opts = bench::BenchOpts {
+                size_mb,
+                iters,
+                parallel,
+                worker_threads,
+                keep,
+                key_prefix,
+            };
+            // run_blocking owns its own runtime; keep it off this async
+            // worker so its block_on doesn't nest inside the outer runtime.
+            tokio::task::spawn_blocking(move || bench::run_blocking(config, opts))
+                .await
+                .context("benchmark task panicked")?
         }
     }
 }
