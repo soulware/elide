@@ -993,6 +993,19 @@ mod imp {
 
             let buf_slice = buf.as_slice();
             let fits_buf = !op_carries_payload(op) || bytes <= buf_slice.len() as u64;
+            if elide_core::wtrace::enabled() {
+                if op == UBLK_IO_OP_WRITE && fits_buf {
+                    let h = blake3::hash(&buf_slice[..bytes as usize]);
+                    tracing::info!(
+                        "[wtrace] ingress write tag={tag} lba={} blocks={} fua={fua} hash={}",
+                        off / 4096,
+                        bytes / 4096,
+                        h.to_hex()
+                    );
+                } else if op == UBLK_IO_OP_FLUSH {
+                    tracing::info!("[wtrace] ingress flush tag={tag}");
+                }
+            }
             let res = if fits_buf {
                 result.store(0, Ordering::Relaxed);
                 let job = Job {

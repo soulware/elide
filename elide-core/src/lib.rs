@@ -30,3 +30,4 @@ pub mod volume;
 pub mod volume_event;
 pub mod volume_ipc;
 pub mod writelog;
+pub mod wtrace;
