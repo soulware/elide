@@ -15,7 +15,7 @@ use crate::{
     segment_cache,
 };
 
-use super::{Volume, latest_snapshot};
+use super::{ResolvabilityGate, Volume, latest_snapshot};
 
 /// Results from a single compaction run.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -28,6 +28,11 @@ pub struct CompactionStats {
     pub bytes_freed: u64,
     /// Number of dead extent entries removed from the extent index.
     pub extents_removed: usize,
+    /// Buckets rolled back by the apply-time resolvability gate: a
+    /// claim minted while the worker ran references an input-owned
+    /// hash the output doesn't carry. Inputs kept, output dropped.
+    #[serde(default)]
+    pub buckets_refused: usize,
 }
 
 /// Stats from a single `delta_repack_post_snapshot` pass.
@@ -83,14 +88,16 @@ pub struct RepackJob {
 /// One bucket from a repack run. A bucket pairs N input segments (1
 /// for solo rewrites, ≥2 for bin-packed merges) with a single rewrite
 /// output, or with `output = None` when every input classified
-/// fully dead and the worker deleted them outright.
+/// fully dead — the input files are untouched by the worker either
+/// way.
 ///
 /// Apply (a) derives the per-input "to remove from extent_index" set
 /// as `owned_hashes - carried_hashes(output)` and CAS-removes against
 /// the per-input gate (`current loc.segment_id == input_ulid`), then
 /// (b) inserts the carried entries under the same gate against the
-/// new output ULID, and (c) returns each input file path for the
-/// caller to unlink once its read snapshot is published.
+/// new output ULID — both behind the resolvability gate — and (c)
+/// returns each input file path for the caller to unlink once its
+/// read snapshot is published.
 pub struct RepackedBucket {
     pub inputs: Vec<RepackedInput>,
     pub output: Option<RepackedOutput>,
@@ -178,8 +185,9 @@ pub struct DeltaRepackResult {
 
 impl Volume {
     /// Rewrite every pending segment with at least one hash-dead body
-    /// entry under a freshly-minted ULID; delete all-dead segments
-    /// outright. Skips fully-live segments larger than the small threshold
+    /// entry under a freshly-minted ULID; all-dead segments produce no
+    /// output and are unlinked after apply. Skips fully-live segments
+    /// larger than the small threshold.
     /// Guarantees deleted data does not leave the host.
     ///
     /// Synchronous wrapper around [`Self::prepare_repack`] +
@@ -251,24 +259,28 @@ impl Volume {
     /// Apply phase of `repack` — runs on the actor thread after the
     /// worker returns.
     ///
-    /// For each repacked segment:
+    /// Each bucket's in-memory merge runs behind
+    /// [`Self::mutate_gated_on_resolvability`]:
     ///   - CAS-remove dropped owned hashes (`current loc.segment_id ==
     ///     input_ulid`); concurrent writers that re-pointed the hash
     ///     win.
     ///   - If a fresh output was written: insert carried entries into
-    ///     the extent index under the same per-input CAS gate, and
-    ///     collect `pending/<input_ulid>` into the returned unlink
-    ///     list. The worker has already written `pending/<new_ulid>`
-    ///     separately.
-    ///   - If every entry was dead: the worker already deleted the
-    ///     input file; nothing more to unlink.
-    ///   - Evict the file-cache fd for the input ULID either way.
+    ///     the extent index under the same per-input CAS gate, then
+    ///     merge them into `self.lbamap` via `insert_if_newer` keyed
+    ///     on `out.new_ulid`. Concurrent live writes have higher
+    ///     claimant ULIDs and are preserved on overlapping LBAs.
     ///
-    /// Then merges each segment's output entries into `self.lbamap`
-    /// via `insert_if_newer` keyed on `out.new_ulid`. Sub-run hashes
-    /// from `Run` records get installed as they appear in the output;
-    /// concurrent live writes have higher claimant ULIDs and are
-    /// preserved on overlapping LBAs.
+    /// A refused bucket is rolled back whole: the worker classified
+    /// against a prep-time lbamap snapshot, so a dedup ref minted
+    /// while it ran can reference an input-owned hash the output
+    /// doesn't carry. The output file is deleted, the inputs stay,
+    /// and the next repack pass — whose prep snapshot includes the
+    /// new claim — carries the hash.
+    ///
+    /// Applied buckets queue `pending/<input_ulid>` into the returned
+    /// unlink list (for all-dead buckets too — `output: None`). The
+    /// worker has already written `pending/<new_ulid>` separately.
+    /// Each input's file-cache fd is evicted.
     ///
     /// The consumed input files are returned, not deleted: the caller
     /// must publish its read snapshot first and then pass them to
@@ -294,14 +306,24 @@ impl Volume {
             let bucket_input_ulids: std::collections::HashSet<Ulid> =
                 bucket.inputs.iter().map(|i| i.input_ulid).collect();
 
-            {
-                let index = Arc::make_mut(&mut self.extent_index);
+            let delta_body_source = match &bucket.output {
+                Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
+                    &pending_dir.join(out.new_ulid.to_string()),
+                    &out.out_entries,
+                    out.new_body_section_start,
+                )?),
+                None => None,
+            };
+
+            let mut extents_removed = 0usize;
+            let gate = self.mutate_gated_on_resolvability(|vol| {
+                let index = Arc::make_mut(&mut vol.extent_index);
 
                 // Per-input CAS-remove for hashes the bucket's output
                 // didn't carry — gated on the specific input's ULID so
                 // a concurrent writer that re-pointed the hash wins.
                 for input in &bucket.inputs {
-                    stats.extents_removed += index.remove_input_owned(
+                    extents_removed += index.remove_input_owned(
                         input.input_ulid,
                         &input.owned_hashes,
                         &carried_hashes,
@@ -312,16 +334,13 @@ impl Volume {
                 // output as the disk rebuild would, gated on the
                 // current owner being any of the bucket's inputs.
                 if let Some(out) = &bucket.output {
-                    let delta_body_source = extentindex::DeltaBodySource::full_for_segment(
-                        &pending_dir.join(out.new_ulid.to_string()),
-                        &out.out_entries,
-                        out.new_body_section_start,
-                    )?;
                     let ctx = extentindex::SegmentRegistrationCtx {
                         segment_id: out.new_ulid,
                         body_section_start: out.new_body_section_start,
                         body_tier: extentindex::RegistrationBodyTier::Local,
-                        delta_body_source,
+                        // `delta_body_source` is Some whenever `bucket.output` is.
+                        delta_body_source: delta_body_source
+                            .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
                         inline: extentindex::InlineSource::EntryInline,
                     };
                     for (raw_idx, e) in out.out_entries.iter().enumerate() {
@@ -332,34 +351,18 @@ impl Volume {
                             &bucket_input_ulids,
                         )?;
                     }
+
+                    let lbamap = Arc::make_mut(&mut vol.lbamap);
+                    for e in &out.out_entries {
+                        lbamap.register_entry_consuming_inputs(
+                            e,
+                            out.new_ulid,
+                            &bucket_input_ulids,
+                        );
+                    }
                 }
-            }
-
-            if let Some(out) = &bucket.output {
-                if self.last_segment_ulid < Some(out.new_ulid) {
-                    self.last_segment_ulid = Some(out.new_ulid);
-                }
-                self.has_new_segments = true;
-
-                let lbamap = Arc::make_mut(&mut self.lbamap);
-                for e in &out.out_entries {
-                    lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
-                }
-            }
-
-            // Per-input bookkeeping: evict cache fd; queue the input
-            // file for unlinking if the worker wrote a fresh output
-            // (when output is None the worker already deleted the
-            // input).
-            for input in &bucket.inputs {
-                self.evict_cached_segment(input.input_ulid);
-
-                if bucket.output.is_some() {
-                    consumed_inputs.push(input.input_path.clone());
-                }
-            }
-
-            stats.bytes_freed += bucket.bytes_freed;
+                Ok(())
+            })?;
 
             let inputs_fmt = bucket
                 .inputs
@@ -367,6 +370,42 @@ impl Volume {
                 .map(|i| i.input_ulid.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+
+            if let ResolvabilityGate::Refused(orphaned) = gate {
+                let detail = orphaned
+                    .iter()
+                    .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                log::error!(
+                    "repack [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
+                     would be unresolvable through the extent index after apply: [{detail}]; \
+                     dropping output and keeping inputs",
+                    orphaned.len(),
+                );
+                stats.buckets_refused += 1;
+                if let Some(out) = &bucket.output {
+                    let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
+                }
+                continue;
+            }
+
+            stats.extents_removed += extents_removed;
+
+            if let Some(out) = &bucket.output {
+                if self.last_segment_ulid < Some(out.new_ulid) {
+                    self.last_segment_ulid = Some(out.new_ulid);
+                }
+                self.has_new_segments = true;
+            }
+
+            for input in &bucket.inputs {
+                self.evict_cached_segment(input.input_ulid);
+                consumed_inputs.push(input.input_path.clone());
+            }
+
+            stats.bytes_freed += bucket.bytes_freed;
+
             match &bucket.output {
                 Some(out) => log::info!(
                     "repack: [{inputs_fmt}] -> {} ({} entries, {} bytes freed)",
@@ -777,6 +816,118 @@ mod tests {
         }
         assert_eq!(vol.read(0, 1).unwrap(), vec![0x22u8; 4096]);
         assert_eq!(vol.read(1, 1).unwrap(), vec![0x33u8; 4096]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn repack_refuses_rewrite_when_dedup_ref_minted_in_worker_window() {
+        // The worker classifies liveness against the prep-time lbamap
+        // snapshot while the actor keeps serving writes. A write whose
+        // content matches an input-owned extent mints a thin DedupRef
+        // and never re-points the extent index, so the apply's CAS
+        // gate alone would drop the canonical body out from under the
+        // fresh claim. The resolvability gate must refuse the bucket.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let recurring = vec![0x11u8; 4096];
+        let interim = vec![0x22u8; 4096];
+
+        // The recurring content is a pending segment; its overwrite is
+        // in the WAL at prep, so the snapshot sees the recurring hash
+        // as dead.
+        vol.write(0, &recurring).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &interim).unwrap();
+
+        let job = vol.prepare_repack().unwrap().expect("repack job");
+
+        // Worker window: the recurring content returns as a DedupRef
+        // against the repack input.
+        vol.write(0, &recurring).unwrap();
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        let (stats, consumed) = vol.apply_repack_result(result).unwrap();
+
+        assert_eq!(stats.buckets_refused, 1);
+        assert!(consumed.is_empty(), "refused bucket must keep its inputs");
+        assert_eq!(vol.read(0, 1).unwrap(), recurring);
+
+        // The next pass preps a snapshot that includes the claim,
+        // carries the body, and converges.
+        let stats = vol.repack().unwrap();
+        assert_eq!(stats.buckets_refused, 0);
+        assert_eq!(vol.read(0, 1).unwrap(), recurring);
+
+        drop(vol);
+        let vol = Volume::open(&base, &base).unwrap();
+        assert_eq!(vol.read(0, 1).unwrap(), recurring);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn apply_gates_all_dead_bucket_and_defers_its_unlink() {
+        // Apply-side contract for `output: None` buckets, which the
+        // worker hands over with the input files untouched. The bucket
+        // is synthesized directly: bin-packing folds an all-dead
+        // candidate into the first live bucket, so the worker only
+        // emits `output: None` when every candidate is dead — a
+        // geometry ordered drains don't produce, but the branch must
+        // still gate on current-lbamap resolvability.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let recurring = vec![0x11u8; 4096];
+        let interim = vec![0x22u8; 4096];
+
+        vol.write(0, &recurring).unwrap();
+        vol.promote_for_test().unwrap();
+        let (input_ulid, input_path) = {
+            let mut paths: Vec<PathBuf> = fs::read_dir(base.join("pending"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(paths.len(), 1);
+            let path = paths.pop().unwrap();
+            let ulid = Ulid::from_string(path.file_name().unwrap().to_str().unwrap()).unwrap();
+            (ulid, path)
+        };
+        let all_dead_bucket = || RepackResult {
+            stats: CompactionStats::default(),
+            buckets: vec![RepackedBucket {
+                inputs: vec![RepackedInput {
+                    input_ulid,
+                    input_path: input_path.clone(),
+                    owned_hashes: vec![blake3::hash(&recurring)],
+                }],
+                output: None,
+                bytes_freed: 4096,
+            }],
+        };
+
+        // LBA 0 still claims the recurring hash, so removing the
+        // input's extent entry must be refused and the file kept.
+        let (stats, consumed) = vol.apply_repack_result(all_dead_bucket()).unwrap();
+        assert_eq!(stats.buckets_refused, 1);
+        assert!(consumed.is_empty(), "refused bucket must keep its inputs");
+        assert!(input_path.exists());
+        assert_eq!(vol.read(0, 1).unwrap(), recurring);
+
+        // Once the claim moves off the recurring hash the same bucket
+        // applies, and the input unlinks through the deferred path.
+        vol.write(0, &interim).unwrap();
+        let (stats, consumed) = vol.apply_repack_result(all_dead_bucket()).unwrap();
+        assert_eq!(stats.buckets_refused, 0);
+        assert_eq!(consumed, vec![input_path.clone()]);
+        assert!(
+            input_path.exists(),
+            "unlink is deferred to remove_consumed_inputs"
+        );
+        vol.remove_consumed_inputs(&consumed).unwrap();
+        assert!(!input_path.exists());
+        assert_eq!(vol.read(0, 1).unwrap(), interim);
 
         fs::remove_dir_all(base).unwrap();
     }

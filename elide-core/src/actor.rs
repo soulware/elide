@@ -2509,14 +2509,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         }
 
         if outputs.is_empty() {
-            // Every entry in every input classified Drop — delete each
-            // input outright. Apply still removes the owned hashes
-            // from the extent index.
-            for input in &bucket_inputs {
-                std::fs::remove_file(&input.input_path)?;
-            }
-            segment::fsync_dir(&pending_dir)?;
-            stats.bytes_freed += bucket_bytes_freed;
+            // Every entry in every input classified Drop — no rewrite
+            // output. The inputs are handed to the apply phase
+            // (`output: None`), which gates the hash removals on
+            // current-lbamap resolvability and queues the files for
+            // the post-publish unlink.
             result_buckets.push(crate::volume::RepackedBucket {
                 inputs: bucket_inputs,
                 output: None,

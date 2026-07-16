@@ -281,6 +281,15 @@ fn apply_promoted_entries(
     );
 }
 
+/// Outcome of [`Volume::mutate_gated_on_resolvability`].
+pub(in crate::volume) enum ResolvabilityGate {
+    /// The mutation is in place.
+    Applied,
+    /// The mutation was rolled back: committing it would have left
+    /// these `(lba, hash)` claims unresolvable (first 8 reported).
+    Refused(Vec<(u64, blake3::Hash)>),
+}
+
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedApply {
@@ -1313,52 +1322,46 @@ impl Volume {
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
         };
+        // `pre_apply_*` back the rename-failure restore below; the
+        // resolvability gate keeps its own snapshots for the refusal
+        // path.
         let pre_apply_index = Arc::clone(&self.extent_index);
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
-        {
-            let index = Arc::make_mut(&mut self.extent_index);
-            for (i, e) in entries.iter().enumerate() {
-                index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
+        let gate = self.mutate_gated_on_resolvability(|vol| {
+            {
+                let index = Arc::make_mut(&mut vol.extent_index);
+                for (i, e) in entries.iter().enumerate() {
+                    index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
+                }
+                for (hash, old_ulid) in &to_remove {
+                    // `remove_owner_at` covers both `inner` and `deltas`. Plain
+                    // `lookup` only checks `inner`, so a Delta-canonical hash
+                    // would be left dangling — phantom entry pointing at a
+                    // deleted input segment. Caught by
+                    // `assert_extent_index_consistent` on
+                    // `gc_delta_partial_death_compaction`.
+                    index.remove_owner_at(hash, *old_ulid);
+                }
             }
-            for (hash, old_ulid) in &to_remove {
-                // `remove_owner_at` covers both `inner` and `deltas`. Plain
-                // `lookup` only checks `inner`, so a Delta-canonical hash
-                // would be left dangling — phantom entry pointing at a
-                // deleted input segment. Caught by
-                // `assert_extent_index_consistent` on
-                // `gc_delta_partial_death_compaction`.
-                index.remove_owner_at(hash, *old_ulid);
-            }
-        }
 
-        // Merge the GC output into self.lbamap by per-entry conditional
-        // insert. `insert_consuming_inputs` skips any sub-range whose
-        // existing claimant ULID is >= `new_ulid` AND is not one of the
-        // inputs being consumed — exactly the post-checkpoint live writes
-        // whose WAL/segment ULID is above gc_checkpoint's mint. A
-        // claimant that *is* a consumed input is overridable: that
-        // segment is being torn down on disk by this apply, so its
-        // lbamap claim is stale. See `docs/design/lbamap-claimant-tracking.md`,
-        // `docs/finding-sweep-flush-claimant-bug.md`, and
-        // `gc_output_loses_to_live_write_applied_after_gc`.
-        {
-            let lbamap = Arc::make_mut(&mut self.lbamap);
+            // Merge the GC output into the lbamap by per-entry conditional
+            // insert. `insert_consuming_inputs` skips any sub-range whose
+            // existing claimant ULID is >= `new_ulid` AND is not one of the
+            // inputs being consumed — exactly the post-checkpoint live writes
+            // whose WAL/segment ULID is above gc_checkpoint's mint. A
+            // claimant that *is* a consumed input is overridable: that
+            // segment is being torn down on disk by this apply, so its
+            // lbamap claim is stale. See `docs/design/lbamap-claimant-tracking.md`,
+            // `docs/finding-sweep-flush-claimant-bug.md`, and
+            // `gc_output_loses_to_live_write_applied_after_gc`.
+            let lbamap = Arc::make_mut(&mut vol.lbamap);
             for e in &entries {
                 lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
             }
-        }
+            Ok(())
+        })?;
 
-        // Pre-commit refusal: with the full in-memory apply done (extent
-        // index and lbamap), every lbamap-referenced hash must resolve
-        // through the extent index — the read path's lookup. A miss here
-        // means committing this fold would strand an LBA claim with no
-        // body location: permanent read EIO that a rebuild reproduces
-        // once the inputs are unlinked. The claim can arrive via the
-        // output's own DedupRef entries during the merge above, so only
-        // this post-merge check sees it — the stale-liveness loop reads
-        // the pre-merge lbamap. Runs unconditionally in production.
-        let orphaned = self.unresolvable_lbamap_hashes(8);
-        if !orphaned.is_empty() {
+        if let ResolvabilityGate::Refused(orphaned) = gate {
             let detail = orphaned
                 .iter()
                 .map(
@@ -1377,8 +1380,6 @@ impl Volume {
                  dropping output and plan",
                 orphaned.len(),
             );
-            self.extent_index = pre_apply_index;
-            self.lbamap = pre_apply_lbamap;
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_refused");
@@ -1784,6 +1785,40 @@ impl Volume {
             }
         }
         unresolved
+    }
+
+    /// Run an in-memory extent-index/lbamap mutation behind the
+    /// resolvability gate shared by the structural rewriters (GC fold
+    /// apply, repack apply): snapshot both maps, run `mutate`, then
+    /// require every lbamap-referenced hash to resolve through the
+    /// extent index — the read path's lookup. A miss means committing
+    /// the mutation would strand an LBA claim with no body location
+    /// (permanent read EIO that a rebuild reproduces once the inputs
+    /// are unlinked), so both maps are restored and the orphans
+    /// returned for the caller to log and refuse. A claim can arrive
+    /// concurrently with the rewrite worker — e.g. a dedup ref minted
+    /// against an input-owned hash, which by design never re-points
+    /// the extent index — so only this post-mutation check sees it;
+    /// worker-side classification reads a prep-time snapshot. Both
+    /// maps are also restored when `mutate` itself errors.
+    pub(in crate::volume) fn mutate_gated_on_resolvability(
+        &mut self,
+        mutate: impl FnOnce(&mut Self) -> io::Result<()>,
+    ) -> io::Result<ResolvabilityGate> {
+        let pre_index = Arc::clone(&self.extent_index);
+        let pre_lbamap = Arc::clone(&self.lbamap);
+        if let Err(e) = mutate(self) {
+            self.extent_index = pre_index;
+            self.lbamap = pre_lbamap;
+            return Err(e);
+        }
+        let orphaned = self.unresolvable_lbamap_hashes(8);
+        if orphaned.is_empty() {
+            return Ok(ResolvabilityGate::Applied);
+        }
+        self.extent_index = pre_index;
+        self.lbamap = pre_lbamap;
+        Ok(ResolvabilityGate::Refused(orphaned))
     }
 
     /// Stress-only invariant: panic if [`Self::unresolvable_lbamap_hashes`]
