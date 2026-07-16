@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Micro-repro for the lost-write / stale-payload class: exercise the
+# umount checkpoint burst repeatedly and fsck between cycles.
+#
+# Each cycle mounts the volume, creates one small file and deletes the
+# previous one (rewriting the inode bitmap and directory block), then
+# umounts — forcing ext4 to checkpoint those metadata blocks in-place,
+# interleaved with the final FLUSH — and runs `e2fsck -fn` on the
+# unmounted device. A stale or lost metadata write fails the fsck
+# within one cycle of the write that lost.
+#
+# Runs ON the target host as root against a formatted, running elide
+# volume that nothing else is using. Start the daemon with
+# ELIDE_WRITE_TRACE=1 so each write is hashed at ublk ingress and at
+# the WAL decision; on failure, cross-check the two [wtrace] streams
+# in elide.log for the fsck-named blocks.
+#
+# Usage:
+#   umount-burst-repro <volume-name> [iterations]      # default 500
+set -u
+
+V=${1:?usage: umount-burst-repro <volume-name> [iterations]}
+N=${2:-500}
+DEV="/dev/elide/$V"
+MNT="/mnt/$V"
+
+[ -b "$(readlink -f "$DEV")" ] || { echo "no block device at $DEV" >&2; exit 1; }
+mkdir -p "$MNT"
+mountpoint -q "$MNT" && { echo "$MNT already mounted; umount first" >&2; exit 1; }
+
+for i in $(seq 1 "$N"); do
+    mount "$DEV" "$MNT" || { echo "iter $i: mount failed"; exit 1; }
+    dd if=/dev/urandom of="$MNT/f$i" bs=4K count=4 status=none
+    rm -f "$MNT/f$((i - 1))"
+    umount "$MNT" || { echo "iter $i: umount failed"; exit 1; }
+    if ! e2fsck -fn "$DEV" >"/tmp/umount-burst-fsck.$i" 2>&1; then
+        echo "iter $i: FSCK FAIL $(date -u +%H:%M:%S)"
+        cat "/tmp/umount-burst-fsck.$i"
+        echo "cross-check [wtrace] lines in elide.log around this window"
+        exit 2
+    fi
+    rm -f "/tmp/umount-burst-fsck.$i"
+    if ((i % 25 == 0)); then
+        echo "iter $i clean $(date -u +%H:%M:%S)"
+    fi
+done
+echo "COMPLETED $N iterations clean"

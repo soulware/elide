@@ -726,10 +726,22 @@ impl Volume {
         if self.lbamap.has_full_match(lba, lba_length, &hash) {
             self.noop_stats.skipped_writes += 1;
             self.noop_stats.skipped_bytes += data.len() as u64;
+            if crate::wtrace::enabled() {
+                log::info!(
+                    "[wtrace] noop-skip lba={lba} blocks={lba_length} hash={}",
+                    hash.to_hex()
+                );
+            }
             return Ok(false);
         }
 
         self.write_commit(lba, lba_length, data, hash, compressed)?;
+        if crate::wtrace::enabled() {
+            log::info!(
+                "[wtrace] commit lba={lba} blocks={lba_length} hash={}",
+                hash.to_hex()
+            );
+        }
         Ok(true)
     }
 
