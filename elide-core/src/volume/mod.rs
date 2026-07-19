@@ -65,7 +65,7 @@ pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_
 pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
-    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteJob, PromoteResult,
+    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteFailure, PromoteJob, PromoteResult,
     PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob,
     SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
@@ -143,7 +143,7 @@ const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 /// and at recovery-time startup promote.
 pub(crate) fn materialise_pending_bodies(
     wal_path: &Path,
-    entries: Vec<segment::SegmentEntry>,
+    entries: &[segment::SegmentEntry],
     body_offsets: &[Option<u64>],
 ) -> io::Result<Vec<segment::PendingEntry>> {
     use std::os::unix::fs::FileExt;
@@ -154,7 +154,7 @@ pub(crate) fn materialise_pending_bodies(
         None
     };
     let mut out = Vec::with_capacity(entries.len());
-    for (mut entry, off) in entries.into_iter().zip(body_offsets.iter()) {
+    for (mut entry, off) in entries.iter().cloned().zip(body_offsets.iter()) {
         let mut body = None;
         if let (Some(off), Some(f)) = (off, &f) {
             let mut buf = vec![0u8; entry.stored_length as usize];
@@ -583,7 +583,8 @@ impl Volume {
                 body_offsets,
                 signer: Arc::clone(&signer),
                 pending_dir: pending_dir.clone(),
-            })?;
+            })
+            .map_err(|failure| failure.error)?;
             apply_promoted_entries(
                 &mut extent_index,
                 &mut lbamap,
@@ -2221,8 +2222,33 @@ impl Volume {
             return Ok(());
         }
         let job = self.take_wal_into_promote_job(segment_ulid)?;
-        let result = crate::actor::execute_promote(job)?;
-        self.apply_promote(&result);
+        match crate::actor::execute_promote(job) {
+            Ok(result) => {
+                self.apply_promote(&result);
+                Ok(())
+            }
+            Err(failure) => {
+                self.restore_failed_promote(*failure.job)?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Inverse of `take_wal_into_promote_job`: reopen the old WAL for
+    /// continued appending and put the entries back, so a failed promote
+    /// leaves the volume exactly as it was before the attempt. The WAL
+    /// file's records were all fully committed, so its current length is
+    /// the valid size.
+    fn restore_failed_promote(&mut self, job: PromoteJob) -> io::Result<()> {
+        let size = fs::metadata(&job.old_wal_path)?.len();
+        let wal = writelog::WriteLog::reopen(&job.old_wal_path, size)?;
+        self.wal = Some(OpenWal {
+            wal,
+            ulid: job.old_wal_ulid,
+            path: job.old_wal_path,
+        });
+        self.pending_entries = job.entries;
+        self.pending_body_offsets = job.body_offsets;
         Ok(())
     }
 

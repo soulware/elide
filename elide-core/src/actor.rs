@@ -42,11 +42,11 @@ use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats,
     DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
-    NoopSkipStats, PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep,
-    PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult,
-    ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, SignSnapshotManifestJob,
-    SignSnapshotManifestResult, Volume, WorkerJob, WorkerResult, find_segment_in_dirs,
-    open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
+    PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
+    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult,
+    SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob, WorkerResult,
+    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,6 +271,12 @@ struct PromotePipeline {
     parked_promote_segments: Vec<ParkedPromoteSegment>,
     /// Number of `promote_segment` jobs dispatched but not yet applied.
     promote_segments_in_flight: usize,
+    /// Failed promote jobs awaiting retry, oldest first. Each holds a
+    /// closed WAL epoch whose on-disk WAL file is the durable copy of
+    /// the data; [`VolumeActor::retry_failed_promote`] re-dispatches one
+    /// per promote trigger (write-path threshold, `PromoteWal`,
+    /// `GcCheckpoint`).
+    failed_promotes: VecDeque<Box<PromoteJob>>,
 }
 
 /// Reply slots for worker operations that admit at most one in flight:
@@ -545,6 +551,7 @@ impl VolumeActor {
     /// a fresh WAL, then sends the job to the worker.  No-op if the WAL
     /// is empty.  Logs and returns on error.
     fn dispatch_promote(&mut self) {
+        self.retry_failed_promote();
         let job = match self.lock_volume().prepare_promote() {
             Ok(Some(job)) => job,
             Ok(None) => return,
@@ -563,6 +570,24 @@ impl VolumeActor {
         self.pipeline.inflight_old_wals.push_back(old_wal_path);
     }
 
+    /// Re-dispatch the oldest stashed failed promote, if any. Returns
+    /// the job's segment ULID when a retry was dispatched. One job per
+    /// call — a job that fails again lands back on the queue, so retries
+    /// pace themselves to the promote triggers rather than spinning.
+    fn retry_failed_promote(&mut self) -> Option<Ulid> {
+        let job = self.pipeline.failed_promotes.pop_front()?;
+        let ulid = job.segment_ulid;
+        let old_wal_path = job.old_wal_path.clone();
+        if let Err(e) = self.send_worker_job(WorkerJob::Promote(*job)) {
+            warn!("failed-promote retry dispatch failed: {e}");
+            return None;
+        }
+        self.pipeline.promotes_in_flight += 1;
+        self.pipeline.promote_gen += 1;
+        self.pipeline.inflight_old_wals.push_back(old_wal_path);
+        Some(ulid)
+    }
+
     /// Run the GC checkpoint prep and dispatch the promote to the worker.
     ///
     /// Mints ULIDs, opens the fresh WAL immediately (writes resume),
@@ -575,6 +600,7 @@ impl VolumeActor {
         max_buckets: usize,
         reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
     ) {
+        self.retry_failed_promote();
         let prep = match self.lock_volume().prepare_gc_checkpoint(max_buckets) {
             Ok(prep) => prep,
             Err(e) => {
@@ -913,10 +939,31 @@ impl VolumeActor {
                     }
                 }
             }
-            WorkerResult::Promote(Err(e)) => {
+            WorkerResult::Promote(Err(failure)) => {
                 self.pipeline.promotes_in_flight -= 1;
-                warn!("worker promote failed: {e}");
+                let ulid = failure.job.segment_ulid;
+                warn!(
+                    "worker promote of segment {ulid} failed: {}; stashed for retry",
+                    failure.error
+                );
                 self.on_promote_failure();
+                // Fail parked repliers waiting on this ULID promptly —
+                // the coordinator retries on its next tick, and by then
+                // `retry_failed_promote` will have re-dispatched the job.
+                let clone_err = |e: &io::Error| io::Error::new(e.kind(), e.to_string());
+                if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
+                    let _ = parked.reply.send(Err(clone_err(&failure.error)));
+                }
+                let mut i = 0;
+                while i < self.pipeline.parked_promote_wal.len() {
+                    if self.pipeline.parked_promote_wal[i].segment_ulid == ulid {
+                        let parked = self.pipeline.parked_promote_wal.swap_remove(i);
+                        let _ = parked.reply.send(Err(clone_err(&failure.error)));
+                    } else {
+                        i += 1;
+                    }
+                }
+                self.pipeline.failed_promotes.push_back(failure.job);
             }
             WorkerResult::GcPlan(Ok(result)) => {
                 self.parked.handoff_in_flight = false;
@@ -1122,6 +1169,7 @@ impl VolumeActor {
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
                             // worker.  Reply once the segment is on disk.
+                            let retried = self.retry_failed_promote();
                             let prep = self.lock_volume().prepare_promote();
                             match prep {
                                 Ok(Some(job)) => {
@@ -1142,8 +1190,17 @@ impl VolumeActor {
                                     }
                                 }
                                 Ok(None) => {
-                                    // WAL empty — nothing to promote.
-                                    let _ = reply.send(Ok(()));
+                                    // Current WAL empty. If a stashed failed
+                                    // promote was just re-dispatched, park the
+                                    // reply on it so the caller observes that
+                                    // epoch's outcome; otherwise nothing to do.
+                                    if let Some(ulid) = retried {
+                                        self.pipeline
+                                            .parked_promote_wal
+                                            .push(ParkedPromoteWal { segment_ulid: ulid, reply });
+                                    } else {
+                                        let _ = reply.send(Ok(()));
+                                    }
                                 }
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
@@ -2050,35 +2107,53 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
 /// Execute a promote job: fsync the old WAL, materialise pending bodies
 /// from it, and write + commit the pending segment.
 ///
+/// On failure the job is returned intact inside [`PromoteFailure`] so the
+/// caller can retry it — the old WAL on disk stays the durable copy of the
+/// epoch, and a retry rewrites the same `pending/<ulid>.tmp` idempotently.
+///
 /// Also reachable from the inline (on-actor) `Volume::flush_wal_to_pending_as`
 /// path and the startup recovery promote in `Volume::open_impl`, so all
 /// three execution sites share one write pass.
-pub(crate) fn execute_promote(job: PromoteJob) -> io::Result<PromoteResult> {
-    std::fs::File::open(&job.old_wal_path)?.sync_data()?;
+pub(crate) fn execute_promote(job: PromoteJob) -> Result<PromoteResult, PromoteFailure> {
+    fn fail(error: io::Error, job: PromoteJob) -> PromoteFailure {
+        PromoteFailure {
+            error,
+            job: Box::new(job),
+        }
+    }
+
+    if let Err(e) = std::fs::File::open(&job.old_wal_path).and_then(|f| f.sync_data()) {
+        return Err(fail(e, job));
+    }
 
     // Body bytes for entries written via `write_commit` live only in the
     // WAL between commit and promote. Pair them with their WAL bytes via
     // `body_offsets` for write_and_commit to consume.
-    let pendings = crate::volume::materialise_pending_bodies(
+    let pendings = match crate::volume::materialise_pending_bodies(
         &job.old_wal_path,
-        job.entries,
+        &job.entries,
         &job.body_offsets,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(fail(e, job)),
+    };
 
-    let (body_section_start, entries) = segment::write_and_commit(
+    match segment::write_and_commit(
         &job.pending_dir,
         job.segment_ulid,
         pendings,
         job.signer.as_ref(),
-    )?;
-    Ok(PromoteResult {
-        segment_ulid: job.segment_ulid,
-        old_wal_ulid: job.old_wal_ulid,
-        old_wal_path: job.old_wal_path,
-        body_section_start,
-        entries,
-        pre_promote_offsets: job.pre_promote_offsets,
-    })
+    ) {
+        Ok((body_section_start, entries)) => Ok(PromoteResult {
+            segment_ulid: job.segment_ulid,
+            old_wal_ulid: job.old_wal_ulid,
+            old_wal_path: job.old_wal_path,
+            body_section_start,
+            entries,
+            pre_promote_offsets: job.pre_promote_offsets,
+        }),
+        Err(e) => Err(fail(e, job)),
+    }
 }
 
 /// Execute a `promote_segment` job: read + verify the source segment

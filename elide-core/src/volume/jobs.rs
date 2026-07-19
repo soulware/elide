@@ -41,6 +41,28 @@ pub struct PromoteJob {
     pub pending_dir: PathBuf,
 }
 
+/// A promote that failed on the worker, carrying the job back intact.
+///
+/// The old WAL file on disk remains the durable copy of the epoch, so the
+/// job can be re-dispatched as-is once the failure cause (e.g. ENOSPC)
+/// clears. The actor stashes it and retries on the next promote trigger;
+/// the synchronous path restores it into the volume via
+/// [`super::Volume`]'s failed-promote restore. Boxed so the error variant
+/// stays small.
+pub struct PromoteFailure {
+    pub error: io::Error,
+    pub job: Box<PromoteJob>,
+}
+
+impl std::fmt::Debug for PromoteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromoteFailure")
+            .field("error", &self.error)
+            .field("segment_ulid", &self.job.segment_ulid)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Result returned by the worker thread after writing the segment.
 ///
 /// Consumed by [`super::Volume::apply_promote`] on the actor thread.
@@ -267,7 +289,7 @@ pub enum WorkerJob {
 /// out-of-band so the actor can match a failed job to its parked reply
 /// (the `Err` path otherwise has no ULID to match on).
 pub enum WorkerResult {
-    Promote(io::Result<PromoteResult>),
+    Promote(Result<PromoteResult, PromoteFailure>),
     GcPlan(io::Result<GcPlanApplyResult>),
     PromoteSegment {
         ulid: Ulid,

@@ -170,3 +170,119 @@ fn data_survives_crash_after_flush_with_deferred_fsync() {
         "LBA 10_001 must survive reopen after flush"
     );
 }
+
+/// A promote that fails on the worker (here: pending/ momentarily
+/// missing) must fail the `PromoteWal` reply rather than hanging it,
+/// keep the old WAL on disk as the durable copy of the epoch, and be
+/// retried by the next promote trigger without a daemon restart.
+///
+/// Reproduces the 2026-07-16 vol8 stall: an ENOSPC promote stranded an
+/// on-disk WAL the running daemon never resealed — `pending` showed
+/// non-zero forever until a manual stop/start replayed it.
+#[test]
+fn failed_promote_is_retried_without_restart() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    let (handle, actor_thread) = open_actor(&fork_dir);
+
+    let block = incompressible_block(1);
+    handle.write(0, &block, false).unwrap();
+
+    let pending = fork_dir.join("pending");
+    let blocked = fork_dir.join("pending.blocked");
+    fs::rename(&pending, &blocked).unwrap();
+
+    // The promote fails (pending/ missing): the reply must be the
+    // error, not a hang.
+    assert!(handle.promote_wal().is_err());
+    // The WAL file is still on disk — durable copy of the failed epoch.
+    assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 1);
+
+    fs::rename(&blocked, &pending).unwrap();
+
+    // The next PromoteWal re-dispatches the stashed job; its reply is
+    // parked on that retry, so success here means the epoch landed.
+    handle.promote_wal().unwrap();
+    assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 1);
+
+    drop(handle);
+    actor_thread.join().unwrap();
+
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(0, 256).unwrap(), block);
+}
+
+/// A GC-checkpoint promote failure must resolve the parked checkpoint
+/// reply with the error (previously it hung forever and every later
+/// checkpoint was rejected as "concurrent gc_checkpoint not allowed"),
+/// and the stashed epoch must land via a later checkpoint's retry.
+#[test]
+fn failed_gc_checkpoint_promote_unblocks_later_checkpoints() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    let (handle, actor_thread) = open_actor(&fork_dir);
+
+    let block = incompressible_block(2);
+    handle.write(0, &block, false).unwrap();
+
+    let pending = fork_dir.join("pending");
+    let blocked = fork_dir.join("pending.blocked");
+    fs::rename(&pending, &blocked).unwrap();
+
+    // Checkpoint promote fails: the parked reply resolves with the error.
+    assert!(handle.gc_checkpoint(2).is_err());
+
+    // Not rejected as concurrent — the failed checkpoint cleared its
+    // parked slot. This call re-dispatches the stashed job (which fails
+    // again); its own WAL view is empty so it completes immediately.
+    handle.gc_checkpoint(2).unwrap();
+    // Barrier: flush parks on the promote generation, so once it
+    // returns the retry's failure has been processed and the job is
+    // back on the stash.
+    handle.flush().unwrap();
+
+    fs::rename(&blocked, &pending).unwrap();
+
+    // This checkpoint re-dispatches the stashed epoch, which now lands.
+    handle.gc_checkpoint(2).unwrap();
+    handle.flush().unwrap();
+    assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 1);
+
+    drop(handle);
+    actor_thread.join().unwrap();
+
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(0, 256).unwrap(), block);
+}
+
+/// The synchronous promote path restores the WAL handle and pending
+/// entries when the promote fails, so writes continue into the same
+/// WAL and a later attempt promotes the whole epoch.
+#[test]
+fn failed_inline_promote_restores_wal_state() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let base: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&base);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &incompressible_block(3)).unwrap();
+
+    let pending = base.join("pending");
+    let blocked = base.join("pending.blocked");
+    fs::rename(&pending, &blocked).unwrap();
+    assert!(vol.promote_for_test().is_err());
+    fs::rename(&blocked, &pending).unwrap();
+
+    // State restored: the next write appends to the same WAL rather
+    // than opening a second one.
+    vol.write(256, &incompressible_block(4)).unwrap();
+    assert_eq!(fs::read_dir(base.join("wal")).unwrap().count(), 1);
+
+    vol.promote_for_test().unwrap();
+    assert_eq!(fs::read_dir(base.join("wal")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 1);
+    assert_eq!(vol.read(0, 256).unwrap(), incompressible_block(3));
+    assert_eq!(vol.read(256, 256).unwrap(), incompressible_block(4));
+}
