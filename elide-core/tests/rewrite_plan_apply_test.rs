@@ -285,20 +285,18 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
     );
 }
 
-/// A stale plan whose output re-plants a DedupRef claim for a hash whose
-/// DATA entry the same plan folds away must be refused at the pre-commit
-/// check, not applied.
+/// A plan that keeps a DedupRef claim while folding away the DATA entry
+/// holding its bytes must be refused at the pre-commit check, not
+/// applied.
 ///
-/// The shape reproduces the vol3 claimant-loss incident: segment A owns
-/// DATA hash H (LBA 0), segment B claims LBA 1 via a DedupRef to H, and
-/// later overwrites of both LBAs make H unreferenced in the live lbamap.
-/// A plan drawn against the pre-overwrite state drops A and keeps B's
-/// DedupRef entry. The stale-liveness loop reads the pre-merge lbamap
-/// (H not live → no cancel), then the merge plants LBA 1 → H from the
-/// output's DedupRef with the fold's ULID as claimant, overriding the
-/// overwrite's claim — an LBA claim with no body location. The apply
-/// must detect this after the merge and refuse: plan and tmp removed,
-/// in-memory state and reads unchanged.
+/// Segment A owns DATA hash H (LBA 0), segment B claims LBA 1 via a
+/// DedupRef to H, and an overwrite of LBA 0 leaves H live only through
+/// B's claim. A plan that drops A and keeps B's DedupRef entry removes
+/// H's only body location while the merge re-plants LBA 1 → H from the
+/// output (claimant B is a consumed input, so the merge admits it) — an
+/// LBA claim with no body location. The apply must detect this after
+/// the merge and refuse: plan and tmp removed, in-memory state and
+/// reads unchanged.
 #[test]
 fn plan_orphaning_dedup_ref_claim_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -316,9 +314,9 @@ fn plan_orphaning_dedup_ref_claim_is_refused() {
     vol.flush_wal().unwrap();
     common::drain_with_repack(&mut vol);
 
-    // Segment C: overwrite both LBAs so H is no longer lbamap-live.
+    // Segment C: overwrite LBA 0 so A's DATA entry is LBA-dead; H stays
+    // live only via B's DedupRef claim at LBA 1.
     vol.write(0, &[0xCC; 4096]).unwrap();
-    vol.write(1, &[0xDD; 4096]).unwrap();
     vol.flush_wal().unwrap();
     common::drain_with_repack(&mut vol);
 
@@ -374,13 +372,13 @@ fn plan_orphaning_dedup_ref_claim_is_refused() {
         "materialised tmp must be removed for a refused plan"
     );
 
-    // In-memory state restored: reads return the overwrite bytes.
+    // In-memory state restored: reads return the pre-plan bytes.
     assert_eq!(vol.read(0, 1).unwrap().as_slice(), &[0xCC; 4096]);
-    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xDD; 4096]);
+    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xAA; 4096]);
 
     // Disk untouched: a rebuild reads the same bytes.
     drop(vol);
     let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     assert_eq!(vol.read(0, 1).unwrap().as_slice(), &[0xCC; 4096]);
-    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xDD; 4096]);
+    assert_eq!(vol.read(1, 1).unwrap().as_slice(), &[0xAA; 4096]);
 }

@@ -961,6 +961,16 @@ impl Volume {
         Ok(u_buckets[0])
     }
 
+    /// `gc_checkpoint_for_test` variant modelling a checkpoint whose WAL
+    /// flush promote failed on the worker: the ULIDs are minted and the
+    /// WAL is taken, then restored through the promote-failure path.
+    pub fn gc_checkpoint_with_failed_flush_for_test(&mut self) -> io::Result<Ulid> {
+        let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(1);
+        let job = self.take_wal_into_promote_job(u_flush)?;
+        self.restore_failed_promote(job)?;
+        Ok(u_buckets[0])
+    }
+
     /// Mint the ULIDs for a GC checkpoint, in ordering-invariant order:
     /// `max_buckets` bucket ULIDs followed by `u_flush`.
     ///
@@ -1346,15 +1356,16 @@ impl Volume {
             }
 
             // Merge the GC output into the lbamap by per-entry conditional
-            // insert. `insert_consuming_inputs` skips any sub-range whose
-            // existing claimant ULID is >= `new_ulid` AND is not one of the
-            // inputs being consumed — exactly the post-checkpoint live writes
-            // whose WAL/segment ULID is above gc_checkpoint's mint. A
-            // claimant that *is* a consumed input is overridable: that
-            // segment is being torn down on disk by this apply, so its
-            // lbamap claim is stale. See `docs/design/lbamap-claimant-tracking.md`,
-            // `docs/finding-sweep-flush-claimant-bug.md`, and
-            // `gc_output_loses_to_live_write_applied_after_gc`.
+            // insert. `insert_consuming_inputs` installs only on sub-ranges
+            // whose existing claimant is one of the inputs this apply
+            // consumes and tears down; every other claimant — above OR
+            // below `new_ulid` — keeps its sub-range, because it marks a
+            // write the plan did not carry (a WAL whose flush promote
+            // failed keeps stamping claims below `new_ulid`). See
+            // `docs/design/lbamap-claimant-tracking.md`,
+            // `docs/finding-sweep-flush-claimant-bug.md`,
+            // `gc_output_loses_to_live_write_applied_after_gc`, and
+            // `gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush`.
             let lbamap = Arc::make_mut(&mut vol.lbamap);
             for e in &entries {
                 lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
@@ -2234,18 +2245,72 @@ impl Volume {
         }
     }
 
-    /// Inverse of `take_wal_into_promote_job`: reopen the old WAL for
+    /// Inverse of `take_wal_into_promote_job`: reopen the WAL for
     /// continued appending and put the entries back, so a failed promote
-    /// leaves the volume exactly as it was before the attempt. The WAL
-    /// file's records were all fully committed, so its current length is
-    /// the valid size.
+    /// loses nothing. The WAL file's records were all fully committed, so
+    /// its current length is the valid size.
+    ///
+    /// The reopened WAL gets a **fresh** ULID (file renamed to match, so
+    /// crash-recovery replay stamps the same claimant): a checkpoint may
+    /// have minted bucket ULIDs above the old one between the take and
+    /// the failure, and reusing it would stamp subsequent writes below
+    /// those buckets — violating the "new WAL above any prior checkpoint
+    /// ULID" invariant `ensure_wal_open` maintains.
     fn restore_failed_promote(&mut self, job: PromoteJob) -> io::Result<()> {
-        let size = fs::metadata(&job.old_wal_path)?.len();
-        let wal = writelog::WriteLog::reopen(&job.old_wal_path, size)?;
+        let new_ulid = self.mint.next();
+        let new_path = self.base_dir.join("wal").join(new_ulid.to_string());
+        fs::rename(&job.old_wal_path, &new_path)?;
+        let size = fs::metadata(&new_path)?.len();
+        let wal = writelog::WriteLog::reopen(&new_path, size)?;
+
+        // The live maps reference the WAL's old identity: extent-index
+        // locations point body-bearing hashes at `(old_wal_ulid, offset)`
+        // and lbamap claims carry `old_wal_ulid` as claimant. Re-key both
+        // to the new identity, mirroring `apply_promoted_entries` — the
+        // CAS/hash-match guards leave anything a concurrent writer has
+        // superseded untouched.
+        {
+            let index = Arc::make_mut(&mut self.extent_index);
+            for (entry, old_wal_offset) in job
+                .entries
+                .iter()
+                .zip(job.pre_promote_offsets.iter().copied())
+            {
+                match entry.kind {
+                    EntryKind::Data
+                    | EntryKind::Inline
+                    | EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline => {}
+                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                }
+                if let Some(old_wal_offset) = old_wal_offset {
+                    index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);
+                }
+            }
+            let lbamap = Arc::make_mut(&mut self.lbamap);
+            for entry in &job.entries {
+                if entry.kind.is_canonical_only() {
+                    continue;
+                }
+                let claim_hash = if entry.kind == EntryKind::Zero {
+                    ZERO_HASH
+                } else {
+                    entry.hash
+                };
+                lbamap.set_claimant_if_matches(
+                    entry.start_lba,
+                    entry.lba_length,
+                    claim_hash,
+                    new_ulid,
+                );
+            }
+        }
+        self.evict_cached_segment(job.old_wal_ulid);
+
         self.wal = Some(OpenWal {
             wal,
-            ulid: job.old_wal_ulid,
-            path: job.old_wal_path,
+            ulid: new_ulid,
+            path: new_path,
         });
         self.pending_entries = job.entries;
         self.pending_body_offsets = job.body_offsets;

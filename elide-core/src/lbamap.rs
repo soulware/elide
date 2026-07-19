@@ -225,16 +225,14 @@ impl LbaMap {
         );
     }
 
-    /// Like [`insert_if_newer`] but treats existing entries whose claimant
-    /// is in `consumed_inputs` as overridable. Intended for sweep / repack
-    /// apply paths that consume input segments and bin-pack their bodies
-    /// under a fresh output ULID `< u_flush`: the prior `flush_wal_to_pending_as`
-    /// already bumped lbamap claimants on the WAL-flushed entries to
-    /// `u_flush`, which is *higher* than the new output ULID even though it
-    /// names a segment the apply is about to delete. Without this override,
-    /// the strict-newer guard would treat a consumed-input claimant as a
-    /// concurrent writer's claim and refuse to install the new output.
-    /// See `docs/finding-sweep-flush-claimant-bug.md`.
+    /// [`insert_if_newer`] variant for rewrite apply paths (GC fold /
+    /// sweep / repack): installs only on sub-ranges whose current claimant
+    /// is one of the `consumed_inputs` this apply consumes and deletes. A
+    /// consumed claimant is overridable at any ULID order — e.g. the
+    /// `u_flush` segment a sweep bin-packs sits *above* the output ULID
+    /// (see `docs/finding-sweep-flush-claimant-bug.md`) — while every
+    /// other claimant keeps its sub-range: it marks a write the rewrite's
+    /// plan did not carry.
     pub fn insert_consuming_inputs(
         &mut self,
         start_lba: u64,
@@ -340,9 +338,8 @@ impl LbaMap {
 
     /// [`register_entry_inner`](Self::register_entry_inner) with the
     /// apply-phase admission: install only on sub-ranges whose current
-    /// claimant is older than `claimant` or is one of the `inputs` this
-    /// apply consumes and deletes; a concurrent writer's higher claim
-    /// wins.
+    /// claimant is one of the `inputs` this apply consumes and deletes;
+    /// every other claimant's sub-range is left untouched.
     pub fn register_entry_consuming_inputs(
         &mut self,
         entry: &segment::SegmentEntry,
@@ -362,10 +359,17 @@ impl LbaMap {
         consumed_inputs: Option<&HashSet<Ulid>>,
     ) {
         let new_end = start_lba + lba_length as u64;
-        // An existing entry blocks the install iff its claimant is >= ours
-        // AND that claimant is not one of the inputs the caller is consuming.
+        // With a consumed set, an existing entry blocks the install unless
+        // its claimant is one of the inputs this apply consumes and
+        // deletes: a rewrite output may only replace claims owned by its
+        // own inputs, and any other claimant — whatever its ULID order —
+        // marks a write the rewrite's plan did not carry. Without a
+        // consumed set, a claimant `>=` ours blocks.
         let blocks = |existing: Ulid| -> bool {
-            existing >= claimant && !consumed_inputs.is_some_and(|set| set.contains(&existing))
+            match consumed_inputs {
+                Some(set) => !set.contains(&existing),
+                None => existing >= claimant,
+            }
         };
 
         // Sub-ranges of [start_lba, new_end) covered by an existing entry
@@ -1619,13 +1623,27 @@ mod tests {
     #[test]
     fn insert_consuming_inputs_preserves_concurrent_higher_claimant() {
         // Existing claimant u(9) is NOT in the consumed set — it's a
-        // concurrent writer. Strict-newer guard still applies; sweep's
-        // output at u(5) must not clobber it.
+        // concurrent writer. Sweep's output at u(5) must not clobber it.
         let mut map = LbaMap::new();
         map.insert(0, 4, h(1), u(9));
         let consumed: HashSet<Ulid> = std::iter::once(u(7)).collect();
         map.insert_consuming_inputs(0, 4, h(2), u(5), &consumed);
         assert_eq!(map.lookup(0), Some((h(1), 0)));
+    }
+
+    #[test]
+    fn insert_consuming_inputs_preserves_lower_nonconsumed_claimant() {
+        // Existing claimant u(3) sorts BELOW the rewrite output's u(5)
+        // but is not a consumed input — e.g. a claim stamped through a
+        // WAL minted before the pass's checkpoint. The rewrite's plan
+        // never saw that write, so the install must leave it untouched;
+        // ULID order alone grants no override.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(3));
+        let consumed: HashSet<Ulid> = std::iter::once(u(2)).collect();
+        map.insert_consuming_inputs(0, 4, h(2), u(5), &consumed);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.claimant_at(0), Some(u(3)));
     }
 
     #[test]
