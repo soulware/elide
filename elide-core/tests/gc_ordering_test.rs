@@ -165,6 +165,88 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
     drop(vol);
 }
 
+/// A fold must not resurrect a stale claim over an LBA freshly written
+/// through a WAL whose checkpoint flush failed.
+///
+/// The write postdates the coordinator's plan scan, so the plan carries
+/// the stale claim for the LBA, and the fresh hash stays live at its
+/// canonical LBA (write-path dedup minted a thin DedupRef), so neither
+/// the stale-liveness cancellation nor the resolvability gate can see a
+/// per-LBA loss. Two defences keep the fresh write the winner: the
+/// restored WAL is re-minted above the pass's bucket ULID, and the
+/// apply merge overrides only sub-ranges claimed by the fold's consumed
+/// inputs (`insert_consuming_inputs_preserves_lower_nonconsumed_claimant`
+/// pins the merge rule directly).
+#[test]
+fn gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    // Stale generation: LBA 0 = 0xAA, promoted to index/.
+    vol.write(0, &[0xAA; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+
+    // Canonical content P at LBA 5, promoted to index/. The overwrite of
+    // LBA 0 below dedups against this hash, keeping it live at LBA 5
+    // regardless of what happens at LBA 0.
+    let payload: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(5, &payload).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+
+    // Open the WAL pre-checkpoint with an unrelated write.
+    vol.write(9, &[0x55; 4096]).unwrap();
+
+    // Checkpoint whose flush promote fails; the WAL is restored through
+    // the promote-failure path.
+    let gc_ulid = vol.gc_checkpoint_with_failed_flush_for_test().unwrap();
+
+    // Coordinator plans now: LBA 0 → 0xAA is live in its view (the
+    // overwrite below has not happened yet), so the plan carries it.
+    let (_, _, to_delete) = common::simulate_coord_gc_local(&fork_dir, gc_ulid, 2)
+        .expect("GC should compact the two seeded segments");
+
+    // Fresh overwrite of LBA 0 with P lands in the restored WAL as a
+    // thin DedupRef claim. The claimant is not one of the fold's
+    // consumed inputs.
+    vol.write(0, &payload).unwrap();
+
+    // Apply must leave the fresh claim in place.
+    vol.apply_gc_handoffs().unwrap();
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The fresh write must win at LBA 0.
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        payload,
+        "LBA 0 must read the fresh dedup'd write, not the resurrected stale generation"
+    );
+
+    // Promote the flush segment; the claim must still resolve fresh.
+    common::drain_with_repack(&mut vol);
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        payload,
+        "LBA 0 wrong after flush segment promote"
+    );
+    assert_eq!(vol.read(5, 1).unwrap(), payload, "canonical LBA 5 wrong");
+
+    // Crash + rebuild must agree with the live maps.
+    drop(vol);
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        payload,
+        "LBA 0 wrong after crash+rebuild"
+    );
+    drop(vol);
+}
+
 /// Regression: write-path dedup creates two segments with the same hash (one
 /// DATA, one DedupRef) for different LBAs.  The extent_index tracks a
 /// single canonical location per hash, so the non-canonical segment's DATA

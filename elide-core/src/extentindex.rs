@@ -408,6 +408,33 @@ impl ExtentIndex {
         }
     }
 
+    /// Re-key the entry for `hash` to a new owning segment ULID,
+    /// preserving every other location field, only if the current
+    /// location matches `(expected_segment_id, expected_body_offset)`.
+    /// Returns `true` if the re-key happened. Used when a restored WAL
+    /// is renamed to a fresh ULID: its resident entries' locations
+    /// follow the file to its new identity.
+    pub fn rekey_owner(
+        &mut self,
+        hash: blake3::Hash,
+        expected_segment_id: Ulid,
+        expected_body_offset: u64,
+        new_segment_id: Ulid,
+    ) -> bool {
+        match self.inner.get(&hash) {
+            Some(loc)
+                if loc.segment_id == expected_segment_id
+                    && loc.body_offset == expected_body_offset =>
+            {
+                let mut new_loc = loc.clone();
+                new_loc.segment_id = new_segment_id;
+                self.inner.insert(hash, new_loc);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Look up the segment location for `hash`.
     pub fn lookup(&self, hash: &blake3::Hash) -> Option<&ExtentLocation> {
         self.inner.get(hash)
