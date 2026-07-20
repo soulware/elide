@@ -130,9 +130,20 @@ bench_bg() {
         >>"$OUT_ROOT/pgbench.log" 2>&1 </dev/null &
 }
 
+# Zombies satisfy pg_ctl status's liveness probe until init reaps them; wait
+# for the process table to clear so recovery sees a dead server.
+kill_postgres() {
+    local deadline=$((SECONDS + 30))
+    pkill -9 -u postgres || true
+    while pgrep -u postgres >/dev/null 2>&1; do
+        ((SECONDS < deadline)) || die "postgres processes did not exit within 30s"
+        sleep 0.5
+    done
+}
+
 crash_pg() {
     log "crash-pg: kill -9 all postgres processes"
-    pkill -9 -u postgres || true
+    kill_postgres
 }
 
 crash_vol() {
@@ -144,7 +155,7 @@ crash_vol() {
     # postgres is now on a dead device; take it down hard and clear the mount
     # so recovery exercises the full path: respawned volume, fsck, remount.
     sleep 2
-    pkill -9 -u postgres || true
+    kill_postgres
     umount -l "$MNT" 2>/dev/null || true
 }
 
