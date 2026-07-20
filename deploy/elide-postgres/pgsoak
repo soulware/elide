@@ -77,7 +77,7 @@ fsck_device() {
     ((rc <= 1)) || die "e2fsck exit $rc on $DEV (see $OUT_ROOT/fsck.log)"
 }
 
-do_start() {
+do_mount() {
     wait_device
     if ! mountpoint -q "$MNT"; then
         fsck_device
@@ -85,7 +85,15 @@ do_start() {
         mount -o discard "$DEV" "$MNT"
         log "mounted $DEV at $MNT"
     fi
+}
+
+do_start() {
+    do_mount
     install -d -o postgres -g postgres /var/run/postgresql
+    # OUT_ROOT is root-owned; pre-create the server log so the postgres user
+    # can append to it.
+    [ -e "$OUT_ROOT/postgres.log" ] \
+        || install -m 644 -o postgres -g postgres /dev/null "$OUT_ROOT/postgres.log"
     if ! pg_running; then
         as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 300 \
             -l "$OUT_ROOT/postgres.log" start
@@ -112,19 +120,33 @@ do_verify() {
 
 do_bench() {
     local secs="${1:-$RUN_SECS}"
-    as_pg "$PGBIN/pgbench" -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
+    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
 }
 
+# -n on every run: pgbench's default startup vacuum truncates pgbench_history,
+# which voids the four-way balance equality across runs. Autovacuum covers the
+# table bloat the skipped vacuum would have handled.
 bench_bg() {
     local secs="${1:-$RUN_SECS}"
     setsid bash -c "exec runuser -u postgres -- $PGBIN/pgbench \
-        -c $CLIENTS -j $JOBS -T $secs -P 10 $DB" \
+        -n -c $CLIENTS -j $JOBS -T $secs -P 10 $DB" \
         >>"$OUT_ROOT/pgbench.log" 2>&1 </dev/null &
+}
+
+# Zombies satisfy pg_ctl status's liveness probe until init reaps them; wait
+# for the process table to clear so recovery sees a dead server.
+kill_postgres() {
+    local deadline=$((SECONDS + 30))
+    pkill -9 -u postgres || true
+    while pgrep -u postgres >/dev/null 2>&1; do
+        ((SECONDS < deadline)) || die "postgres processes did not exit within 30s"
+        sleep 0.5
+    done
 }
 
 crash_pg() {
     log "crash-pg: kill -9 all postgres processes"
-    pkill -9 -u postgres || true
+    kill_postgres
 }
 
 crash_vol() {
@@ -136,7 +158,7 @@ crash_vol() {
     # postgres is now on a dead device; take it down hard and clear the mount
     # so recovery exercises the full path: respawned volume, fsck, remount.
     sleep 2
-    pkill -9 -u postgres || true
+    kill_postgres
     umount -l "$MNT" 2>/dev/null || true
 }
 
@@ -162,30 +184,34 @@ do_cycle() {
 mkdir -p "$OUT_ROOT"
 case "${1:-}" in
     setup)
+        # Every step is guarded on its own effect, so a rerun resumes an
+        # interrupted setup instead of failing or redoing work.
         [ -e "$DATA_DIR/by_name/$VOL" ] || elide volume create --size "$VOL_SIZE" "$VOL"
         wait_device
-        if [ -e "$PGDATA/PG_VERSION" ]; then
-            log "setup: $PGDATA already initialised"; exit 0
-        fi
-        mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
-            "$(readlink -f "$DEV")"
-        mkdir -p "$MNT"
-        mount -o discard "$DEV" "$MNT"
-        install -d -o postgres -g postgres "$PGDATA"
-        as_pg "$PGBIN/initdb" -k -D "$PGDATA"
-        # Small buffer pool and tight WAL ceiling so the workload reaches the
-        # device instead of idling in shared memory: frequent checkpoints
-        # (random heap writes) and a steady fsync stream on the WAL.
-        cat >>"$PGDATA/postgresql.conf" <<'EOF'
+        blkid "$(readlink -f "$DEV")" >/dev/null 2>&1 \
+            || mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+                "$(readlink -f "$DEV")"
+        do_mount
+        if [ ! -e "$PGDATA/PG_VERSION" ]; then
+            install -d -o postgres -g postgres "$PGDATA"
+            as_pg "$PGBIN/initdb" -k -D "$PGDATA"
+            # Small buffer pool and tight WAL ceiling so the workload reaches
+            # the device instead of idling in shared memory: frequent
+            # checkpoints (random heap writes) and a steady fsync stream on
+            # the WAL.
+            cat >>"$PGDATA/postgresql.conf" <<'EOF'
 listen_addresses = ''
 shared_buffers = '128MB'
 checkpoint_timeout = '60s'
 max_wal_size = '256MB'
 log_checkpoints = on
 EOF
+        fi
         do_start
-        as_pg "$PGBIN/createdb" "$DB"
-        as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
+        if ! as_pg "$PGBIN/psql" -X -At -l | cut -d'|' -f1 | grep -qx "$DB"; then
+            as_pg "$PGBIN/createdb" "$DB"
+            as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
+        fi
         log "setup complete: volume $VOL, scale $SCALE"
         ;;
     start)     do_start ;;
