@@ -47,6 +47,15 @@ Select sources by content resemblance rather than location or path. This needs n
 
 **Failure modes.** A spurious super-feature match produces a delta that fails the size check and is discarded. Entries without sketches (segments written before the bump, sub-threshold extents) contribute no candidates and nothing else changes.
 
+**Snapshot-free operation.** The sealed-snapshot scoping above is a property of the other selection strategies, not of delta compression itself: same-LBA lookup needs a consistent prior LBA map, and path matching needs filemaps at sealed points. Similarity needs only the sketch index, and with sketches persisted per index entry that index is maintainable incrementally from the live extent index. The producer can therefore run on every drain tick, deltaing pending segments against any locally-present prior extent before their first upload, on a volume with no snapshot in its history. The WAL write path stays out of scope in this form too: the WAL is local and short-lived and its records need plain bytes for crash recovery, so segment formation is the earliest point where a delta earns anything.
+
+Two things distinguish snapshot-free from the snapshot-scoped form:
+
+- *Source churn.* A Delta keeps its source body alive through GC (`lba_referenced_hashes`, `FLAG_CANONICAL_ONLY`), so a young source that is overwritten soon after leaves GC carrying its body only because a delta references it. Snapshot scoping filtered for cold sources as a side effect; a snapshot-free producer needs an explicit source-age gate — only extents older than some number of ticks are indexed as candidates. The journal exclusion removes the highest-churn range independently.
+- *Pinning.* Scoping candidates to the prior sealed snapshot left the pinning invariant untouched. Arbitrary-source selection rests directly on GC's reference rules for source liveness, so that analysis becomes part of the work rather than something sidestepped.
+
+The snapshot-scoped form is the same producer with a stricter candidate filter (membership in the prior sealed snapshot instead of a source-age gate), so the two forms are one code path and either can ship first.
+
 ## Proposed: journal-region awareness
 
 The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at mkfs) and is continuously rewritten with copies of metadata blocks. On the round-1 workload the journal was 8.9% of all changed bytes and non-file metadata another 14.1% ([findings.md](../findings.md)). Untreated, it interacts poorly with each producer: journal blocks sit in the post-floor population every tick and mostly fail the delta size check, so repack burns compute on them; their metadata copies would sketch-match the metadata home locations and fill the similarity index with the highest-churn extents on the device; and opportunistic dedup can bind journal LBAs to metadata extents via DedupRef.
@@ -65,5 +74,6 @@ Round 1 (2026-07-20, full numbers in [findings.md](../findings.md)): same-LBA se
 
 - Final sketch parameters. Round 1 fixed the grouping question (pairs, not quadruples) but not the feature count or the per-entry size/recall tradeoff (8 pairs cost 64 bytes per index entry against the 24 bytes a 12/4/3 split would).
 - Windowed sketches for large sources.
-- Widening the candidate set beyond the prior sealed snapshot to the full extent-index lineage, which reopens the pinning analysis.
+- The source-age gate for snapshot-free operation: how cold a candidate must be before referencing it is worth the GC entanglement, and whether the gate is a tick count or something cheaper to reason about.
+- The pinning analysis for arbitrary-source selection (§ Snapshot-free operation), including cross-lineage candidates from ancestor volumes.
 - Filemap hardlinks produce duplicate rows with different paths and the same hash; harmless, worth deduplicating for compactness.
