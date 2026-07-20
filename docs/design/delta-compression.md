@@ -1,6 +1,6 @@
 # Design: delta compression
 
-Status: format, producers, and read path landed. Two additions proposed, not started: similarity-based source selection and journal-region awareness. Both are gated on the measurement in § Measurement.
+Status: format, producers, and read path landed. Two additions proposed, not started: similarity-based source selection and journal-region awareness. Measurement round 1 (§ Measurement) supports both; implementation is not started.
 
 Date: 2026-07-20 (supersedes the 2026-04 revision)
 
@@ -31,13 +31,13 @@ Delta options are hints. The reader takes the first option whose source is alrea
 
 Same-LBA selection misses when file data re-materialises at new LBAs. On ext4 this is not a journaling effect (data blocks are overwritten in place under `data=ordered`); it comes from applications writing a new file and renaming it over the old one, with delayed allocation choosing fresh blocks. Package upgrades and config rewrites follow this pattern.
 
-Extending path matching to this case (pairing paths across the two snapshots' filemaps) needs a filemap at both snapshots, and filemap generation is an operator verb precisely because it is expensive. Same-path lookup also pairs paths, not logical files: a rename such as logrotate's `log` → `log.1` defeats it in both directions.
+Extending path matching to this case (pairing paths across the two snapshots' filemaps) needs a filemap at both snapshots, and filemap generation is an operator verb precisely because it is expensive. Same-path lookup also pairs paths, not logical files: content that reappears under a different path (a copied file, a package manager's staged output) has no same-path source. A plain rename is not among the miss cases — `mv` moves no data blocks, so a renamed-in-place file never enters the changed set at all.
 
 ## Proposed: similarity-based source selection
 
-Select sources by content resemblance rather than location or path. This needs no filemap, works on any filesystem, and can pair renamed or copied files. Whether it recovers enough bytes in practice to justify the added machinery is what the measurement decides.
+Select sources by content resemblance rather than location or path. This needs no filemap, works on any filesystem, and can pair copied or re-pathed files. Measurement round 1 (§ Measurement) recovered ~86% of what path matching achieves on an apt-upgrade workload, without filemaps.
 
-**Sketch.** Per extent, a fixed-size resemblance sketch using the super-feature construction (Broder resemblance, computed in the style of Finesse, FAST '19): split the extent into N fixed subchunks, take the maximum Gear rolling-hash value in each, hash groups of features into three 8-byte super-features. Extents sharing any super-feature are likely similar. 24 bytes per extent, one linear pass over the data.
+**Sketch.** Per extent, a fixed-size resemblance sketch using the super-feature construction (Broder resemblance; cheap positional computation in the style of Finesse, FAST '19): split the extent into N fixed subchunks, take the maximum Gear rolling-hash value in each, hash feature groups into 8-byte super-features. Extents sharing any super-feature are likely similar; one linear pass over the data. Round 1 measured grouping width as the dominant recall parameter — two-feature groups recovered ~1.6× the bytes of four-feature groups on rebuilt binaries, whose diffuse diffs rarely leave four features jointly intact, and at pair grouping the positional construction matched a position-independent variant within 1%. The working configuration is 16 features in 8 pairs (64 bytes per entry); final parameters are an open question.
 
 **Persistence.** The sketch is stored as a per-entry field in the segment index, a format bump. It then travels with the entry the way the hash does: GC's copy-through preserves it, and a similarity index over any lineage is rebuildable from `.idx` files alone, which `prefetch_indexes` already keeps present without bodies. The alternative, a per-segment sidecar file, avoids the bump but adds an artifact to generate, upload, and keep consistent with the index.
 
@@ -49,7 +49,7 @@ Select sources by content resemblance rather than location or path. This needs n
 
 ## Proposed: journal-region awareness
 
-The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at mkfs) and is continuously rewritten with copies of metadata blocks. Untreated, it interacts poorly with each producer: journal blocks sit in the post-floor population every tick and mostly fail the delta size check, so repack burns compute on them; their metadata copies would sketch-match the metadata home locations and fill the similarity index with the highest-churn extents on the device; and opportunistic dedup can bind journal LBAs to metadata extents via DedupRef.
+The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at mkfs) and is continuously rewritten with copies of metadata blocks. On the round-1 workload the journal was 8.9% of all changed bytes and non-file metadata another 14.1% ([findings.md](../findings.md)). Untreated, it interacts poorly with each producer: journal blocks sit in the post-floor population every tick and mostly fail the delta size check, so repack burns compute on them; their metadata copies would sketch-match the metadata home locations and fill the similarity index with the highest-churn extents on the device; and opportunistic dedup can bind journal LBAs to metadata extents via DedupRef.
 
 **Identification.** Parse the superblock, walk inode 8's extent tree, cache the resulting LBA range set. The location is fixed for the life of the filesystem, and `ext4_scan.rs` already has the parsing. Non-ext4 volumes, external journals, and parse failures yield an empty set.
 
@@ -57,13 +57,13 @@ The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at
 
 ## Measurement
 
-An offline experiment precedes any implementation. Take two states of a live-written volume under a rename-heavy workload such as a package upgrade (postgres is a poor testbed: it overwrites in place, which same-LBA selection already covers). Replay same-LBA selection, run the sketch match over the misses, and compute actual zstd-dictionary ratios for the matches. Journal-range bytes get their own bucket so they inflate neither the miss population nor the recovery figure.
+The offline experiment runs via `elide delta-sim <before.img> <after.img>` over two states of one live-written ext4 filesystem (`scripts/delta-sim-workload` generates a pair via an in-place apt upgrade). It replays same-LBA selection over the changed blocks, runs the sketch match over the misses with real zstd-dictionary ratios, buckets journal-range and non-file metadata bytes separately, and bounds what path matching would achieve with a same-path oracle.
 
-Outputs: the fraction of missed bytes for which similarity finds a source, the achieved ratios, sketch compute cost, index size, and the journal's share of post-floor churn. The first number decides whether implementation proceeds; the last informs whether metadata tagging beyond the journal is worth pursuing.
+Round 1 (2026-07-20, full numbers in [findings.md](../findings.md)): same-LBA selection found sources for 5.7% of changed file-data bytes; similarity recovered 30% of the miss bytes, which is ~86% of the same-path oracle's recovery plus 22 MiB the oracle cannot reach; every surviving match beat LZ4 (zero false positives past the size check); journal plus metadata was 23% of changed bytes. The largest unrecovered bucket was apt's downloaded archives and lists — new high-entropy content with no source under any strategy. One workload on a fresh filesystem; a second round on an aged filesystem or a different churn profile would strengthen the numbers.
 
 ## Open questions
 
-- Sketch parameters (subchunk count, features per super-feature) and whether the common 12-feature/3-super-feature split suits extent-sized inputs.
+- Final sketch parameters. Round 1 fixed the grouping question (pairs, not quadruples) but not the feature count or the per-entry size/recall tradeoff (8 pairs cost 64 bytes per index entry against the 24 bytes a 12/4/3 split would).
 - Windowed sketches for large sources.
 - Widening the candidate set beyond the prior sealed snapshot to the full extent-index lineage, which reopens the pinning analysis.
 - Filemap hardlinks produce duplicate rows with different paths and the same hash; harmless, worth deduplicating for compactness.
