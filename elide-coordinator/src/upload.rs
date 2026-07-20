@@ -5,8 +5,12 @@
 // The date is extracted from the ULID timestamp (creation time, not upload time),
 // so keys are stable and deterministic regardless of when drain-pending runs.
 //
-// Each segment is handled independently. A failure on one segment does not
-// prevent the remaining segments from uploading.
+// Segments upload in ULID-ascending order and the drain halts at the first
+// failure, so the S3-committed set is always a ULID-prefix of the local
+// commit order: `max(committed) < min(pending)` holds structurally, never
+// transiently violated by a younger segment committing past a failed older
+// one. The drain interval is the retry cadence — the next tick re-runs from
+// the same oldest ULID with an idempotent re-PUT; there is no in-tick retry.
 //
 // Upload commit sequence per segment:
 //   1. Read pending/<ulid> into memory
@@ -14,8 +18,11 @@
 //   3. IPC → volume: "promote <ulid>"
 //      Volume copies pending/<ulid> → cache/<ulid>.body, writes cache/<ulid>.present,
 //      and deletes pending/<ulid>.
-//   4. On failure at any step: leave pending/<ulid> in place, record error, continue.
-//      If volume is not running: leave pending/ in place, retry next tick.
+//   4. On failure at any step: leave pending/<ulid> in place, record the error,
+//      and stop — younger pending segments wait for the next tick. Errors whose
+//      class can never succeed on retry (local file damage, credential or
+//      configuration errors) log at ERROR; store-side and network errors log
+//      at WARN and self-heal when the store recovers.
 //
 // Crash safety:
 //   - Crash before step 3: pending/<ulid> still exists; drain re-uploads (idempotent
@@ -31,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -198,7 +205,8 @@ pub fn mark_already_uploaded(
 pub struct DrainResult {
     /// Segments observed in `pending/` at the start of the tick.
     pub seen: usize,
-    /// Segments whose S3 PUT failed. Likely a persistent store-side issue.
+    /// Segments whose S3 PUT failed before the drain halted (0 or 1 —
+    /// the first failure stops the pass).
     pub upload_failed: usize,
     /// Segments that uploaded to S3 but whose promote IPC to the volume
     /// process did not succeed. Typically transient (startup/shutdown race);
@@ -269,11 +277,11 @@ pub async fn drain_pending(
     let published_user_snapshot =
         upload_volume_metadata(vol_dir, vol_ulid, store, meta_store, head_cache).await;
 
-    // Upload + promote in ULID-ascending order so each promote moves
-    // the lowest-ULID pending to committed, preserving
-    // `max(committed) < min(pending)` at every boundary. The drain
-    // caller has already run repack, so every remaining pending file
-    // is upload-ready.
+    // Upload + promote in ULID-ascending order, halting at the first
+    // failure, so each promote moves the lowest-ULID pending to
+    // committed and `max(committed) < min(pending)` holds at every
+    // boundary. The drain caller has already run repack, so every
+    // remaining pending file is upload-ready.
 
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
@@ -314,14 +322,26 @@ pub async fn drain_pending(
                     // promote.
                     warn!(
                         "promote {upload_name}: uploaded to S3 but volume promote IPC unavailable; \
-                         will retry next tick"
+                         drain halted, will retry next tick"
                     );
                     promote_failed += 1;
+                    break;
                 }
             }
             Err(e) => {
-                warn!("upload failed for segment {upload_name}: {e:#}");
                 upload_failed += 1;
+                if e.is_permanent() {
+                    error!(
+                        "upload failed for segment {upload_name}: {e:#}; this error class \
+                         cannot succeed on retry — operator attention required; drain halted"
+                    );
+                } else {
+                    warn!(
+                        "upload failed for segment {upload_name}: {e:#}; \
+                         drain halted, will retry next tick"
+                    );
+                }
+                break;
             }
         }
     }
@@ -1173,5 +1193,135 @@ mod tests {
             Some(user_snap),
             "LATEST still points at the user manifest"
         );
+    }
+
+    /// Write two one-entry pending segments and return their ULID strings
+    /// in ascending order.
+    fn write_two_pending(pending_dir: &Path) -> (String, String) {
+        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::signing::generate_ephemeral_signer;
+
+        let (signer, _) = generate_ephemeral_signer();
+        let ulid1 = make_ulid(1743120000000, 1);
+        let ulid2 = make_ulid(1743120000000, 2);
+        for (ulid, fill, lba) in [(&ulid1, 0xABu8, 0), (&ulid2, 0xCDu8, 1)] {
+            let data = vec![fill; 4096];
+            let h = blake3::hash(&data);
+            let entries = vec![SegmentEntry::new_data(
+                h,
+                lba,
+                1,
+                SegmentFlags::empty(),
+                data,
+            )];
+            write_segment(&pending_dir.join(ulid), entries, signer.as_ref()).unwrap();
+        }
+        (ulid1, ulid2)
+    }
+
+    #[tokio::test]
+    async fn drain_halts_at_first_upload_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        let pending_dir = vol_dir.join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("halt-vol".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
+        let (ulid1, ulid2) = write_two_pending(&pending_dir);
+        let _mock = spawn_mock_socket(vol_dir.clone()).await;
+
+        // Segment store rooted in a read-only directory: every PUT fails.
+        // Metadata goes to a separate writable store so only the segment
+        // path exercises the failure.
+        let seg_tmp = TempDir::new().unwrap();
+        std::fs::set_permissions(seg_tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let seg_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(seg_tmp.path()).unwrap());
+        let meta_tmp = TempDir::new().unwrap();
+        let meta_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(meta_tmp.path()).unwrap());
+
+        let result = drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &seg_store,
+            &meta_store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.seen, 2);
+        assert_eq!(
+            result.upload_failed, 1,
+            "the drain must stop at the first failed upload, not attempt the second"
+        );
+        assert_eq!(result.promote_failed, 0);
+        assert!(result.uploaded_ulids.is_empty());
+        assert!(pending_dir.join(&ulid1).exists());
+        assert!(pending_dir.join(&ulid2).exists());
+
+        std::fs::set_permissions(seg_tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_halts_at_first_promote_failure() {
+        let tmp = TempDir::new().unwrap();
+        let vol_dir = tmp.path().join(VOL_ULID);
+        let pending_dir = vol_dir.join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        elide_core::config::VolumeConfig {
+            name: Some("halt-vol".into()),
+            size: Some(4096),
+            ..Default::default()
+        }
+        .write(&vol_dir)
+        .unwrap();
+        let (ulid1, ulid2) = write_two_pending(&pending_dir);
+        // No mock socket: the first promote IPC fails after a successful PUT.
+
+        let store_tmp = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
+
+        let result = drain_pending(
+            &vol_dir,
+            VOL_ULID.parse().unwrap(),
+            &store,
+            &store,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.seen, 2);
+        assert_eq!(result.upload_failed, 0);
+        assert_eq!(
+            result.promote_failed, 1,
+            "the drain must stop at the first failed promote, not attempt the second"
+        );
+        assert!(result.uploaded_ulids.is_empty());
+
+        let vol: Ulid = VOL_ULID.parse().unwrap();
+        store
+            .head(&segment_key(vol, ulid1.parse().unwrap()))
+            .await
+            .expect("first segment PUT completed before the promote failed");
+        assert!(
+            store
+                .head(&segment_key(vol, ulid2.parse().unwrap()))
+                .await
+                .is_err(),
+            "second segment must not upload past the first failure"
+        );
+        assert!(pending_dir.join(&ulid1).exists());
+        assert!(pending_dir.join(&ulid2).exists());
     }
 }
