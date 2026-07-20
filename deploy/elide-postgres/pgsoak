@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# pgsoak: postgres-on-elide correctness soak. Runs ON the Fly machine as root
+# (baked into the image at /usr/local/bin/pgsoak); soak.sh drives it from the
+# workstation over `fly ssh`.
+#
+# Postgres runs with data checksums on a pgbench database whose TPC-B schema
+# carries a global invariant: every transaction adds the same delta to one
+# account, one teller, and one branch, and inserts a history row, so at any
+# committed state
+#     sum(abalance) = sum(tbalance) = sum(bbalance) = sum(history.delta)
+# A crash that loses or resurrects acked writes breaks either that equality,
+# a page checksum (the sums read every heap page), amcheck's index checks,
+# or ext4 recovery. Each cycle runs pgbench, crashes something mid-run,
+# recovers, and checks all four.
+#
+# Verbs:
+#   setup            create volume, mkfs, mount, initdb, start, pgbench -i
+#   start            recover to a running postgres from any state (idempotent):
+#                    wait for the device, e2fsck if unmounted, mount, pg_ctl
+#   bench [secs]     run pgbench in the foreground
+#   bench-bg [secs]  same, detached (survives the ssh session)
+#   crash-pg         kill -9 every postgres process
+#   crash-vol        kill -9 the elide volume server mid-IO, then postgres
+#   verify           invariant sums + amcheck; exit 1 on any failure
+#   check            start, then verify (one ssh round-trip after a host crash)
+#   cycle pg|vol     bench-bg, crash at a random point mid-run, check
+#   status           volume + postgres + mount state at a glance
+#
+# Env overrides (all optional):
+#   VOL       volume name (default pg0)
+#   VOL_SIZE  size for `volume create` (default 8G)
+#   SCALE     pgbench scale factor (default 50)
+#   CLIENTS   pgbench clients (default 8)
+#   JOBS      pgbench threads (default 2)
+#   RUN_SECS  pgbench duration per cycle in seconds (default 120, min 30)
+#   OUT_ROOT  evidence directory (default /data/pgsoak, on the Fly volume so
+#             logs survive a machine crash)
+set -euo pipefail
+
+VOL="${VOL:-pg0}"
+VOL_SIZE="${VOL_SIZE:-8G}"
+SCALE="${SCALE:-50}"
+CLIENTS="${CLIENTS:-8}"
+JOBS="${JOBS:-2}"
+RUN_SECS="${RUN_SECS:-120}"
+OUT_ROOT="${OUT_ROOT:-/data/pgsoak}"
+
+PGBIN=/usr/lib/postgresql/16/bin
+DEV="/dev/elide/${VOL}"
+MNT="/mnt/${VOL}"
+PGDATA="${MNT}/pgdata"
+DB=bench
+DATA_DIR="${ELIDE_DATA_DIR:-/data/elide_data}"
+
+log() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$OUT_ROOT/pgsoak.log"; }
+die() { log "FAIL: $*"; exit 1; }
+
+as_pg() { runuser -u postgres -- "$@"; }
+sql() { as_pg "$PGBIN/psql" -X -At -d "$DB" -c "$1"; }
+
+pg_running() { as_pg "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; }
+
+wait_device() {
+    local deadline=$((SECONDS + 120))
+    until [ -b "$(readlink -f "$DEV" 2>/dev/null || true)" ]; do
+        ((SECONDS < deadline)) || die "device $DEV did not appear within 120s"
+        sleep 1
+    done
+}
+
+# e2fsck -p replays the journal and fixes what a crash legitimately leaves
+# behind (exit 0 clean, 1 fixed). Exit ≥2 means damage recovery should never
+# produce; that is a soak failure, not something to repair and move past.
+fsck_device() {
+    local rc=0
+    e2fsck -fp "$(readlink -f "$DEV")" >>"$OUT_ROOT/fsck.log" 2>&1 || rc=$?
+    ((rc <= 1)) || die "e2fsck exit $rc on $DEV (see $OUT_ROOT/fsck.log)"
+}
+
+do_start() {
+    wait_device
+    if ! mountpoint -q "$MNT"; then
+        fsck_device
+        mkdir -p "$MNT"
+        mount -o discard "$DEV" "$MNT"
+        log "mounted $DEV at $MNT"
+    fi
+    install -d -o postgres -g postgres /var/run/postgresql
+    if ! pg_running; then
+        as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 300 \
+            -l "$OUT_ROOT/postgres.log" start
+        log "postgres started (recovery complete)"
+    fi
+}
+
+do_verify() {
+    local sums b t a h
+    sums="$(sql "SELECT (SELECT sum(bbalance) FROM pgbench_branches),
+                        (SELECT sum(tbalance) FROM pgbench_tellers),
+                        (SELECT sum(abalance) FROM pgbench_accounts),
+                        (SELECT coalesce(sum(delta),0) FROM pgbench_history)")"
+    IFS='|' read -r b t a h <<<"$sums"
+    if [ "$b" = "$t" ] && [ "$b" = "$a" ] && [ "$b" = "$h" ]; then
+        log "invariant OK: sum=$b across branches/tellers/accounts/history"
+    else
+        die "balance invariant broken: branches=$b tellers=$t accounts=$a history=$h"
+    fi
+    as_pg "$PGBIN/pg_amcheck" --install-missing -d "$DB" >>"$OUT_ROOT/amcheck.log" 2>&1 \
+        || die "pg_amcheck failed (see $OUT_ROOT/amcheck.log)"
+    log "amcheck OK"
+}
+
+do_bench() {
+    local secs="${1:-$RUN_SECS}"
+    as_pg "$PGBIN/pgbench" -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
+}
+
+bench_bg() {
+    local secs="${1:-$RUN_SECS}"
+    setsid bash -c "exec runuser -u postgres -- $PGBIN/pgbench \
+        -c $CLIENTS -j $JOBS -T $secs -P 10 $DB" \
+        >>"$OUT_ROOT/pgbench.log" 2>&1 </dev/null &
+}
+
+crash_pg() {
+    log "crash-pg: kill -9 all postgres processes"
+    pkill -9 -u postgres || true
+}
+
+crash_vol() {
+    local fork_dir pid
+    fork_dir="$(readlink -f "$DATA_DIR/by_name/$VOL")"
+    pid="$(cat "$fork_dir/volume.pid")"
+    log "crash-vol: kill -9 volume server pid $pid"
+    kill -9 "$pid"
+    # postgres is now on a dead device; take it down hard and clear the mount
+    # so recovery exercises the full path: respawned volume, fsck, remount.
+    sleep 2
+    pkill -9 -u postgres || true
+    umount -l "$MNT" 2>/dev/null || true
+}
+
+do_cycle() {
+    local mode="$1" point
+    ((RUN_SECS >= 30)) || die "RUN_SECS must be at least 30"
+    do_start
+    do_verify
+    bench_bg "$RUN_SECS"
+    point=$((10 + RANDOM % (RUN_SECS - 20)))
+    log "cycle $mode: pgbench running, crashing in ${point}s"
+    sleep "$point"
+    case "$mode" in
+        pg)  crash_pg ;;
+        vol) crash_vol ;;
+        *)   die "unknown cycle mode '$mode' (pg|vol)" ;;
+    esac
+    do_start
+    do_verify
+    log "cycle $mode: PASS"
+}
+
+mkdir -p "$OUT_ROOT"
+case "${1:-}" in
+    setup)
+        [ -e "$DATA_DIR/by_name/$VOL" ] || elide volume create --size "$VOL_SIZE" "$VOL"
+        wait_device
+        if [ -e "$PGDATA/PG_VERSION" ]; then
+            log "setup: $PGDATA already initialised"; exit 0
+        fi
+        mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+            "$(readlink -f "$DEV")"
+        mkdir -p "$MNT"
+        mount -o discard "$DEV" "$MNT"
+        install -d -o postgres -g postgres "$PGDATA"
+        as_pg "$PGBIN/initdb" -k -D "$PGDATA"
+        # Small buffer pool and tight WAL ceiling so the workload reaches the
+        # device instead of idling in shared memory: frequent checkpoints
+        # (random heap writes) and a steady fsync stream on the WAL.
+        cat >>"$PGDATA/postgresql.conf" <<'EOF'
+listen_addresses = ''
+shared_buffers = '128MB'
+checkpoint_timeout = '60s'
+max_wal_size = '256MB'
+log_checkpoints = on
+EOF
+        do_start
+        as_pg "$PGBIN/createdb" "$DB"
+        as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
+        log "setup complete: volume $VOL, scale $SCALE"
+        ;;
+    start)     do_start ;;
+    bench)     do_bench "${2:-}" ;;
+    bench-bg)
+        bench_bg "${2:-}"
+        log "pgbench detached for ${2:-$RUN_SECS}s"
+        ;;
+    crash-pg)  crash_pg ;;
+    crash-vol) crash_vol ;;
+    verify)    do_verify ;;
+    check)     do_start; do_verify ;;
+    cycle)     do_cycle "${2:?usage: pgsoak cycle pg|vol}" ;;
+    status)
+        elide volume list || true
+        mountpoint -q "$MNT" && echo "mounted: $MNT" || echo "not mounted: $MNT"
+        pg_running && echo "postgres: running" || echo "postgres: down"
+        ;;
+    *)
+        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac
