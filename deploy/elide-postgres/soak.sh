@@ -52,8 +52,16 @@ host_cycle() {
     point=$((10 + RANDOM % (RUN_SECS - 20)))
     echo "host cycle: crashing machine $machine in ${point}s" >&2
     sleep "$point"
-    run fly machine stop --signal KILL "$machine" || true
-    run fly machine start "$machine"
+    run fly machine stop --signal SIGKILL "$machine"
+    # The machine may still be settling into stopped state, or the restart
+    # policy may have brought it back already; retry start until one of the
+    # two has happened.
+    local deadline=$((SECONDS + 180))
+    sleep 3
+    until run fly machine start "$machine"; do
+        ((SECONDS < deadline)) || { echo "machine did not restart within 180s" >&2; exit 1; }
+        sleep 5
+    done
     wait_ssh
     ssh_cmd "pgsoak check"
 }
