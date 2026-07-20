@@ -648,6 +648,17 @@ impl GcCycleOrchestrator {
             .map(|(input, _)| *input)
             .collect();
         if expired.is_empty() {
+            // Nothing reapable yet, but superseded inputs may still be
+            // inside their retention window — say so, or a segment
+            // count read next to a "[gc] idle" line looks inexplicably
+            // high while this queue drains.
+            let waiting = head.superseded.len();
+            if waiting > 0 {
+                info!(
+                    "[reap {}] {waiting} superseded segment(s) in retention window",
+                    self.vol_ulid
+                );
+            }
             return false;
         }
 
@@ -754,8 +765,10 @@ impl GcCycleOrchestrator {
             .await;
         head.apply_reap(&to_reap);
         info!(
-            "[reap {vol_ulid}] reaped {} input segment(s) past retention",
-            to_reap.len()
+            "[reap {vol_ulid}] reaped {} input segment(s) past retention; \
+             {} in retention window",
+            to_reap.len(),
+            head.superseded.len()
         );
         true
     }
