@@ -120,13 +120,16 @@ do_verify() {
 
 do_bench() {
     local secs="${1:-$RUN_SECS}"
-    as_pg "$PGBIN/pgbench" -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
+    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
 }
 
+# -n on every run: pgbench's default startup vacuum truncates pgbench_history,
+# which voids the four-way balance equality across runs. Autovacuum covers the
+# table bloat the skipped vacuum would have handled.
 bench_bg() {
     local secs="${1:-$RUN_SECS}"
     setsid bash -c "exec runuser -u postgres -- $PGBIN/pgbench \
-        -c $CLIENTS -j $JOBS -T $secs -P 10 $DB" \
+        -n -c $CLIENTS -j $JOBS -T $secs -P 10 $DB" \
         >>"$OUT_ROOT/pgbench.log" 2>&1 </dev/null &
 }
 
