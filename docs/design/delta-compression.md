@@ -1,12 +1,14 @@
 # Design: delta compression
 
-Status: format, producers, and read path landed. Two additions proposed, not started: similarity-based source selection and journal-region awareness. Measurement round 1 (§ Measurement) supports both; implementation is not started.
+Status: format, producers, and read path landed. Proposed, not started: similarity-based source selection, journal-region awareness, and a unified selection cascade at segment formation (which moves dedup out of the WAL write path). Measurement round 1 (§ Measurement) supports the first two.
 
 Date: 2026-07-20 (supersedes the 2026-04 revision)
 
 ## The source-selection problem
 
 A delta entry stores an extent as a zstd-compressed diff against a source extent, with the source as the zstd dictionary. The recurring design question is source selection: given a changed extent, which prior extent is the dictionary? Any choice is correct. Dictionary compression produces valid output for any dictionary, and the producer discards a delta that is not smaller than the plain body. A poor source costs compute and forgoes savings, never correctness.
+
+Dedup is the boundary case of the same question: a source identical to the target, encoded as a reference with no bytes (DedupRef). § Unified selection treats it as such.
 
 ## Landed system
 
@@ -64,6 +66,32 @@ The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at
 
 **Use.** A derived in-memory range set with three consumers: delta repack skips journal-range entries; the similarity index excludes them on both build and query sides; and dedup excludes them in both directions — journal-range writes emit no DedupRefs, and journal-range extents are not admitted as canonical dedup sources. The admission direction is the load-bearing one (it is what stops durable LBAs referencing journal-claimed bodies) and applies everywhere hashes are registered as canonical: the WAL write path and GC fold/reclaim re-registration. The forgone dedup win is the copy⇄home pair, bounded by the journal region size and transient anyway. Nothing is persisted, and an empty set reproduces current behaviour exactly. Persisting per-entry metadata tags for read-path or cache policy (the metadata-tagging note in [operations.md](../operations.md)) is a separate decision this design does not take.
 
+## Proposed: unified selection at segment formation
+
+The format already treats thin DedupRef and thin Delta as siblings: `stored_length = 0`, resolution through `extent_index.lookup`, the same `lba_referenced_hashes` liveness rule, the same GC copy-through. The producer side is not unified: dedup runs in the WAL write path (an extent-index lookup per write emitting a thin REF record into the WAL) and again in GC/reclaim conversion, while delta runs in repack.
+
+**The cascade.** At segment formation, every entry is classified once:
+
+1. Exact-hash hit in the extent index → DedupRef. Verification is hash equality; zero bytes always wins, no size check.
+2. Super-feature hit → compute the delta, keep iff smaller than the LZ4 body.
+3. Otherwise → Data (or Inline/Zero per the existing rules).
+
+The two lookups are one structure at two precisions: the full-hash extent index is the exact tier, the super-feature index the approximate tier. The reclaim workers' existing exact-first ordering ("DedupRef strictly beats any Delta") is the cascade's priority rule.
+
+**One policy surface.** Journal-range exclusion (both directions), the source-age gate, the source-body-locally-present rule, and candidate scoping apply once, at the cascade, to both tiers — rather than separately in a write-path check, the repack pass, and reclaim conversion.
+
+**Dedup leaves the WAL write path.** Writes always append full body records; the write path keeps hashing and compression but performs no extent-index lookup and holds no policy. The no-op skip (same LBA, same hash, no append) stays: it creates no cross-reference and covers the common unchanged-page rewrite. Consequences:
+
+- The WAL is self-contained at crash recovery: no record's readability depends on segment-store canonical presence.
+- Reading back just-written data is local until promote. A thin WAL REF today can resolve to an evicted canonical and demand-fetch from S3.
+- The hot path needs no filesystem awareness; the journal range set is consulted only tick-side.
+- Duplicate-content writes carry full bodies in the WAL until the next promote thins them. Write-path dedup hits are a small fraction of real ublk traffic, and the cost is bounded by the promote threshold.
+- The WAL REF record kind becomes dead format once the write path stops emitting it.
+
+Stored and uploaded bytes are unchanged: pending segments carry the same DedupRef entries, minted at promote instead of at write.
+
+**Where unification stops.** DedupRef and Delta remain distinct entry kinds with distinct read paths. The boundary case has load-bearing properties the general case lacks: a DedupRef read fetches nothing beyond the body its own hash names; verification is free and has no false-positive concept; and its sources are perfectly interchangeable (any canonical with the hash serves), where a delta is pinned to specific source bytes.
+
 ## Measurement
 
 The offline experiment runs via `elide delta-sim <before.img> <after.img>` over two states of one live-written ext4 filesystem (`scripts/delta-sim-workload` generates a pair via an in-place apt upgrade). It replays same-LBA selection over the changed blocks, runs the sketch match over the misses with real zstd-dictionary ratios, buckets journal-range and non-file metadata bytes separately, and bounds what path matching would achieve with a same-path oracle.
@@ -76,4 +104,5 @@ Round 1 (2026-07-20, full numbers in [findings.md](../findings.md)): same-LBA se
 - Windowed sketches for large sources.
 - The source-age gate for snapshot-free operation: how cold a candidate must be before referencing it is worth the GC entanglement, and whether the gate is a tick count or something cheaper to reason about.
 - The pinning analysis for arbitrary-source selection (§ Snapshot-free operation), including cross-lineage candidates from ancestor volumes.
+- Write-path dedup incidence: how much WAL growth promote-time DedupRef minting costs on real traffic, and the retirement path for the WAL REF record kind.
 - Filemap hardlinks produce duplicate rows with different paths and the same hash; harmless, worth deduplicating for compactness.
