@@ -667,6 +667,33 @@ pub enum SegmentsError {
     },
 }
 
+impl SegmentsError {
+    /// True when retrying the same operation can never succeed without
+    /// operator intervention: local file damage, credential errors, or
+    /// store configuration errors. Network and store-side errors
+    /// (`Generic`, join, not-found) classify as retryable. The split is
+    /// advisory — it selects log severity, never queue behaviour — so a
+    /// permanent error the store maps into `Generic` merely logs at WARN
+    /// instead of ERROR.
+    pub fn is_permanent(&self) -> bool {
+        let store_err = match self {
+            Self::ReadFile { .. } => return true,
+            Self::Get(e) | Self::Put(e) | Self::Delete(e) => e,
+        };
+        matches!(
+            store_err,
+            object_store::Error::InvalidPath { .. }
+                | object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented
+                | object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. }
+                | object_store::Error::UnknownConfigurationKey { .. }
+                | object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. }
+        )
+    }
+}
+
 impl std::fmt::Display for SegmentsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1325,5 +1352,26 @@ mod tests {
             err,
             SegmentsError::Get(object_store::Error::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn segments_error_classification() {
+        let read = SegmentsError::ReadFile {
+            path: std::path::PathBuf::from("/x"),
+            source: std::io::Error::other("boom"),
+        };
+        assert!(read.is_permanent(), "local file damage never self-heals");
+
+        let generic = SegmentsError::Put(object_store::Error::Generic {
+            store: "test",
+            source: "connection reset".into(),
+        });
+        assert!(
+            !generic.is_permanent(),
+            "network/store-side errors are retryable"
+        );
+
+        let unimplemented = SegmentsError::Put(object_store::Error::NotImplemented);
+        assert!(unimplemented.is_permanent(), "code/config errors are not");
     }
 }
