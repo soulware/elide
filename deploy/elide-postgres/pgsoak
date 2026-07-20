@@ -77,7 +77,7 @@ fsck_device() {
     ((rc <= 1)) || die "e2fsck exit $rc on $DEV (see $OUT_ROOT/fsck.log)"
 }
 
-do_start() {
+do_mount() {
     wait_device
     if ! mountpoint -q "$MNT"; then
         fsck_device
@@ -85,7 +85,15 @@ do_start() {
         mount -o discard "$DEV" "$MNT"
         log "mounted $DEV at $MNT"
     fi
+}
+
+do_start() {
+    do_mount
     install -d -o postgres -g postgres /var/run/postgresql
+    # OUT_ROOT is root-owned; pre-create the server log so the postgres user
+    # can append to it.
+    [ -e "$OUT_ROOT/postgres.log" ] \
+        || install -m 644 -o postgres -g postgres /dev/null "$OUT_ROOT/postgres.log"
     if ! pg_running; then
         as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 300 \
             -l "$OUT_ROOT/postgres.log" start
@@ -162,30 +170,34 @@ do_cycle() {
 mkdir -p "$OUT_ROOT"
 case "${1:-}" in
     setup)
+        # Every step is guarded on its own effect, so a rerun resumes an
+        # interrupted setup instead of failing or redoing work.
         [ -e "$DATA_DIR/by_name/$VOL" ] || elide volume create --size "$VOL_SIZE" "$VOL"
         wait_device
-        if [ -e "$PGDATA/PG_VERSION" ]; then
-            log "setup: $PGDATA already initialised"; exit 0
-        fi
-        mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
-            "$(readlink -f "$DEV")"
-        mkdir -p "$MNT"
-        mount -o discard "$DEV" "$MNT"
-        install -d -o postgres -g postgres "$PGDATA"
-        as_pg "$PGBIN/initdb" -k -D "$PGDATA"
-        # Small buffer pool and tight WAL ceiling so the workload reaches the
-        # device instead of idling in shared memory: frequent checkpoints
-        # (random heap writes) and a steady fsync stream on the WAL.
-        cat >>"$PGDATA/postgresql.conf" <<'EOF'
+        blkid "$(readlink -f "$DEV")" >/dev/null 2>&1 \
+            || mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+                "$(readlink -f "$DEV")"
+        do_mount
+        if [ ! -e "$PGDATA/PG_VERSION" ]; then
+            install -d -o postgres -g postgres "$PGDATA"
+            as_pg "$PGBIN/initdb" -k -D "$PGDATA"
+            # Small buffer pool and tight WAL ceiling so the workload reaches
+            # the device instead of idling in shared memory: frequent
+            # checkpoints (random heap writes) and a steady fsync stream on
+            # the WAL.
+            cat >>"$PGDATA/postgresql.conf" <<'EOF'
 listen_addresses = ''
 shared_buffers = '128MB'
 checkpoint_timeout = '60s'
 max_wal_size = '256MB'
 log_checkpoints = on
 EOF
+        fi
         do_start
-        as_pg "$PGBIN/createdb" "$DB"
-        as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
+        if ! as_pg "$PGBIN/psql" -X -At -l | cut -d'|' -f1 | grep -qx "$DB"; then
+            as_pg "$PGBIN/createdb" "$DB"
+            as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
+        fi
         log "setup complete: volume $VOL, scale $SCALE"
         ;;
     start)     do_start ;;
