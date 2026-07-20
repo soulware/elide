@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Generates before.img / after.img for `elide delta-sim`: one ext4
+# filesystem captured before and after an in-place package upgrade plus
+# logrotate-style rename churn. The mutation needs root and loop mounts,
+# so it runs inside a privileged Docker container when docker is
+# available, else inside a Lima VM (default: elide-dev, override with
+# DELTA_SIM_VM).
+#
+# usage: delta-sim-workload <output-dir> [size-mib]
+set -euo pipefail
+
+out=${1:?usage: delta-sim-workload <output-dir> [size-mib]}
+size_mib=${2:-4096}
+mkdir -p "$out"
+out_abs=$(cd "$out" && pwd)
+
+inner=$(mktemp)
+trap 'rm -f "$inner"' EXIT
+cat > "$inner" <<'INNER'
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -qq
+apt-get install -y -qq debootstrap e2fsprogs zstd >/dev/null
+
+mkdir -p /work /mnt/fs "$OUT"
+truncate -s "${SIZE_MIB}M" /work/fs.img
+mkfs.ext4 -q -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 /work/fs.img
+mount -o loop /work/fs.img /mnt/fs
+
+arch=$(dpkg --print-architecture)
+case "$arch" in
+    amd64) mirror=http://archive.ubuntu.com/ubuntu ;;
+    *)     mirror=http://ports.ubuntu.com/ubuntu-ports ;;
+esac
+
+# Base system at the release-pocket package versions; the upgrade below
+# moves everything to noble-updates/noble-security, which is the
+# rename-write churn this workload exists to produce.
+debootstrap --include=python3,openssl noble /mnt/fs "$mirror"
+
+cat > /mnt/fs/etc/apt/sources.list <<EOF
+deb $mirror noble main universe
+deb $mirror noble-updates main universe
+deb $mirror noble-security main universe
+EOF
+cp /etc/resolv.conf /mnt/fs/etc/resolv.conf
+printf '#!/bin/sh\nexit 101\n' > /mnt/fs/usr/sbin/policy-rc.d
+chmod +x /mnt/fs/usr/sbin/policy-rc.d
+
+# A sizeable log so the rotate below is a measurable rename case.
+seq 1 200000 | sed 's/^/app log line /' > /mnt/fs/var/log/app.log
+
+umount /mnt/fs
+cp --sparse=always /work/fs.img "$OUT/before.img"
+
+mount -o loop /work/fs.img /mnt/fs
+mount -t proc proc /mnt/fs/proc
+mount --bind /dev /mnt/fs/dev
+chroot /mnt/fs apt-get update -qq
+chroot /mnt/fs apt-get -y -qq upgrade
+umount /mnt/fs/dev
+umount /mnt/fs/proc
+
+# Rename churn beyond apt: logrotate and tmp+rename config rewrites.
+mv /mnt/fs/var/log/app.log /mnt/fs/var/log/app.log.1
+seq 1 5000 | sed 's/^/app log line /' > /mnt/fs/var/log/app.log
+for f in /mnt/fs/etc/services /mnt/fs/etc/login.defs; do
+    sed 's/^#/#  /' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+
+umount /mnt/fs
+cp --sparse=always /work/fs.img "$OUT/after.img"
+chmod 644 "$OUT/before.img" "$OUT/after.img"
+INNER
+
+if command -v docker >/dev/null 2>&1; then
+    docker run --rm -i --privileged \
+        -e SIZE_MIB="$size_mib" -e OUT=/out \
+        -v "$out_abs":/out ubuntu:24.04 bash -s < "$inner"
+elif command -v limactl >/dev/null 2>&1; then
+    vm=${DELTA_SIM_VM:-elide-dev}
+    vm_out=/tmp/delta-sim
+    limactl shell "$vm" -- sudo env SIZE_MIB="$size_mib" OUT="$vm_out" bash -s < "$inner"
+    for f in before.img after.img; do
+        limactl shell "$vm" -- sudo zstd -qc "$vm_out/$f" | zstd -qd -o "$out_abs/$f" -f
+    done
+    limactl shell "$vm" -- sudo rm -rf "$vm_out"
+else
+    echo "need docker or limactl" >&2
+    exit 1
+fi
+
+echo "wrote $out_abs/before.img and $out_abs/after.img"

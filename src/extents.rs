@@ -13,41 +13,41 @@ use ext4_view::{DirEntry, Ext4, Metadata};
 
 // --- ext4 constants ---
 
-const SUPERBLOCK_OFFSET: u64 = 1024;
+pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 const EXT4_MAGIC: u16 = 0xef53;
 const EXTENT_MAGIC: u16 = 0xf30a;
-const INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
-const S_IFREG: u16 = 0x8000;
-const S_IFMT: u16 = 0xf000;
+pub(crate) const INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
+pub(crate) const S_IFREG: u16 = 0x8000;
+pub(crate) const S_IFMT: u16 = 0xf000;
 const INCOMPAT_64BIT: u32 = 0x80;
 const EXTENT_ENTRY_SIZE: usize = 12;
 
 // --- byte helpers ---
 
-fn u16le(data: &[u8], off: usize) -> u16 {
+pub(crate) fn u16le(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([data[off], data[off + 1]])
 }
 
-fn u32le(data: &[u8], off: usize) -> u32 {
+pub(crate) fn u32le(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
 
-fn hilo64(hi: u32, lo: u32) -> u64 {
+pub(crate) fn hilo64(hi: u32, lo: u32) -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
 // --- superblock ---
 
-struct Superblock {
-    block_size: u64,
-    inode_size: usize,
-    inodes_per_group: u32,
-    num_block_groups: u32,
+pub(crate) struct Superblock {
+    pub(crate) block_size: u64,
+    pub(crate) inode_size: usize,
+    pub(crate) inodes_per_group: u32,
+    pub(crate) num_block_groups: u32,
     is_64bit: bool,
 }
 
 impl Superblock {
-    fn read(f: &mut File) -> io::Result<Self> {
+    pub(crate) fn read(f: &mut File) -> io::Result<Self> {
         let mut buf = vec![0u8; 1024];
         f.seek(SeekFrom::Start(SUPERBLOCK_OFFSET))?;
         f.read_exact(&mut buf)?;
@@ -92,7 +92,7 @@ impl Superblock {
 
 // --- block group descriptor ---
 
-fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u64> {
+pub(crate) fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u64> {
     let offset = sb.bgdt_start() + group as u64 * sb.bgd_size();
     let mut buf = vec![0u8; sb.bgd_size() as usize];
     f.seek(SeekFrom::Start(offset))?;
@@ -111,7 +111,7 @@ fn inode_table_block(f: &mut File, sb: &Superblock, group: u32) -> io::Result<u6
 
 // Collect all leaf extents from an extent tree node. Recurses into
 // index nodes by seeking into the image file.
-fn collect_extents(
+pub(crate) fn collect_extents(
     data: &[u8],
     f: &mut File,
     sb: &Superblock,

@@ -7,7 +7,7 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    VolumeFetchInputs, coordinator_client, extents, inspect, inspect_files, parse_size,
+    VolumeFetchInputs, coordinator_client, delta_sim, extents, inspect, inspect_files, parse_size,
     resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
 };
 
@@ -54,6 +54,21 @@ enum Command {
         image2: Option<String>,
         #[arg(long, default_value_t = 3)]
         level: i32,
+    },
+
+    /// Measure delta source selection between two states of a live-written ext4 image
+    #[command(hide = true)]
+    DeltaSim {
+        before: String,
+        after: String,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
+        /// Minimum run/fragment size (bytes) for similarity sketching
+        #[arg(long, default_value_t = 32768)]
+        threshold: u64,
+        /// Sketch construction: broder (position-independent) or finesse
+        #[arg(long, default_value = "broder")]
+        sketch: String,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -966,6 +981,24 @@ fn main() {
         } => {
             extents::run(Path::new(&image1), image2.as_deref().map(Path::new), level)
                 .expect("extents failed");
+        }
+
+        Command::DeltaSim {
+            before,
+            after,
+            level,
+            threshold,
+            sketch,
+        } => {
+            let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
+            delta_sim::run(
+                Path::new(&before),
+                Path::new(&after),
+                level,
+                threshold,
+                kind,
+            )
+            .expect("delta-sim failed");
         }
 
         Command::ColdBoot {
