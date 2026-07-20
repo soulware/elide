@@ -1,0 +1,35 @@
+# Elide coordinator + postgres soak rig on Fly.io — a private app (no public
+# service), reachable over 6PN at <app>.internal. Template: ./launch.sh
+# generates fly.toml (gitignored) from this; or copy it yourself, fill
+# app/primary_region and DATA_BUCKET, set the AWS_* secrets, then `fly deploy`
+# from this directory. See README.md.
+
+app = "elide-postgres-soak"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    # DATA_BUCKET: the Tigris bucket the AWS_* keypair has read/write on; baked
+    # into coord.toml [store].bucket.
+    DATA_BUCKET = "elide"
+
+# Coordinator state — index/, cache/, credentials/, keys — plus pgsoak's
+# evidence logs live here so they survive the machine crashes the soak
+# inflicts (matches data_dir in coord.toml). The first deploy creates the
+# volume at initial_size. The Tigris read/write keypair is supplied as
+# secrets, not here:
+#   fly secrets set AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+[mounts]
+  source = "elide_data"
+  destination = "/data"
+  initial_size = "10gb"
+
+# Serverless-off: keep one instance up so the served volume stays live.
+# Sized for coordinator + volume server + postgres + pgbench on one machine.
+# An idle ublk volume trips Fly's iowait-based CPU throttle on shared-cpu
+# sizes; the soak keeps the machine busy, but use a performance size for any
+# run whose timings you intend to read as measurements.
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2048mb"
