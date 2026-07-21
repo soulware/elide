@@ -58,7 +58,7 @@ The `pending/` directory exists because Elide decouples local promotion from S3 
 
 ## Design decision comparisons
 
-**Segment format:** lsvd uses a single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]` — all metadata embedded in the body. Elide also uses a single file, but with a four-section layout (header + index + inline + body + delta) that allows the index section to be fetched independently via byte-range GET, avoiding retrieval of body data that isn't needed. The local file and S3 object use the same format; the S3 object may additionally carry a delta body computed at upload time.
+**Segment format:** lsvd uses a single file per segment: `[SegmentHeader (8 bytes)][ExtentHeaders (varint-encoded)][body data]` — all metadata embedded in the body. Elide also uses a single file, but with a four-section layout (header + index + inline + body + delta) that allows the index section to be fetched independently via byte-range GET, avoiding retrieval of body data that isn't needed. The local file and S3 object use the same format; the S3 object may additionally carry a delta body computed at segment formation.
 
 **Snapshot / lower-disk model:** lsvd implements layering via a `lowers` parameter — an array of read-only disk handles that the read path falls through. Elide encodes the same relationship in the directory tree: ancestor directories are the "lower disks", their absence of `wal/` enforces read-only semantics, and the ancestry is directly inspectable via `ls`.
 

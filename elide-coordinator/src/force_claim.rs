@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     /// Mirror of the 2026-07-06 quickstart incident: the dead owner's
-    /// head delta carries a `Delta` entry (from `delta_repack`) whose
+    /// head delta carries a `Delta` entry (minted by the formation delta tier) whose
     /// source extent lives in a sealed segment, the handoff manifest
     /// exists as a user-kind object but `snapshots/LATEST` is absent,
     /// and the name record still hints the handoff snapshot. After the

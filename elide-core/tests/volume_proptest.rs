@@ -294,24 +294,15 @@ enum SimOp {
     /// offload. Exercised against a subsequent `Crash` + rebuild so the
     /// crash-recovery invariants fire on this specific shape.
     HalfPromotePending,
-    /// Phase 5 Tier 1 dictionary-delta repack of post-snapshot pending
-    /// segments. No-op when there is no sealed snapshot or no Data
-    /// entries match same-LBA extents in the prior snapshot. Each
-    /// converted input is rewritten under a freshly-minted output ULID
-    /// and unlinked. The actor-layer proptest covers this through
-    /// `ActorOp::DeltaRepack`; modelling it here exercises the same
-    /// invariants directly against the volume layer (oracle preserved
-    /// across subsequent crash + rebuild).
-    DeltaRepack,
     /// Write a near-duplicate incompressible block:
     /// `incompressible_block(base_seed)` with the first 32 bytes set to
     /// `tweak`. Two draws sharing `(lba, base_seed)` with different
     /// tweaks differ by ~32 bytes, so once the earlier one sits under a
-    /// signed snapshot, `DeltaRepack` converts the later write into a
-    /// thin Delta entry — the only op shape that arms the Delta
-    /// read/GC-fold paths (`WriteLarge`/`WriteMulti` bodies are
-    /// uncorrelated per seed, so the delta-smaller-than-stored gate
-    /// never passes on them).
+    /// signed snapshot, the next promote's formation delta tier converts
+    /// the later write into a thin Delta entry — the only op shape that
+    /// arms the Delta read/GC-fold paths (`WriteLarge`/`WriteMulti`
+    /// bodies are uncorrelated per seed, so the delta-smaller-than-stored
+    /// gate never passes on them).
     ///
     /// LBA range 52..56 — disjoint from Write (0..8), WriteZeroes
     /// (8..16), PopulateFetched (16..24), WriteLarge (24..32),
@@ -420,7 +411,6 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_count,
         }),
         Just(SimOp::HalfPromotePending),
-        Just(SimOp::DeltaRepack),
         Just(SimOp::SignSnapshot),
         (0u8..4, 0u8..4, any::<u8>()).prop_map(|(lba, base_seed, tweak)| SimOp::WriteNearDup {
             lba,
@@ -651,7 +641,6 @@ fn delta_gc_prefix() -> Vec<SimOp> {
             tweak: 0x02,
         },
         SimOp::Flush,
-        SimOp::DeltaRepack,
     ]
 }
 
@@ -1020,15 +1009,6 @@ proptest! {
                     // original pending ULID. Nothing to assert for monotonicity.
                     let _ = common::half_promote_first_pending(fork_dir);
                 }
-                SimOp::DeltaRepack => {
-                    // Rewrites post-snapshot pending segments under
-                    // freshly-minted output ULIDs (PR #273+). Each
-                    // converted input is unlinked and replaced by an
-                    // output at a higher ULID. We don't assert on the
-                    // ULID set here — the per-LBA oracle invariant
-                    // below covers content correctness.
-                    let _ = vol.delta_repack_post_snapshot();
-                }
                 SimOp::SignSnapshot => {
                     // Manifest + marker land under `snapshots/`, which
                     // `all_segment_ulids` does not scan. The segment
@@ -1351,13 +1331,6 @@ proptest! {
                     // will verify reclaim's contribution alongside everything else.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
-                SimOp::DeltaRepack => {
-                    // Rewrites Data entries in post-snapshot pending
-                    // segments to thin Deltas. Observable content is
-                    // unchanged; oracle survival is verified by the
-                    // next Crash handler.
-                    let _ = vol.delta_repack_post_snapshot();
-                }
                 SimOp::SignSnapshot => {
                     // Signing must not touch the data path; oracle
                     // survival is verified by the next Crash handler.
@@ -1649,9 +1622,6 @@ proptest! {
                     // lbamap stale until Crash rebuilds it.
                     let _ = vol.reclaim_alias_merge(*start_lba as u64, *lba_count as u32);
                 }
-                SimOp::DeltaRepack => {
-                    let _ = vol.delta_repack_post_snapshot();
-                }
                 SimOp::SignSnapshot => {
                     let snap_ulid = pick_snap_ulid(fork_dir);
                     if vol.sign_snapshot_manifest(snap_ulid).is_ok() {
@@ -1794,7 +1764,7 @@ proptest! {
 }
 
 /// The `delta_gc_prefix` steps must actually mint a Delta entry —
-/// asserted here on `DeltaRepackStats` so a future change to the
+/// asserted on the promoted segment's `.idx` so a future change to the
 /// conversion gates (inline threshold, delta-smaller-than-stored,
 /// snapshot resolution) cannot silently regress the suite's Delta
 /// coverage back to a structural no-op, which is the gap that hid the
@@ -1814,14 +1784,22 @@ fn delta_gc_prefix_mints_a_delta_entry() {
 
     vol.write(52, &common::variant_block(0, 0x02)).unwrap();
     vol.flush_wal().unwrap();
-    let stats = vol.delta_repack_post_snapshot().unwrap();
+
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .unwrap();
+    let minted = std::fs::read_dir(fork_dir.join("pending"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_none())
+        .filter_map(|p| elide_core::segment::read_and_verify_segment_index(&p, &vk).ok())
+        .flat_map(|(_, entries, _)| entries)
+        .filter(|e| e.kind == elide_core::segment::EntryKind::Delta)
+        .count();
     assert!(
-        stats.entries_converted >= 1,
-        "near-duplicate post-seal overwrite must convert to a Delta entry \
-         (scanned={} rewritten={} converted={})",
-        stats.segments_scanned,
-        stats.segments_rewritten,
-        stats.entries_converted,
+        minted >= 1,
+        "near-duplicate post-seal overwrite must convert to a Delta entry at formation"
     );
 
     let expected = common::variant_block(0, 0x02);

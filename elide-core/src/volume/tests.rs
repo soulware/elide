@@ -1125,6 +1125,143 @@ fn recovery_promote_of_extra_wal_classifies_dedup() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Distinct, incompressible 4 KiB block per seed (keyed-BLAKE3 stream) —
+/// stays a body-section Data entry, the shape the delta tier converts.
+fn delta_base_block(seed: u8) -> Vec<u8> {
+    let mut out = vec![0u8; 4096];
+    let mut hasher = blake3::Hasher::new_keyed(&[seed; 32]);
+    for (i, chunk) in out.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        chunk.copy_from_slice(&hasher.finalize().as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    out
+}
+
+/// `delta_base_block(seed)` with the first 32 bytes overwritten — a
+/// near-duplicate whose zstd-dict delta against the base is tiny.
+fn delta_variant_block(seed: u8, tweak: u8) -> Vec<u8> {
+    let mut out = delta_base_block(seed);
+    out[..32].fill(tweak);
+    out
+}
+
+fn pending_entry_kinds(base: &Path, vol: &Volume, seg: Ulid) -> Vec<segment::EntryKind> {
+    let seg_path = base.join("pending").join(seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    entries.iter().map(|e| e.kind).collect()
+}
+
+#[test]
+fn formation_deltas_post_seal_near_duplicate() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &delta_base_block(1)).unwrap();
+    vol.snapshot().unwrap();
+
+    let variant = delta_variant_block(1, 0x7E);
+    vol.write(0, &variant).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Delta],
+        "post-seal near-duplicate must be minted as a thin Delta at formation"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), variant, "delta read-back");
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.read(0, 1).unwrap(),
+        variant,
+        "delta read-back after reopen"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn formation_without_sealed_snapshot_stays_data() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &delta_base_block(2)).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(0, &delta_variant_block(2, 0x11)).unwrap();
+    vol.promote_for_test().unwrap();
+
+    for seg in pending_ulids(&base) {
+        for kind in pending_entry_kinds(&base, &vol, seg) {
+            assert_eq!(kind, segment::EntryKind::Data, "no snapshot, no delta tier");
+        }
+    }
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn formation_skips_delta_when_source_body_evicted() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &delta_base_block(3)).unwrap();
+    vol.snapshot().unwrap();
+
+    // Evict the sealed source bodies (snapshot() promoted them into
+    // cache/): the delta tier is best-effort and must fall through to a
+    // plain Data entry.
+    for entry in fs::read_dir(base.join("cache")).unwrap().flatten() {
+        if entry.path().extension().is_some_and(|x| x == "body") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let variant = delta_variant_block(3, 0x22);
+    vol.write(0, &variant).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Data],
+        "evicted source must skip conversion, never fetch"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), variant);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn formation_exact_hash_beats_delta() {
+    // Post-seal write of bytes identical to a sealed extent at another
+    // LBA: the exact tier mints a DedupRef and the delta tier never
+    // sees the entry.
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data = delta_base_block(4);
+    vol.write(0, &data).unwrap();
+    vol.snapshot().unwrap();
+
+    vol.write(8, &data).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let sealed = pending_ulids(&base);
+    let seg = *sealed.last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::DedupRef],
+        "exact-hash hit wins over any delta"
+    );
+    assert_eq!(vol.read(8, 1).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn legacy_ref_wal_record_replays_and_promotes() {
     let base = keyed_temp_dir();

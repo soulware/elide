@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::volume::{CompactionStats, DeltaRepackStats};
+use crate::volume::CompactionStats;
 
 /// Typed volume control IPC request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,7 +27,6 @@ pub enum VolumeRequest {
     /// bin-pack small segments into denser outputs at the same time.
     Repack,
     /// Rewrite post-snapshot pending segments as zstd-dictionary deltas.
-    DeltaRepack,
     /// Flush the WAL and return `max_buckets` pre-minted GC output
     /// ULIDs. The coordinator emits up to one plan per ULID this tick.
     GcCheckpoint {
@@ -68,12 +67,6 @@ pub enum VolumeRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CompactionReply {
     pub stats: CompactionStats,
-}
-
-/// Reply for [`VolumeRequest::DeltaRepack`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct DeltaRepackReply {
-    pub stats: DeltaRepackStats,
 }
 
 /// Reply for [`VolumeRequest::GcCheckpoint`]. Carries one ULID per

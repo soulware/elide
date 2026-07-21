@@ -14,10 +14,10 @@
 use std::path::Path;
 
 use elide_core::ipc::{Envelope, IpcError};
-use elide_core::volume::{CompactionStats, DeltaRepackStats};
+use elide_core::volume::CompactionStats;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
-    ReclaimReply, VolumeRequest,
+    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, GcCheckpointReply, ReclaimReply,
+    VolumeRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,15 +44,6 @@ pub async fn promote_wal(fork_dir: &Path) -> bool {
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
 pub async fn repack(fork_dir: &Path) -> Option<CompactionStats> {
     let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::Repack).await?;
-    Some(reply.stats)
-}
-
-/// Rewrite post-snapshot pending segments with zstd-dictionary deltas
-/// against same-LBA extents from the latest sealed snapshot.
-/// Returns delta-repack stats on success.
-/// Returns `None` and logs a warning if the socket is absent or the call fails.
-pub async fn delta_repack_post_snapshot(fork_dir: &Path) -> Option<DeltaRepackStats> {
-    let reply: DeltaRepackReply = call_typed(fork_dir, &VolumeRequest::DeltaRepack).await?;
     Some(reply.stats)
 }
 
@@ -299,7 +290,6 @@ fn verb_label(request: &VolumeRequest) -> &'static str {
         VolumeRequest::Flush => "flush",
         VolumeRequest::PromoteWal => "promote-wal",
         VolumeRequest::Repack => "repack",
-        VolumeRequest::DeltaRepack => "delta-repack",
         VolumeRequest::GcCheckpoint { .. } => "gc-checkpoint",
         VolumeRequest::ApplyGcHandoffs => "apply-gc-handoffs",
         VolumeRequest::SnapshotManifest { .. } => "snapshot-manifest",

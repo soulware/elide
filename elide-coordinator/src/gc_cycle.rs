@@ -424,24 +424,6 @@ impl GcCycleOrchestrator {
                 s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
             );
         }
-
-        // Phase 5 Tier 1: rewrite post-snapshot pending segments with
-        // zstd-dictionary deltas against same-LBA extents from the latest
-        // sealed snapshot. Runs before drain so converted segments reach S3
-        // as thin Delta entries rather than full bodies.
-        if let Some(s) = control::delta_repack_post_snapshot(&self.fork_dir).await
-            && s.entries_converted > 0
-        {
-            info!(
-                "[drain {vol_ulid}] delta_repack: {}/{} segment(s) rewritten, \
-                 {} entries converted, {} → {} bytes",
-                s.segments_rewritten,
-                s.segments_scanned,
-                s.entries_converted,
-                s.original_body_bytes,
-                s.delta_body_bytes,
-            );
-        }
     }
 
     /// Drain pending segments to S3. Returns whether GC may proceed: a drain

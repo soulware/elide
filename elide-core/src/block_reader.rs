@@ -193,65 +193,7 @@ impl BlockReader {
         snap_ulid: &ulid::Ulid,
         mk_fetcher: Box<FetcherFactory<'_>>,
     ) -> io::Result<Self> {
-        let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-        let by_id_dir = dir.parent().unwrap_or(&dir);
-
-        // Trust root: this volume's own volume.pub. Callers are expected to
-        // have validated that they asked for this identity.
-        let own_pubkey = signing::load_verifying_key(&dir, signing::VOLUME_PUB_FILE)?;
-        let own_segs = signing::read_snapshot_manifest(&dir, &own_pubkey, snap_ulid)?.segment_ulids;
-        let own_lineage =
-            signing::read_lineage_with_key(&dir, &own_pubkey, signing::VOLUME_PROVENANCE_FILE)?;
-
-        // Walk the parent chain, accumulating (dir, segs, vk) tuples.
-        // Parent's provenance is verified under the parent_pubkey the child
-        // signed over — not the parent's own volume.pub on disk.
-        let mut parents: Vec<SnapshotLayer> = Vec::new();
-        let mut cursor = own_lineage.parent().cloned();
-        while let Some(parent) = cursor {
-            let parent_dir = volume::resolve_ancestor_dir(by_id_dir, &parent.volume_ulid);
-            if !parent_dir.exists() {
-                return Err(io::Error::other(format!(
-                    "ancestor {} not found locally",
-                    parent.volume_ulid
-                )));
-            }
-            let parent_vk = VerifyingKey::from_bytes(&parent.pubkey).map_err(|e| {
-                io::Error::other(format!(
-                    "invalid parent pubkey in provenance for {}: {e}",
-                    parent.volume_ulid
-                ))
-            })?;
-            let manifest_vk = parent_vk;
-            let parent_snap = ulid::Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
-                io::Error::other(format!(
-                    "invalid snapshot ulid in provenance parent {}: {e}",
-                    parent.volume_ulid
-                ))
-            })?;
-            let segs = signing::read_snapshot_manifest(&parent_dir, &manifest_vk, &parent_snap)?
-                .segment_ulids;
-            let parent_lineage = signing::read_lineage_with_key(
-                &parent_dir,
-                &parent_vk,
-                signing::VOLUME_PROVENANCE_FILE,
-            )?;
-            parents.push(SnapshotLayer {
-                dir: parent_dir,
-                segs,
-                vk: parent_vk,
-            });
-            cursor = parent_lineage.parent().cloned();
-        }
-
-        // Apply oldest-first: root ancestor, ..., immediate parent, own fork.
-        parents.reverse();
-        let mut layers = parents;
-        layers.push(SnapshotLayer {
-            dir: dir.clone(),
-            segs: own_segs,
-            vk: own_pubkey,
-        });
+        let layers = snapshot_layers(dir, snap_ulid)?;
 
         let mut lbamap = lbamap::LbaMap::new();
         let mut extent_index = extentindex::ExtentIndex::new();
@@ -732,6 +674,121 @@ struct SnapshotLayer {
     dir: PathBuf,
     segs: Vec<ulid::Ulid>,
     vk: VerifyingKey,
+}
+
+/// Verified snapshot layers for `dir` at `snap_ulid`, oldest ancestor
+/// first. Each layer's segment set comes from its signed snapshot
+/// manifest; the parent chain is walked via the `parent_pubkey` each
+/// child signed over — not the parent's own `volume.pub` on disk.
+fn snapshot_layers(dir: &Path, snap_ulid: &ulid::Ulid) -> io::Result<Vec<SnapshotLayer>> {
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    let by_id_dir = dir.parent().unwrap_or(&dir);
+
+    // Trust root: this volume's own volume.pub. Callers are expected to
+    // have validated that they asked for this identity.
+    let own_pubkey = signing::load_verifying_key(&dir, signing::VOLUME_PUB_FILE)?;
+    let own_segs = signing::read_snapshot_manifest(&dir, &own_pubkey, snap_ulid)?.segment_ulids;
+    let own_lineage =
+        signing::read_lineage_with_key(&dir, &own_pubkey, signing::VOLUME_PROVENANCE_FILE)?;
+
+    let mut parents: Vec<SnapshotLayer> = Vec::new();
+    let mut cursor = own_lineage.parent().cloned();
+    while let Some(parent) = cursor {
+        let parent_dir = volume::resolve_ancestor_dir(by_id_dir, &parent.volume_ulid);
+        if !parent_dir.exists() {
+            return Err(io::Error::other(format!(
+                "ancestor {} not found locally",
+                parent.volume_ulid
+            )));
+        }
+        let parent_vk = VerifyingKey::from_bytes(&parent.pubkey).map_err(|e| {
+            io::Error::other(format!(
+                "invalid parent pubkey in provenance for {}: {e}",
+                parent.volume_ulid
+            ))
+        })?;
+        let manifest_vk = parent_vk;
+        let parent_snap = ulid::Ulid::from_string(&parent.snapshot_ulid).map_err(|e| {
+            io::Error::other(format!(
+                "invalid snapshot ulid in provenance parent {}: {e}",
+                parent.volume_ulid
+            ))
+        })?;
+        let segs =
+            signing::read_snapshot_manifest(&parent_dir, &manifest_vk, &parent_snap)?.segment_ulids;
+        let parent_lineage = signing::read_lineage_with_key(
+            &parent_dir,
+            &parent_vk,
+            signing::VOLUME_PROVENANCE_FILE,
+        )?;
+        parents.push(SnapshotLayer {
+            dir: parent_dir,
+            segs,
+            vk: parent_vk,
+        });
+        cursor = parent_lineage.parent().cloned();
+    }
+
+    // Oldest-first: root ancestor, ..., immediate parent, own fork.
+    parents.reverse();
+    let mut layers = parents;
+    layers.push(SnapshotLayer {
+        dir,
+        segs: own_segs,
+        vk: own_pubkey,
+    });
+    Ok(layers)
+}
+
+/// The formation delta tier's view of a sealed snapshot: `LBA → content
+/// hash`, and nothing else. Source *bodies* are resolved by hash through
+/// the live extent index, which serves identical bytes from whichever
+/// canonical currently holds them — so this map carries no locations, no
+/// per-hash index, and no inline payloads. Packed runs in a sorted `Vec`
+/// cost ~44 bytes each, roughly 5× below the full snapshot-pinned
+/// [`BlockReader`] this replaces as worker-resident state.
+pub struct SnapshotSourceMap {
+    runs: Vec<SourceRun>,
+}
+
+struct SourceRun {
+    start_lba: u64,
+    lba_length: u32,
+    hash: blake3::Hash,
+}
+
+impl SnapshotSourceMap {
+    /// Build the map for `dir`'s sealed snapshot `snap_ulid`, walking the
+    /// same verified manifest chain as [`BlockReader::open_snapshot`]. The
+    /// full snapshot maps exist only transiently during the build; zero
+    /// runs are dropped (`ZERO_HASH` never serves as a dictionary).
+    pub fn build(dir: &Path, snap_ulid: &ulid::Ulid) -> io::Result<Self> {
+        let layers = snapshot_layers(dir, snap_ulid)?;
+        let mut lbamap = lbamap::LbaMap::new();
+        let mut extent_index = extentindex::ExtentIndex::new();
+        for layer in &layers {
+            apply_snapshot_layer(&mut lbamap, &mut extent_index, layer)?;
+        }
+        let mut runs: Vec<SourceRun> = lbamap
+            .iter_entries()
+            .filter(|(_, _, hash, _)| *hash != volume::ZERO_HASH)
+            .map(|(start_lba, lba_length, hash, _)| SourceRun {
+                start_lba,
+                lba_length,
+                hash,
+            })
+            .collect();
+        runs.sort_unstable_by_key(|r| r.start_lba);
+        Ok(Self { runs })
+    }
+
+    /// The content hash of the snapshot extent covering `lba`, or `None`
+    /// for unwritten LBAs.
+    pub fn hash_for_lba(&self, lba: u64) -> Option<blake3::Hash> {
+        let i = self.runs.partition_point(|r| r.start_lba <= lba);
+        let run = &self.runs[i.checked_sub(1)?];
+        (lba < run.start_lba + run.lba_length as u64).then_some(run.hash)
+    }
 }
 
 /// Apply one snapshot layer to an in-progress `(LbaMap, ExtentIndex)` pair.

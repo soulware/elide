@@ -65,9 +65,9 @@ pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_
 pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
-    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteFailure, PromoteJob, PromoteResult,
-    PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob,
-    SignSnapshotManifestResult, WorkerJob, WorkerResult,
+    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteDeltaPrior, PromoteFailure,
+    PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult,
+    SignSnapshotManifestJob, SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
 use open_state::open_read_state;
 pub use read::DmatCache;
@@ -80,8 +80,7 @@ pub use reclaim::{
     scan_reclaim_candidates,
 };
 pub use repack::{
-    CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats, DeltaRepackedSegment,
-    RepackJob, RepackResult, RepackedBucket, RepackedInput, RepackedOutput,
+    CompactionStats, RepackJob, RepackResult, RepackedBucket, RepackedInput, RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -235,24 +234,73 @@ fn classify_pending_dedup_entries(
 /// Apply a committed promote to the in-memory maps: CAS each body-bearing
 /// entry in the extent index from its WAL-relative location to the new
 /// segment (skipping entries a concurrent write or GC handoff has
-/// superseded), bump lbamap claimants from the WAL ULID to the segment
-/// ULID, and log the entry counts.
+/// superseded), register formation-minted Delta entries, bump lbamap
+/// claimants from the WAL ULID to the segment ULID, and log the entry
+/// counts.
 fn apply_promoted_entries(
     extent_index: &mut extentindex::ExtentIndex,
     lbamap: &mut lbamap::LbaMap,
-    entries: &[segment::SegmentEntry],
-    pre_promote_offsets: &[Option<u64>],
-    old_wal_ulid: Ulid,
-    segment_ulid: Ulid,
-    body_section_start: u64,
-) {
-    for (entry, old_wal_offset) in entries.iter().zip(pre_promote_offsets.iter().copied()) {
+    result: &PromoteResult,
+) -> io::Result<()> {
+    let PromoteResult {
+        segment_ulid,
+        old_wal_ulid,
+        old_wal_path: _,
+        body_section_start,
+        entries,
+        pre_promote_offsets,
+        delta_region_body_length,
+    } = result;
+    let (segment_ulid, old_wal_ulid, body_section_start, delta_region_body_length) = (
+        *segment_ulid,
+        *old_wal_ulid,
+        *body_section_start,
+        *delta_region_body_length,
+    );
+    let delta_ctx = extentindex::SegmentRegistrationCtx {
+        segment_id: segment_ulid,
+        body_section_start,
+        body_tier: extentindex::RegistrationBodyTier::Local,
+        delta_body_source: Some(extentindex::DeltaBodySource::Full {
+            body_section_start,
+            body_length: delta_region_body_length,
+        }),
+        inline: extentindex::InlineSource::EntryInline,
+    };
+    let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
+    for (raw_idx, (entry, old_wal_offset)) in entries
+        .iter()
+        .zip(pre_promote_offsets.iter().copied())
+        .enumerate()
+    {
         match entry.kind {
             EntryKind::Data
             | EntryKind::Inline
             | EntryKind::CanonicalData
             | EntryKind::CanonicalInline => {}
-            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+            // A Delta with a CAS token was a Data entry at prep time that
+            // the worker's delta tier converted: drop the WAL-pointing
+            // DATA location, then register the Delta as the disk rebuild
+            // would. The removal is gated on the WAL still owning the
+            // hash, and the registration's admission on no other segment
+            // having taken it — a concurrent writer wins both. A Delta
+            // without a token never had a body location.
+            EntryKind::Delta => {
+                if let Some(old_wal_offset) = old_wal_offset {
+                    extent_index.remove_if_matches(&entry.hash, old_wal_ulid, old_wal_offset);
+                    extent_index.register_entry_consuming_inputs(
+                        entry,
+                        raw_idx as u32,
+                        &delta_ctx,
+                        &consumed,
+                    )?;
+                    let sources: Arc<[blake3::Hash]> =
+                        entry.delta_options.iter().map(|o| o.source_hash).collect();
+                    lbamap.set_delta_sources_if_matches(entry.start_lba, entry.hash, sources);
+                }
+                continue;
+            }
+            EntryKind::DedupRef | EntryKind::Zero => continue,
         }
         let Some(old_wal_offset) = old_wal_offset else {
             // No prior extent index entry for this hash. write_commit
@@ -317,6 +365,7 @@ fn apply_promoted_entries(
          {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
         entries.len()
     );
+    Ok(())
 }
 
 /// Outcome of [`Volume::mutate_gated_on_resolvability`].
@@ -635,26 +684,26 @@ impl Volume {
             recovery_dedup_stats.minted_entries += minted.minted_entries;
             recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
             let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
-            let result = crate::actor::execute_promote(PromoteJob {
-                segment_ulid: mint.next(),
-                old_wal_ulid,
-                old_wal_path: wal_path.clone(),
-                entries: pending_entries,
-                pre_promote_offsets,
-                body_offsets,
-                signer: Arc::clone(&signer),
-                pending_dir: pending_dir.clone(),
-            })
+            let result = crate::actor::execute_promote(
+                PromoteJob {
+                    segment_ulid: mint.next(),
+                    old_wal_ulid,
+                    old_wal_path: wal_path.clone(),
+                    entries: pending_entries,
+                    pre_promote_offsets,
+                    body_offsets,
+                    signer: Arc::clone(&signer),
+                    pending_dir: pending_dir.clone(),
+                    // Recovery promotes of stale WALs write plain Data
+                    // entries: the delta tier resolves source bodies
+                    // through an Arc'd extent-index snapshot, and the
+                    // open path holds the index by value at this point.
+                    delta_prior: None,
+                },
+                &mut crate::actor::PriorSourceCache::default(),
+            )
             .map_err(|failure| failure.error)?;
-            apply_promoted_entries(
-                &mut extent_index,
-                &mut lbamap,
-                &result.entries,
-                &result.pre_promote_offsets,
-                result.old_wal_ulid,
-                result.segment_ulid,
-                result.body_section_start,
-            );
+            apply_promoted_entries(&mut extent_index, &mut lbamap, &result)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers this recovery-promoted segment.
             if last_segment_ulid < Some(result.segment_ulid) {
@@ -2283,11 +2332,8 @@ impl Volume {
             return Ok(());
         }
         let job = self.take_wal_into_promote_job(segment_ulid)?;
-        match crate::actor::execute_promote(job) {
-            Ok(result) => {
-                self.apply_promote(&result);
-                Ok(())
-            }
+        match crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default()) {
+            Ok(result) => self.apply_promote(&result),
             Err(failure) => {
                 self.restore_failed_promote(*failure.job)?;
                 Err(failure.error)
@@ -2784,6 +2830,20 @@ impl Volume {
         self.classify_pending_dedup(open.ulid);
         let pre_promote_offsets =
             snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
+        let delta_prior = latest_snapshot(&self.base_dir)?.map(|snap_ulid| {
+            let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
+            for layer in &self.ancestor_layers {
+                if !search_dirs.contains(&layer.dir) {
+                    search_dirs.push(layer.dir.clone());
+                }
+            }
+            PromoteDeltaPrior {
+                base_dir: self.base_dir.clone(),
+                snap_ulid,
+                extent_index: Arc::clone(&self.extent_index),
+                search_dirs,
+            }
+        });
         Ok(PromoteJob {
             segment_ulid,
             old_wal_ulid: open.ulid,
@@ -2793,6 +2853,7 @@ impl Volume {
             body_offsets: std::mem::take(&mut self.pending_body_offsets),
             signer: Arc::clone(&self.signer),
             pending_dir: self.base_dir.join("pending"),
+            delta_prior,
         })
     }
 
@@ -2802,19 +2863,15 @@ impl Volume {
     /// Updates the extent index (CAS), deletes the old WAL, and evicts
     /// the cached file descriptor.  The caller must call `publish_snapshot`
     /// after this to make the changes visible to readers.
-    pub fn apply_promote(&mut self, result: &PromoteResult) {
+    pub fn apply_promote(&mut self, result: &PromoteResult) -> io::Result<()> {
         self.has_new_segments = true;
         self.last_segment_ulid = Some(result.segment_ulid);
 
         apply_promoted_entries(
             Arc::make_mut(&mut self.extent_index),
             Arc::make_mut(&mut self.lbamap),
-            &result.entries,
-            &result.pre_promote_offsets,
-            result.old_wal_ulid,
-            result.segment_ulid,
-            result.body_section_start,
-        );
+            result,
+        )?;
 
         // Delete old WAL — only after the extent index is updated.
         if let Err(e) = fs::remove_file(&result.old_wal_path) {
@@ -2824,6 +2881,7 @@ impl Volume {
             );
         }
         self.evict_cached_segment(result.old_wal_ulid);
+        Ok(())
     }
 
     // ------------------------------------------------------------------

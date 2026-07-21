@@ -21,8 +21,8 @@ use elide_core::actor::VolumeClient;
 use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::ReclaimThresholds;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, DeltaRepackReply, GcCheckpointReply,
-    ReclaimReply, VolumeRequest,
+    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, GcCheckpointReply, ReclaimReply,
+    VolumeRequest,
 };
 
 /// Start the control socket server for `fork_dir`.
@@ -143,17 +143,6 @@ fn dispatch(
             }
             Err(e) => {
                 let _ = write_envelope::<CompactionReply>(
-                    writer,
-                    &Envelope::err(IpcError::internal(e.to_string())),
-                );
-            }
-        },
-        VolumeRequest::DeltaRepack => match handle.delta_repack_post_snapshot() {
-            Ok(stats) => {
-                let _ = write_envelope(writer, &Envelope::ok(DeltaRepackReply { stats }));
-            }
-            Err(e) => {
-                let _ = write_envelope::<DeltaRepackReply>(
                     writer,
                     &Envelope::err(IpcError::internal(e.to_string())),
                 );

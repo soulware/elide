@@ -142,7 +142,7 @@ wal/<ULID>  →  pending/<ULID>  →  S3 upload  →  index/<ULID>.idx + cache/<
                                                    demand-fetch from S3 ┘
 ```
 
-A `pending/<ULID>` file holds the full segment in the same format used in S3 minus the delta body (which the coordinator appends at upload time). Once the coordinator confirms upload, the volume writes `index/<ULID>.idx` plus `cache/<ULID>.body` + `.present` (with all bits set, since the full body is on hand) and then deletes `pending/<ULID>`. Demand-fetched segments arrive in the same shape: `index/<ULID>.idx` written first, body bytes populated incrementally into `cache/<ULID>.body` with corresponding bits in `.present`. There is no separate "uploaded full-file" local state — the cache triplet is the only post-upload form.
+A `pending/<ULID>` file holds the full segment in the same format used in S3, delta body included. Once the coordinator confirms upload, the volume writes `index/<ULID>.idx` plus `cache/<ULID>.body` + `.present` (with all bits set, since the full body is on hand) and then deletes `pending/<ULID>`. Demand-fetched segments arrive in the same shape: `index/<ULID>.idx` written first, body bytes populated incrementally into `cache/<ULID>.body` with corresponding bits in `.present`. There is no separate "uploaded full-file" local state — the cache triplet is the only post-upload form.
 
 `wal/` normally contains one entry — the active WAL — but can contain two during the brief promotion window. On crash recovery all files in `wal/` are treated identically: scan, truncate partial tail, promote.
 
@@ -178,14 +178,15 @@ The same `rename + fsync_dir` pattern applies to all segment-creating renames: W
        `u_repack < u_flush`.
      - Delta entries (and their delta body section) were written into the
        file by either elide-import (filemap-matched, at import time) or by
-       the post-snapshot delta repack pass that the coordinator runs before
-       drain. See [design/delta-compression.md](design/delta-compression.md).
+       the formation delta tier at WAL promote (same-LBA sources from the
+       latest sealed snapshot).
+       See [design/delta-compression.md](design/delta-compression.md).
 7. Upload the file unmodified.
 8. Volume writes index/<ULID>.idx and cache/<ULID>.{body,present}
    (full body, all bits set); deletes pending/<ULID>.
 ```
 
-The local `pending/<ULID>` file and the uploaded S3 object are **byte-identical at PUT time**. There is no upload-time strategy choice and no fresh S3-side construction. All thinning happens on the local file before drain, and delta bodies are baked into the file by the producer (import or post-snapshot delta repack), not appended at upload.
+The local `pending/<ULID>` file and the uploaded S3 object are **byte-identical at PUT time**. There is no upload-time strategy choice and no fresh S3-side construction. All thinning happens on the local file before drain, and delta bodies are baked into the file by the producer (import or the formation delta tier at promote), not appended at upload.
 
 This is the same `body_length`-is-DATA+INLINE-only thin layout described under § Segment File Format — FLAG_DEDUP_REF and FLAG_DELTA. Local and S3 agree on the bytes; the only divergence between them is that `cache/<ULID>.body` may be sparsely populated post-upload as bodies are evicted or arrive on demand-fetch.
 
@@ -200,7 +201,7 @@ Then scan ancestor nodes' `index/` directories (no `wal/` or `pending/` — they
 
 ## Segment File Format
 
-Each segment is a **single file** both locally and in S3. The same format is used throughout — the local `pending/<ULID>` file is byte-identical to the S3 object at upload time. Delta bodies, when present, are written into `pending/<ULID>` by the producer (import or post-snapshot delta repack) before drain; the coordinator's drain pass streams the file unmodified.
+Each segment is a **single file** both locally and in S3. The same format is used throughout — the local `pending/<ULID>` file is byte-identical to the S3 object at upload time. Delta bodies, when present, are written into `pending/<ULID>` by the producer (import or the formation delta tier at promote) before drain; the coordinator's drain pass streams the file unmodified.
 
 ### File layout
 
@@ -496,8 +497,8 @@ Segments fetched from S3 are **inherently partial**: a newly-arrived segment has
 |---|---|---|
 | File count | 1 per segment | 3 per segment (`.idx`, `.body`, `.present`) |
 | Completeness | Always complete (atomic tmp→rename) | Self-written: full body; demand-fetched: populated incrementally |
-| Format | Header + index + inline + body + delta (delta written by import or post-snapshot delta repack before drain) | `.idx`: header + index + inline; `.body`: sparse body bytes; `.delta`: delta blobs |
-| Delta section | Inline at `body_section_start + body_length`; written by import / post-snapshot delta repack before drain. The local file is byte-identical to the S3 object | Promoted to a separate `cache/<ULID>.delta` file by `promote_to_cache`; same byte content as the S3 object's delta body section |
+| Format | Header + index + inline + body + delta (delta written by import or the formation delta tier at promote) | `.idx`: header + index + inline; `.body`: sparse body bytes; `.delta`: delta blobs |
+| Delta section | Inline at `body_section_start + body_length`; written by import or the formation delta tier at promote. The local file is byte-identical to the S3 object | Promoted to a separate `cache/<ULID>.delta` file by `promote_to_cache`; same byte content as the S3 object's delta body section |
 | `body_offset` reference point | File-relative (as written) | Body-relative (0 = first byte of body section) — matches `entry.body_offset` directly |
 | Presence tracking | N/A — always 100% present | `.present` bitset; one bit per index entry |
 | Signature location | `header[32..96]` in the single file | `header[32..96]` in `.idx`; verified before any body fetch |
