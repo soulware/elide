@@ -46,6 +46,7 @@ pub(super) fn replay_wal_records(
     path: &Path,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
+    journal_ranges: &crate::journal::JournalRanges,
 ) -> io::Result<WalReplay> {
     let ulid_str = path
         .file_name()
@@ -78,9 +79,10 @@ pub(super) fn replay_wal_records(
                 };
                 lbamap.insert(start_lba, lba_length, hash, ulid);
                 // Temporary WAL offset — updated to segment offset on
-                // promotion. If-absent mirrors `write_commit`: a hash that
-                // already resolves keeps its owner and this record is
-                // minted as a DedupRef at formation.
+                // promotion. The admission mirrors `write_commit`: a hash
+                // that already resolves keeps its owner (unless the owner
+                // is a journal copy and this record is not) and the loser
+                // is minted as a DedupRef at formation.
                 extent_index.insert_if_absent(
                     hash,
                     extentindex::ExtentLocation {
@@ -91,6 +93,7 @@ pub(super) fn replay_wal_records(
                         body_source: BodySource::Local,
                         body_section_start: 0,
                         inline_data: None,
+                        journal: journal_ranges.contains(start_lba),
                     },
                 );
                 // Drop the body bytes here — they live in the WAL at
@@ -157,8 +160,9 @@ pub(super) fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
+    journal_ranges: &crate::journal::JournalRanges,
 ) -> io::Result<RecoveredWal> {
-    let replay = replay_wal_records(&path, lbamap, extent_index)?;
+    let replay = replay_wal_records(&path, lbamap, extent_index, journal_ranges)?;
     let wal = writelog::WriteLog::reopen(&path, replay.valid_size)?;
     Ok(RecoveredWal {
         wal,

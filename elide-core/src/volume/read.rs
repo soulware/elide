@@ -963,3 +963,34 @@ pub(crate) fn find_segment_in_dirs(
         format!("segment not found: {sid}"),
     ))
 }
+
+/// `ext4_view::Ext4Read` adapter over a `Volume`'s in-memory read path,
+/// for parsing the guest filesystem at open time (journal window
+/// derivation). Byte-granular reads are assembled from whole-block
+/// `read_into` calls; an unreadable block (e.g. an evicted body with no
+/// fetcher attached) surfaces as an error the caller treats as
+/// "no journal awareness".
+pub(super) struct VolumeExt4Reader<'a> {
+    pub volume: &'a super::Volume,
+}
+
+impl ext4_view::Ext4Read for VolumeExt4Reader<'_> {
+    fn read(
+        &mut self,
+        start_byte: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let lba = start_byte / 4096;
+        let lba_end = (start_byte + dst.len() as u64).div_ceil(4096);
+        let bytes = self
+            .volume
+            .read(lba, (lba_end - lba) as u32)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let off = (start_byte % 4096) as usize;
+        dst.copy_from_slice(&bytes[off..off + dst.len()]);
+        Ok(())
+    }
+}

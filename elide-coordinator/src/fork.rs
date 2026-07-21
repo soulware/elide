@@ -717,6 +717,7 @@ async fn fork_create_op(
         size: Some(size),
         ublk: ublk_cfg,
         lazy: None,
+        journal_ranges: Default::default(),
     }
     .write(&new_fork_dir))
     {

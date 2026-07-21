@@ -1024,6 +1024,144 @@ fn duplicate_of_promoted_canonical_minted_at_formation() {
     fs::remove_dir_all(base).unwrap();
 }
 
+fn set_journal_ranges(base: &Path, ranges: Vec<(u64, u64)>) {
+    let mut cfg = crate::config::VolumeConfig::read(base).unwrap();
+    cfg.journal_ranges = crate::journal::JournalRanges::new(ranges);
+    cfg.write(base).unwrap();
+}
+
+#[test]
+fn journal_write_loses_ownership_to_same_epoch_home_write() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Journal copy first (jbd2 commit order), home checkpoint second,
+    // same epoch. The write path re-owns the hash to the home copy, so
+    // formation mints the journal entry as the DedupRef — canonical
+    // bytes live at the stable LBA, the journal claim dies at wrap.
+    let data: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(100, &data).unwrap();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = pending_ulids(&base)[0];
+    let seg_path = base.join("pending").join(seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 2);
+    let owner = entries
+        .iter()
+        .find(|e| e.kind == segment::EntryKind::Data)
+        .expect("one Data owner");
+    let minted = entries
+        .iter()
+        .find(|e| e.kind == segment::EntryKind::DedupRef)
+        .expect("one minted DedupRef");
+    assert_eq!(owner.start_lba, 0, "home copy owns");
+    assert_eq!(minted.start_lba, 100, "journal copy is the DedupRef");
+
+    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
+    assert_eq!(loc.segment_id, seg);
+    assert!(!loc.journal);
+
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(100, 1).unwrap(), data);
+
+    // Rebuild picks the same owner.
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
+    assert_eq!(loc.segment_id, seg);
+    assert!(!loc.journal);
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(100, 1).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn home_write_displaces_committed_journal_canonical() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Journal copy commits in epoch 1 and becomes canonical; the home
+    // checkpoint write lands in epoch 2 and displaces it.
+    let data: Vec<u8> = (0..4096).map(|i| (i * 11 + 5) as u8).collect();
+    vol.write(100, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    let s1 = pending_ulids(&base)[0];
+    let hash = blake3::hash(&data);
+    let loc = vol.extent_index.lookup(&hash).unwrap();
+    assert_eq!(loc.segment_id, s1);
+    assert!(loc.journal, "journal copy owns while no stable copy exists");
+
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
+
+    // The epoch-2 segment carries a full Data owner, not a DedupRef
+    // into the journal-claimed body.
+    let seg_path = base.join("pending").join(s2.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, segment::EntryKind::Data);
+
+    let loc = vol.extent_index.lookup(&hash).unwrap();
+    assert_eq!(
+        loc.segment_id, s2,
+        "home copy displaced the journal canonical"
+    );
+    assert!(!loc.journal);
+
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(100, 1).unwrap(), data);
+
+    // Rebuild walks s1 (lower ULID, journal) before s2 and still picks
+    // s2 — the displacement rule is identical live and at rebuild.
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    let loc = vol.extent_index.lookup(&hash).unwrap();
+    assert_eq!(loc.segment_id, s2, "rebuild agrees with the live path");
+    assert!(!loc.journal);
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(100, 1).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_write_dedups_against_stable_canonical() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Home copy already canonical; a journal write of the same bytes
+    // dedups against it (journal → stable direction is the good one).
+    let data: Vec<u8> = (0..4096).map(|i| (i * 13 + 9) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    let s1 = pending_ulids(&base)[0];
+
+    vol.write(100, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
+
+    let seg_path = base.join("pending").join(s2.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, segment::EntryKind::DedupRef);
+
+    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
+    assert_eq!(loc.segment_id, s1, "stable canonical keeps ownership");
+
+    assert_eq!(vol.read(100, 1).unwrap(), data);
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn failed_promote_restore_keeps_formation_minted_dedup_ref() {
     let base = keyed_temp_dir();
@@ -2009,7 +2147,8 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 let rebuild_chain = vec![(fork_dir.clone(), None)];
                 let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
                 let _live_hashes = lba_map.lba_referenced_hashes();
-                let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
+                let extent_index =
+                    extentindex::rebuild(&rebuild_chain, &crate::journal::EMPTY).unwrap();
 
                 let vk =
                     crate::signing::load_verifying_key(&fork_dir, crate::signing::VOLUME_PUB_FILE)

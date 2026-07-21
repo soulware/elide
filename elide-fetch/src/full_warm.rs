@@ -327,6 +327,7 @@ mod tests {
                 body_source: BodySource::Cached(7),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         extent_index.insert(
@@ -339,6 +340,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         extent_index.insert(
@@ -351,6 +353,7 @@ mod tests {
                 body_source: BodySource::Cached(0),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -387,6 +390,7 @@ mod tests {
                 body_source: BodySource::Cached(3),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -419,6 +423,7 @@ mod tests {
                 body_source: BodySource::Cached(0),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -457,6 +462,7 @@ mod tests {
                     body_source: BodySource::Cached(idx),
                     body_section_start: 0,
                     inline_data: None,
+                    journal: false,
                 },
             );
         }
@@ -499,6 +505,7 @@ mod tests {
                 body_source: BodySource::Cached(2),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         extent_index.insert(
@@ -511,6 +518,7 @@ mod tests {
                 body_source: BodySource::Cached(3),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         extent_index.insert(
@@ -523,6 +531,7 @@ mod tests {
                 body_source: BodySource::Cached(7),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -576,6 +585,7 @@ mod tests {
                 body_source: BodySource::Cached(0),
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         extent_index.insert(
@@ -588,6 +598,7 @@ mod tests {
                 body_source: BodySource::Cached(1),
                 body_section_start: 0,
                 inline_data: Some(b"hello!\n".as_slice().into()),
+                journal: false,
             },
         );
 
@@ -627,6 +638,7 @@ mod tests {
                 body_source: BodySource::Cached(0),
                 body_section_start: 0,
                 inline_data: Some(b"hello".as_slice().into()),
+                journal: false,
             },
         );
 
