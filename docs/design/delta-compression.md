@@ -1,6 +1,6 @@
 # Design: delta compression
 
-Status: format, producers, read path, the unified selection cascade at segment formation (dedup off the WAL write path), and journal-region identification + the ownership rule landed. Proposed, not started: similarity-based source selection, journal segment segregation, and the journal delta-tier exclusion. Measurement round 1 (§ Measurement) supports the similarity and journal work.
+Status: format, producers, read path, the unified selection cascade at segment formation (dedup off the WAL write path), and journal-region awareness (identification, the ownership rule, segment segregation, delta-tier exclusion) landed. Proposed, not started: similarity-based source selection. Measurement round 1 (§ Measurement) supports the similarity and journal work.
 
 Date: 2026-07-20 (supersedes the 2026-04 revision)
 
@@ -66,7 +66,11 @@ The jbd2 journal occupies a fixed set of LBA ranges (inode 8, preallocated at mk
 
 **Ownership rule.** The extent index's canonical admission is "lowest non-journal ULID wins": a journal-window copy owns its hash slot only while no stable-LBA copy exists, and a non-journal write displaces a journal owner (`ExtentIndex::insert_if_absent`, mirrored by the rebuild walk, WAL replay, and the volume-invariants drift checker; each `ExtentLocation` carries a `journal` flag stamped from the entry's LBA at insert). This inverts the hazard into a win in both directions: a home checkpoint write displaces a same-epoch or committed journal canonical, so formation mints the *journal* copy as the DedupRef — canonical bytes live at the stable LBA and the journal claim dies at wrap — while a journal write of already-canonical bytes dedups thinly against the stable copy and stores nothing. Snapshot-pinned readers keep plain lowest-ULID-wins: ownership never changes which bytes a hash resolves to, only which copy serves and lives.
 
-**Proposed: remaining consumers.** Segment segregation (journal-window entries form their own segment per promote, so journal segments die whole at wrap and GC reaps instead of folding), the formation delta tier skipping journal-window entries as targets and sources, and the similarity index excluding them on both build and query sides. Persisting per-entry metadata tags for read-path or cache policy (the metadata-tagging note in [operations.md](../operations.md)) is a separate decision this design does not take.
+**Segment segregation.** A promote whose epoch touched journal LBAs writes a segment pair: the stable share under the first ULID, the journal-window share under a second, higher ULID. jbd2 is a circular log — the head-run written in one epoch is overwritten by a later wrap, so a journal segment's claims die together and GC reaps the whole file instead of folding live neighbours out of mixed segments. The ULID order is load-bearing: canonicals live in the data segment, so a journal entry minted as a DedupRef points backward as DedupRefs must. An epoch with no journal writes forms a single segment exactly as before.
+
+**Delta exclusion.** The formation delta tier never sees journal entries (the journal partition skips the tier structurally), and journal-window runs are dropped from the `SnapshotSourceMap`, so journal content never seeds a dictionary from either side.
+
+**Proposed: similarity exclusion.** The similarity index excludes journal-window extents on both build and query sides. Persisting per-entry metadata tags for read-path or cache policy (the metadata-tagging note in [operations.md](../operations.md)) is a separate decision this design does not take.
 
 ## Unified selection at segment formation
 

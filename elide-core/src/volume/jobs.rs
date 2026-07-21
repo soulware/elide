@@ -42,6 +42,28 @@ pub struct PromoteJob {
     /// single-block Data entries against same-LBA extents from it before
     /// writing the segment. `None` reproduces a plain promote.
     pub delta_prior: Option<PromoteDeltaPrior>,
+    /// The epoch's journal-window share, written as its own segment.
+    /// `None` when the volume has no journal window or the epoch touched
+    /// no journal LBAs.
+    pub journal: Option<JournalPartition>,
+}
+
+/// The journal-window share of one promote: entries whose LBAs fall in
+/// the guest filesystem's jbd2 journal window form their own segment,
+/// so the whole segment dies together as the journal wraps and GC reaps
+/// it instead of folding live neighbours out. Same positionally
+/// parallel triple shape as the primary fields on [`PromoteJob`].
+///
+/// `segment_ulid` is always minted after the primary's, so the journal
+/// segment sorts above the data segment — load-bearing for rebuild:
+/// the ownership displacement rule keeps canonicals in the data
+/// segment, and a journal entry minted as a DedupRef then points at a
+/// lower ULID as required.
+pub struct JournalPartition {
+    pub segment_ulid: Ulid,
+    pub entries: Vec<segment::SegmentEntry>,
+    pub pre_promote_offsets: Vec<Option<u64>>,
+    pub body_offsets: Vec<Option<u64>>,
 }
 
 /// The sealed snapshot a promote's delta tier sources dictionaries from.
@@ -55,6 +77,9 @@ pub struct PromoteDeltaPrior {
     pub extent_index: Arc<extentindex::ExtentIndex>,
     /// Body-lookup roots: the fork directory first, then ancestor dirs.
     pub search_dirs: Vec<PathBuf>,
+    /// The volume's journal window: journal LBAs are excluded from the
+    /// source map, so journal content never seeds a dictionary.
+    pub journal_ranges: crate::journal::JournalRanges,
 }
 
 /// A promote that failed on the worker, carrying the job back intact.
@@ -94,6 +119,18 @@ pub struct PromoteResult {
     /// at `body_section_start + delta_region_body_length`. Zero when no
     /// entries were converted.
     pub delta_region_body_length: u64,
+    /// The journal segment written alongside the primary, when the
+    /// epoch carried journal-window entries. The journal segment never
+    /// has a delta region.
+    pub journal: Option<JournalSegmentResult>,
+}
+
+/// The journal segment's share of a [`PromoteResult`].
+pub struct JournalSegmentResult {
+    pub segment_ulid: Ulid,
+    pub body_section_start: u64,
+    pub entries: Vec<segment::SegmentEntry>,
+    pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
 /// The ULIDs needed for a GC checkpoint, minted atomically in order.

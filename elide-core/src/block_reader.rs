@@ -766,8 +766,14 @@ impl SnapshotSourceMap {
     /// Build the map for `dir`'s sealed snapshot `snap_ulid`, walking the
     /// same verified manifest chain as [`BlockReader::open_snapshot`]. The
     /// full snapshot maps exist only transiently during the build; zero
-    /// runs are dropped (`ZERO_HASH` never serves as a dictionary).
-    pub fn build(dir: &Path, snap_ulid: &ulid::Ulid) -> io::Result<Self> {
+    /// runs are dropped (`ZERO_HASH` never serves as a dictionary), and
+    /// so are runs inside the guest filesystem's journal window —
+    /// journal content never seeds a dictionary.
+    pub fn build(
+        dir: &Path,
+        snap_ulid: &ulid::Ulid,
+        journal_ranges: &crate::journal::JournalRanges,
+    ) -> io::Result<Self> {
         let layers = snapshot_layers(dir, snap_ulid)?;
         let mut lbamap = lbamap::LbaMap::new();
         let mut extent_index = extentindex::ExtentIndex::new();
@@ -776,7 +782,9 @@ impl SnapshotSourceMap {
         }
         let mut runs: Vec<SourceRun> = lbamap
             .iter_entries()
-            .filter(|(_, _, hash, _)| *hash != volume::ZERO_HASH)
+            .filter(|(start_lba, _, hash, _)| {
+                *hash != volume::ZERO_HASH && !journal_ranges.contains(*start_lba)
+            })
             .map(|(start_lba, lba_length, hash, _)| SourceRun {
                 start_lba,
                 lba_length,

@@ -367,6 +367,16 @@ enum SimOp {
     /// 52..56). Unwritten LBAs in that range read back as zeros, which
     /// is checked too.
     ReadAfterDrain { lba: u8 },
+    /// Write `incompressible_block(seed)` to the fixed journal-window
+    /// LBA (96) and the fixed stable LBA (97), in randomized order.
+    /// Every proptest fork stamps `journal_ranges = [(96, 1)]` into
+    /// `volume.toml` before the first open, so this pair exercises the
+    /// non-journal ownership preference (whichever copy commits first,
+    /// the stable one must own or displace) and journal segment
+    /// segregation at the next promote — interleaved with every
+    /// GC/repack/drain/crash shape the suite generates. LBAs 96/97 are
+    /// disjoint from every other op range (highest otherwise is 64).
+    JournalDupWrite { journal_first: bool, seed: u8 },
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -425,8 +435,23 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             }
         }),
         Just(SimOp::EvictCacheBody),
-        (0u8..56).prop_map(|lba| SimOp::ReadAfterDrain { lba }),
+        prop_oneof![0u8..56, 96u8..98].prop_map(|lba| SimOp::ReadAfterDrain { lba }),
+        (any::<bool>(), 0u8..128u8).prop_map(|(journal_first, seed)| SimOp::JournalDupWrite {
+            journal_first,
+            seed,
+        }),
     ]
+}
+
+/// The journal window every proptest fork runs with: LBA 96, one block.
+/// Stamped into `volume.toml` before the first open so the extent
+/// index's non-journal ownership preference and journal segment
+/// segregation are live for `JournalDupWrite`. Empty-window behaviour is
+/// covered by every other volume test in the workspace.
+fn stamp_journal_window(fork_dir: &std::path::Path) {
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal_ranges = elide_core::journal::JournalRanges::new(vec![(96, 1)]);
+    cfg.write(fork_dir).unwrap();
 }
 
 /// Minimal op set for the reclaim-focused proptest. Deliberately does
@@ -689,6 +714,7 @@ proptest! {
         let fork_dir = fork_dir.as_path();
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
+        stamp_journal_window(fork_dir);
         let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
@@ -1066,6 +1092,12 @@ proptest! {
                         );
                     }
                 }
+                SimOp::JournalDupWrite { journal_first, seed } => {
+                    let data = incompressible_block(*seed);
+                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let _ = vol.write(first, &data);
+                    let _ = vol.write(second, &data);
+                }
                 SimOp::ReadAfterDrain { lba } => {
                     // Reads must not mint new ULIDs. A demand fetch may
                     // rehydrate a previously-evicted body into cache/,
@@ -1100,6 +1132,7 @@ proptest! {
         let fork_dir = fork_dir.as_path();
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
+        stamp_journal_window(fork_dir);
         let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
@@ -1377,6 +1410,16 @@ proptest! {
                     // verifies the post-eviction read path end to end.
                     let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
                 }
+                SimOp::JournalDupWrite { journal_first, seed } => {
+                    let data = incompressible_block(*seed);
+                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let _ = vol.write(first, &data);
+                    let _ = vol.write(second, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(96, block);
+                    oracle.insert(97, block);
+                }
                 SimOp::ReadAfterDrain { lba } => {
                     // Read in-process against the oracle without
                     // waiting for the next `Crash`. Catches drain / GC
@@ -1415,6 +1458,7 @@ proptest! {
         let fork_dir = fork_dir.as_path();
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
+        stamp_journal_window(fork_dir);
         let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
@@ -1649,6 +1693,16 @@ proptest! {
                 SimOp::EvictCacheBody => {
                     let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
                 }
+                SimOp::JournalDupWrite { journal_first, seed } => {
+                    let data = incompressible_block(*seed);
+                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let _ = vol.write(first, &data);
+                    let _ = vol.write(second, &data);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&data);
+                    oracle.insert(96, block);
+                    oracle.insert(97, block);
+                }
                 SimOp::ReadAfterDrain { lba } => {
                     let expected = oracle
                         .get(&(*lba as u64))
@@ -1688,6 +1742,7 @@ proptest! {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
         common::write_test_keypair(fork_dir);
+        stamp_journal_window(fork_dir);
         let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
@@ -1774,6 +1829,7 @@ fn delta_gc_prefix_mints_a_delta_entry() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
     common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
