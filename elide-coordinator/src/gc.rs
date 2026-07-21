@@ -359,7 +359,11 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_path_buf(), None)))
         .collect();
-    let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
+    let journal_ranges = elide_core::config::VolumeConfig::read(fork_dir)
+        .context("reading volume.toml for journal window")?
+        .journal_ranges;
+    let index =
+        extentindex::rebuild(&rebuild_chain, &journal_ranges).context("rebuilding extent index")?;
     let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
 
     // Replay any in-progress WAL files into the LBA map so that hashes
@@ -2141,7 +2145,7 @@ mod tests {
 
         // Rebuild from disk — extent_index has H101→S2 (S2 processed last).
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let index = extentindex::rebuild(&rebuild_chain, &elide_core::journal::EMPTY).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
@@ -2264,7 +2268,7 @@ mod tests {
 
         // Rebuild state + compute stats.
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let index = extentindex::rebuild(&rebuild_chain, &elide_core::journal::EMPTY).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
@@ -2387,7 +2391,7 @@ mod tests {
 
         // Rebuild state + compute stats.
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let index = extentindex::rebuild(&rebuild_chain, &elide_core::journal::EMPTY).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
@@ -2660,7 +2664,7 @@ mod tests {
         let s1_ulid = ulids[0].to_string();
 
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
-        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let index = extentindex::rebuild(&rebuild_chain, &elide_core::journal::EMPTY).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 

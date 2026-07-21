@@ -40,6 +40,7 @@ const S_IFREG: u16 = 0x8000;
 const S_IFDIR: u16 = 0x4000;
 const S_IFMT: u16 = 0xf000;
 const INCOMPAT_64BIT: u32 = 0x80;
+const COMPAT_HAS_JOURNAL: u32 = 0x4;
 const EXTENT_ENTRY_SIZE: usize = 12;
 const EXT4_ROOT_INO: u32 = 2;
 const EXT4_FT_REG_FILE: u8 = 1;
@@ -84,6 +85,10 @@ struct Superblock {
     inodes_per_group: u32,
     num_block_groups: u32,
     is_64bit: bool,
+    /// `s_journal_inum` when the COMPAT_HAS_JOURNAL feature is set and
+    /// the journal is internal; `None` for no journal or an external
+    /// journal device.
+    journal_inum: Option<u32>,
 }
 
 impl Superblock {
@@ -108,6 +113,16 @@ impl Superblock {
         let blocks_count = hilo64(u32le(&buf, 0x150)?, u32le(&buf, 0x04)?);
         let is_64bit = (u32le(&buf, 0x60)? & INCOMPAT_64BIT) != 0;
 
+        let has_journal = (u32le(&buf, 0x5c)? & COMPAT_HAS_JOURNAL) != 0;
+        let journal_inum = if has_journal {
+            match u32le(&buf, 0xe0)? {
+                0 => None,
+                n => Some(n),
+            }
+        } else {
+            None
+        };
+
         let num_data_blocks = blocks_count.saturating_sub(first_data_block);
         let num_block_groups = num_data_blocks.div_ceil(blocks_per_group as u64) as u32;
 
@@ -117,6 +132,7 @@ impl Superblock {
             inodes_per_group,
             num_block_groups,
             is_64bit,
+            journal_inum,
         })
     }
 
@@ -198,6 +214,50 @@ fn collect_extents_with_logical(
     }
 
     Ok(())
+}
+
+/// LBA ranges of the jbd2 journal: the extents of the superblock's
+/// journal inode (normally inode 8).
+///
+/// `Ok(None)` means "no opinion" — not ext4, unsupported block size,
+/// or a non-extent-mapped journal inode; the caller keeps whatever
+/// window it already has. `Ok(Some(...))` is an authoritative answer
+/// from a successful parse, including the empty window for an ext4
+/// filesystem with no internal journal (feature absent or external
+/// journal device). Read errors propagate.
+pub fn journal_lba_ranges(
+    reader: &mut dyn Ext4Read,
+) -> io::Result<Option<crate::journal::JournalRanges>> {
+    if !probe_ext4(reader)? {
+        return Ok(None);
+    }
+    // The only parse error past a good magic is an unsupported block
+    // size, which precludes walking the journal inode.
+    let Ok(sb) = Superblock::read(reader) else {
+        return Ok(None);
+    };
+    let Some(journal_inum) = sb.journal_inum else {
+        return Ok(Some(crate::journal::JournalRanges::default()));
+    };
+
+    let offset = inode_offset(reader, &sb, journal_inum)?;
+    let mut inode_buf = vec![0u8; sb.inode_size];
+    read_at(reader, offset, &mut inode_buf)?;
+
+    let i_flags = u32le(&inode_buf, 0x20)?;
+    if (i_flags & INODE_FLAG_EXTENTS) == 0 {
+        return Ok(None);
+    }
+
+    let i_block = &inode_buf[0x28..0x28 + 60];
+    let mut raw: Vec<(u32, u64, u16)> = Vec::new();
+    collect_extents_with_logical(i_block, reader, &sb, &mut raw)?;
+
+    Ok(Some(crate::journal::JournalRanges::new(
+        raw.into_iter()
+            .map(|(_, phys, len)| (phys, len as u64))
+            .collect(),
+    )))
 }
 
 /// One contiguous LBA range owned by a regular file — layout only.
@@ -668,4 +728,111 @@ pub fn scan(image: &Path) -> io::Result<Ext4Scan> {
     let f = File::open(image)?;
     let image_size = f.metadata()?.len();
     scan_via_reader(image_size, Box::new(f))
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    /// In-memory image implementing `Ext4Read`.
+    struct VecReader(Vec<u8>);
+
+    impl Ext4Read for VecReader {
+        fn read(
+            &mut self,
+            start_byte: u64,
+            dst: &mut [u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let start = start_byte as usize;
+            let end = start + dst.len();
+            let src = self
+                .0
+                .get(start..end)
+                .ok_or_else(|| io::Error::other("read past end of image"))?;
+            dst.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn put_u16(img: &mut [u8], off: usize, v: u16) {
+        img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(img: &mut [u8], off: usize, v: u32) {
+        img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Minimal ext4 image: superblock + one block group descriptor +
+    /// inode table holding an extent-mapped journal inode 8 with two
+    /// extents.
+    fn journal_image() -> Vec<u8> {
+        let mut img = vec![0u8; 64 * 4096];
+        let sb = SUPERBLOCK_OFFSET as usize;
+        put_u16(&mut img, sb + 0x38, EXT4_MAGIC);
+        put_u32(&mut img, sb + 0x18, 2); // block_size = 1024 << 2
+        put_u16(&mut img, sb + 0x58, 256); // inode_size
+        put_u32(&mut img, sb + 0x28, 16); // inodes_per_group
+        put_u32(&mut img, sb + 0x20, 32768); // blocks_per_group
+        put_u32(&mut img, sb + 0x04, 64); // blocks_count_lo
+        put_u32(&mut img, sb + 0x5c, COMPAT_HAS_JOURNAL);
+        put_u32(&mut img, sb + 0xe0, 8); // s_journal_inum
+
+        // Group 0 descriptor: inode table at block 4.
+        put_u32(&mut img, 4096 + 0x08, 4);
+
+        // Inode 8 (1-based) = slot 7 of group 0.
+        let ino = 4 * 4096 + 7 * 256;
+        put_u32(&mut img, ino + 0x20, INODE_FLAG_EXTENTS);
+        let eh = ino + 0x28;
+        put_u16(&mut img, eh, EXTENT_MAGIC);
+        put_u16(&mut img, eh + 2, 2); // entries
+        put_u16(&mut img, eh + 6, 0); // depth
+        // Extent 1: logical 0, len 8, phys 40.
+        put_u32(&mut img, eh + 12, 0);
+        put_u16(&mut img, eh + 16, 8);
+        put_u16(&mut img, eh + 18, 0);
+        put_u32(&mut img, eh + 20, 40);
+        // Extent 2: logical 8, len 4, phys 56.
+        put_u32(&mut img, eh + 24, 8);
+        put_u16(&mut img, eh + 28, 4);
+        put_u16(&mut img, eh + 30, 0);
+        put_u32(&mut img, eh + 32, 56);
+        img
+    }
+
+    #[test]
+    fn journal_ranges_from_extent_mapped_inode() {
+        let mut reader = VecReader(journal_image());
+        let ranges = journal_lba_ranges(&mut reader).unwrap().unwrap();
+        assert_eq!(ranges.as_slice(), &[(40, 8), (56, 4)]);
+        assert!(ranges.contains(40));
+        assert!(ranges.contains(47));
+        assert!(!ranges.contains(48));
+        assert!(ranges.contains(59));
+        assert!(!ranges.contains(60));
+    }
+
+    #[test]
+    fn not_ext4_yields_no_opinion() {
+        let mut reader = VecReader(vec![0u8; 8192]);
+        assert!(journal_lba_ranges(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn ext4_without_journal_feature_yields_empty() {
+        let mut img = journal_image();
+        put_u32(&mut img, SUPERBLOCK_OFFSET as usize + 0x5c, 0);
+        let mut reader = VecReader(img);
+        let ranges = journal_lba_ranges(&mut reader).unwrap().unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn block_mapped_journal_yields_no_opinion() {
+        let mut img = journal_image();
+        let ino = 4 * 4096 + 7 * 256;
+        put_u32(&mut img, ino + 0x20, 0); // clear INODE_FLAG_EXTENTS
+        let mut reader = VecReader(img);
+        assert!(journal_lba_ranges(&mut reader).unwrap().is_none());
+    }
 }

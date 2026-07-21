@@ -80,6 +80,11 @@ pub struct ExtentLocation {
     /// Reads return this directly with zero file I/O.  `None` for non-inline
     /// entries (the normal case).
     pub inline_data: Option<Box<[u8]>>,
+    /// True when the entry's LBA falls inside the guest filesystem's
+    /// journal window (`JournalRanges`). A journal copy owns its hash
+    /// slot only while no non-journal copy exists — see
+    /// [`ExtentIndex::insert_if_absent`].
+    pub journal: bool,
 }
 
 // Inherent impl on SegmentBodyLayout that needs ExtentLocation. Lives here
@@ -197,6 +202,10 @@ pub struct SegmentRegistrationCtx<'a> {
     /// without it is an error.
     pub delta_body_source: Option<DeltaBodySource>,
     pub inline: InlineSource<'a>,
+    /// Journal window of the guest filesystem, for stamping
+    /// `ExtentLocation::journal` per entry. Empty disables the
+    /// non-journal ownership preference.
+    pub journal_ranges: &'a crate::journal::JournalRanges,
 }
 
 /// Admission policy for [`ExtentIndex::register_entry`].
@@ -367,8 +376,17 @@ impl ExtentIndex {
         self.deltas.remove(&hash);
     }
 
-    /// Insert `location` only if `hash` is not already present.
-    /// Returns `true` if the entry was inserted, `false` if it already existed.
+    /// First-instance admission for `hash`: insert when absent, and
+    /// otherwise displace the existing owner only when it is a journal
+    /// copy and `location` is not. Journal-window bytes are cyclically
+    /// overwritten copies of blocks that also exist at stable LBAs, so
+    /// a non-journal copy always makes the better canonical — it keeps
+    /// durable references out of journal segments, which want to die
+    /// whole. Returns `true` when `location` is now the owner.
+    ///
+    /// The same preference is applied by the rebuild walk
+    /// ([`register_entry`](Self::register_entry) under `IfAbsent`), so
+    /// the in-memory index always matches a fresh disk rebuild.
     pub fn insert_if_absent(&mut self, hash: blake3::Hash, location: ExtentLocation) -> bool {
         use imbl::hashmap::Entry;
         match self.inner.entry(hash) {
@@ -376,7 +394,14 @@ impl ExtentIndex {
                 v.insert(location);
                 true
             }
-            Entry::Occupied(_) => false,
+            Entry::Occupied(mut o) => {
+                if o.get().journal && !location.journal {
+                    o.insert(location);
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -650,8 +675,14 @@ impl ExtentIndex {
                 } else {
                     None
                 };
+                let journal = ctx.journal_ranges.contains(entry.start_lba);
                 let admitted = match admission {
-                    Admission::IfAbsent => !self.inner.contains_key(&entry.hash),
+                    // First-write-wins with the non-journal preference,
+                    // matching `insert_if_absent`.
+                    Admission::IfAbsent => match self.inner.get(&entry.hash) {
+                        None => true,
+                        Some(existing) => existing.journal && !journal,
+                    },
                     Admission::ConsumingInputs(inputs) => match self.inner.get(&entry.hash) {
                         None => true,
                         Some(loc) => inputs.contains(&loc.segment_id),
@@ -670,6 +701,7 @@ impl ExtentIndex {
                         },
                         body_section_start: ctx.body_section_start,
                         inline_data,
+                        journal,
                     };
                     match admission {
                         Admission::IfAbsent => {
@@ -818,15 +850,21 @@ impl Default for ExtentIndex {
 /// The caller (Volume::open) inserts in-progress WAL entries on top.
 /// Canonical location semantics: when the same hash appears in multiple
 /// segments (e.g. a DATA entry and a later DedupRef from dedup),
-/// the **lowest ULID wins** — segments are processed in ascending order
-/// with first-write-wins insert (`insert_if_absent`), so the earliest
-/// segment becomes canonical.  This is correct because a DedupRef always
-/// refers to a segment with a lower ULID than itself, so the original
-/// DATA entry (lowest ULID) is the natural canonical location.
+/// the **lowest non-journal ULID wins** — segments are processed in
+/// ascending order with first-write-wins insert plus the non-journal
+/// displacement rule (`insert_if_absent`), so the earliest segment
+/// holding a stable-LBA copy becomes canonical, and a journal-window
+/// copy owns only while no stable copy exists. A DedupRef always
+/// refers to a segment with a lower ULID than itself, so the walk has
+/// registered every canonical a DedupRef can name by the time it is
+/// reached.
 ///
-/// `promote_segment`'s `should_update` check and `compact_candidates_inner`'s
-/// Repack deduplication both agree on this direction.
-pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
+/// `journal_ranges` is the persisted journal window from
+/// `volume.toml`; empty reproduces plain lowest-ULID-wins.
+pub fn rebuild(
+    forks: &[(PathBuf, Option<String>)],
+    journal_ranges: &crate::journal::JournalRanges,
+) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in forks {
@@ -922,6 +960,7 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
                 body_tier,
                 delta_body_source,
                 inline: InlineSource::Section(&inline_bytes),
+                journal_ranges,
             };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
@@ -956,21 +995,47 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
 ///
 /// Walk order matches [`rebuild`]: committed (gc ∪ index) sorted by
 /// ULID, then pending sorted by ULID, with `insert_if_absent` semantics
-/// (lowest-ULID-wins).
+/// (lowest-non-journal-ULID-wins, per the same displacement rule).
 ///
 /// **Do not use for production rebuild paths** — they need the full
 /// machinery.
 #[cfg(feature = "volume-invariants")]
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
+    journal_ranges: &crate::journal::JournalRanges,
 ) -> io::Result<(
     HashMap<blake3::Hash, Ulid>,
     HashMap<blake3::Hash, Ulid>,
     std::collections::HashSet<Ulid>,
 )> {
     let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
+    let mut journal_owned: std::collections::HashSet<blake3::Hash> =
+        std::collections::HashSet::new();
     let mut delta_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
     let mut live_segments: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
+
+    // Mirror of `insert_if_absent`: first write wins, except a
+    // non-journal copy displaces a journal owner.
+    let mut admit_owner = |owners: &mut HashMap<blake3::Hash, Ulid>,
+                           journal_owned: &mut std::collections::HashSet<blake3::Hash>,
+                           hash: blake3::Hash,
+                           ulid: Ulid,
+                           journal: bool| {
+        match owners.entry(hash) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(ulid);
+                if journal {
+                    journal_owned.insert(hash);
+                }
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if journal_owned.contains(&hash) && !journal {
+                    o.insert(ulid);
+                    journal_owned.remove(&hash);
+                }
+            }
+        }
+    };
 
     for (fork_dir, branch_ulid) in forks {
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
@@ -988,7 +1053,13 @@ pub fn rebuild_owners_unverified(
                     | EntryKind::Inline
                     | EntryKind::CanonicalData
                     | EntryKind::CanonicalInline => {
-                        inner_owners.entry(entry.hash).or_insert(sref.ulid);
+                        admit_owner(
+                            &mut inner_owners,
+                            &mut journal_owned,
+                            entry.hash,
+                            sref.ulid,
+                            journal_ranges.contains(entry.start_lba),
+                        );
                     }
                     EntryKind::Delta => {
                         // Mirror the registration rule: skip if a DATA
@@ -1027,8 +1098,17 @@ pub fn rebuild_owners_unverified(
                     continue;
                 };
                 for record in records {
-                    if let crate::writelog::LogRecord::Data { hash, .. } = record {
-                        inner_owners.entry(hash).or_insert(wal_ulid);
+                    if let crate::writelog::LogRecord::Data {
+                        hash, start_lba, ..
+                    } = record
+                    {
+                        admit_owner(
+                            &mut inner_owners,
+                            &mut journal_owned,
+                            hash,
+                            wal_ulid,
+                            journal_ranges.contains(start_lba),
+                        );
                     }
                 }
             }
@@ -1094,6 +1174,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         let loc = index.lookup(&hash).unwrap();
@@ -1126,6 +1207,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -1142,6 +1224,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
+                journal: false,
             },
         );
         assert!(replaced);
@@ -1173,6 +1256,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -1189,6 +1273,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
+                journal: false,
             },
         );
         assert!(!replaced);
@@ -1215,6 +1300,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -1230,6 +1316,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
+                journal: false,
             },
         );
         assert!(!replaced);
@@ -1253,6 +1340,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
         assert!(!replaced);
@@ -1278,6 +1366,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -1306,6 +1395,7 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
+                journal: false,
             },
         );
 
@@ -1351,6 +1441,7 @@ mod tests {
                 body_length: 4096,
             }),
             inline: InlineSource::EntryInline,
+            journal_ranges: &crate::journal::EMPTY,
         }
     }
 
@@ -1363,6 +1454,7 @@ mod tests {
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,
+            journal: false,
         }
     }
 
@@ -1582,7 +1674,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         // body_offset is body-relative (= stored_offset); body_section_start carries bss.
@@ -1620,7 +1712,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         // Only Data indexed; DedupRef skipped.
         assert_eq!(index.len(), 1);
         assert!(index.lookup(&ref_hash).is_none());
@@ -1675,7 +1767,7 @@ mod tests {
             .unwrap();
         }
 
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         // Oldest segment (lowest ULID) wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset1);
@@ -1688,7 +1780,7 @@ mod tests {
     fn rebuild_empty_dirs_returns_empty() {
         let base = temp_dir();
         std::fs::create_dir_all(&base).unwrap();
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         assert!(index.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1725,7 +1817,11 @@ mod tests {
             stored_offset = written[0].stored_offset;
         }
 
-        let index = rebuild(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
+        let index = rebuild(
+            &[(ancestor.clone(), None), (live.clone(), None)],
+            &crate::journal::EMPTY,
+        )
+        .unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset);
@@ -1761,7 +1857,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();
@@ -1803,7 +1899,7 @@ mod tests {
         segment::extract_idx(&seg_path, &idx_path).unwrap();
         std::fs::remove_file(&seg_path).unwrap();
 
-        let index = rebuild(&[(base.clone(), None)]).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();

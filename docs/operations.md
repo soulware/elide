@@ -327,9 +327,13 @@ Only one outstanding pass per fork: new passes are deferred while any `gc/<ulid>
 
 S3 repacking is a locality optimisation and is not subject to the leaf-only constraint — the coordinator can read any node's segments (local or S3) and rewrite them to co-locate extents accessed together, so a boot sequence can be served by one range-GET. The snapshot tree makes the two-tier layout structurally explicit: ancestor-node extents belong in shared base segments; leaf-node extents belong in snapshot-specific objects. Boot-hint accumulation (per-boot access observations, aggregated per snapshot node) would drive the decisions.
 
-## Filesystem metadata awareness (future)
+## Filesystem metadata awareness
 
-Because Elide controls the block device, it sees every write including ext4 metadata (superblock, group descriptors, inode tables, extent trees, journal). Two concrete opportunities:
+Because Elide controls the block device, it sees every write including ext4 metadata (superblock, group descriptors, inode tables, extent trees, journal).
+
+**Journal-window awareness** is implemented: the jbd2 journal's LBA ranges are derived from the filesystem at open, persisted in `volume.toml`, and drive the extent index's canonical-ownership rule (see `docs/design/delta-compression.md` § Journal-region awareness and `docs/architecture.md` § Dedup).
+
+Further opportunities (future):
 
 - **Metadata extent tagging** (near-term). Identify metadata LBAs from the superblock, tag them in the LBA map, skip dedup and cache aggressively.
 - **Shadow filesystem view** (deferred). Maintain a continuously-updated view of ext4 layout for free snapshot-time re-alignment. Complicated by jbd2: metadata goes to the journal first, not its final LBA. Level 2 (parse committed transactions at snapshot/GC time, `e2fsck`-style) is sufficient for re-alignment; Level 3 (live transaction tracking) is only needed for real-time file-identity-aware dedup and should stay deferred.

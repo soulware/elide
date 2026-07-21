@@ -147,7 +147,10 @@ pub fn rewrite_pending_with_deltas(
 
         let source_chain: Vec<(PathBuf, Option<String>)> =
             vec![(source_dir.clone(), Some(source_snap.clone()))];
-        let source_index = extentindex::rebuild(&source_chain)?;
+        // Source-body resolution only — ownership preference is
+        // irrelevant to which bytes a hash resolves to.
+        let source_index =
+            extentindex::rebuild(&source_chain, &crate::journal::JournalRanges::default())?;
 
         match_filemaps_into(
             &child_filemap,

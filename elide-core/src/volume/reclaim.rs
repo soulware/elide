@@ -405,6 +405,7 @@ impl Volume {
                 body_length: result.body_length,
             }),
             inline: extentindex::InlineSource::EntryInline,
+            journal_ranges: &self.journal_ranges,
         };
         for (raw_idx, re) in result.entries.iter().enumerate() {
             lbamap.register_entry(&re.entry, result.segment_ulid);

@@ -241,6 +241,7 @@ fn apply_promoted_entries(
     extent_index: &mut extentindex::ExtentIndex,
     lbamap: &mut lbamap::LbaMap,
     result: &PromoteResult,
+    journal_ranges: &crate::journal::JournalRanges,
 ) -> io::Result<()> {
     let PromoteResult {
         segment_ulid,
@@ -266,6 +267,7 @@ fn apply_promoted_entries(
             body_length: delta_region_body_length,
         }),
         inline: extentindex::InlineSource::EntryInline,
+        journal_ranges,
     };
     let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
     for (raw_idx, (entry, old_wal_offset)) in entries
@@ -327,6 +329,7 @@ fn apply_promoted_entries(
                 body_source: BodySource::Local,
                 body_section_start,
                 inline_data: idata,
+                journal: journal_ranges.contains(entry.start_lba),
             },
         );
     }
@@ -489,6 +492,12 @@ pub struct Volume {
     /// Stats for DedupRef minting at segment formation
     /// (`classify_pending_dedup`).
     pub(in crate::volume) dedup_mint_stats: DedupMintStats,
+    /// The guest filesystem's jbd2 journal window. Loaded from
+    /// `volume.toml` before the extent-index rebuild (which needs it for
+    /// the non-journal ownership preference), re-derived from the
+    /// filesystem after the maps are built, and persisted back when it
+    /// changed. Empty when the volume has no parseable ext4 journal.
+    pub(in crate::volume) journal_ranges: crate::journal::JournalRanges,
     /// Shared LRU of parsed+verified segment indices. Keyed by
     /// `(path, file_len)`. Cloned into worker jobs so the actor thread
     /// and the worker thread hit the same cache. See
@@ -572,8 +581,15 @@ impl Volume {
             }
         }
 
+        // The journal window persisted by the previous session. The
+        // extent-index rebuild needs it before the filesystem is
+        // parseable; a freshly derived window is persisted at the end of
+        // open for the next session (`refresh_journal_ranges`).
+        let journal_ranges = crate::config::VolumeConfig::read(base_dir)?.journal_ranges;
+
         // Walk the origin chain and rebuild maps from all committed segments.
-        let (ancestor_layers, mut lbamap, mut extent_index) = open_read_state(base_dir, by_id_dir)?;
+        let (ancestor_layers, mut lbamap, mut extent_index) =
+            open_read_state(base_dir, by_id_dir, &journal_ranges)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -670,7 +686,7 @@ impl Volume {
                 valid_size: _,
                 mut pending_entries,
                 mut body_offsets,
-            } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
+            } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index, &journal_ranges)?;
             if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
@@ -703,7 +719,7 @@ impl Volume {
                 &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
-            apply_promoted_entries(&mut extent_index, &mut lbamap, &result)?;
+            apply_promoted_entries(&mut extent_index, &mut lbamap, &result, &journal_ranges)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers this recovery-promoted segment.
             if last_segment_ulid < Some(result.segment_ulid) {
@@ -725,7 +741,7 @@ impl Volume {
                     path,
                     pending_entries,
                     body_offsets,
-                } = recover_wal(path, &mut lbamap, &mut extent_index)?;
+                } = recover_wal(path, &mut lbamap, &mut extent_index, &journal_ranges)?;
                 (
                     Some(OpenWal { wal, ulid, path }),
                     pending_entries,
@@ -758,13 +774,58 @@ impl Volume {
             mint,
             noop_stats: NoopSkipStats::default(),
             dedup_mint_stats: recovery_dedup_stats,
+            journal_ranges,
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
             own_segments,
         };
+        ret.refresh_journal_ranges();
         ret.assert_volume_invariants("Volume::open");
         Ok(ret)
+    }
+
+    /// Derive the journal window from the guest filesystem and persist
+    /// it to `volume.toml` when it differs from the stored value. The
+    /// in-memory set stays what this open's rebuild used — the derived
+    /// window takes effect at the next open, keeping the live index and
+    /// the drift checker on one consistent range set per session.
+    /// Best-effort: not-ext4, an unreadable block (e.g. evicted body
+    /// with no fetcher), or a config write failure keeps the stored set.
+    fn refresh_journal_ranges(&self) {
+        let mut reader = read::VolumeExt4Reader { volume: self };
+        let derived = match crate::ext4_scan::journal_lba_ranges(&mut reader) {
+            // "No opinion" (not ext4, or unparseable layout): keep the
+            // stored window.
+            Ok(None) => return,
+            Ok(Some(r)) => r,
+            Err(e) => {
+                log::warn!("[journal] window derivation failed, keeping stored set: {e}");
+                return;
+            }
+        };
+        if derived == self.journal_ranges {
+            return;
+        }
+        let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[journal] reading volume.toml for window update failed: {e}");
+                return;
+            }
+        };
+        cfg.journal_ranges = derived.clone();
+        if let Err(e) = cfg.write(&self.base_dir) {
+            log::warn!("[journal] persisting window failed: {e}");
+            return;
+        }
+        log::info!(
+            "[journal] window changed: {} range(s), {} LBAs (was {} range(s), {} LBAs); effective next open",
+            derived.as_slice().len(),
+            derived.lba_count(),
+            self.journal_ranges.as_slice().len(),
+            self.journal_ranges.lba_count(),
+        );
     }
 
     /// Write `data` starting at logical block address `lba`.
@@ -900,10 +961,12 @@ impl Volume {
         };
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw payload
-        // offset, updated to segment file offsets after promotion. If-absent:
+        // offset, updated to segment file offsets after promotion. Admission:
         // a hash that already resolves (a prior canonical, or an earlier write
-        // of the same bytes in this WAL epoch) keeps its owner, and this entry
-        // is minted as a DedupRef at formation (`classify_pending_dedup`).
+        // of the same bytes in this WAL epoch) keeps its owner — unless that
+        // owner is a journal-window copy and this write is not, in which case
+        // this write displaces it. The non-owner is minted as a DedupRef at
+        // formation (`classify_pending_dedup`).
         Arc::make_mut(&mut self.extent_index).insert_if_absent(
             hash,
             extentindex::ExtentLocation {
@@ -914,6 +977,7 @@ impl Volume {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
+                journal: self.journal_ranges.contains(lba),
             },
         );
         self.pending_entries
@@ -1425,12 +1489,14 @@ impl Volume {
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         let delta_body_source =
             extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
+        let journal_ranges = self.journal_ranges.clone();
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: new_ulid,
             body_section_start: new_bss,
             body_tier: extentindex::RegistrationBodyTier::Cached,
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
+            journal_ranges: &journal_ranges,
         };
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
@@ -1764,7 +1830,7 @@ impl Volume {
     /// between in-memory and disk-rebuild. The two representations
     /// legitimately diverge on which segment is named as the owner:
     /// - `extentindex::rebuild` walks segments in ULID-ascending order
-    ///   and uses `insert_if_absent` (lowest-ULID-wins).
+    ///   and uses `insert_if_absent` (lowest non-journal ULID wins).
     /// - Several apply paths (reclaim, write-then-flush) use
     ///   unconditional `insert` and override with the newer ULID.
     ///
@@ -1793,7 +1859,7 @@ impl Volume {
             .collect();
         chain.push((self.base_dir.clone(), None));
         let (disk_inner, disk_deltas, live_segments) =
-            match extentindex::rebuild_owners_unverified(&chain) {
+            match extentindex::rebuild_owners_unverified(&chain, &self.journal_ranges) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("assert_extent_index_consistent[{caller}]: rebuild failed: {e}");
@@ -2133,35 +2199,40 @@ impl Volume {
                 if !entry.kind.has_body_bytes() {
                     continue;
                 }
-                if self
+                // Ownership does not change here (the CAS is gated on this
+                // segment already owning the hash), so the journal flag
+                // carries over from the current location.
+                let Some(journal) = self
                     .extent_index
                     .lookup(&entry.hash)
-                    .is_some_and(|loc| loc.segment_id == ulid)
-                {
-                    let idata = if entry.kind.is_inline() {
-                        let start = entry.stored_offset as usize;
-                        let end = start + entry.stored_length as usize;
-                        if end <= inline.len() {
-                            Some(inline[start..end].into())
-                        } else {
-                            continue;
-                        }
+                    .and_then(|loc| (loc.segment_id == ulid).then_some(loc.journal))
+                else {
+                    continue;
+                };
+                let idata = if entry.kind.is_inline() {
+                    let start = entry.stored_offset as usize;
+                    let end = start + entry.stored_length as usize;
+                    if end <= inline.len() {
+                        Some(inline[start..end].into())
                     } else {
-                        None
-                    };
-                    Arc::make_mut(&mut self.extent_index).insert(
-                        entry.hash,
-                        extentindex::ExtentLocation {
-                            segment_id: ulid,
-                            body_offset: entry.stored_offset,
-                            body_length: entry.stored_length,
-                            compressed: entry.compressed,
-                            body_source: BodySource::Cached(i as u32),
-                            body_section_start,
-                            inline_data: idata,
-                        },
-                    );
-                }
+                        continue;
+                    }
+                } else {
+                    None
+                };
+                Arc::make_mut(&mut self.extent_index).insert(
+                    entry.hash,
+                    extentindex::ExtentLocation {
+                        segment_id: ulid,
+                        body_offset: entry.stored_offset,
+                        body_length: entry.stored_length,
+                        compressed: entry.compressed,
+                        body_source: BodySource::Cached(i as u32),
+                        body_section_start,
+                        inline_data: idata,
+                        journal,
+                    },
+                );
             }
 
             // Delta entries: the delta blob has moved from inline in
@@ -2871,6 +2942,7 @@ impl Volume {
             Arc::make_mut(&mut self.extent_index),
             Arc::make_mut(&mut self.lbamap),
             result,
+            &self.journal_ranges,
         )?;
 
         // Delete old WAL — only after the extent index is updated.

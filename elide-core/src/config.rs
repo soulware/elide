@@ -30,6 +30,15 @@ pub struct VolumeConfig {
     /// false) eagerly warms every live extent from S3 in the background.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lazy: Option<bool>,
+    /// LBA ranges of the guest filesystem's jbd2 journal (inode 8's
+    /// extents), derived at open and consulted by the extent index's
+    /// canonical-ownership rule before the filesystem is parseable.
+    /// Empty means no journal awareness.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::journal::JournalRanges::is_empty"
+    )]
+    pub journal_ranges: crate::journal::JournalRanges,
 }
 
 /// ublk server configuration within `volume.toml`.
@@ -220,6 +229,24 @@ mod tests {
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         let ublk = cfg.ublk.expect("ublk section should be present");
         assert_eq!(ublk.dev_id, None);
+    }
+
+    #[test]
+    fn toml_without_journal_ranges_parses_empty() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "size = 1024\n");
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert!(cfg.journal_ranges.is_empty());
+    }
+
+    #[test]
+    fn journal_ranges_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
+        cfg.journal_ranges = crate::journal::JournalRanges::new(vec![(100, 16), (300, 4)]);
+        cfg.write(tmp.path()).unwrap();
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.journal_ranges.as_slice(), &[(100, 16), (300, 4)]);
     }
 
     #[test]

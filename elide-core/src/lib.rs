@@ -12,6 +12,7 @@ pub mod extentindex;
 pub mod filemap;
 pub mod import;
 pub mod ipc;
+pub mod journal;
 pub mod lbamap;
 pub mod malloc_debug;
 pub mod malloc_policy;
