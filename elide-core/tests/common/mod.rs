@@ -388,10 +388,12 @@ pub fn simulate_coord_gc_local(
     let mut lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
     replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lba_map);
     let live_hashes = lba_map.lba_referenced_hashes();
-    let journal_ranges = elide_core::config::VolumeConfig::read(fork_dir)
-        .ok()?
-        .journal_ranges;
-    let extent_index = extentindex::rebuild(&rebuild_chain, &journal_ranges).ok()?;
+    let cfg = elide_core::config::VolumeConfig::read(fork_dir).ok()?;
+    let journal = elide_core::journal::JournalWindow {
+        ranges: cfg.journal_ranges.unwrap_or_default(),
+        activation: cfg.journal_activation,
+    };
+    let extent_index = extentindex::rebuild(&rebuild_chain, &journal).ok()?;
 
     compact_candidates_inner(
         fork_dir,

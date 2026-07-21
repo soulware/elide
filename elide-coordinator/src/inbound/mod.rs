@@ -1678,6 +1678,7 @@ async fn create_volume_op(
             ublk: ublk_cfg,
             lazy: None,
             journal_ranges: Default::default(),
+            journal_activation: None,
         }
         .write(&vol_dir)?;
         std::fs::create_dir_all(&by_name_dir)?;
@@ -3168,6 +3169,7 @@ mod tests {
             ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig { dev_id: Some(id) }),
             lazy: None,
             journal_ranges: Default::default(),
+            journal_activation: None,
         }
         .write(&vol_dir)
         .unwrap();

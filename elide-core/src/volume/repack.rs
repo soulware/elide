@@ -263,7 +263,7 @@ impl Volume {
                         delta_body_source: delta_body_source
                             .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
                         inline: extentindex::InlineSource::EntryInline,
-                        journal_ranges: &vol.journal_ranges,
+                        journal: &vol.journal,
                     };
                     for (raw_idx, e) in out.out_entries.iter().enumerate() {
                         index.register_entry_consuming_inputs(

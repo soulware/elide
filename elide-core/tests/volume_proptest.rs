@@ -450,7 +450,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
 /// covered by every other volume test in the workspace.
 fn stamp_journal_window(fork_dir: &std::path::Path) {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
-    cfg.journal_ranges = elide_core::journal::JournalRanges::new(vec![(96, 1)]);
+    cfg.journal_ranges = Some(elide_core::journal::JournalRanges::new(vec![(96, 1)]));
     cfg.write(fork_dir).unwrap();
 }
 

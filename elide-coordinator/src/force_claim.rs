@@ -472,6 +472,7 @@ impl ForceClaimOrchestrator {
                 .then(elide_core::config::UblkConfig::default),
             lazy: None,
             journal_ranges: Default::default(),
+            journal_activation: None,
         }
         .write(dir)
         .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))

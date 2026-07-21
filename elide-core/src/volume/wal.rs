@@ -46,7 +46,7 @@ pub(super) fn replay_wal_records(
     path: &Path,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<WalReplay> {
     let ulid_str = path
         .file_name()
@@ -93,7 +93,7 @@ pub(super) fn replay_wal_records(
                         body_source: BodySource::Local,
                         body_section_start: 0,
                         inline_data: None,
-                        journal: journal_ranges.contains(start_lba),
+                        journal: journal.is_journal(start_lba, ulid),
                     },
                 );
                 // Drop the body bytes here — they live in the WAL at
@@ -160,9 +160,9 @@ pub(super) fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<RecoveredWal> {
-    let replay = replay_wal_records(&path, lbamap, extent_index, journal_ranges)?;
+    let replay = replay_wal_records(&path, lbamap, extent_index, journal)?;
     let wal = writelog::WriteLog::reopen(&path, replay.valid_size)?;
     Ok(RecoveredWal {
         wal,

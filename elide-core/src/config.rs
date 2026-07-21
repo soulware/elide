@@ -31,14 +31,22 @@ pub struct VolumeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lazy: Option<bool>,
     /// LBA ranges of the guest filesystem's jbd2 journal (inode 8's
-    /// extents), derived at open and consulted by the extent index's
+    /// extents), derived at open — and, while `None`, re-attempted at
+    /// every promote take so a filesystem formatted mid-session gains
+    /// awareness without a reopen. Consulted by the extent index's
     /// canonical-ownership rule before the filesystem is parseable.
-    /// Empty means no journal awareness.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::journal::JournalRanges::is_empty"
-    )]
-    pub journal_ranges: crate::journal::JournalRanges,
+    /// `None` = never derived (keep attempting); `Some` (possibly
+    /// empty) = an authoritative parse answered, including "ext4 with
+    /// no internal journal".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_ranges: Option<crate::journal::JournalRanges>,
+    /// First segment ULID minted after a mid-session None→window flip
+    /// of `journal_ranges`. While present, journal classification
+    /// applies the window only to segments at or above this ULID, so
+    /// rebuilds during the flip session reproduce the live stamps. The
+    /// next open reclassifies uniformly and clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_activation: Option<ulid::Ulid>,
 }
 
 /// ublk server configuration within `volume.toml`.
@@ -232,21 +240,53 @@ mod tests {
     }
 
     #[test]
-    fn toml_without_journal_ranges_parses_empty() {
+    fn toml_without_journal_ranges_parses_never_derived() {
         let tmp = TempDir::new().unwrap();
         write_config(tmp.path(), "size = 1024\n");
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert!(cfg.journal_ranges.is_empty());
+        assert_eq!(cfg.journal_ranges, None);
+        assert_eq!(cfg.journal_activation, None);
     }
 
     #[test]
     fn journal_ranges_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
-        cfg.journal_ranges = crate::journal::JournalRanges::new(vec![(100, 16), (300, 4)]);
+        cfg.journal_ranges = Some(crate::journal::JournalRanges::new(vec![
+            (100, 16),
+            (300, 4),
+        ]));
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert_eq!(cfg.journal_ranges.as_slice(), &[(100, 16), (300, 4)]);
+        assert_eq!(
+            cfg.journal_ranges.unwrap().as_slice(),
+            &[(100, 16), (300, 4)]
+        );
+    }
+
+    #[test]
+    fn journal_derived_empty_roundtrips_distinct_from_never_derived() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
+        cfg.journal_ranges = Some(crate::journal::JournalRanges::default());
+        cfg.write(tmp.path()).unwrap();
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.journal_ranges,
+            Some(crate::journal::JournalRanges::default())
+        );
+    }
+
+    #[test]
+    fn journal_activation_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
+        let activation = ulid::Ulid::from_parts(1234, 42);
+        cfg.journal_ranges = Some(crate::journal::JournalRanges::new(vec![(100, 16)]));
+        cfg.journal_activation = Some(activation);
+        cfg.write(tmp.path()).unwrap();
+        let cfg = VolumeConfig::read(tmp.path()).unwrap();
+        assert_eq!(cfg.journal_activation, Some(activation));
     }
 
     #[test]

@@ -1026,8 +1026,132 @@ fn duplicate_of_promoted_canonical_minted_at_formation() {
 
 fn set_journal_ranges(base: &Path, ranges: Vec<(u64, u64)>) {
     let mut cfg = crate::config::VolumeConfig::read(base).unwrap();
-    cfg.journal_ranges = crate::journal::JournalRanges::new(ranges);
+    cfg.journal_ranges = Some(crate::journal::JournalRanges::new(ranges));
     cfg.write(base).unwrap();
+}
+
+/// Write the synthetic ext4 image's populated blocks onto the volume —
+/// the in-test equivalent of running mkfs on the device.
+fn write_ext4_image(vol: &mut Volume, img: &[u8]) {
+    for (i, block) in img.chunks(4096).enumerate() {
+        if block.iter().any(|&b| b != 0) {
+            vol.write(i as u64, block).unwrap();
+        }
+    }
+}
+
+/// Mid-session derivation end to end: a fresh volume is never-derived,
+/// polls harmlessly while blank, flips the window live at the first
+/// promote take after the filesystem appears, and classifies with the
+/// activation marker so pre-flip stamps survive rebuild. The next open
+/// clears the marker and reclassifies uniformly.
+#[test]
+fn format_mid_session_flips_window_at_promote_take() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert!(
+        crate::config::VolumeConfig::read(&base)
+            .unwrap()
+            .journal_ranges
+            .is_none(),
+        "fresh volume must start never-derived",
+    );
+
+    // Pre-format write into what will become the journal window: the
+    // blank-device poll at this promote must not derive anything.
+    let pre_flip = high_entropy_block(0xD1);
+    vol.write(40, &pre_flip).unwrap();
+    vol.promote_for_test().unwrap();
+    assert!(
+        crate::config::VolumeConfig::read(&base)
+            .unwrap()
+            .journal_ranges
+            .is_none(),
+        "no filesystem yet — still never-derived",
+    );
+
+    write_ext4_image(&mut vol, &crate::ext4_scan::test_support::journal_image());
+    vol.promote_for_test().unwrap();
+
+    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    let ranges = cfg.journal_ranges.expect("window derived at take");
+    assert_eq!(ranges.as_slice(), &[(40, 8), (56, 4)]);
+    let activation = cfg.journal_activation.expect("activation marker persisted");
+    assert_eq!(vol.journal.activation, Some(activation));
+    assert_eq!(vol.journal.ranges, ranges);
+
+    // The pre-flip window-LBA entry keeps its non-journal stamp: its
+    // segment sorts below the activation marker.
+    let pre_hash = blake3::hash(&pre_flip);
+    let pre_loc = vol.extent_index.lookup(&pre_hash).unwrap().clone();
+    assert!(!pre_loc.journal);
+    assert!(pre_loc.segment_id < activation);
+
+    // A post-flip window write partitions into a journal segment above
+    // the marker.
+    let post_flip = high_entropy_block(0xD2);
+    vol.write(56, &post_flip).unwrap();
+    let home = high_entropy_block(0xD3);
+    vol.write(200, &home).unwrap();
+    vol.promote_for_test().unwrap();
+    let post_loc = vol
+        .extent_index
+        .lookup(&blake3::hash(&post_flip))
+        .unwrap()
+        .clone();
+    assert!(post_loc.journal);
+    assert!(post_loc.segment_id > activation);
+
+    // A mid-session rebuild honouring the marker (what the coordinator's
+    // GC pass and a readonly open do) reproduces the live stamps.
+    let window = crate::journal::JournalWindow {
+        ranges: ranges.clone(),
+        activation: Some(activation),
+    };
+    let disk = extentindex::rebuild(&[(base.clone(), None)], &window).unwrap();
+    assert!(!disk.lookup(&pre_hash).unwrap().journal);
+    assert!(disk.lookup(&blake3::hash(&post_flip)).unwrap().journal);
+
+    // Reopen: marker cleared, uniform reclassification under the plain
+    // window heals the pre-flip stamp.
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert!(
+        crate::config::VolumeConfig::read(&base)
+            .unwrap()
+            .journal_activation
+            .is_none(),
+        "open must clear the activation marker",
+    );
+    assert!(vol.extent_index.lookup(&pre_hash).unwrap().journal);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// An authoritative "no internal journal" parse persists as
+/// derived-empty — distinct from never-derived — and ends the polling.
+#[test]
+fn derived_empty_window_persists_and_stops_polling() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let mut img = crate::ext4_scan::test_support::journal_image();
+    // Clear COMPAT_HAS_JOURNAL: valid ext4, no internal journal.
+    crate::ext4_scan::test_support::put_u32(&mut img, 1024 + 0x5c, 0);
+    write_ext4_image(&mut vol, &img);
+    vol.promote_for_test().unwrap();
+
+    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    assert_eq!(
+        cfg.journal_ranges,
+        Some(crate::journal::JournalRanges::default()),
+        "authoritative empty answer must persist as derived",
+    );
+    assert_eq!(cfg.journal_activation, None);
+    assert!(vol.journal_derived);
+    assert!(vol.journal.ranges.is_empty());
+
+    fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
@@ -2347,7 +2471,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
                 let _live_hashes = lba_map.lba_referenced_hashes();
                 let extent_index =
-                    extentindex::rebuild(&rebuild_chain, &crate::journal::EMPTY).unwrap();
+                    extentindex::rebuild(&rebuild_chain, &crate::journal::NO_WINDOW).unwrap();
 
                 let vk =
                     crate::signing::load_verifying_key(&fork_dir, crate::signing::VOLUME_PUB_FILE)
