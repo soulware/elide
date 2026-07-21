@@ -1045,22 +1045,32 @@ fn journal_write_loses_ownership_to_same_epoch_home_write() {
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    let seg = pending_ulids(&base)[0];
-    let seg_path = base.join("pending").join(seg.to_string());
-    let (_, entries, _) =
-        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
-    assert_eq!(entries.len(), 2);
-    let owner = entries
-        .iter()
-        .find(|e| e.kind == segment::EntryKind::Data)
-        .expect("one Data owner");
-    let minted = entries
-        .iter()
-        .find(|e| e.kind == segment::EntryKind::DedupRef)
-        .expect("one minted DedupRef");
-    assert_eq!(owner.start_lba, 0, "home copy owns");
-    assert_eq!(minted.start_lba, 100, "journal copy is the DedupRef");
+    // Segregation splits the epoch: the home copy owns as Data in the
+    // data segment (lower ULID), the journal copy is the DedupRef in the
+    // journal segment (higher ULID) — pointing backward as DedupRefs
+    // must.
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 2);
+    let (data_seg, journal_seg) = (ulids[0], ulids[1]);
+    let read_entries = |seg: Ulid| {
+        let seg_path = base.join("pending").join(seg.to_string());
+        let (_, entries, _) =
+            segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+        entries
+    };
+    let data_entries = read_entries(data_seg);
+    assert_eq!(data_entries.len(), 1);
+    assert_eq!(data_entries[0].kind, segment::EntryKind::Data);
+    assert_eq!(data_entries[0].start_lba, 0, "home copy owns");
+    let journal_entries = read_entries(journal_seg);
+    assert_eq!(journal_entries.len(), 1);
+    assert_eq!(journal_entries[0].kind, segment::EntryKind::DedupRef);
+    assert_eq!(
+        journal_entries[0].start_lba, 100,
+        "journal copy is the DedupRef"
+    );
 
+    let seg = data_seg;
     let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
     assert_eq!(loc.segment_id, seg);
     assert!(!loc.journal);
@@ -1159,6 +1169,195 @@ fn journal_write_dedups_against_stable_canonical() {
     assert_eq!(loc.segment_id, s1, "stable canonical keeps ownership");
 
     assert_eq!(vol.read(100, 1).unwrap(), data);
+    fs::remove_dir_all(base).unwrap();
+}
+
+fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
+    let seg_path = base.join("pending").join(seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    entries.iter().map(|e| e.start_lba).collect()
+}
+
+#[test]
+fn mixed_epoch_forms_data_and_journal_segments() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| (i * 5 + 2) as u8).collect();
+    let c: Vec<u8> = (0..4096).map(|i| (i * 7 + 4) as u8).collect();
+    vol.write(0, &a).unwrap();
+    vol.write(100, &b).unwrap();
+    vol.write(5, &c).unwrap();
+    vol.promote_for_test().unwrap();
+
+    // One data segment (lower ULID) and one journal segment (higher).
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 2, "mixed epoch forms a segment pair");
+    let (data_seg, journal_seg) = (ulids[0], ulids[1]);
+    let mut data_lbas = entry_lbas(&base, &vol, data_seg);
+    data_lbas.sort_unstable();
+    assert_eq!(data_lbas, vec![0, 5]);
+    assert_eq!(entry_lbas(&base, &vol, journal_seg), vec![100]);
+
+    assert_eq!(vol.read(0, 1).unwrap(), a);
+    assert_eq!(vol.read(100, 1).unwrap(), b);
+    assert_eq!(vol.read(5, 1).unwrap(), c);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap(), a);
+    assert_eq!(vol.read(100, 1).unwrap(), b);
+    assert_eq!(vol.read(5, 1).unwrap(), c);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn all_journal_epoch_forms_single_journal_segment() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a: Vec<u8> = (0..4096).map(|i| (i * 3 + 7) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| (i * 5 + 9) as u8).collect();
+    vol.write(100, &a).unwrap();
+    vol.write(101, &b).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(
+        ulids.len(),
+        1,
+        "all-journal epoch writes no empty data segment"
+    );
+    let mut lbas = entry_lbas(&base, &vol, ulids[0]);
+    lbas.sort_unstable();
+    assert_eq!(lbas, vec![100, 101]);
+
+    assert_eq!(vol.read(100, 1).unwrap(), a);
+    assert_eq!(vol.read(101, 1).unwrap(), b);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(100, 1).unwrap(), a);
+    assert_eq!(vol.read(101, 1).unwrap(), b);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn failed_promote_restore_reparks_both_partitions() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a: Vec<u8> = (0..4096).map(|i| (i * 11 + 1) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| (i * 13 + 2) as u8).collect();
+    vol.write(0, &a).unwrap();
+    vol.write(100, &b).unwrap();
+    vol.gc_checkpoint_with_failed_flush_for_test().unwrap();
+
+    assert_eq!(vol.read(0, 1).unwrap(), a, "read after restore");
+    assert_eq!(vol.read(100, 1).unwrap(), b, "read after restore");
+
+    vol.promote_for_test().unwrap();
+    assert_eq!(pending_ulids(&base).len(), 2);
+    assert_eq!(vol.read(0, 1).unwrap(), a);
+    assert_eq!(vol.read(100, 1).unwrap(), b);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap(), a, "read after reopen");
+    assert_eq!(vol.read(100, 1).unwrap(), b, "read after reopen");
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn recovery_promote_partitions_journal_writes() {
+    // A crash-leftover extra WAL holding both stable and journal writes
+    // must partition at the recovery promote exactly like a live one.
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let a: Vec<u8> = (0..4096).map(|i| (i * 17 + 3) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| (i * 19 + 5) as u8).collect();
+    let fresh: Vec<u8> = (0..4096).map(|i| (i * 23 + 7) as u8).collect();
+
+    let last_ulid = {
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(2, &fresh).unwrap();
+        vol.promote_for_test().unwrap();
+        pending_ulids(&base)[0]
+    };
+
+    let mut mint = crate::ulid_mint::UlidMint::new(last_ulid);
+    let wal_a_ulid = mint.next();
+    let wal_b_ulid = mint.next();
+    let mut wal_a =
+        writelog::WriteLog::create(&base.join("wal").join(wal_a_ulid.to_string())).unwrap();
+    wal_a
+        .append_data(0, 1, &blake3::hash(&a), writelog::WalFlags::empty(), &a)
+        .unwrap();
+    wal_a
+        .append_data(100, 1, &blake3::hash(&b), writelog::WalFlags::empty(), &b)
+        .unwrap();
+    drop(wal_a);
+    let mut wal_b =
+        writelog::WriteLog::create(&base.join("wal").join(wal_b_ulid.to_string())).unwrap();
+    wal_b
+        .append_data(
+            4,
+            1,
+            &blake3::hash(&fresh),
+            writelog::WalFlags::empty(),
+            &fresh,
+        )
+        .unwrap();
+    drop(wal_b);
+
+    let vol = Volume::open(&base, &base).unwrap();
+    // The extra WAL promoted into a data + journal segment pair.
+    let ulids = pending_ulids(&base);
+    assert!(
+        ulids
+            .iter()
+            .any(|u| entry_lbas(&base, &vol, *u) == vec![100]),
+        "journal write promoted into its own segment"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), a);
+    assert_eq!(vol.read(100, 1).unwrap(), b);
+    assert_eq!(vol.read(4, 1).unwrap(), fresh);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_lba_never_deltas() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // A sealed same-LBA near-duplicate is the delta tier's prime case;
+    // on a journal LBA it must stay Data (journal partition is never
+    // delta'd, and journal runs are excluded from the source map).
+    vol.write(100, &delta_base_block(9)).unwrap();
+    vol.snapshot().unwrap();
+
+    let variant = delta_variant_block(9, 0x5A);
+    vol.write(100, &variant).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Data],
+        "journal-window entry must not be minted as Delta"
+    );
+    assert_eq!(vol.read(100, 1).unwrap(), variant);
+
     fs::remove_dir_all(base).unwrap();
 }
 

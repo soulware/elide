@@ -65,9 +65,10 @@ pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_
 pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
-    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, PromoteDeltaPrior, PromoteFailure,
-    PromoteJob, PromoteResult, PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult,
-    SignSnapshotManifestJob, SignSnapshotManifestResult, WorkerJob, WorkerResult,
+    GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, JournalPartition, JournalSegmentResult,
+    PromoteDeltaPrior, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
+    PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob, SignSnapshotManifestResult,
+    WorkerJob, WorkerResult,
 };
 use open_state::open_read_state;
 pub use read::DmatCache;
@@ -231,33 +232,127 @@ fn classify_pending_dedup_entries(
     stats
 }
 
+/// Split the positional (entries, pre_promote_offsets, body_offsets)
+/// triple into the stable share and the journal-window share, in
+/// lockstep so the CAS-token pairing survives the split. Returns
+/// `(primary_triple, None)` untouched when the window is empty or the
+/// epoch wrote no journal LBAs.
+///
+/// Must run after `classify_pending_dedup_entries` and
+/// `snapshot_pre_promote_offsets` — the split permutes positions, so
+/// the tokens must already be paired.
+#[allow(clippy::type_complexity)]
+fn partition_journal_pending(
+    entries: Vec<segment::SegmentEntry>,
+    pre_promote_offsets: Vec<Option<u64>>,
+    body_offsets: Vec<Option<u64>>,
+    journal_ranges: &crate::journal::JournalRanges,
+) -> (
+    (
+        Vec<segment::SegmentEntry>,
+        Vec<Option<u64>>,
+        Vec<Option<u64>>,
+    ),
+    Option<(
+        Vec<segment::SegmentEntry>,
+        Vec<Option<u64>>,
+        Vec<Option<u64>>,
+    )>,
+) {
+    if journal_ranges.is_empty() || !entries.iter().any(|e| journal_ranges.contains(e.start_lba)) {
+        return ((entries, pre_promote_offsets, body_offsets), None);
+    }
+    let mut primary = (Vec::new(), Vec::new(), Vec::new());
+    let mut journal = (Vec::new(), Vec::new(), Vec::new());
+    for ((entry, pre), body) in entries
+        .into_iter()
+        .zip(pre_promote_offsets)
+        .zip(body_offsets)
+    {
+        let dst = if journal_ranges.contains(entry.start_lba) {
+            &mut journal
+        } else {
+            &mut primary
+        };
+        dst.0.push(entry);
+        dst.1.push(pre);
+        dst.2.push(body);
+    }
+    (primary, Some(journal))
+}
+
 /// Apply a committed promote to the in-memory maps: CAS each body-bearing
 /// entry in the extent index from its WAL-relative location to the new
 /// segment (skipping entries a concurrent write or GC handoff has
 /// superseded), register formation-minted Delta entries, bump lbamap
 /// claimants from the WAL ULID to the segment ULID, and log the entry
-/// counts.
+/// counts. Applies the primary partition, then the journal segment when
+/// present.
 fn apply_promoted_entries(
     extent_index: &mut extentindex::ExtentIndex,
     lbamap: &mut lbamap::LbaMap,
     result: &PromoteResult,
     journal_ranges: &crate::journal::JournalRanges,
 ) -> io::Result<()> {
-    let PromoteResult {
+    apply_promoted_partition(
+        extent_index,
+        lbamap,
+        result.old_wal_ulid,
+        ApplyPartition {
+            segment_ulid: result.segment_ulid,
+            body_section_start: result.body_section_start,
+            delta_region_body_length: result.delta_region_body_length,
+            entries: &result.entries,
+            pre_promote_offsets: &result.pre_promote_offsets,
+            journal_segment: false,
+        },
+        journal_ranges,
+    )?;
+    if let Some(j) = &result.journal {
+        apply_promoted_partition(
+            extent_index,
+            lbamap,
+            result.old_wal_ulid,
+            ApplyPartition {
+                segment_ulid: j.segment_ulid,
+                body_section_start: j.body_section_start,
+                delta_region_body_length: 0,
+                entries: &j.entries,
+                pre_promote_offsets: &j.pre_promote_offsets,
+                journal_segment: true,
+            },
+            journal_ranges,
+        )?;
+    }
+    Ok(())
+}
+
+/// One destination segment's share of a promote apply.
+struct ApplyPartition<'a> {
+    segment_ulid: Ulid,
+    body_section_start: u64,
+    delta_region_body_length: u64,
+    entries: &'a [segment::SegmentEntry],
+    pre_promote_offsets: &'a [Option<u64>],
+    /// Marks the journal segment's flush log line.
+    journal_segment: bool,
+}
+
+fn apply_promoted_partition(
+    extent_index: &mut extentindex::ExtentIndex,
+    lbamap: &mut lbamap::LbaMap,
+    old_wal_ulid: Ulid,
+    part: ApplyPartition<'_>,
+    journal_ranges: &crate::journal::JournalRanges,
+) -> io::Result<()> {
+    let ApplyPartition {
         segment_ulid,
-        old_wal_ulid,
-        old_wal_path: _,
         body_section_start,
+        delta_region_body_length,
         entries,
         pre_promote_offsets,
-        delta_region_body_length,
-    } = result;
-    let (segment_ulid, old_wal_ulid, body_section_start, delta_region_body_length) = (
-        *segment_ulid,
-        *old_wal_ulid,
-        *body_section_start,
-        *delta_region_body_length,
-    );
+        journal_segment,
+    } = part;
     let delta_ctx = extentindex::SegmentRegistrationCtx {
         segment_id: segment_ulid,
         body_section_start,
@@ -364,8 +459,9 @@ fn apply_promoted_entries(
     }
     let _ = canonical;
     log::info!(
-        "flush {segment_ulid} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
+        "flush {segment_ulid}{} (from WAL {old_wal_ulid}): {data} data, {inline} inline, \
          {refs} dedup-ref, {zero} zero, {delta} delta ({} entries total)",
+        if journal_segment { " [journal]" } else { "" },
         entries.len()
     );
     Ok(())
@@ -700,14 +796,32 @@ impl Volume {
             recovery_dedup_stats.minted_entries += minted.minted_entries;
             recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
             let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
+            let (primary, journal) = partition_journal_pending(
+                pending_entries,
+                pre_promote_offsets,
+                body_offsets,
+                &journal_ranges,
+            );
+            // Primary ULID first: the journal segment must sort above the
+            // data segment (see `JournalPartition`).
+            let segment_ulid = mint.next();
+            let journal =
+                journal.map(
+                    |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
+                        segment_ulid: mint.next(),
+                        entries,
+                        pre_promote_offsets,
+                        body_offsets,
+                    },
+                );
             let result = crate::actor::execute_promote(
                 PromoteJob {
-                    segment_ulid: mint.next(),
+                    segment_ulid,
                     old_wal_ulid,
                     old_wal_path: wal_path.clone(),
-                    entries: pending_entries,
-                    pre_promote_offsets,
-                    body_offsets,
+                    entries: primary.0,
+                    pre_promote_offsets: primary.1,
+                    body_offsets: primary.2,
                     signer: Arc::clone(&signer),
                     pending_dir: pending_dir.clone(),
                     // Recovery promotes of stale WALs write plain Data
@@ -715,15 +829,22 @@ impl Volume {
                     // through an Arc'd extent-index snapshot, and the
                     // open path holds the index by value at this point.
                     delta_prior: None,
+                    journal,
                 },
                 &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
             apply_promoted_entries(&mut extent_index, &mut lbamap, &result, &journal_ranges)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
-            // (see `Volume::snapshot`) covers this recovery-promoted segment.
-            if last_segment_ulid < Some(result.segment_ulid) {
-                last_segment_ulid = Some(result.segment_ulid);
+            // (see `Volume::snapshot`) covers the recovery-promoted segments.
+            let max_promoted = result
+                .journal
+                .as_ref()
+                .map(|j| j.segment_ulid)
+                .unwrap_or(result.segment_ulid)
+                .max(result.segment_ulid);
+            if last_segment_ulid < Some(max_promoted) {
+                last_segment_ulid = Some(max_promoted);
             }
             fs::remove_file(&wal_path)?;
         }
@@ -2437,39 +2558,46 @@ impl Volume {
         // CAS/hash-match guards leave anything a concurrent writer has
         // superseded untouched.
         {
+            let journal_part = job
+                .journal
+                .as_ref()
+                .map(|j| (j.entries.as_slice(), j.pre_promote_offsets.as_slice()));
+            let partitions =
+                std::iter::once((job.entries.as_slice(), job.pre_promote_offsets.as_slice()))
+                    .chain(journal_part);
             let index = Arc::make_mut(&mut self.extent_index);
-            for (entry, old_wal_offset) in job
-                .entries
-                .iter()
-                .zip(job.pre_promote_offsets.iter().copied())
-            {
-                match entry.kind {
-                    EntryKind::Data
-                    | EntryKind::Inline
-                    | EntryKind::CanonicalData
-                    | EntryKind::CanonicalInline => {}
-                    EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
-                }
-                if let Some(old_wal_offset) = old_wal_offset {
-                    index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);
-                }
-            }
             let lbamap = Arc::make_mut(&mut self.lbamap);
-            for entry in &job.entries {
-                if entry.kind.is_canonical_only() {
-                    continue;
+            for (entries, pre_promote_offsets) in partitions {
+                for (entry, old_wal_offset) in
+                    entries.iter().zip(pre_promote_offsets.iter().copied())
+                {
+                    match entry.kind {
+                        EntryKind::Data
+                        | EntryKind::Inline
+                        | EntryKind::CanonicalData
+                        | EntryKind::CanonicalInline => {}
+                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                    }
+                    if let Some(old_wal_offset) = old_wal_offset {
+                        index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);
+                    }
                 }
-                let claim_hash = if entry.kind == EntryKind::Zero {
-                    ZERO_HASH
-                } else {
-                    entry.hash
-                };
-                lbamap.set_claimant_if_matches(
-                    entry.start_lba,
-                    entry.lba_length,
-                    claim_hash,
-                    new_ulid,
-                );
+                for entry in entries {
+                    if entry.kind.is_canonical_only() {
+                        continue;
+                    }
+                    let claim_hash = if entry.kind == EntryKind::Zero {
+                        ZERO_HASH
+                    } else {
+                        entry.hash
+                    };
+                    lbamap.set_claimant_if_matches(
+                        entry.start_lba,
+                        entry.lba_length,
+                        claim_hash,
+                        new_ulid,
+                    );
+                }
             }
         }
         self.evict_cached_segment(job.old_wal_ulid);
@@ -2481,6 +2609,10 @@ impl Volume {
         });
         self.pending_entries = job.entries;
         self.pending_body_offsets = job.body_offsets;
+        if let Some(j) = job.journal {
+            self.pending_entries.extend(j.entries);
+            self.pending_body_offsets.extend(j.body_offsets);
+        }
         Ok(())
     }
 
@@ -2913,18 +3045,37 @@ impl Volume {
                 snap_ulid,
                 extent_index: Arc::clone(&self.extent_index),
                 search_dirs,
+                journal_ranges: self.journal_ranges.clone(),
             }
         });
+        let (primary, journal) = partition_journal_pending(
+            std::mem::take(&mut self.pending_entries),
+            pre_promote_offsets,
+            std::mem::take(&mut self.pending_body_offsets),
+            &self.journal_ranges,
+        );
+        // The journal segment ULID is minted after the primary's, so it
+        // sorts above the data segment (see `JournalPartition`).
+        let journal =
+            journal.map(
+                |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
+                    segment_ulid: self.mint.next(),
+                    entries,
+                    pre_promote_offsets,
+                    body_offsets,
+                },
+            );
         Ok(PromoteJob {
             segment_ulid,
             old_wal_ulid: open.ulid,
             old_wal_path: open.path,
-            entries: std::mem::take(&mut self.pending_entries),
-            pre_promote_offsets,
-            body_offsets: std::mem::take(&mut self.pending_body_offsets),
+            entries: primary.0,
+            pre_promote_offsets: primary.1,
+            body_offsets: primary.2,
             signer: Arc::clone(&self.signer),
             pending_dir: self.base_dir.join("pending"),
             delta_prior,
+            journal,
         })
     }
 
@@ -2936,7 +3087,16 @@ impl Volume {
     /// after this to make the changes visible to readers.
     pub fn apply_promote(&mut self, result: &PromoteResult) -> io::Result<()> {
         self.has_new_segments = true;
-        self.last_segment_ulid = Some(result.segment_ulid);
+        // The journal segment ULID is the higher of the pair; the
+        // snapshot-pinning invariant needs the max here.
+        self.last_segment_ulid = Some(
+            result
+                .journal
+                .as_ref()
+                .map(|j| j.segment_ulid)
+                .unwrap_or(result.segment_ulid)
+                .max(result.segment_ulid),
+        );
 
         apply_promoted_entries(
             Arc::make_mut(&mut self.extent_index),

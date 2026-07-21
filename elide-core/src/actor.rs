@@ -2047,9 +2047,14 @@ impl PriorSourceCache {
         &mut self,
         base_dir: &std::path::Path,
         snap_ulid: Ulid,
+        journal_ranges: &crate::journal::JournalRanges,
     ) -> io::Result<&crate::block_reader::SnapshotSourceMap> {
         if self.cached.as_ref().is_none_or(|(u, _)| *u != snap_ulid) {
-            let map = crate::block_reader::SnapshotSourceMap::build(base_dir, &snap_ulid)?;
+            let map = crate::block_reader::SnapshotSourceMap::build(
+                base_dir,
+                &snap_ulid,
+                journal_ranges,
+            )?;
             self.cached = Some((snap_ulid, map));
         }
         // The line above just populated the cache on the miss path.
@@ -2108,7 +2113,11 @@ pub(crate) fn execute_promote(
     // corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
     if let Some(prior_spec) = &job.delta_prior {
-        match prior_cache.map_for(&prior_spec.base_dir, prior_spec.snap_ulid) {
+        match prior_cache.map_for(
+            &prior_spec.base_dir,
+            prior_spec.snap_ulid,
+            &prior_spec.journal_ranges,
+        ) {
             Ok(prior) => {
                 match crate::delta_compute::delta_pendings_against_prior(
                     &mut pendings,
@@ -2141,35 +2150,81 @@ pub(crate) fn execute_promote(
         }
     }
 
-    match segment::write_and_commit(
-        &job.pending_dir,
-        job.segment_ulid,
-        pendings,
-        &delta_body,
-        job.signer.as_ref(),
-    ) {
-        Ok((body_section_start, entries)) => {
-            let delta_region_body_length: u64 = if delta_body.is_empty() {
-                0
-            } else {
-                entries
-                    .iter()
-                    .filter(|e| e.kind == segment::EntryKind::Data)
-                    .map(|e| e.stored_length as u64)
-                    .sum()
-            };
-            Ok(PromoteResult {
-                segment_ulid: job.segment_ulid,
-                old_wal_ulid: job.old_wal_ulid,
-                old_wal_path: job.old_wal_path,
-                body_section_start,
-                entries,
-                pre_promote_offsets: job.pre_promote_offsets,
-                delta_region_body_length,
-            })
+    // An all-journal epoch leaves the primary partition empty; no
+    // primary segment file is written, and the result carries the
+    // primary ULID with no entries (parked-reply matching keys on it).
+    let (body_section_start, entries) = if pendings.is_empty() {
+        (0, Vec::new())
+    } else {
+        match segment::write_and_commit(
+            &job.pending_dir,
+            job.segment_ulid,
+            pendings,
+            &delta_body,
+            job.signer.as_ref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(fail(e, job)),
         }
-        Err(e) => Err(fail(e, job)),
-    }
+    };
+    let delta_region_body_length: u64 = if delta_body.is_empty() {
+        0
+    } else {
+        entries
+            .iter()
+            .filter(|e| e.kind == segment::EntryKind::Data)
+            .map(|e| e.stored_length as u64)
+            .sum()
+    };
+
+    // The epoch's journal-window share commits as its own segment, so
+    // it dies whole as the journal wraps. Never delta'd.
+    let journal = match &job.journal {
+        None => None,
+        Some(jpart) => {
+            let j_pendings = match crate::volume::materialise_pending_bodies(
+                &job.old_wal_path,
+                &jpart.entries,
+                &jpart.body_offsets,
+            ) {
+                Ok(p) => p,
+                Err(e) => return Err(fail(e, job)),
+            };
+            match segment::write_and_commit(
+                &job.pending_dir,
+                jpart.segment_ulid,
+                j_pendings,
+                &[],
+                job.signer.as_ref(),
+            ) {
+                Ok((j_bss, j_entries)) => {
+                    log::info!(
+                        "formation {}: journal segment, {} entries",
+                        jpart.segment_ulid,
+                        j_entries.len(),
+                    );
+                    Some(crate::volume::JournalSegmentResult {
+                        segment_ulid: jpart.segment_ulid,
+                        body_section_start: j_bss,
+                        entries: j_entries,
+                        pre_promote_offsets: jpart.pre_promote_offsets.clone(),
+                    })
+                }
+                Err(e) => return Err(fail(e, job)),
+            }
+        }
+    };
+
+    Ok(PromoteResult {
+        segment_ulid: job.segment_ulid,
+        old_wal_ulid: job.old_wal_ulid,
+        old_wal_path: job.old_wal_path,
+        body_section_start,
+        entries,
+        pre_promote_offsets: job.pre_promote_offsets,
+        delta_region_body_length,
+        journal,
+    })
 }
 
 /// Execute a `promote_segment` job: read + verify the source segment
