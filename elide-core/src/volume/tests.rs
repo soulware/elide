@@ -888,7 +888,8 @@ fn dedup_write_same_data_different_lba() {
 #[test]
 fn dedup_ref_survives_promote_and_reopen() {
     // Write data, promote so it lands in pending/, then write the same data
-    // to a new LBA (dedup REF in WAL). Reopen and verify both LBAs read back.
+    // to a new LBA (full DATA record; the canonical keeps owning the hash).
+    // Reopen and verify both LBAs read back.
     let base = keyed_temp_dir();
 
     {
@@ -896,7 +897,8 @@ fn dedup_ref_survives_promote_and_reopen() {
         let data = vec![0xABu8; 4096];
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
-        // Second write: same data, different LBA → dedup hit, REF record in WAL.
+        // Second write: same data, different LBA — resolves through the
+        // promoted canonical on read.
         vol.write(1, &data).unwrap();
         vol.fsync().unwrap();
     }
@@ -911,8 +913,8 @@ fn dedup_ref_survives_promote_and_reopen() {
 
 #[test]
 fn dedup_ref_in_segment_survives_reopen() {
-    // Write data, promote, write same data (REF in WAL), promote again so
-    // the REF lands in a segment. Reopen and verify reads still work.
+    // Write data, promote, write same data, promote again so formation
+    // mints a DedupRef into the second segment. Reopen and verify reads.
     let base = keyed_temp_dir();
 
     {
@@ -920,14 +922,239 @@ fn dedup_ref_in_segment_survives_reopen() {
         let data = vec![0xCDu8; 4096];
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
-        vol.write(1, &data).unwrap(); // REF
-        vol.promote_for_test().unwrap(); // REF lands in segment
+        vol.write(1, &data).unwrap();
+        vol.promote_for_test().unwrap(); // minted as DedupRef here
     }
 
     let vol = Volume::open(&base, &base).unwrap();
     let data = vec![0xCDu8; 4096];
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(1, 1).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn same_epoch_duplicate_minted_as_dedup_ref_at_formation() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Incompressible so the stored body is full-size and the WAL carries
+    // real bytes for both writes.
+    let data: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.write(4, &data).unwrap();
+
+    // The write path performs no dedup: both pending entries carry bodies.
+    assert!(
+        vol.pending_entries
+            .iter()
+            .all(|e| e.kind == segment::EntryKind::Data),
+        "write path must append full Data entries for duplicate content"
+    );
+    assert_eq!(vol.dedup_mint_stats().minted_entries, 0);
+
+    vol.promote_for_test().unwrap();
+
+    // Formation classified the duplicate: one Data owner + one DedupRef,
+    // same hash, in the same segment.
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 1);
+    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    let hash = blake3::hash(&data);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.hash == hash));
+    let owner = entries
+        .iter()
+        .find(|e| e.kind == segment::EntryKind::Data)
+        .expect("one Data owner");
+    let minted = entries
+        .iter()
+        .find(|e| e.kind == segment::EntryKind::DedupRef)
+        .expect("one minted DedupRef");
+    assert_eq!(owner.start_lba, 0);
+    assert_eq!(minted.start_lba, 4);
+
+    let stats = vol.dedup_mint_stats();
+    assert_eq!(stats.minted_entries, 1);
+    assert_eq!(
+        stats.wal_body_bytes, owner.stored_length as u64,
+        "foregone WAL bytes are the duplicate's stored body"
+    );
+
+    // The extent index owner is the segment's Data entry, not a stale WAL
+    // location (the pre-promote CAS pairing must survive the duplicate).
+    let loc = vol.extent_index.lookup(&hash).expect("hash resolvable");
+    assert_eq!(loc.segment_id, ulids[0]);
+
+    assert_eq!(vol.read(0, 2).unwrap(), data);
+    assert_eq!(vol.read(4, 2).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn duplicate_of_promoted_canonical_minted_at_formation() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data: Vec<u8> = (0..4096).map(|i| (i * 11 + 3) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+    let s1 = pending_ulids(&base)[0];
+
+    vol.write(10, &data).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
+    let seg_path = base.join("pending").join(s2.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, segment::EntryKind::DedupRef);
+    assert_eq!(vol.dedup_mint_stats().minted_entries, 1);
+
+    // The canonical stays owned by the first segment.
+    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
+    assert_eq!(loc.segment_id, s1);
+
+    assert_eq!(vol.read(10, 1).unwrap(), data);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn failed_promote_restore_keeps_formation_minted_dedup_ref() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data: Vec<u8> = (0..4096).map(|i| (i * 13 + 7) as u8).collect();
+    let fresh: Vec<u8> = (0..4096).map(|i| (i * 17 + 5) as u8).collect();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+
+    // Duplicate + fresh content in one WAL epoch, taken through a failed
+    // flush: take classifies the duplicate, restore re-parks both entries.
+    vol.write(4, &data).unwrap();
+    vol.write(6, &fresh).unwrap();
+    vol.gc_checkpoint_with_failed_flush_for_test().unwrap();
+
+    assert_eq!(vol.read(4, 1).unwrap(), data, "read after restore");
+    assert_eq!(vol.read(6, 1).unwrap(), fresh, "read after restore");
+
+    // The retried promote writes the segment with the converted entry.
+    vol.promote_for_test().unwrap();
+    assert_eq!(vol.read(4, 1).unwrap(), data);
+    assert_eq!(vol.read(6, 1).unwrap(), fresh);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(4, 1).unwrap(), data, "read after reopen");
+    assert_eq!(vol.read(6, 1).unwrap(), fresh, "read after reopen");
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn recovery_promote_of_extra_wal_classifies_dedup() {
+    // A crash can leave multiple WAL files; open promotes every non-latest
+    // WAL directly. That path must classify duplicates like a live promote.
+    let base = keyed_temp_dir();
+    let data: Vec<u8> = (0..4096).map(|i| (i * 23 + 9) as u8).collect();
+    let fresh: Vec<u8> = (0..4096).map(|i| (i * 29 + 17) as u8).collect();
+
+    let canonical_ulid = {
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+        pending_ulids(&base)[0]
+    };
+
+    // Two hand-written WALs: the older holds a duplicate of the canonical,
+    // the newer holds fresh content and stays the live WAL after open.
+    let mut mint = crate::ulid_mint::UlidMint::new(canonical_ulid);
+    let wal_a_ulid = mint.next();
+    let wal_b_ulid = mint.next();
+    let mut wal_a =
+        writelog::WriteLog::create(&base.join("wal").join(wal_a_ulid.to_string())).unwrap();
+    wal_a
+        .append_data(
+            8,
+            1,
+            &blake3::hash(&data),
+            writelog::WalFlags::empty(),
+            &data,
+        )
+        .unwrap();
+    drop(wal_a);
+    let mut wal_b =
+        writelog::WriteLog::create(&base.join("wal").join(wal_b_ulid.to_string())).unwrap();
+    wal_b
+        .append_data(
+            12,
+            1,
+            &blake3::hash(&fresh),
+            writelog::WalFlags::empty(),
+            &fresh,
+        )
+        .unwrap();
+    drop(wal_b);
+
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.dedup_mint_stats().minted_entries,
+        1,
+        "recovery promote of the extra WAL must classify the duplicate"
+    );
+
+    let recovery_seg = *pending_ulids(&base)
+        .iter()
+        .find(|u| **u != canonical_ulid)
+        .expect("recovery-promoted segment in pending/");
+    let seg_path = base.join("pending").join(recovery_seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, segment::EntryKind::DedupRef);
+
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(8, 1).unwrap(), data);
+    assert_eq!(vol.read(12, 1).unwrap(), fresh);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn legacy_ref_wal_record_replays_and_promotes() {
+    let base = keyed_temp_dir();
+    let data: Vec<u8> = (0..4096).map(|i| (i * 19 + 11) as u8).collect();
+    let hash = blake3::hash(&data);
+
+    let canonical_ulid = {
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+        pending_ulids(&base)[0]
+    };
+
+    // Hand-write a WAL holding a REF record, as a binary with write-path
+    // dedup would have left behind at a crash.
+    let wal_ulid = crate::ulid_mint::UlidMint::new(canonical_ulid).next();
+    let wal_path = base.join("wal").join(wal_ulid.to_string());
+    let mut wal = writelog::WriteLog::create(&wal_path).unwrap();
+    wal.append_ref(20, 1, &hash).unwrap();
+    drop(wal);
+
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(20, 1).unwrap(), data, "replayed REF resolves");
+    vol.promote_for_test().unwrap();
+    assert_eq!(
+        vol.dedup_mint_stats().minted_entries,
+        0,
+        "replayed REF entries are already DedupRef; formation mints nothing"
+    );
+    assert_eq!(vol.read(20, 1).unwrap(), data, "read after promote");
 
     fs::remove_dir_all(base).unwrap();
 }

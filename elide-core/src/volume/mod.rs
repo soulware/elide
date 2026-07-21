@@ -194,6 +194,44 @@ fn snapshot_pre_promote_offsets(
         .collect()
 }
 
+/// Classify pending entries at segment formation: a `Data` or `Inline`
+/// entry whose hash resolves in the extent index to a body other than its
+/// own WAL record — a canonical in a committed or ancestor segment, or an
+/// earlier write of the same bytes in this WAL epoch — becomes a thin
+/// `DedupRef`, and its WAL body bytes are dropped at the segment write.
+/// Inline-sized duplicates dedup like any other: a DedupRef costs zero
+/// bytes where an Inline entry would put its body in the `.idx`.
+///
+/// Must run before `snapshot_pre_promote_offsets`: the offsets snapshot
+/// keys off `entry.kind`, so a converted entry must already read as
+/// DedupRef when the CAS tokens are taken. Returns the counters for this
+/// formation.
+fn classify_pending_dedup_entries(
+    entries: &mut [segment::SegmentEntry],
+    body_offsets: &mut [Option<u64>],
+    extent_index: &extentindex::ExtentIndex,
+    wal_ulid: Ulid,
+) -> DedupMintStats {
+    let mut stats = DedupMintStats::default();
+    for (entry, body_offset) in entries.iter_mut().zip(body_offsets.iter_mut()) {
+        if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+            continue;
+        }
+        let Some(loc) = extent_index.lookup(&entry.hash) else {
+            continue;
+        };
+        if loc.segment_id == wal_ulid && Some(loc.body_offset) == *body_offset {
+            continue;
+        }
+        stats.minted_entries += 1;
+        stats.wal_body_bytes += entry.stored_length as u64;
+        *entry =
+            segment::SegmentEntry::new_dedup_ref(entry.hash, entry.start_lba, entry.lba_length);
+        *body_offset = None;
+    }
+    stats
+}
+
 /// Apply a committed promote to the in-memory maps: CAS each body-bearing
 /// entry in the extent index from its WAL-relative location to the new
 /// segment (skipping entries a concurrent write or GC handoff has
@@ -399,6 +437,9 @@ pub struct Volume {
     /// Stats for the no-op write skip path (LBA-map hash compare).
     /// See `docs/design/noop-write-skip.md`.
     pub(in crate::volume) noop_stats: NoopSkipStats,
+    /// Stats for DedupRef minting at segment formation
+    /// (`classify_pending_dedup`).
+    pub(in crate::volume) dedup_mint_stats: DedupMintStats,
     /// Shared LRU of parsed+verified segment indices. Keyed by
     /// `(path, file_len)`. Cloned into worker jobs so the actor thread
     /// and the worker thread hit the same cache. See
@@ -422,6 +463,17 @@ pub struct NoopSkipStats {
     pub skipped_writes: u64,
     /// Total bytes of incoming data the skip avoided writing to the WAL.
     pub skipped_bytes: u64,
+}
+
+/// Counters for DedupRef minting at segment formation. Counted since
+/// `Volume::open`; open-time recovery promotes contribute.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DedupMintStats {
+    /// Data entries converted to DedupRef by `classify_pending_dedup`.
+    pub minted_entries: u64,
+    /// Stored WAL body bytes those entries carried — the WAL growth cost
+    /// of minting DedupRefs at formation instead of at write time.
+    pub wal_body_bytes: u64,
 }
 
 impl Volume {
@@ -562,17 +614,26 @@ impl Volume {
         } else {
             Vec::new()
         };
+        let mut recovery_dedup_stats = DedupMintStats::default();
         for wal_path in wal_files_to_promote {
             let wal::WalReplay {
                 ulid: old_wal_ulid,
                 valid_size: _,
-                pending_entries,
-                body_offsets,
+                mut pending_entries,
+                mut body_offsets,
             } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
             if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
             }
+            let minted = classify_pending_dedup_entries(
+                &mut pending_entries,
+                &mut body_offsets,
+                &extent_index,
+                old_wal_ulid,
+            );
+            recovery_dedup_stats.minted_entries += minted.minted_entries;
+            recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
             let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
             let result = crate::actor::execute_promote(PromoteJob {
                 segment_ulid: mint.next(),
@@ -647,6 +708,7 @@ impl Volume {
             fetcher: None,
             mint,
             noop_stats: NoopSkipStats::default(),
+            dedup_mint_stats: recovery_dedup_stats,
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
@@ -773,26 +835,6 @@ impl Volume {
             writelog::WalFlags::empty()
         };
 
-        // Write-path dedup: if this extent already exists in this volume's
-        // segment tree (own segments + ancestors), write a thin REF record
-        // instead of a DATA record. No body bytes in the WAL — reads resolve
-        // through the extent index to the canonical segment's body.
-        if self.extent_index.lookup(&hash).is_some() {
-            let wal_ulid = {
-                let open = self.ensure_wal_open()?;
-                open.wal.append_ref(lba, lba_length, &hash)?;
-                open.ulid
-            };
-            Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
-            // Do NOT update extent_index — the canonical entry already points
-            // to the segment with the body bytes. DedupRef entries carry no
-            // body bytes and no body reservation.
-            self.pending_entries
-                .push(segment::SegmentEntry::new_dedup_ref(hash, lba, lba_length));
-            self.pending_body_offsets.push(None);
-            return Ok(());
-        }
-
         let seg_flags = if is_compressed {
             segment::SegmentFlags::COMPRESSED
         } else {
@@ -808,9 +850,12 @@ impl Volume {
             (offset, open.ulid)
         };
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
-        // Temporary extent index entry: points into the WAL at the raw payload offset.
-        // Updated to segment file offsets after promotion.
-        Arc::make_mut(&mut self.extent_index).insert(
+        // Temporary extent index entry: points into the WAL at the raw payload
+        // offset, updated to segment file offsets after promotion. If-absent:
+        // a hash that already resolves (a prior canonical, or an earlier write
+        // of the same bytes in this WAL epoch) keeps its owner, and this entry
+        // is minted as a DedupRef at formation (`classify_pending_dedup`).
+        Arc::make_mut(&mut self.extent_index).insert_if_absent(
             hash,
             extentindex::ExtentLocation {
                 segment_id: wal_ulid,
@@ -937,6 +982,11 @@ impl Volume {
     /// No-op skip counters. See `docs/design/noop-write-skip.md`.
     pub fn noop_stats(&self) -> NoopSkipStats {
         self.noop_stats
+    }
+
+    /// Counters for DedupRef minting at segment formation since open.
+    pub fn dedup_mint_stats(&self) -> DedupMintStats {
+        self.dedup_mint_stats
     }
 
     /// Inline, test-only variant of the GC checkpoint.
@@ -2696,6 +2746,30 @@ impl Volume {
         Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
     }
 
+    /// Run [`classify_pending_dedup_entries`] over the pending entries
+    /// under the volume lock, folding the counters into
+    /// `self.dedup_mint_stats`.
+    fn classify_pending_dedup(&mut self, wal_ulid: Ulid) {
+        let stats = classify_pending_dedup_entries(
+            &mut self.pending_entries,
+            &mut self.pending_body_offsets,
+            &self.extent_index,
+            wal_ulid,
+        );
+        if stats.minted_entries > 0 {
+            self.dedup_mint_stats.minted_entries += stats.minted_entries;
+            self.dedup_mint_stats.wal_body_bytes += stats.wal_body_bytes;
+            log::info!(
+                "formation {wal_ulid}: {} dedup-ref minted, {} WAL body bytes dropped \
+                 (cumulative {} entries / {} bytes)",
+                stats.minted_entries,
+                stats.wal_body_bytes,
+                self.dedup_mint_stats.minted_entries,
+                self.dedup_mint_stats.wal_body_bytes
+            );
+        }
+    }
+
     /// Take the open WAL and pending entries into a [`PromoteJob`] targeting
     /// `segment_ulid`. Snapshots the CAS precondition tokens before
     /// `write_and_commit` rewrites `stored_offset` to segment-relative.
@@ -2707,6 +2781,7 @@ impl Volume {
         let open = self.wal.take().ok_or_else(|| {
             io::Error::other("internal: pending_entries non-empty but wal absent")
         })?;
+        self.classify_pending_dedup(open.ulid);
         let pre_promote_offsets =
             snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
         Ok(PromoteJob {
