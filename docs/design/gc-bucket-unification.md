@@ -83,8 +83,14 @@ Replace the tier model with one bin-pack:
    segments (no change here), then **filter to cache-resident
    candidates** (see below).
 2. **Bin-pack** candidates into output buckets sized to
-   `SWEEP_LIVE_CAP` (32 MiB live) and `SWEEP_ENTRY_CAP` (8192 entries).
-   First-fit-decreasing on `live_lba_bytes`. Tombstones fold into the
+   `SWEEP_MATERIALISE_CAP` (32 MiB materialised) and `SWEEP_ENTRY_CAP`
+   (8192 entries). First-fit-decreasing on `materialised_bytes` — the
+   bytes the volume must materialise to apply a plan that includes the
+   input: kept and canonical body bytes plus partial-death run slices.
+   Live LBA bytes are the wrong unit for this budget: a segment whose
+   extents are almost entirely LBA-dead can still require every
+   composite body carried into the output as a canonical alongside its
+   surviving runs. Tombstones fold into the
    first bucket (or any bucket — they cost nothing). A bucket with
    exactly one input that is not tombstone-bearing and not sparse is
    a no-op rewrite and is dropped (the existing skip-check rule).
@@ -98,7 +104,7 @@ Replace the tier model with one bin-pack:
 5. **Emit** one `gc/<u_bucket_i>.plan` per filled bucket via tmp+rename.
 
 Per-tick reclamation throughput becomes
-`max_buckets_per_tick × SWEEP_LIVE_CAP` of cache-resident input,
+`max_buckets_per_tick × SWEEP_MATERIALISE_CAP` of cache-resident input,
 bounded above by what's actually local on the volume. Raising the
 cap is a deliberate tuning decision; lowering candidate residency
 self-throttles GC without operator action.
@@ -253,7 +259,7 @@ packing.
 
 **Con**
 - Per-bucket PUT to S3 for each emitted output. Modest — bounded by
-  `max_buckets × SWEEP_LIVE_CAP` of compressed live bytes — but real,
+  `max_buckets × SWEEP_MATERIALISE_CAP` of output bytes — but real,
   and not amortised the way local rewrites are on pending.
 - Retention peak grows linearly with bucket count. Operators raising
   `max_buckets_per_tick` need to consider

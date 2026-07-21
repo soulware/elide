@@ -217,9 +217,7 @@ pub fn materialise_plan(
 ) -> Result<Materialised, MaterialiseOutcome> {
     let mut out_entries: Vec<PendingEntry> = Vec::new();
     let mut delta_body: Vec<u8> = Vec::new();
-    // Cache of uncompressed composite bodies, keyed by (input, entry_idx).
-    // Consecutive `Run` records for the same entry share the resolved body.
-    let mut composite_cache: HashMap<(Ulid, u32), Vec<u8>> = HashMap::new();
+    let mut composite_slot: Option<CompositeSlot> = None;
 
     for output in &plan.outputs {
         apply_one_output(
@@ -227,7 +225,7 @@ pub fn materialise_plan(
             ctx,
             &mut out_entries,
             &mut delta_body,
-            &mut composite_cache,
+            &mut composite_slot,
         )?;
     }
 
@@ -237,12 +235,23 @@ pub fn materialise_plan(
     })
 }
 
+/// Single-slot cache for the uncompressed composite body of the input
+/// entry currently being materialised. Plan emission groups an entry's
+/// records consecutively (`Canonical` then its `Run`s), so one slot gives
+/// the same hit rate as an unbounded map while holding at most one
+/// composite at a time. An out-of-order plan costs a recompute, never a
+/// wrong body.
+struct CompositeSlot {
+    key: (Ulid, u32),
+    body: Vec<u8>,
+}
+
 fn apply_one_output(
     output: &PlanOutput,
     ctx: &MaterialiseCtx<'_>,
     out_entries: &mut Vec<PendingEntry>,
     delta_body: &mut Vec<u8>,
-    composite_cache: &mut HashMap<(Ulid, u32), Vec<u8>>,
+    composite_slot: &mut Option<CompositeSlot>,
 ) -> Result<(), MaterialiseOutcome> {
     match output {
         PlanOutput::Keep { input, entry_idx } => {
@@ -262,7 +271,7 @@ fn apply_one_output(
             out_entries,
         ),
         PlanOutput::Canonical { input, entry_idx } => {
-            emit_canonical(*input, *entry_idx, ctx, out_entries)
+            emit_canonical(*input, *entry_idx, ctx, out_entries, composite_slot)
         }
         PlanOutput::Run {
             input,
@@ -278,7 +287,7 @@ fn apply_one_output(
             *lba_length,
             ctx,
             out_entries,
-            composite_cache,
+            composite_slot,
         ),
         PlanOutput::Drop { .. } => {
             // No output entry — the apply path evicts this input's hashes
@@ -430,6 +439,7 @@ fn emit_canonical(
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
     out_entries: &mut Vec<PendingEntry>,
+    composite_slot: &mut Option<CompositeSlot>,
 ) -> Result<(), MaterialiseOutcome> {
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     match entry.kind {
@@ -451,7 +461,10 @@ fn emit_canonical(
             // Partial-death Delta with external ref: reconstruct the
             // composite body and emit as a canonical full-body entry (not
             // re-encoded as a Delta), so dedup reads resolve in O(1).
-            let composite = compute_composite_body(input_ulid, entry_idx, ctx)?;
+            // Resolved through the slot so the entry's `Run` records that
+            // follow reuse the composite instead of recomputing it.
+            let composite =
+                resolve_composite_body(input_ulid, entry_idx, ctx, composite_slot)?.to_vec();
             let built = SegmentEntry::new_data(entry.hash, 0, 0, SegmentFlags::empty(), composite);
             out_entries.push(built.into_canonical());
         }
@@ -467,8 +480,8 @@ fn emit_canonical(
 }
 
 /// Emit one fresh Data entry for a surviving sub-run of a partial-death
-/// entry. Resolves the composite body (using a cache keyed by `(input,
-/// entry_idx)`) and slices at the requested offset.
+/// entry. Resolves the composite body through the single-slot cache and
+/// slices at the requested offset.
 #[allow(clippy::too_many_arguments)]
 fn emit_run(
     input_ulid: Ulid,
@@ -478,12 +491,12 @@ fn emit_run(
     lba_length: u32,
     ctx: &MaterialiseCtx<'_>,
     out_entries: &mut Vec<PendingEntry>,
-    composite_cache: &mut HashMap<(Ulid, u32), Vec<u8>>,
+    composite_slot: &mut Option<CompositeSlot>,
 ) -> Result<(), MaterialiseOutcome> {
     if lba_length == 0 {
         return Ok(());
     }
-    let composite = resolve_composite_body(input_ulid, entry_idx, ctx, composite_cache)?;
+    let composite = resolve_composite_body(input_ulid, entry_idx, ctx, composite_slot)?;
     let start = payload_block_offset as usize * BLOCK_BYTES as usize;
     let end = start + lba_length as usize * BLOCK_BYTES as usize;
     if end > composite.len() {
@@ -509,18 +522,25 @@ fn emit_run(
     Ok(())
 }
 
-/// Cache-fronted [`compute_composite_body`]: on a hit, borrow the cached
-/// body; on a miss, compute, insert, and borrow the inserted body.
+/// Slot-fronted [`compute_composite_body`]: on a key hit, borrow the held
+/// body; on a miss, compute the composite and replace the slot's contents,
+/// dropping the previous entry's body.
 fn resolve_composite_body<'c>(
     input_ulid: Ulid,
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
-    cache: &'c mut HashMap<(Ulid, u32), Vec<u8>>,
+    slot: &'c mut Option<CompositeSlot>,
 ) -> Result<&'c [u8], MaterialiseOutcome> {
-    use std::collections::hash_map::Entry;
-    match cache.entry((input_ulid, entry_idx)) {
-        Entry::Occupied(e) => Ok(e.into_mut()),
-        Entry::Vacant(v) => Ok(v.insert(compute_composite_body(input_ulid, entry_idx, ctx)?)),
+    let key = (input_ulid, entry_idx);
+    if slot.as_ref().is_none_or(|s| s.key != key) {
+        let body = compute_composite_body(input_ulid, entry_idx, ctx)?;
+        *slot = Some(CompositeSlot { key, body });
+    }
+    match slot {
+        Some(s) => Ok(&s.body),
+        None => {
+            Err(MaterialiseError::Internal("composite slot empty after fill".to_string()).into())
+        }
     }
 }
 
@@ -972,6 +992,72 @@ mod tests {
         assert_eq!(e.entry.kind, EntryKind::Zero);
         assert_eq!(e.entry.start_lba, 200);
         assert_eq!(e.entry.lba_length, 50);
+    }
+
+    #[test]
+    fn materialise_runs_slice_correctly_across_slot_evictions() {
+        // Two inputs, each with a 4-block Data entry of distinct per-block
+        // fill values. The plan interleaves runs A, B, A so the composite
+        // slot fills for A, evicts to B, then recomputes A — every emitted
+        // run body must still match its block's fill value.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("vol");
+        fs::create_dir_all(base.join("index")).unwrap();
+
+        let make_body = |fills: [u8; 4]| -> Vec<u8> {
+            fills
+                .iter()
+                .flat_map(|&f| vec![f; BLOCK_BYTES as usize])
+                .collect()
+        };
+        let body_a = make_body([1, 2, 3, 4]);
+        let body_b = make_body([5, 6, 7, 8]);
+        let (ulid_a, path_a, _, _) = write_simple_input(dir.path(), &body_a);
+        let (ulid_b, path_b, _, _) = write_simple_input(dir.path(), &body_b);
+        for (u, p) in [(ulid_a, &path_a), (ulid_b, &path_b)] {
+            fs::copy(p, base.join("index").join(format!("{u}.idx"))).unwrap();
+        }
+
+        let mut resolver = MockResolver {
+            files: HashMap::new(),
+            delta_files: HashMap::new(),
+        };
+        resolver
+            .files
+            .insert(ulid_a, (path_a, SegmentBodyLayout::FullSegment));
+        resolver
+            .files
+            .insert(ulid_b, (path_b, SegmentBodyLayout::FullSegment));
+
+        let run = |input, payload_block_offset, start_lba| PlanOutput::Run {
+            input,
+            entry_idx: 0,
+            payload_block_offset,
+            start_lba,
+            lba_length: 1,
+        };
+        let plan = RewritePlan {
+            new_ulid: Ulid::new(),
+            outputs: vec![
+                run(ulid_a, 0, 100),
+                run(ulid_b, 3, 203),
+                run(ulid_a, 2, 102),
+            ],
+        };
+
+        let index = ExtentIndex::default();
+        let inputs = plan.inputs();
+        let ctx = MaterialiseCtx::new(&base, &inputs, &index, &resolver).unwrap();
+        let out = materialise_plan(&plan, &ctx).unwrap();
+        assert_eq!(out.entries.len(), 3);
+        let expect = [(100u64, 1u8), (203, 8), (102, 3)];
+        for (e, (start_lba, fill)) in out.entries.iter().zip(expect) {
+            assert_eq!(e.entry.start_lba, start_lba);
+            assert_eq!(
+                e.body.as_deref(),
+                Some(vec![fill; BLOCK_BYTES as usize].as_slice())
+            );
+        }
     }
 
     #[test]
