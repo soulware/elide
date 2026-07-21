@@ -142,9 +142,9 @@ fn variant_block(base_seed: u8, tweak: u8) -> [u8; 4096] {
 }
 
 /// Keypair + default (root) `volume.provenance`, matching production
-/// volume setup. The provenance file is required by snapshot-pinned
-/// readers (`BlockReader::open_snapshot`), which the formation delta
-/// tier builds.
+/// volume setup. The provenance file is required by the verified
+/// manifest walk (`SnapshotSourceMap::build`), which the formation
+/// delta tier runs.
 fn write_keypair_and_provenance(dir: &Path) {
     let key = elide_core::signing::generate_keypair(
         dir,

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
-use crate::block_reader::BlockReader;
+use crate::block_reader::SnapshotSourceMap;
 use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
 use crate::segment::{
@@ -452,22 +452,66 @@ pub struct SegmentDeltaStats {
     pub delta_body_bytes: u64,
 }
 
+/// Full plaintext of the Data/Inline extent `hash` resolves to, for use
+/// as a delta dictionary. `None` when the hash has no DATA-map location
+/// (a delta-backed hash never serves as a source — no delta-of-delta
+/// chains), when a cached body's presence bit is unset (reading a sparse
+/// hole would silently dictionary against zeros), or when the bytes
+/// cannot be read — the delta tier is best-effort and never fetches.
+fn read_source_plaintext(
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
+    hash: &blake3::Hash,
+) -> Option<Vec<u8>> {
+    let loc = extent_index.lookup(hash)?;
+    if let Some(ref idata) = loc.inline_data {
+        return if loc.compressed {
+            decompress_lz4(idata).ok()
+        } else {
+            Some(idata.to_vec())
+        };
+    }
+    if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
+        let present = extent_index
+            .segment_presence(loc.segment_id)
+            .is_some_and(|p| p.test(entry_idx));
+        if !present {
+            return None;
+        }
+    }
+    let (path, layout) = search_dirs
+        .iter()
+        .find_map(|d| segment::locate_segment_body(d, loc.segment_id))?;
+    let f = fs::File::open(&path).ok()?;
+    let mut buf = vec![0u8; loc.body_length as usize];
+    f.read_exact_at(&mut buf, layout.body_seek(loc)).ok()?;
+    if loc.compressed {
+        decompress_lz4(&buf).ok()
+    } else {
+        Some(buf)
+    }
+}
+
 /// Convert single-block `Data` pendings to thin `Delta` entries wherever
 /// `prior` holds a different same-LBA extent whose body is locally
 /// present and the zstd-dict delta beats the stored size. Runs at segment
 /// formation, on the materialised pendings, before the segment is
 /// written.
 ///
-/// `prior` must be a snapshot-pinned [`BlockReader`] on the latest sealed
-/// snapshot, opened without a fetcher — a source body missing locally is
-/// skipped, never fetched from S3 to seed a dictionary. Multi-block
-/// entries are left alone.
+/// `prior` is the [`SnapshotSourceMap`] of the latest sealed snapshot;
+/// source bodies are resolved by hash through `extent_index` (the live
+/// index — any canonical serving the hash yields identical bytes) and
+/// read from `search_dirs`. A source not locally readable is skipped,
+/// never fetched from S3 to seed a dictionary. Multi-block entries are
+/// left alone.
 ///
 /// Returns the delta body region (each converted entry's `delta_offset`
 /// indexes into it) and the conversion stats.
 pub fn delta_pendings_against_prior(
     pendings: &mut [segment::PendingEntry],
-    prior: &BlockReader,
+    prior: &SnapshotSourceMap,
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
 ) -> io::Result<(Vec<u8>, SegmentDeltaStats)> {
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
@@ -495,12 +539,9 @@ pub fn delta_pendings_against_prior(
         let source_plain = match source_plain_cache.get(&source_hash) {
             Some(v) => v,
             None => {
-                let plain = match prior.read_extent_body(&source_hash) {
-                    Ok(p) => p,
-                    // Source body missing locally (e.g. evicted and no
-                    // fetcher configured). Skip this entry — delta is
-                    // best-effort.
-                    Err(_) => continue,
+                let Some(plain) = read_source_plaintext(extent_index, search_dirs, &source_hash)
+                else {
+                    continue;
                 };
                 source_plain_cache.entry(source_hash).or_insert(plain)
             }

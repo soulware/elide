@@ -1803,7 +1803,7 @@ impl VolumeReader {
 /// `result_tx`.  Exits when `job_rx` disconnects (actor dropped the sender)
 /// or `result_tx` disconnects (actor gone).
 fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
-    let mut prior_cache = PriorReaderCache::default();
+    let mut prior_cache = PriorSourceCache::default();
     while let Ok(job) = job_rx.recv() {
         let msg = match job {
             WorkerJob::Promote(job) => {
@@ -2028,39 +2028,35 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
     }
 }
 
-/// Snapshot-pinned [`BlockReader`] reused across promote jobs on one
-/// thread, keyed by the sealed snapshot ULID it was opened against.
-/// Rebuilding the reader walks the provenance chain and every `.idx` in
-/// the lineage, so paying that once per snapshot rather than once per
-/// promote matters under sustained write load. The worker thread owns
-/// one across its job loop; inline promote sites pass a fresh default.
+/// [`SnapshotSourceMap`] reused across promote jobs on one thread, keyed
+/// by the sealed snapshot ULID it was built from. The build walks the
+/// provenance chain and every `.idx` in the lineage, so paying that once
+/// per snapshot rather than once per promote matters under sustained
+/// write load; what stays resident between promotes is only the packed
+/// `LBA → hash` runs. The worker thread owns one across its job loop;
+/// inline promote sites pass a fresh default.
 #[derive(Default)]
-pub(crate) struct PriorReaderCache {
-    cached: Option<(Ulid, crate::block_reader::BlockReader)>,
+pub(crate) struct PriorSourceCache {
+    cached: Option<(Ulid, crate::block_reader::SnapshotSourceMap)>,
 }
 
-impl PriorReaderCache {
-    /// Reader for `snap_ulid`, rebuilding when the cached one was opened
-    /// against a different snapshot. No fetcher: a source body missing
-    /// locally is a skipped candidate, never an S3 fetch.
-    fn reader_for(
+impl PriorSourceCache {
+    /// Source map for `snap_ulid`, rebuilding when the cached one was
+    /// built from a different snapshot.
+    fn map_for(
         &mut self,
         base_dir: &std::path::Path,
         snap_ulid: Ulid,
-    ) -> io::Result<&crate::block_reader::BlockReader> {
+    ) -> io::Result<&crate::block_reader::SnapshotSourceMap> {
         if self.cached.as_ref().is_none_or(|(u, _)| *u != snap_ulid) {
-            let reader = crate::block_reader::BlockReader::open_snapshot(
-                base_dir,
-                &snap_ulid,
-                Box::new(|_| None),
-            )?;
-            self.cached = Some((snap_ulid, reader));
+            let map = crate::block_reader::SnapshotSourceMap::build(base_dir, &snap_ulid)?;
+            self.cached = Some((snap_ulid, map));
         }
         // The line above just populated the cache on the miss path.
         Ok(&self
             .cached
             .as_ref()
-            .expect("prior reader cache populated")
+            .expect("prior source cache populated")
             .1)
     }
 }
@@ -2080,7 +2076,7 @@ impl PriorReaderCache {
 /// three execution sites share one write pass.
 pub(crate) fn execute_promote(
     job: PromoteJob,
-    prior_cache: &mut PriorReaderCache,
+    prior_cache: &mut PriorSourceCache,
 ) -> Result<PromoteResult, PromoteFailure> {
     fn fail(error: io::Error, job: PromoteJob) -> PromoteFailure {
         PromoteFailure {
@@ -2107,14 +2103,19 @@ pub(crate) fn execute_promote(
 
     // Delta tier: convert single-block Data entries whose same-LBA prior
     // extent beats the stored size as a zstd dictionary. Best-effort on
-    // reader construction (a promote must not fail because the delta
-    // optimisation's snapshot reader broke); conversion errors are real
+    // map construction (a promote must not fail because the delta
+    // optimisation's source map broke); conversion errors are real
     // corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
     if let Some(prior_spec) = &job.delta_prior {
-        match prior_cache.reader_for(&prior_spec.base_dir, prior_spec.snap_ulid) {
+        match prior_cache.map_for(&prior_spec.base_dir, prior_spec.snap_ulid) {
             Ok(prior) => {
-                match crate::delta_compute::delta_pendings_against_prior(&mut pendings, prior) {
+                match crate::delta_compute::delta_pendings_against_prior(
+                    &mut pendings,
+                    prior,
+                    &prior_spec.extent_index,
+                    &prior_spec.search_dirs,
+                ) {
                     Ok((body, stats)) => {
                         if stats.entries_converted > 0 {
                             log::info!(
@@ -2133,7 +2134,7 @@ pub(crate) fn execute_promote(
             }
             Err(e) => {
                 warn!(
-                    "formation {}: snapshot {} reader unavailable, skipping delta tier: {e}",
+                    "formation {}: snapshot {} source map unavailable, skipping delta tier: {e}",
                     job.segment_ulid, prior_spec.snap_ulid
                 );
             }

@@ -1406,7 +1406,7 @@ mod tests {
 
         let job = vol.prepare_promote().unwrap().expect("promote job");
         let result =
-            crate::actor::execute_promote(job, &mut crate::actor::PriorReaderCache::default())
+            crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default())
                 .unwrap();
 
         let mut saw_inline = false;

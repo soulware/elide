@@ -694,12 +694,13 @@ impl Volume {
                     body_offsets,
                     signer: Arc::clone(&signer),
                     pending_dir: pending_dir.clone(),
-                    delta_prior: latest_snap.map(|snap_ulid| PromoteDeltaPrior {
-                        base_dir: base_dir.to_owned(),
-                        snap_ulid,
-                    }),
+                    // Recovery promotes of stale WALs write plain Data
+                    // entries: the delta tier resolves source bodies
+                    // through an Arc'd extent-index snapshot, and the
+                    // open path holds the index by value at this point.
+                    delta_prior: None,
                 },
-                &mut crate::actor::PriorReaderCache::default(),
+                &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
             apply_promoted_entries(&mut extent_index, &mut lbamap, &result)?;
@@ -2331,7 +2332,7 @@ impl Volume {
             return Ok(());
         }
         let job = self.take_wal_into_promote_job(segment_ulid)?;
-        match crate::actor::execute_promote(job, &mut crate::actor::PriorReaderCache::default()) {
+        match crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default()) {
             Ok(result) => self.apply_promote(&result),
             Err(failure) => {
                 self.restore_failed_promote(*failure.job)?;
@@ -2829,9 +2830,19 @@ impl Volume {
         self.classify_pending_dedup(open.ulid);
         let pre_promote_offsets =
             snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
-        let delta_prior = latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
-            base_dir: self.base_dir.clone(),
-            snap_ulid,
+        let delta_prior = latest_snapshot(&self.base_dir)?.map(|snap_ulid| {
+            let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
+            for layer in &self.ancestor_layers {
+                if !search_dirs.contains(&layer.dir) {
+                    search_dirs.push(layer.dir.clone());
+                }
+            }
+            PromoteDeltaPrior {
+                base_dir: self.base_dir.clone(),
+                snap_ulid,
+                extent_index: Arc::clone(&self.extent_index),
+                search_dirs,
+            }
         });
         Ok(PromoteJob {
             segment_ulid,

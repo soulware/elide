@@ -48,6 +48,13 @@ pub struct PromoteJob {
 pub struct PromoteDeltaPrior {
     pub base_dir: PathBuf,
     pub snap_ulid: Ulid,
+    /// Live extent-index snapshot for resolving source bodies by hash.
+    /// Any canonical serving a hash yields identical bytes, so the
+    /// worker needs no snapshot-pinned locations — only the snapshot's
+    /// `LBA → hash` map (built worker-side, cached per `snap_ulid`).
+    pub extent_index: Arc<extentindex::ExtentIndex>,
+    /// Body-lookup roots: the fork directory first, then ancestor dirs.
+    pub search_dirs: Vec<PathBuf>,
 }
 
 /// A promote that failed on the worker, carrying the job back intact.
