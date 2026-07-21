@@ -5,6 +5,7 @@ pub mod body_prefetch;
 pub mod control;
 pub mod coordinator_client;
 pub mod creds_fetcher;
+pub mod delta_sim;
 pub mod extents;
 pub mod inspect;
 pub mod inspect_files;
