@@ -1,12 +1,14 @@
 # Design: delta compression
 
-Status: format, producers, and read path landed. Two additions proposed, not started: similarity-based source selection and journal-region awareness. Both are gated on the measurement in § Measurement.
+Status: format, producers, and read path landed. Proposed, not started: similarity-based source selection, journal-region awareness, and a unified selection cascade at segment formation (which moves dedup out of the WAL write path). Measurement round 1 (§ Measurement) supports the first two.
 
 Date: 2026-07-20 (supersedes the 2026-04 revision)
 
 ## The source-selection problem
 
 A delta entry stores an extent as a zstd-compressed diff against a source extent, with the source as the zstd dictionary. The recurring design question is source selection: given a changed extent, which prior extent is the dictionary? Any choice is correct. Dictionary compression produces valid output for any dictionary, and the producer discards a delta that is not smaller than the plain body. A poor source costs compute and forgoes savings, never correctness.
+
+Dedup is the boundary case of the same question: a source identical to the target, encoded as a reference with no bytes (DedupRef). § Unified selection treats it as such.
 
 ## Landed system
 
@@ -31,13 +33,13 @@ Delta options are hints. The reader takes the first option whose source is alrea
 
 Same-LBA selection misses when file data re-materialises at new LBAs. On ext4 this is not a journaling effect (data blocks are overwritten in place under `data=ordered`); it comes from applications writing a new file and renaming it over the old one, with delayed allocation choosing fresh blocks. Package upgrades and config rewrites follow this pattern.
 
-Extending path matching to this case (pairing paths across the two snapshots' filemaps) needs a filemap at both snapshots, and filemap generation is an operator verb precisely because it is expensive. Same-path lookup also pairs paths, not logical files: a rename such as logrotate's `log` → `log.1` defeats it in both directions.
+Extending path matching to this case (pairing paths across the two snapshots' filemaps) needs a filemap at both snapshots, and filemap generation is an operator verb precisely because it is expensive. Same-path lookup also pairs paths, not logical files: content that reappears under a different path (a copied file, a package manager's staged output) has no same-path source. A plain rename is not among the miss cases — `mv` moves no data blocks, so a renamed-in-place file never enters the changed set at all.
 
 ## Proposed: similarity-based source selection
 
-Select sources by content resemblance rather than location or path. This needs no filemap, works on any filesystem, and can pair renamed or copied files. Whether it recovers enough bytes in practice to justify the added machinery is what the measurement decides.
+Select sources by content resemblance rather than location or path. This needs no filemap, works on any filesystem, and can pair copied or re-pathed files. Measurement round 1 (§ Measurement) recovered ~86% of what path matching achieves on an apt-upgrade workload, without filemaps.
 
-**Sketch.** Per extent, a fixed-size resemblance sketch using the super-feature construction (Broder resemblance, computed in the style of Finesse, FAST '19): split the extent into N fixed subchunks, take the maximum Gear rolling-hash value in each, hash groups of features into three 8-byte super-features. Extents sharing any super-feature are likely similar. 24 bytes per extent, one linear pass over the data.
+**Sketch.** Per extent, a fixed-size resemblance sketch using the super-feature construction (Broder resemblance; cheap positional computation in the style of Finesse, FAST '19): split the extent into N fixed subchunks, take the maximum Gear rolling-hash value in each, hash feature groups into 8-byte super-features. Extents sharing any super-feature are likely similar; one linear pass over the data. Round 1 measured grouping width as the dominant recall parameter — two-feature groups recovered ~1.6× the bytes of four-feature groups on rebuilt binaries, whose diffuse diffs rarely leave four features jointly intact, and at pair grouping the positional construction matched a position-independent variant within 1%. The working configuration is 16 features in 8 pairs (64 bytes per entry); final parameters are an open question.
 
 **Persistence.** The sketch is stored as a per-entry field in the segment index, a format bump. It then travels with the entry the way the hash does: GC's copy-through preserves it, and a similarity index over any lineage is rebuildable from `.idx` files alone, which `prefetch_indexes` already keeps present without bodies. The alternative, a per-segment sidecar file, avoids the bump but adds an artifact to generate, upload, and keep consistent with the index.
 
@@ -47,23 +49,60 @@ Select sources by content resemblance rather than location or path. This needs n
 
 **Failure modes.** A spurious super-feature match produces a delta that fails the size check and is discarded. Entries without sketches (segments written before the bump, sub-threshold extents) contribute no candidates and nothing else changes.
 
+**Snapshot-free operation.** The sealed-snapshot scoping above is a property of the other selection strategies, not of delta compression itself: same-LBA lookup needs a consistent prior LBA map, and path matching needs filemaps at sealed points. Similarity needs only the sketch index, and with sketches persisted per index entry that index is maintainable incrementally from the live extent index. The producer can therefore run on every drain tick, deltaing pending segments against any locally-present prior extent before their first upload, on a volume with no snapshot in its history. The WAL write path stays out of scope in this form too: the WAL is local and short-lived and its records need plain bytes for crash recovery, so segment formation is the earliest point where a delta earns anything.
+
+Two things distinguish snapshot-free from the snapshot-scoped form:
+
+- *Source churn.* A Delta keeps its source body alive through GC (`lba_referenced_hashes`, `FLAG_CANONICAL_ONLY`), so a young source that is overwritten soon after leaves GC carrying its body only because a delta references it. Snapshot scoping filtered for cold sources as a side effect; a snapshot-free producer needs an explicit source-age gate — only extents older than some number of ticks are indexed as candidates. The journal exclusion removes the highest-churn range independently.
+- *Pinning.* Scoping candidates to the prior sealed snapshot left the pinning invariant untouched. Arbitrary-source selection rests directly on GC's reference rules for source liveness, so that analysis becomes part of the work rather than something sidestepped.
+
+The snapshot-scoped form is the same producer with a stricter candidate filter (membership in the prior sealed snapshot instead of a source-age gate), so the two forms are one code path and either can ship first.
+
 ## Proposed: journal-region awareness
 
-The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at mkfs) and is continuously rewritten with copies of metadata blocks. Untreated, it interacts poorly with each producer: journal blocks sit in the post-floor population every tick and mostly fail the delta size check, so repack burns compute on them; their metadata copies would sketch-match the metadata home locations and fill the similarity index with the highest-churn extents on the device; and opportunistic dedup can bind journal LBAs to metadata extents via DedupRef.
+The jbd2 journal occupies a fixed contiguous LBA range (inode 8, preallocated at mkfs) and is continuously rewritten with copies of metadata blocks. On the round-1 workload the journal was 8.9% of all changed bytes and non-file metadata another 14.1% ([findings.md](../findings.md)). Untreated, it interacts poorly with each producer: journal blocks enter the formation delta tier every promote and mostly fail the size check, wasting compute; their metadata copies would sketch-match the metadata home locations and fill the similarity index with the highest-churn extents on the device; and dedup can genuinely match the copy against its home block — jbd2 writes the journal copy first, so it becomes the canonical DATA entry and the home-LBA checkpoint write becomes a DedupRef pointing into a journal-claimed extent. The journal recycles, the canonical goes LBA-dead, and GC carries the body as `FLAG_CANONICAL_ONLY` for as long as the durable reference lives.
 
 **Identification.** Parse the superblock, walk inode 8's extent tree, cache the resulting LBA range set. The location is fixed for the life of the filesystem, and `ext4_scan.rs` already has the parsing. Non-ext4 volumes, external journals, and parse failures yield an empty set.
 
-**Use.** A derived in-memory range set with three consumers: the formation delta tier skips journal-range entries, the similarity index excludes them on both build and query sides, and dedup skips them as candidates. Nothing is persisted, and an empty set reproduces current behaviour exactly. Persisting per-entry metadata tags for read-path or cache policy (the metadata-tagging note in [operations.md](../operations.md)) is a separate decision this design does not take.
+**Use.** A derived in-memory range set with three consumers: the formation delta tier skips journal-range entries; the similarity index excludes them on both build and query sides; and dedup excludes them in both directions — journal-range writes emit no DedupRefs, and journal-range extents are not admitted as canonical dedup sources. The admission direction is the load-bearing one (it is what stops durable LBAs referencing journal-claimed bodies) and applies everywhere hashes are registered as canonical: the WAL write path and GC fold/reclaim re-registration. The forgone dedup win is the copy⇄home pair, bounded by the journal region size and transient anyway. Nothing is persisted, and an empty set reproduces current behaviour exactly. Persisting per-entry metadata tags for read-path or cache policy (the metadata-tagging note in [operations.md](../operations.md)) is a separate decision this design does not take.
+
+## Unified selection at segment formation
+
+The format treats thin DedupRef and thin Delta as siblings: `stored_length = 0`, resolution through `extent_index.lookup`, the same `lba_referenced_hashes` liveness rule, the same GC copy-through. The producer side matches: segment formation classifies every entry once.
+
+**The cascade.**
+
+1. Exact-hash hit in the extent index → DedupRef. Verification is hash equality; zero bytes always wins, no size check.
+2. Same-LBA hit in the latest sealed snapshot → compute the zstd-dictionary delta, keep iff smaller than the stored body.
+3. Otherwise → Data (or Inline/Zero per the existing rules).
+
+The similarity tier slots in at step 2 as an approximate probe when the same-LBA lookup misses. The reclaim workers' existing exact-first ordering ("DedupRef strictly beats any Delta") is the cascade's priority rule.
+
+**One policy surface.** Candidate filters — journal-range exclusion (both directions), the source-age gate, the source-body-locally-present rule, snapshot scoping — apply once, at the cascade, rather than separately in a write-path check, a tick pass, and reclaim conversion.
+
+**Dedup is off the WAL write path.** Writes always append full body records; the write path keeps hashing and compression but takes no dedup decision. The no-op skip (same LBA, same hash, no append) stays: it creates no cross-reference and covers the common unchanged-page rewrite. Consequences:
+
+- The WAL is self-contained at crash recovery: no record's readability depends on segment-store canonical presence.
+- Reading back just-written data is local until promote. A thin WAL REF could resolve to an evicted canonical and demand-fetch from S3.
+- The hot path needs no filesystem awareness; the journal range set is consulted only at formation.
+- Duplicate-content writes carry full bodies in the WAL until the next promote thins them. Write-path dedup hits are a small fraction of real ublk traffic, and the cost is bounded by the promote threshold.
+- The WAL REF record kind is parse-only legacy format.
+
+Pending segments carry DedupRef entries minted at formation, on the actor at take time; the delta tier runs in the promote worker, off-lock.
+
+**Where unification stops.** DedupRef and Delta remain distinct entry kinds with distinct read paths. The boundary case has load-bearing properties the general case lacks: a DedupRef read fetches nothing beyond the body its own hash names; verification is free and has no false-positive concept; and its sources are perfectly interchangeable (any canonical with the hash serves), where a delta is pinned to specific source bytes.
 
 ## Measurement
 
-An offline experiment precedes any implementation. Take two states of a live-written volume under a rename-heavy workload such as a package upgrade (postgres is a poor testbed: it overwrites in place, which same-LBA selection already covers). Replay same-LBA selection, run the sketch match over the misses, and compute actual zstd-dictionary ratios for the matches. Journal-range bytes get their own bucket so they inflate neither the miss population nor the recovery figure.
+The offline experiment runs via `elide delta-sim <before.img> <after.img>` over two states of one live-written ext4 filesystem (`scripts/delta-sim-workload` generates a pair via an in-place apt upgrade). It replays same-LBA selection over the changed blocks, runs the sketch match over the misses with real zstd-dictionary ratios, buckets journal-range and non-file metadata bytes separately, and bounds what path matching would achieve with a same-path oracle.
 
-Outputs: the fraction of missed bytes for which similarity finds a source, the achieved ratios, sketch compute cost, index size, and the journal's share of post-floor churn. The first number decides whether implementation proceeds; the last informs whether metadata tagging beyond the journal is worth pursuing.
+Round 1 (2026-07-20, full numbers in [findings.md](../findings.md)): same-LBA selection found sources for 5.7% of changed file-data bytes; similarity recovered 30% of the miss bytes, which is ~86% of the same-path oracle's recovery plus 22 MiB the oracle cannot reach; every surviving match beat LZ4 (zero false positives past the size check); journal plus metadata was 23% of changed bytes. The largest unrecovered bucket was apt's downloaded archives and lists — new high-entropy content with no source under any strategy. One workload on a fresh filesystem; a second round on an aged filesystem or a different churn profile would strengthen the numbers.
 
 ## Open questions
 
-- Sketch parameters (subchunk count, features per super-feature) and whether the common 12-feature/3-super-feature split suits extent-sized inputs.
+- Final sketch parameters. Round 1 fixed the grouping question (pairs, not quadruples) but not the feature count or the per-entry size/recall tradeoff (8 pairs cost 64 bytes per index entry against the 24 bytes a 12/4/3 split would).
 - Windowed sketches for large sources.
-- Widening the candidate set beyond the prior sealed snapshot to the full extent-index lineage, which reopens the pinning analysis.
+- The source-age gate for snapshot-free operation: how cold a candidate must be before referencing it is worth the GC entanglement, and whether the gate is a tick count or something cheaper to reason about.
+- The pinning analysis for arbitrary-source selection (§ Snapshot-free operation), including cross-lineage candidates from ancestor volumes.
+- Write-path dedup incidence: how much WAL growth promote-time DedupRef minting costs on real traffic, and the retirement path for the WAL REF record kind.
 - Filemap hardlinks produce duplicate rows with different paths and the same hash; harmless, worth deduplicating for compactness.

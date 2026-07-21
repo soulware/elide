@@ -102,6 +102,49 @@ Combining delta and sparse (31.6 MB warm) saves only 1.8 MB over delta alone (33
 
 **Conclusion:** zstd+sparse (36.6 MB warm) achieves 81% of the marginal improvement of zstd+delta (33.4 MB) — only 3.2 MB apart on the boot trace — while being substantially simpler to implement: no diff library, no source-hash dependency chains, cleaner GC semantics. For point-release Ubuntu workloads, zstd+sparse is the preferred default. Delta compression is the higher-complexity option that closes the remaining gap.
 
+## Delta source selection on a live-written volume
+
+Measured 2026-07-20 with `elide delta-sim` on one 4 GiB ext4 filesystem captured before and after an in-place `apt upgrade` (Ubuntu noble, release pocket to noble-updates, 272 package unpack operations) plus tmp+rename config rewrites (`scripts/delta-sim-workload` generates the pair). The tool replays the production same-LBA selection rule over the changed blocks, attempts super-feature similarity matching on the misses, and bounds what filemap path matching would achieve with a same-path oracle. One workload on a freshly-made filesystem; the numbers are indicative, not general.
+
+**Where the churn goes** (721.4 MiB changed):
+
+| Bucket | Bytes | Share |
+|---|---|---|
+| jbd2 journal range | 64.0 MiB | 8.9% |
+| Metadata (non-file blocks) | 101.5 MiB | 14.1% |
+| File data | 555.8 MiB | 77.1% |
+
+The journal region cycled completely during the upgrade. Journal plus metadata is 23% of all changed bytes — the churn the proposed journal-region exclusion and metadata tagging would keep out of the delta and similarity pipelines.
+
+**Same-LBA selection barely fires on this workload:** 31.9 MiB of the 555.8 file-data MiB (5.7%) found a beneficial same-LBA source. Package upgrades re-materialise nearly everything at fresh LBAs. (In-place writers such as postgres are the opposite regime and are already covered.)
+
+**Similarity matching on the 523.9 MiB of misses** (16 features, grouped in pairs into eight 8-byte super-features, 32 KiB threshold):
+
+| Outcome | Bytes | Note |
+|---|---|---|
+| Recovered | 158.1 MiB (30.2%) | delta 39.0 MiB vs 90.3 MiB as LZ4 |
+| No candidate | 327.8 MiB | see oracle split below |
+| Matched, no benefit | 0 MiB | zero false positives survive the size check |
+| Sub-threshold | 38.0 MiB | runs < 32 KiB |
+
+**Similarity vs the same-path oracle**, on miss bytes at or above the threshold:
+
+| | Bytes |
+|---|---|
+| Both find a source | 136.3 MiB |
+| Similarity only | 21.8 MiB |
+| Oracle only | 48.5 MiB |
+| Neither | 300.4 MiB |
+
+The "neither" bucket is almost entirely `/var/cache/apt` and `/var/lib/apt` — downloaded `.deb` archives and compressed package lists, new high-entropy content for which no delta source exists under any selection strategy. Excluding it, similarity recovers 158.1 MiB against the oracle's 184.8 MiB (~86% of what path matching achieves), without filemaps, plus 21.8 MiB that same-path lookup cannot reach (content under a different path).
+
+**Costs:** sketching ran at ~490 MiB/s single-threaded; the index over 1,911 before-fragments is ~179 KiB; 1.7 candidate dictionaries tried per matched run.
+
+**Two parameter findings:**
+
+- Super-feature grouping width dominated recall. Four-feature groups recovered 101.4 MiB; two-feature pairs recovered 158.1 MiB. Rebuilt binaries have diffuse byte-level diffs, so requiring four features to survive jointly is what broke matching. With pair grouping, the cheap positional construction (max per fixed subchunk) matched the position-independent one within 1%.
+- A plain `mv` rename moves no data blocks, so rotated-in-place files never enter the changed-block set at all. Rename-only churn costs nothing at the block layer; the case that matters is a rewrite landing at fresh LBAs.
+
 ## OCI container images vs cloud images
 
 The findings above are from Ubuntu 22.04 cloud images (~2.1 GB root partition). OCI container
