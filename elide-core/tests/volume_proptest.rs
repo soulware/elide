@@ -294,6 +294,19 @@ enum SimOp {
     /// offload. Exercised against a subsequent `Crash` + rebuild so the
     /// crash-recovery invariants fire on this specific shape.
     HalfPromotePending,
+    /// Simulate a crash one step earlier than `HalfPromotePending`:
+    /// after `extract_idx` commits `index/<ulid>.idx`, before
+    /// `promote_to_cache` renames the cache body into place. The
+    /// segment body is captured into the fetcher's store, so after the
+    /// next `Crash` the leaked idx classifies the entries `Cached` and
+    /// a `ReadAfterDrain` builds `cache/<ulid>.body` one extent at a
+    /// time underneath the surviving pending source.
+    ///
+    /// The promote retry that any later drain issues therefore meets a
+    /// partially-fetched body rather than a promoted one, which is the
+    /// state where trusting bare `.body` existence as the promote
+    /// commit marker installs an all-present bitset over short reads.
+    HalfPromoteIdxOnly,
     /// Write a near-duplicate incompressible block:
     /// `incompressible_block(base_seed)` with the first 32 bytes set to
     /// `tweak`. Two draws sharing `(lba, base_seed)` with different
@@ -421,6 +434,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba_count,
         }),
         Just(SimOp::HalfPromotePending),
+        Just(SimOp::HalfPromoteIdxOnly),
         Just(SimOp::SignSnapshot),
         (0u8..4, 0u8..4, any::<u8>()).prop_map(|(lba, base_seed, tweak)| SimOp::WriteNearDup {
             lba,
@@ -1035,6 +1049,12 @@ proptest! {
                     // original pending ULID. Nothing to assert for monotonicity.
                     let _ = common::half_promote_first_pending(fork_dir);
                 }
+                SimOp::HalfPromoteIdxOnly => {
+                    // Same ULID reuse as HalfPromotePending: the leaked
+                    // idx and the captured store body both carry the
+                    // pending segment's own ULID.
+                    let _ = common::leak_promote_idx_first_pending(fork_dir, &store_dir);
+                }
                 SimOp::SignSnapshot => {
                     // Manifest + marker land under `snapshots/`, which
                     // `all_segment_ulids` does not scan. The segment
@@ -1106,7 +1126,15 @@ proptest! {
                     // fetcher re-uses the original segment ULID for any
                     // re-fetched `index/<id>.idx`, so the ULID set
                     // must remain identical pre/post.
-                    let _ = vol.read(*lba as u64, 1);
+                    //
+                    // This block keeps no oracle, so the content check
+                    // lives in the other two suites; what is checked
+                    // here is that the read succeeds at all and that
+                    // any demand fetch it triggered left every present
+                    // bit backed by bytes on disk.
+                    let read = vol.read(*lba as u64, 1);
+                    prop_assert!(read.is_ok(), "read of lba {} failed: {:?}", lba, read.err());
+                    common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     let after = all_segment_ulids(fork_dir);
                     prop_assert_eq!(
                         &after,
@@ -1243,6 +1271,7 @@ proptest! {
                     // transition extent-index entries to Cached. The retry
                     // runs inline with prop_assert via the helper.
                     common::assert_promote_recovery(&mut vol, fork_dir);
+                    common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1272,6 +1301,14 @@ proptest! {
                     // that verifies recovery runs inside the next `Crash`
                     // handler (before the oracle read-back loop).
                     let _ = common::half_promote_first_pending(fork_dir);
+                }
+                SimOp::HalfPromoteIdxOnly => {
+                    // Recovery is driven by whichever drain op the
+                    // sequence draws next, not by the `Crash` handler:
+                    // the partial fetch that arms the interesting state
+                    // needs a rebuild first, so repairing at `Crash`
+                    // would make it unreachable.
+                    let _ = common::leak_promote_idx_first_pending(fork_dir, &store_dir);
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // Simulate a demand-fetch from S3: write one segment directly to
@@ -1433,6 +1470,7 @@ proptest! {
                         .copied()
                         .unwrap_or([0u8; 4096]);
                     let actual = vol.read(*lba as u64, 1).unwrap();
+                    common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),
@@ -1565,6 +1603,7 @@ proptest! {
                     pending_gc = None;
                     // See crash_recovery_oracle for rationale.
                     common::assert_promote_recovery(&mut vol, fork_dir);
+                    common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1588,6 +1627,9 @@ proptest! {
                 }
                 SimOp::HalfPromotePending => {
                     let _ = common::half_promote_first_pending(fork_dir);
+                }
+                SimOp::HalfPromoteIdxOnly => {
+                    let _ = common::leak_promote_idx_first_pending(fork_dir, &store_dir);
                 }
                 SimOp::PopulateFetched { lba, seed } => {
                     // Skip if already populated — see crash_recovery_oracle for rationale.
@@ -1709,6 +1751,7 @@ proptest! {
                         .copied()
                         .unwrap_or([0u8; 4096]);
                     let actual = vol.read(*lba as u64, 1).unwrap();
+                    common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),

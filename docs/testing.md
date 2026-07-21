@@ -54,6 +54,8 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 - `ulid_monotonicity` — every new segment's ULID must be `> max(pre-existing ULIDs)`; snapshot-floor segments must not be deleted.
 - `crash_recovery_oracle` — maintains a ground-truth `HashMap<lba, data>`; after every `Crash` (drop + reopen), reads every LBA back and compares.
 
+A presence-truthfulness invariant runs alongside the oracle: after every `Crash` and `ReadAfterDrain`, `check_presence_truthful` walks each `cache/<ulid>.present` and asserts every set data bit is backed by a `cache/<ulid>.body` long enough to cover that entry's stored extent. A present bit over a short body is exactly the shape a partial fetch-created body leaves when an interrupted promote is retried against it, and it surfaces to the guest as EIO. `CapturedBodyFetcher` writes only the requested entry's byte range (read from the `.idx`, matching `elide_fetch::fetch_one_extent`), so a body it builds is genuinely short until every entry is fetched.
+
 | Op | What it does |
 |----|-------------|
 | `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` |
@@ -69,6 +71,8 @@ The volume's crash-recovery model is verified with [proptest](https://proptest-r
 | `Crash` | drops the `Volume` and reopens it (full rebuild) |
 | `Snapshot` | `vol.snapshot()` — sets the snapshot floor |
 | `PopulateFetched` | writes 3-file demand-fetch cache format (`.idx` + `.body` + `.present`) |
+| `HalfPromotePending` | runs `extract_idx` + `promote_to_cache` for one pending segment without the actor apply — the mid-apply crash shape |
+| `HalfPromoteIdxOnly` | commits `index/<ulid>.idx` only, captures the body into the fetcher store — after `Crash` a `ReadAfterDrain` builds `cache/<ulid>.body` one extent at a time under the surviving pending source |
 | `ReadUnwritten` | reads LBA 64 (always outside write range); must be zero |
 
 `CoordGcLocal` picks the `n` oldest S3-confirmed segments, writes a self-describing GC output to `gc/<ulid>.staged` (with the consumed input ULID list embedded in the segment header, no manifest sidecar), and calls `vol.apply_gc_handoffs()` to exercise the volume's handoff path — the same algorithm as `elide-coordinator/src/gc.rs`.
