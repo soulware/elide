@@ -14,8 +14,7 @@ use ulid::Ulid;
 use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
-    AncestorLayer, BoxFetcher, DeltaRepackJob, DeltaRepackResult, ReclaimJob, ReclaimResult,
-    RepackJob, RepackResult, StagedApply,
+    AncestorLayer, BoxFetcher, ReclaimJob, ReclaimResult, RepackJob, RepackResult, StagedApply,
 };
 
 /// Data needed by the worker thread to write a pending segment.
@@ -39,6 +38,16 @@ pub struct PromoteJob {
     pub body_offsets: Vec<Option<u64>>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
+    /// Present when the volume has a sealed snapshot: the worker deltas
+    /// single-block Data entries against same-LBA extents from it before
+    /// writing the segment. `None` reproduces a plain promote.
+    pub delta_prior: Option<PromoteDeltaPrior>,
+}
+
+/// The sealed snapshot a promote's delta tier sources dictionaries from.
+pub struct PromoteDeltaPrior {
+    pub base_dir: PathBuf,
+    pub snap_ulid: Ulid,
 }
 
 /// A promote that failed on the worker, carrying the job back intact.
@@ -73,6 +82,11 @@ pub struct PromoteResult {
     pub body_section_start: u64,
     pub entries: Vec<segment::SegmentEntry>,
     pub pre_promote_offsets: Vec<Option<u64>>,
+    /// Byte length of the body region holding Data entries; the delta
+    /// region (blobs for entries the worker converted to `Delta`) starts
+    /// at `body_section_start + delta_region_body_length`. Zero when no
+    /// entries were converted.
+    pub delta_region_body_length: u64,
 }
 
 /// The ULIDs needed for a GC checkpoint, minted atomically in order.
@@ -272,7 +286,6 @@ pub enum WorkerJob {
     GcPlan(GcPlanApplyJob),
     PromoteSegment(PromoteSegmentJob),
     Repack(RepackJob),
-    DeltaRepack(DeltaRepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
     Reclaim(ReclaimJob),
     /// Test seam: the worker blocks on the receiver, then returns
@@ -296,7 +309,6 @@ pub enum WorkerResult {
         result: io::Result<PromoteSegmentResult>,
     },
     Repack(io::Result<RepackResult>),
-    DeltaRepack(io::Result<DeltaRepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),
     /// Test seam: completion of a [`WorkerJob::Barrier`]. No-op on apply.

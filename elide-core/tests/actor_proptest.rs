@@ -77,14 +77,6 @@ enum ActorOp {
     /// `has_new_segments` flip on the actor. After the call, every oracle LBA
     /// must still read correctly (signing must not touch data paths).
     Snapshot,
-    /// Run `handle.delta_repack_post_snapshot` — exercises the offloaded
-    /// `WorkerJob::DeltaRepack` path and the three-way CAS apply phase.
-    /// Covers Data-to-Data via `replace_if_matches`, Data-to-Delta via
-    /// `remove_if_matches` paired with `insert_delta_if_absent`, and
-    /// pre-existing Delta via `insert_delta_if_absent` alone. No-op when
-    /// no sealed snapshot exists — needs a prior `Snapshot` op. After
-    /// the call, every oracle LBA must still read correctly.
-    DeltaRepack,
 }
 
 fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
@@ -99,7 +91,6 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         1 => (0u8..8, 1u8..8u8)
             .prop_map(|(start_lba, lba_count)| ActorOp::Reclaim { start_lba, lba_count }),
         1 => Just(ActorOp::Snapshot),
-        1 => Just(ActorOp::DeltaRepack),
     ]
 }
 
@@ -291,23 +282,6 @@ proptest! {
                             actual.as_slice(),
                             expected.as_slice(),
                             "lba {} wrong after sign_snapshot_manifest via actor",
-                            lba
-                        );
-                    }
-                }
-                ActorOp::DeltaRepack => {
-                    // Offload path: parked_delta_repack + worker.  Apply
-                    // walks the three-way CAS (Data→Data, Data→Delta,
-                    // Delta→Delta); we assert every oracle LBA survives.
-                    // No-op when no sealed snapshot exists — the prep
-                    // phase returns None and the call is a nil op.
-                    let _ = handle.delta_repack_post_snapshot();
-                    for (&lba, expected) in &oracle {
-                        let actual = handle.reader().read(lba, 1).unwrap();
-                        prop_assert_eq!(
-                            actual.as_slice(),
-                            expected.as_slice(),
-                            "lba {} wrong after delta_repack_post_snapshot via actor",
                             lba
                         );
                     }

@@ -607,7 +607,7 @@ pub fn incompressible_block(seed: u8) -> Vec<u8> {
 
 /// `incompressible_block(base_seed)` with the first 32 bytes replaced
 /// by `tweak`: a near-duplicate whose zstd-dict delta against the base
-/// is tiny, so delta_repack's smaller-than-stored gate passes.
+/// is tiny, so the formation delta tier's smaller-than-stored gate passes.
 pub fn variant_block(base_seed: u8, tweak: u8) -> Vec<u8> {
     let mut buf = incompressible_block(base_seed);
     buf[..32].fill(tweak);

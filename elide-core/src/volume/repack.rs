@@ -9,9 +9,8 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::{
-    extentindex::{self, BodySource},
-    lbamap,
-    segment::{self, EntryKind},
+    extentindex, lbamap,
+    segment::{self},
     segment_cache,
 };
 
@@ -33,26 +32,6 @@ pub struct CompactionStats {
     /// hash the output doesn't carry. Inputs kept, output dropped.
     #[serde(default)]
     pub buckets_refused: usize,
-}
-
-/// Stats from a single `delta_repack_post_snapshot` pass.
-#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct DeltaRepackStats {
-    /// Number of post-snapshot segments inspected.
-    pub segments_scanned: usize,
-    /// Number of segments actually rewritten (had at least one conversion).
-    pub segments_rewritten: usize,
-    /// Total Data→Delta conversions across all rewritten segments.
-    pub entries_converted: usize,
-    /// Sum of original `stored_length` for converted entries.
-    pub original_body_bytes: u64,
-    /// Sum of delta blob sizes written.
-    pub delta_body_bytes: u64,
-    /// Number of segments skipped because one of their LBA claims is
-    /// superseded by a later pending segment — rewriting would re-emit
-    /// the dead claim above its overwriter on rebuild.
-    #[serde(default)]
-    pub segments_skipped_superseded: usize,
 }
 
 /// Data needed by the worker to repack sparse segments in `pending/`.
@@ -123,64 +102,6 @@ pub struct RepackedOutput {
 pub struct RepackResult {
     pub stats: CompactionStats,
     pub buckets: Vec<RepackedBucket>,
-}
-
-/// Data needed by the worker to rewrite post-snapshot pending segments
-/// with zstd-dictionary deltas against the prior sealed snapshot.
-///
-/// Produced by [`super::Volume::prepare_delta_repack`] on the actor thread.
-///
-/// `snap_ulid` is the latest sealed snapshot: only segments with a
-/// strictly greater ULID are rewritten; the snapshot itself is frozen.
-/// The worker constructs a snapshot-pinned `BlockReader` from
-/// `base_dir` + `snap_ulid` — kept off the actor so the manifest /
-/// provenance / extent-index rebuild runs on the worker thread.
-///
-/// `ceiling` is the WAL-flush ULID minted at prep time: every output
-/// ULID is below it, so any pending segment with a strictly greater
-/// ULID was minted after prep (e.g. by a `prepare_promote` racing under
-/// the dropped lock). The worker skips such segments — without this,
-/// rewriting a post-prep segment under one of the lower pre-minted
-/// output ULIDs would re-key its claims below claims minted between
-/// prep and the racing segment, which win on the last-writer-wins
-/// rebuild. Mirrors the `ceiling` filter on `RepackJob`.
-pub struct DeltaRepackJob {
-    pub base_dir: PathBuf,
-    pub pending_dir: PathBuf,
-    pub snap_ulid: Ulid,
-    pub ceiling: Ulid,
-    /// Pre-minted output ULIDs (one per post-snapshot pending segment
-    /// at prep time, monotonically increasing, all below the next WAL
-    /// ULID). Worker assigns them in input-ULID order and only
-    /// consumes as many as it actually rewrites.
-    pub output_ulids: Vec<Ulid>,
-    /// Prep-time lbamap snapshot (taken after the prep WAL flush). The
-    /// worker only rewrites a segment whose every LBA claim is still
-    /// held by that segment: a rewrite re-emits all entries at a fresh
-    /// ULID that sorts above every other pending segment, so a claim
-    /// superseded by a later segment would be resurrected on the
-    /// last-writer-wins lbamap rebuild.
-    pub lbamap: Arc<lbamap::LbaMap>,
-    pub signer: Arc<dyn segment::SegmentSigner>,
-    pub verifying_key: ed25519_dalek::VerifyingKey,
-    pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
-}
-
-/// Per-segment payload from a [`DeltaRepackJob`]. One of these is
-/// produced for every segment the worker actually rewrote
-/// (segments that had no convertible entries are skipped).
-pub struct DeltaRepackedSegment {
-    pub input_ulid: Ulid,
-    pub input_path: PathBuf,
-    pub new_ulid: Ulid,
-    pub rewrite: crate::delta_compute::RewrittenSegment,
-}
-
-/// Result of a [`DeltaRepackJob`]. Consumed by
-/// [`super::Volume::apply_delta_repack_result`] on the actor thread.
-pub struct DeltaRepackResult {
-    pub stats: DeltaRepackStats,
-    pub segments: Vec<DeltaRepackedSegment>,
 }
 
 impl Volume {
@@ -452,265 +373,6 @@ impl Volume {
         }
         self.assert_volume_invariants("remove_consumed_inputs");
         Ok(())
-    }
-
-    /// Phase 5 Tier 1: rewrite post-snapshot pending segments with
-    /// zstd-dictionary deltas against same-LBA extents from the prior
-    /// sealed snapshot.
-    ///
-    /// For every segment in `pending/` whose ULID is greater than the
-    /// latest sealed snapshot, walks single-block `Data` entries and
-    /// looks up the LBA in a snapshot-pinned `BlockReader` on that
-    /// snapshot. If the prior snapshot holds a different extent at
-    /// that LBA and the source body is locally available, the entry
-    /// is converted to a thin `Delta` with the prior extent as its
-    /// dictionary source.
-    ///
-    /// Runs on post-snapshot segments only — never touches segments
-    /// that are part of a sealed snapshot. No-op when there is no
-    /// sealed snapshot (nothing to source deltas from) or when no
-    /// entries match.
-    ///
-    /// Synchronous wrapper around [`Self::prepare_delta_repack`] +
-    /// [`crate::actor::execute_delta_repack`] +
-    /// [`Self::apply_delta_repack_result`]. The actor uses the three
-    /// phases directly so that the heavy middle phase runs off the
-    /// request channel; this wrapper exists for tests and any inline
-    /// callers.
-    pub fn delta_repack_post_snapshot(&mut self) -> io::Result<DeltaRepackStats> {
-        let Some(job) = self.prepare_delta_repack()? else {
-            return Ok(DeltaRepackStats::default());
-        };
-        let result = crate::actor::execute_delta_repack(job)?;
-        let (stats, consumed_inputs) = self.apply_delta_repack_result(result)?;
-        self.remove_consumed_inputs(&consumed_inputs)?;
-        Ok(stats)
-    }
-
-    /// Prep phase of `delta_repack_post_snapshot` — runs on the actor
-    /// thread.
-    ///
-    /// Resolves the latest sealed snapshot and packages the signer
-    /// state + segment-cache handle + base/pending directories into a
-    /// [`DeltaRepackJob`]. Returns `None` when there is no sealed
-    /// snapshot (nothing to source deltas from); the worker dispatch is
-    /// then skipped.
-    ///
-    /// The snapshot-pinned `BlockReader` is constructed by the worker,
-    /// not here — its provenance walk and extent-index rebuild can run
-    /// off the actor.
-    pub fn prepare_delta_repack(&mut self) -> io::Result<Option<DeltaRepackJob>> {
-        let Some(snap_ulid) = latest_snapshot(&self.base_dir)? else {
-            return Ok(None);
-        };
-        let pending_dir = self.base_dir.join("pending");
-
-        // Pre-mint one output ULID per post-snapshot pending segment +
-        // u_flush. Mirrors `prepare_repack`. Bound: every pending
-        // segment could in principle be a candidate; unused ULIDs are
-        // wasted advances of the mint counter (cheap).
-        let candidate_count = match segment::collect_segment_files(&pending_dir) {
-            Ok(v) => v.len(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e),
-        };
-        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(candidate_count);
-        for _ in 0..candidate_count {
-            output_ulids.push(self.mint.next());
-        }
-        let u_flush = self.mint.next();
-        self.flush_wal_to_pending_as(u_flush)?;
-
-        Ok(Some(DeltaRepackJob {
-            base_dir: self.base_dir.clone(),
-            pending_dir,
-            snap_ulid,
-            ceiling: u_flush,
-            output_ulids,
-            lbamap: Arc::clone(&self.lbamap),
-            signer: Arc::clone(&self.signer),
-            verifying_key: self.verifying_key,
-            segment_cache: Arc::clone(&self.segment_cache),
-        }))
-    }
-
-    /// Apply phase of `delta_repack_post_snapshot` — runs on the actor
-    /// thread after the worker returns.
-    ///
-    /// For each rewritten segment: CAS-updates entries against the
-    /// **input** ULID (`current loc.segment_id == input_ulid`) but
-    /// re-points them at the freshly-minted output ULID. Concurrent
-    /// writers that re-pointed a hash at a newer segment win — the
-    /// rewritten body simply becomes unreferenced until the next pass.
-    /// Updates each lbamap entry's claimant ULID in place to the new
-    /// output ULID (the rewrite preserves start_lba/lba_length/hash;
-    /// only storage representation changes) and evicts the input's fd
-    /// cache. The consumed input files are returned for the caller to
-    /// pass to [`Self::remove_consumed_inputs`] after publishing its
-    /// read snapshot.
-    pub fn apply_delta_repack_result(
-        &mut self,
-        result: DeltaRepackResult,
-    ) -> io::Result<(DeltaRepackStats, Vec<PathBuf>)> {
-        let DeltaRepackResult {
-            mut stats,
-            segments,
-        } = result;
-        let pending_dir = self.base_dir.join("pending");
-        let mut consumed_inputs: Vec<PathBuf> = Vec::new();
-
-        for seg in segments {
-            let DeltaRepackedSegment {
-                input_ulid,
-                input_path,
-                new_ulid,
-                rewrite,
-            } = seg;
-            let crate::delta_compute::RewrittenSegment {
-                entries,
-                new_body_section_start: new_bss,
-                delta_region_body_length,
-                stats: seg_stats,
-            } = rewrite;
-
-            let entries_len = entries.len();
-            let consumed: std::collections::HashSet<Ulid> = std::iter::once(input_ulid).collect();
-            let ctx = extentindex::SegmentRegistrationCtx {
-                segment_id: new_ulid,
-                body_section_start: new_bss,
-                body_tier: extentindex::RegistrationBodyTier::Local,
-                delta_body_source: Some(extentindex::DeltaBodySource::Full {
-                    body_section_start: new_bss,
-                    body_length: delta_region_body_length,
-                }),
-                inline: extentindex::InlineSource::EntryInline,
-            };
-            let ei = Arc::make_mut(&mut self.extent_index);
-            let lm = Arc::make_mut(&mut self.lbamap);
-            for (raw_idx, item) in entries.iter().enumerate() {
-                let post = &item.post;
-                match (item.pre_kind, post.kind) {
-                    (EntryKind::Data, EntryKind::Data) => {
-                        ei.replace_if_matches(
-                            post.hash,
-                            input_ulid,
-                            item.pre_stored_offset,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: post.stored_offset,
-                                body_length: post.stored_length,
-                                compressed: post.compressed,
-                                body_source: BodySource::Local,
-                                body_section_start: new_bss,
-                                inline_data: None,
-                            },
-                        );
-                        lm.set_claimant_consuming_input(
-                            post.start_lba,
-                            post.lba_length,
-                            post.hash,
-                            new_ulid,
-                            input_ulid,
-                        );
-                    }
-                    (EntryKind::Inline, EntryKind::Inline) => {
-                        ei.replace_if_matches(
-                            post.hash,
-                            input_ulid,
-                            item.pre_stored_offset,
-                            extentindex::ExtentLocation {
-                                segment_id: new_ulid,
-                                body_offset: post.stored_offset,
-                                body_length: post.stored_length,
-                                compressed: post.compressed,
-                                body_source: BodySource::Local,
-                                body_section_start: new_bss,
-                                inline_data: post.inline.clone(),
-                            },
-                        );
-                        lm.set_claimant_consuming_input(
-                            post.start_lba,
-                            post.lba_length,
-                            post.hash,
-                            new_ulid,
-                            input_ulid,
-                        );
-                    }
-                    (EntryKind::Data, EntryKind::Delta) => {
-                        // Converted entry: drop the input's DATA-map
-                        // location, then register the Delta as the disk
-                        // rebuild would.
-                        ei.remove_if_matches(&post.hash, input_ulid, item.pre_stored_offset);
-                        ei.register_entry_consuming_inputs(post, raw_idx as u32, &ctx, &consumed)?;
-                        let sources: Arc<[blake3::Hash]> =
-                            post.delta_options.iter().map(|o| o.source_hash).collect();
-                        lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
-                        lm.set_claimant_consuming_input(
-                            post.start_lba,
-                            post.lba_length,
-                            post.hash,
-                            new_ulid,
-                            input_ulid,
-                        );
-                    }
-                    (EntryKind::Delta, EntryKind::Delta) => {
-                        // Carried Delta: re-point the delta location at
-                        // the output, gated on the current owner being
-                        // the input this rewrite consumes — a concurrent
-                        // writer that re-pointed the hash wins.
-                        ei.register_entry_consuming_inputs(post, raw_idx as u32, &ctx, &consumed)?;
-                        let sources: Arc<[blake3::Hash]> =
-                            post.delta_options.iter().map(|o| o.source_hash).collect();
-                        lm.set_delta_sources_if_matches(post.start_lba, post.hash, sources);
-                        lm.set_claimant_consuming_input(
-                            post.start_lba,
-                            post.lba_length,
-                            post.hash,
-                            new_ulid,
-                            input_ulid,
-                        );
-                    }
-                    (EntryKind::DedupRef, EntryKind::DedupRef)
-                    | (EntryKind::Zero, EntryKind::Zero) => {
-                        // No body / extent_index update; LBA range and
-                        // hash unchanged. Bring the lbamap claimant
-                        // into agreement with the new on-disk segment.
-                        lm.set_claimant_consuming_input(
-                            post.start_lba,
-                            post.lba_length,
-                            post.hash,
-                            new_ulid,
-                            input_ulid,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            self.evict_cached_segment(input_ulid);
-            consumed_inputs.push(input_path);
-            if self.last_segment_ulid < Some(new_ulid) {
-                self.last_segment_ulid = Some(new_ulid);
-            }
-            self.has_new_segments = true;
-
-            log::info!(
-                "delta_repack: seg {input_ulid} -> {new_ulid} converted {}/{} entries, {}→{} bytes",
-                seg_stats.entries_converted,
-                entries_len,
-                seg_stats.original_body_bytes,
-                seg_stats.delta_body_bytes,
-            );
-
-            stats.segments_rewritten += 1;
-            stats.entries_converted += seg_stats.entries_converted;
-            stats.original_body_bytes += seg_stats.original_body_bytes;
-            stats.delta_body_bytes += seg_stats.delta_body_bytes;
-        }
-
-        segment::fsync_dir(&pending_dir)?;
-
-        Ok((stats, consumed_inputs))
     }
 }
 
@@ -1676,99 +1338,6 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    #[test]
-    fn lock_drop_delta_repack_skips_post_prep_segment() {
-        // Mirrors the repack ceiling filter for `execute_delta_repack`.
-        // Without the filter, a pending segment minted after
-        // `prepare_delta_repack` returns (here: by an explicit
-        // `flush_wal` standing in for a `prepare_promote` racing under
-        // the dropped lock) would be picked up by the worker as a
-        // candidate, rewritten under a pre-minted output ULID that
-        // sorts *below* the input's ULID, then have its file unlinked
-        // by `apply_delta_repack_result` — leaving lbamap claimants
-        // pointing at the deleted ULID (the strict-newer guard refuses
-        // to downgrade).
-        //
-        // Test asserts the post-prep segment's pending file is still
-        // present after apply, AND its writes still read back
-        // correctly across a reopen.
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-
-        // High-entropy so payloads aren't inlined.
-        let payload_a: Vec<u8> = (0..4096usize).map(|i| (i * 7 + 13) as u8).collect();
-        let payload_b: Vec<u8> = (0..4096usize).map(|i| (i * 11 + 3) as u8).collect();
-
-        // Pre-snapshot: write A at lba 100, promote, snapshot.
-        vol.write(100, &payload_a).unwrap();
-        vol.promote_for_test().unwrap();
-        let _snap = vol.snapshot().unwrap();
-
-        // Post-snapshot: write at a different lba so there's *something*
-        // to scan in delta_repack.  The exact entry shape doesn't
-        // matter for this test — what matters is that the post-prep
-        // segment is filtered out before the worker considers it.
-        vol.write(200, &payload_a).unwrap();
-        vol.promote_for_test().unwrap();
-
-        let job = vol
-            .prepare_delta_repack()
-            .unwrap()
-            .expect("delta repack job");
-
-        // Lock-drop window: a direct write at a fresh lba, flushed into
-        // a pending segment with ULID strictly greater than `ceiling`.
-        vol.write(300, &payload_b).unwrap();
-        vol.flush_wal().unwrap();
-
-        // Snapshot the pending dir state *before* execute, so we can
-        // identify the post-prep segment later.
-        let pending_dir = base.join("pending");
-        let pre_apply_pending: std::collections::BTreeSet<String> = fs::read_dir(&pending_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-
-        let result = crate::actor::execute_delta_repack(job).unwrap();
-        let (_stats, consumed) = vol.apply_delta_repack_result(result).unwrap();
-        vol.remove_consumed_inputs(&consumed).unwrap();
-
-        // The post-prep flushed segment must still be in pending/.
-        // (It is the highest-ULID entry in `pending/` post-flush.)
-        let post_apply_pending: std::collections::BTreeSet<String> = fs::read_dir(&pending_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        let post_prep_seg = pre_apply_pending
-            .iter()
-            .max()
-            .expect("pending should not be empty pre-apply");
-        assert!(
-            post_apply_pending.contains(post_prep_seg),
-            "post-prep segment {post_prep_seg} must survive delta_repack apply"
-        );
-
-        // Reads still work in-memory and across reopen.
-        assert_eq!(vol.read(100, 1).unwrap(), payload_a);
-        assert_eq!(vol.read(200, 1).unwrap(), payload_a);
-        assert_eq!(vol.read(300, 1).unwrap(), payload_b);
-
-        drop(vol);
-        let vol2 = Volume::open(&base, &base).unwrap();
-        assert_eq!(vol2.read(100, 1).unwrap(), payload_a);
-        assert_eq!(vol2.read(200, 1).unwrap(), payload_a);
-        assert_eq!(vol2.read(300, 1).unwrap(), payload_b);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    // --- worker-result body tests ---
-    //
-    // Worker results carry body-less `SegmentEntry` metas: the type has
-    // no Data body field, so bodies are excluded structurally. Inline
-    // entries hand their bytes to apply on `entry.inline`. These tests
-    // cover that inline handoff plus apply + read-back.
-
     /// Distinct, incompressible 4 KiB block per seed (splitmix64 stream).
     /// `unique_block` above lz4-compresses below `INLINE_THRESHOLD` for
     /// some seeds; these tests need entries that stay `Data` kind.
@@ -1836,7 +1405,9 @@ mod tests {
         vol.write(1, &[3u8; 4096]).unwrap();
 
         let job = vol.prepare_promote().unwrap().expect("promote job");
-        let result = crate::actor::execute_promote(job).unwrap();
+        let result =
+            crate::actor::execute_promote(job, &mut crate::actor::PriorReaderCache::default())
+                .unwrap();
 
         let mut saw_inline = false;
         for e in &result.entries {
@@ -1847,57 +1418,10 @@ mod tests {
         }
         assert!(saw_inline, "setup must yield an Inline entry");
 
-        vol.apply_promote(&result);
+        vol.apply_promote(&result).unwrap();
 
         assert_eq!(vol.read(0, 1).unwrap(), incompressible_block(9));
         assert_eq!(vol.read(1, 1).unwrap(), [3u8; 4096]);
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn delta_repack_result_applies_body_less_metas() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-
-        let prior = incompressible_block(21);
-        vol.write(100, &prior).unwrap();
-        vol.promote_for_test().unwrap();
-        let _snap = vol.snapshot().unwrap();
-
-        // Same-LBA rewrite delta-compresses against the sealed prior
-        // (converted to Delta); the block at 300 has no prior and stays
-        // Data with its body loaded for the rewrite.
-        let mut updated = prior.clone();
-        updated[0] ^= 0xFF;
-        vol.write(100, &updated).unwrap();
-        vol.write(300, &incompressible_block(22)).unwrap();
-        vol.promote_for_test().unwrap();
-
-        let job = vol
-            .prepare_delta_repack()
-            .unwrap()
-            .expect("delta repack job");
-        let result = crate::actor::execute_delta_repack(job).unwrap();
-        assert!(!result.segments.is_empty(), "segment must be rewritten");
-
-        let (mut saw_data, mut saw_delta) = (false, false);
-        for seg in &result.segments {
-            for item in &seg.rewrite.entries {
-                saw_data |= item.post.kind == EntryKind::Data;
-                saw_delta |= item.post.kind == EntryKind::Delta;
-            }
-        }
-        assert!(
-            saw_data && saw_delta,
-            "setup must yield Data + Delta entries"
-        );
-
-        let (_stats, consumed) = vol.apply_delta_repack_result(result).unwrap();
-        vol.remove_consumed_inputs(&consumed).unwrap();
-
-        assert_eq!(vol.read(100, 1).unwrap(), updated);
-        assert_eq!(vol.read(300, 1).unwrap(), incompressible_block(22));
 
         fs::remove_dir_all(base).unwrap();
     }

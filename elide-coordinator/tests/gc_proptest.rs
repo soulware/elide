@@ -90,10 +90,11 @@ fn promote_gc_outputs(vol: &mut Volume, dir: &Path) {
     }
 }
 
-/// Run one delta-repack pass with the `pick`-th sealed cache body
-/// hidden, restoring it afterwards. Falls back to a plain pass when
-/// there is nothing to hide.
-fn delta_repack_with_evicted_source(vol: &mut Volume, dir: &Path, pick: u8) {
+/// Promote the WAL with the `pick`-th sealed cache body hidden,
+/// restoring it afterwards. The formation delta tier treats an
+/// unreadable source as "skip, delta is best-effort". Falls back to a
+/// plain promote when there is nothing to hide.
+fn flush_with_evicted_source(vol: &mut Volume, dir: &Path, pick: u8) {
     let cache_dir = dir.join("cache");
     let mut bodies: Vec<std::path::PathBuf> = fs::read_dir(&cache_dir)
         .map(|d| {
@@ -108,7 +109,7 @@ fn delta_repack_with_evicted_source(vol: &mut Volume, dir: &Path, pick: u8) {
         .get(pick as usize % bodies.len().max(1))
         .cloned()
         .filter(|t| fs::rename(t, dir.join("evicted-source.aside")).is_ok());
-    let _ = vol.delta_repack_post_snapshot();
+    let _ = vol.flush_wal();
     if let Some(t) = target {
         fs::rename(dir.join("evicted-source.aside"), t).unwrap();
     }
@@ -117,7 +118,7 @@ fn delta_repack_with_evicted_source(vol: &mut Volume, dir: &Path, pick: u8) {
 /// One block of incompressible, hash-derived bytes per seed. Mirrors
 /// `common::incompressible_block` in the elide-core test suite. Stored
 /// raw (lz4 can't shrink it), so the write lands as a body-section
-/// Data entry rather than Inline — the shape delta_repack converts.
+/// Data entry rather than Inline — the shape the delta tier converts.
 fn incompressible_block(seed: u8) -> [u8; 4096] {
     let mut buf = [0u8; 4096];
     let key = [seed; 32];
@@ -133,7 +134,7 @@ fn incompressible_block(seed: u8) -> [u8; 4096] {
 
 /// `incompressible_block(base_seed)` with the first 32 bytes replaced
 /// by `tweak`: a near-duplicate whose zstd-dict delta against the base
-/// is tiny, so delta_repack's smaller-than-stored gate passes.
+/// is tiny, so the delta tier's smaller-than-stored gate passes.
 fn variant_block(base_seed: u8, tweak: u8) -> [u8; 4096] {
     let mut buf = incompressible_block(base_seed);
     buf[..32].fill(tweak);
@@ -142,7 +143,8 @@ fn variant_block(base_seed: u8, tweak: u8) -> [u8; 4096] {
 
 /// Keypair + default (root) `volume.provenance`, matching production
 /// volume setup. The provenance file is required by snapshot-pinned
-/// readers (`BlockReader::open_snapshot`), which `DeltaRepack` builds.
+/// readers (`BlockReader::open_snapshot`), which the formation delta
+/// tier builds.
 fn write_keypair_and_provenance(dir: &Path) {
     let key = elide_core::signing::generate_keypair(
         dir,
@@ -167,30 +169,28 @@ enum SimOp {
     /// future delta candidate's dictionary source once sealed.
     BaseWrite { lba: u8, base_seed: u8 },
     /// Write a near-duplicate of `base_seed`'s block at `lba`. When the
-    /// LBA's sealed prior content shares the base, `DeltaRepack`
-    /// converts this write to a thin Delta entry against it.
+    /// LBA's sealed prior content shares the base, the next promote's
+    /// formation delta tier converts this write to a thin Delta entry
+    /// against it.
     VariantWrite { lba: u8, base_seed: u8, tweak: u8 },
     /// Seal: snapshot (flushes the WAL) + sign the manifest. Gives
-    /// `DeltaRepack` its prior reader and activates the GC floor —
-    /// sealed segments are excluded from compaction.
+    /// the formation delta tier its prior reader and activates the GC
+    /// floor — sealed segments are excluded from compaction.
     SnapshotSign,
-    /// The drain tick's delta_repack: rewrite post-seal single-block
-    /// Data overwrites as Delta entries against the sealed snapshot.
+    /// Promote the WAL: post-seal single-block Data overwrites convert
+    /// to Delta entries against the sealed snapshot at formation.
     /// Content-neutral; no oracle change.
-    DeltaRepack,
-    /// `DeltaRepack` with one sealed cache body hidden for the duration
-    /// of the pass (restored afterwards — content-neutral). The worker
-    /// treats an unreadable source as "skip, delta is best-effort", so
-    /// which entries convert varies between passes. This is the
-    /// reachability precondition for a later pass rewriting a segment
-    /// that already carries a Delta entry — the carried-Delta apply
-    /// arms are unreachable when every pass converts everything.
-    DeltaRepackEvictedSource { pick: u8 },
+    PromoteWal,
+    /// `PromoteWal` with one sealed cache body hidden for the duration
+    /// of the promote (restored afterwards — content-neutral). The
+    /// formation delta tier treats an unreadable source as "skip, delta
+    /// is best-effort", so which entries convert varies.
+    PromoteEvictedSource { pick: u8 },
     /// Two incompressible bases sealed in separate segments (flush
     /// between them), then near-duplicate overwrites of both in one WAL
     /// window. The next flush yields one pending segment holding two
     /// convertible Data entries whose dictionary sources live in
-    /// different sealed segments — so a `DeltaRepackEvictedSource` pass
+    /// different sealed segments — so a `PromoteEvictedSource` pass
     /// converts one and carries the other, and a follow-up pass
     /// rewrites a segment that already holds a Delta entry. Packaged as
     /// one op (like `SplitDedupWrite`) because the shape is a
@@ -292,8 +292,8 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         3 => (0u8..8, 0u8..4, any::<u8>())
             .prop_map(|(lba, base_seed, tweak)| SimOp::VariantWrite { lba, base_seed, tweak }),
         2 => Just(SimOp::SnapshotSign),
-        2 => Just(SimOp::DeltaRepack),
-        2 => any::<u8>().prop_map(|pick| SimOp::DeltaRepackEvictedSource { pick }),
+        2 => Just(SimOp::PromoteWal),
+        2 => any::<u8>().prop_map(|pick| SimOp::PromoteEvictedSource { pick }),
         2 => (0u8..4, 4u8..8, 0u8..4, any::<u8>()).prop_map(|(lba_a, lba_b, base_seed, tweak)| {
             SimOp::SealedBaseVariantPair { lba_a, lba_b, base_seed, tweak }
         }),
@@ -343,8 +343,8 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..30)
 }
 
-/// The BaseWrite → seal → VariantWrite → DeltaRepack chain must
-/// actually mint a Delta entry — asserted on `DeltaRepackStats` so a
+/// The BaseWrite → seal → VariantWrite → promote chain must actually
+/// mint a Delta entry — asserted on the promoted segment's `.idx` so a
 /// future change to the conversion gates cannot silently regress the
 /// suite's Delta coverage to a structural no-op (the gap that hid the
 /// #681 fold mis-registration).
@@ -363,14 +363,21 @@ fn delta_ops_mint_a_delta_entry() {
 
     vol.write(0, &variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
-    let stats = vol.delta_repack_post_snapshot().unwrap();
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .unwrap();
+    let minted = fs::read_dir(fork_dir.join("pending"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_none())
+        .filter_map(|p| elide_core::segment::read_and_verify_segment_index(&p, &vk).ok())
+        .flat_map(|(_, entries, _)| entries)
+        .filter(|e| e.kind == elide_core::segment::EntryKind::Delta)
+        .count();
     assert!(
-        stats.entries_converted >= 1,
-        "near-duplicate post-seal overwrite must convert to a Delta entry \
-         (scanned={} rewritten={} converted={})",
-        stats.segments_scanned,
-        stats.segments_rewritten,
-        stats.entries_converted,
+        minted >= 1,
+        "near-duplicate post-seal overwrite must convert to a Delta entry at formation"
     );
     assert_eq!(
         vol.read(0, 1).unwrap().as_slice(),
@@ -490,11 +497,11 @@ proptest! {
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
                 }
-                SimOp::DeltaRepack => {
-                    let _ = vol.delta_repack_post_snapshot();
+                SimOp::PromoteWal => {
+                    let _ = vol.flush_wal();
                 }
-                SimOp::DeltaRepackEvictedSource { pick } => {
-                    delta_repack_with_evicted_source(&mut vol, fork_dir, *pick);
+                SimOp::PromoteEvictedSource { pick } => {
+                    flush_with_evicted_source(&mut vol, fork_dir, *pick);
                 }
                 SimOp::SealedBaseVariantPair {
                     lba_a,
@@ -743,20 +750,21 @@ proptest! {
                 }
                 SimOp::SnapshotSign => {
                     // Content-neutral: sealing changes which segments GC
-                    // may touch and arms DeltaRepack, not logical bytes.
+                    // may touch and arms the formation delta tier, not
+                    // logical bytes.
                     if let Ok(snap) = vol.snapshot() {
                         let _ = vol.sign_snapshot_manifest(snap);
                     }
                 }
-                SimOp::DeltaRepack => {
+                SimOp::PromoteWal => {
                     // Content-neutral: Data entries become thin Delta
                     // entries materialising to identical bytes.
-                    let _ = vol.delta_repack_post_snapshot();
+                    let _ = vol.flush_wal();
                 }
-                SimOp::DeltaRepackEvictedSource { pick } => {
+                SimOp::PromoteEvictedSource { pick } => {
                     // Content-neutral: the hidden body is restored
                     // before the op returns.
-                    delta_repack_with_evicted_source(&mut vol, fork_dir, *pick);
+                    flush_with_evicted_source(&mut vol, fork_dir, *pick);
                 }
                 SimOp::SealedBaseVariantPair {
                     lba_a,
@@ -1026,8 +1034,8 @@ fn gc_oracle_repro_bug_h() {
 
 /// Deterministic materialisation of the minimal gc_oracle sequence CI
 /// found 2026-07-10 (seed 68cb98…): a sealed variant base, a split
-/// dedup pair, a near-duplicate overwrite of the sealed LBA, then
-/// DeltaRepack and a drain. The drain's promote trips the
+/// dedup pair, a near-duplicate overwrite of the sealed LBA promoted
+/// into a Delta entry, then a drain. The drain's promote trips the
 /// volume-invariants extent-index rebuild check with a phantom inner
 /// entry — an in-memory DATA hash no on-disk index owns.
 #[test]
@@ -1053,11 +1061,10 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
     vol.write(4, &data).unwrap();
     vol.flush_wal().unwrap();
 
-    // VariantWrite { lba: 6, base_seed: 0, tweak: 1 }
+    // VariantWrite { lba: 6, base_seed: 0, tweak: 1 }, promoted — the
+    // formation delta tier converts it against the sealed snapshot.
     vol.write(6, &variant_block(0, 1)).unwrap();
-
-    // DeltaRepack
-    let _ = vol.delta_repack_post_snapshot();
+    vol.flush_wal().unwrap();
 
     // GcSweep's drain: repack + promote each pending segment.
     simulate_upload(&mut vol, fork_dir);
@@ -1069,8 +1076,8 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
 
 /// Deterministic materialisation of the minimal gc_oracle sequence CI
 /// found 2026-07-10 on the #696 merge run: a sealed base, a
-/// near-duplicate overwrite converted by DeltaRepack, then a plain
-/// overwrite of the same LBA before the drain. The drain's promote
+/// near-duplicate overwrite converted to a Delta at promote, then a
+/// plain overwrite of the same LBA before the drain. The drain's promote
 /// trips the volume-invariants rebuild check with a phantom delta —
 /// an in-memory Delta hash no on-disk index owns.
 ///
@@ -1078,7 +1085,6 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
 ///   SnapshotSign
 ///   VariantWrite { lba: 5, base_seed: 3, tweak: 0 }
 ///   Flush
-///   DeltaRepack
 ///   BaseWrite { lba: 5, base_seed: 0 }
 ///   GcSweep
 #[test]
@@ -1100,11 +1106,8 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
     // VariantWrite { lba: 5, base_seed: 3, tweak: 0 }
     vol.write(5, &variant_block(3, 0)).unwrap();
 
-    // Flush
+    // Flush — the formation delta tier converts the variant write.
     vol.flush_wal().unwrap();
-
-    // DeltaRepack
-    let _ = vol.delta_repack_post_snapshot();
 
     // BaseWrite { lba: 5, base_seed: 0 } — supersedes the delta's claim.
     let last = incompressible_block(0);
@@ -1114,145 +1117,6 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
     simulate_upload(&mut vol, fork_dir);
 
     assert_eq!(&vol.read(5, 1).unwrap(), &last);
-}
-
-/// Deterministic materialisation of the lbamap claimant drift two gc
-/// proptests found 2026-07-10 (seeds fdc9b246… and d0e328fc… in
-/// gc_proptest.proptest-regressions): delta-repack converts the
-/// prep-time WAL-flush segment itself, whose pre-minted output ULID
-/// sorts below it, so the apply's strict-newer claimant promotion
-/// refused the re-point and left the in-memory claim naming the
-/// deleted input. The sealing snapshot's promote then tripped the
-/// volume-invariants lbamap rebuild comparison.
-#[test]
-fn gc_oracle_repro_delta_repack_claimant_drift() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let fork_dir = dir.path();
-
-    write_keypair_and_provenance(fork_dir);
-
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-
-    // BaseWrite { lba: 1, base_seed: 0 }
-    vol.write(1, &incompressible_block(0)).unwrap();
-
-    // SnapshotSign
-    let snap = vol.snapshot().unwrap();
-    vol.sign_snapshot_manifest(snap).unwrap();
-
-    // SplitDedupWrite { lba_a: 0, lba_b: 4, seed: 0 }
-    let data = [0u8; 4096];
-    vol.write(0, &data).unwrap();
-    vol.flush_wal().unwrap();
-    vol.write(4, &data).unwrap();
-    vol.flush_wal().unwrap();
-
-    // VariantWrite { lba: 1, base_seed: 0, tweak: 0 } — stays in the
-    // WAL so the DeltaRepack prep's own flush segment carries it.
-    let v = variant_block(0, 0);
-    vol.write(1, &v).unwrap();
-
-    // DeltaRepack — rewrites the prep-flush segment under a pre-minted
-    // (lower) output ULID; the lba 1 claim must move with it.
-    let _ = vol.delta_repack_post_snapshot();
-
-    // SnapshotSign — the seal's promote runs the volume-invariants
-    // rebuild comparison.
-    let snap = vol.snapshot().unwrap();
-    vol.sign_snapshot_manifest(snap).unwrap();
-
-    assert_eq!(&vol.read(1, 1).unwrap(), &v);
-    assert_eq!(&vol.read(0, 1).unwrap(), &data);
-    assert_eq!(&vol.read(4, 1).unwrap(), &data);
-}
-
-/// A delta-repack rewrite that carries an existing Delta entry must
-/// re-point the in-memory delta location at its output — the apply
-/// unlinks the input segment. `apply_delta_repack_result`'s
-/// `(Delta, Delta)` arm used `insert_delta_if_absent`, which refused
-/// while the hash still pointed at the input, leaving the location
-/// aimed at a deleted file; the LBA's next read then failed at
-/// materialisation with "segment not found".
-///
-/// Reaching the arm takes two delta-repack passes with a drain-tick
-/// repack between them. Pass 1 skips one conversion deterministically
-/// (its source cache body is evicted; the worker treats an unreadable
-/// source as "skip — delta is best-effort"). The repack packs the
-/// pass-1 output — re-keying lbamap claimants, which pass 2's
-/// superseded-claim guard requires. Pass 2 converts the skipped entry
-/// and carries pass 1's Delta. Invisible to the drift invariant: the
-/// on-disk pass-2 output does own the hash, and the checker
-/// deliberately compares ownership, not segment ids.
-#[test]
-fn delta_repack_second_pass_carries_delta() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let fork_dir = dir.path();
-
-    write_keypair_and_provenance(fork_dir);
-
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-    let pending_dir = fork_dir.join("pending");
-    let pending = |exclude: &[ulid::Ulid]| -> ulid::Ulid {
-        elide_core::segment::read_ulid_dir_sorted(&pending_dir)
-            .unwrap()
-            .into_iter()
-            .find(|u| !exclude.contains(u))
-            .unwrap()
-    };
-
-    // Two bases in separate segments so pass 1 can lose exactly one
-    // source body.
-    vol.write(6, &incompressible_block(6)).unwrap();
-    vol.flush_wal().unwrap();
-    let base6_seg = pending(&[]);
-    vol.write(7, &incompressible_block(7)).unwrap();
-    vol.flush_wal().unwrap();
-    let base7_seg = pending(&[base6_seg]);
-
-    // Seal them; snapshot() promotes both to index/ + cache/.
-    let snap = vol.snapshot().unwrap();
-    vol.sign_snapshot_manifest(snap).unwrap();
-
-    // Evict lba 7's source body for pass 1.
-    let base7_body = fork_dir.join("cache").join(format!("{base7_seg}.body"));
-    let aside = fork_dir.join("base7.body.aside");
-    fs::rename(&base7_body, &aside).unwrap();
-
-    // A pending segment with no snapshot counterpart, so prepare
-    // pre-mints an output ULID for the worker to rewrite with.
-    vol.write(9, &incompressible_block(9)).unwrap();
-    vol.flush_wal().unwrap();
-
-    // Near-duplicate overwrites of both sealed LBAs in one WAL window —
-    // one flushed segment with two convertible Data entries.
-    let v6 = variant_block(6, 1);
-    let v7 = variant_block(7, 1);
-    vol.write(6, &v6).unwrap();
-    vol.write(7, &v7).unwrap();
-
-    let pass1 = vol.delta_repack_post_snapshot().unwrap();
-    assert_eq!(
-        pass1.entries_converted, 1,
-        "pass 1 must convert lba 6 and skip lba 7 (source body evicted)"
-    );
-
-    fs::rename(&aside, &base7_body).unwrap();
-
-    // Drain-tick repack: packs the pass-1 output with its pending
-    // sibling and re-keys the lbamap claimants to the packed segment.
-    // Without this, pass 2's superseded-claim guard skips the segment
-    // (pass-1 outputs sort below their input's flush ULID, so its
-    // claims still name the deleted input).
-    let _ = vol.repack().unwrap();
-
-    let pass2 = vol.delta_repack_post_snapshot().unwrap();
-    assert_eq!(
-        pass2.entries_converted, 1,
-        "pass 2 must convert the carried lba 7 Data entry"
-    );
-
-    assert_eq!(&vol.read(6, 1).unwrap(), &v6);
-    assert_eq!(&vol.read(7, 1).unwrap(), &v7);
 }
 
 /// Deterministic regression for a proptest failure under the plan-based
@@ -1342,60 +1206,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         final_idx.len(),
         final_idx.join(", "),
     );
-}
-
-/// Deterministic regression for a proptest failure on main (CI run
-/// 29011159501): delta_repack rewrote a pending segment holding
-/// {Data lba3, Zero [0,2)} to a fresh ULID above the later pending
-/// segment claiming LBA 1, so the re-emitted Zero resurrected its dead
-/// LBA 1 claim on lbamap rebuild — drift at the promote inside the
-/// final `SnapshotSign`. The superseded-claim guard in
-/// `execute_delta_repack` now skips that segment.
-///
-/// Minimal input from proptest shrinking:
-///   VariantWrite { lba: 3, base_seed: 3, tweak: 0 }
-///   SnapshotSign
-///   VariantWrite { lba: 3, base_seed: 3, tweak: 1 }
-///   ZeroThenPartialWrite { start_lba: 0, span: 2, inner_off: 1, seed: 0 }
-///   DeltaRepack
-///   SnapshotSign
-#[test]
-fn delta_repack_zero_sibling_lbamap_drift() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let fork_dir = dir.path();
-    write_keypair_and_provenance(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
-
-    // Op 1: VariantWrite lba=3 base_seed=3 tweak=0.
-    vol.write(3, &variant_block(3, 0)).unwrap();
-
-    // Op 2: SnapshotSign.
-    let snap = vol.snapshot().unwrap();
-    vol.sign_snapshot_manifest(snap).unwrap();
-
-    // Op 3: VariantWrite lba=3 base_seed=3 tweak=1.
-    vol.write(3, &variant_block(3, 1)).unwrap();
-
-    // Op 4: ZeroThenPartialWrite start_lba=0 span=2 inner_off=1 seed=0.
-    vol.write_zeroes(0, 2).unwrap();
-    vol.flush_wal().unwrap();
-    vol.write(1, &[0u8; 4096]).unwrap();
-    vol.flush_wal().unwrap();
-
-    // Op 5: DeltaRepack. The Zero [0,2) segment's LBA 1 claim is
-    // superseded by the later data segment, so the guard must skip it.
-    let stats = vol.delta_repack_post_snapshot().unwrap();
-    assert_eq!(stats.segments_rewritten, 0, "stats: {stats:?}");
-    assert_eq!(stats.segments_skipped_superseded, 1, "stats: {stats:?}");
-
-    // Op 6: SnapshotSign — the promotes inside snapshot() run the
-    // lbamap drift assert.
-    let snap = vol.snapshot().unwrap();
-    vol.sign_snapshot_manifest(snap).unwrap();
-
-    assert_eq!(&vol.read(3, 1).unwrap(), &variant_block(3, 1));
-    assert_eq!(&vol.read(1, 1).unwrap(), &[0u8; 4096]);
-    assert_eq!(&vol.read(0, 1).unwrap(), &[0u8; 4096]);
 }
 
 fn list_dir(dir: &Path) -> Vec<String> {

@@ -40,8 +40,7 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, DeltaRepackJob, DeltaRepackResult, DeltaRepackStats,
-    DeltaRepackedSegment, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
+    AncestorLayer, CompactionStats, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
     ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult,
@@ -117,9 +116,6 @@ pub(crate) enum VolumeRequest {
     },
     Repack {
         reply: Sender<io::Result<CompactionStats>>,
-    },
-    DeltaRepackPostSnapshot {
-        reply: Sender<io::Result<DeltaRepackStats>>,
     },
     /// Promote the current WAL to a `pending/` segment via the worker
     /// thread.  Reply is sent once `pending/<ulid>` is on disk.
@@ -291,10 +287,6 @@ struct ParkedOps {
     /// Reply channel for an in-flight `Repack` request, parked while
     /// the worker thread executes the repack.
     repack: Option<Sender<io::Result<CompactionStats>>>,
-    /// Reply channel for an in-flight `DeltaRepackPostSnapshot`
-    /// request, parked while the worker thread executes the delta
-    /// rewrite.
-    delta_repack: Option<Sender<io::Result<DeltaRepackStats>>>,
     /// Reply channel for an in-flight `SignSnapshotManifest` request,
     /// parked while the worker thread enumerates `index/`, signs, and
     /// writes the manifest + marker.  Concurrent requests are rejected
@@ -429,21 +421,6 @@ impl VolumeActor {
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let (stats, consumed_inputs) = self.lock_volume().apply_repack_result(result)?;
         if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
-            self.publish_snapshot();
-        }
-        self.lock_volume()
-            .remove_consumed_inputs(&consumed_inputs)?;
-        Ok(stats)
-    }
-
-    /// Delta-repack twin of [`Self::apply_repack_and_publish`] — same
-    /// publish-before-unlink ordering.
-    fn apply_delta_repack_and_publish(
-        &mut self,
-        result: DeltaRepackResult,
-    ) -> io::Result<DeltaRepackStats> {
-        let (stats, consumed_inputs) = self.lock_volume().apply_delta_repack_result(result)?;
-        if stats.entries_converted > 0 || !consumed_inputs.is_empty() {
             self.publish_snapshot();
         }
         self.lock_volume()
@@ -771,38 +748,6 @@ impl VolumeActor {
         self.parked.repack = Some(reply);
     }
 
-    /// Run the delta_repack prep on the actor and dispatch the heavy
-    /// middle to the worker.  Reply is parked until
-    /// [`crate::volume::DeltaRepackResult`] arrives and is applied.
-    ///
-    /// Reply is sent immediately with default stats when the prep
-    /// returns `None` (no sealed snapshot) or when the dispatch fails
-    /// because the worker channel has closed.
-    fn start_delta_repack(&mut self, reply: Sender<io::Result<DeltaRepackStats>>) {
-        let job = match self.lock_volume().prepare_delta_repack() {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                let _ = reply.send(Ok(DeltaRepackStats::default()));
-                return;
-            }
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
-        // `prepare_delta_repack` flushes the WAL before pre-minting
-        // output ULIDs (mirrors `start_repack`).
-        // Republish so readers don't resolve hashes through a deleted
-        // WAL.
-        self.publish_snapshot();
-        if let Err(e) = self.send_worker_job(WorkerJob::DeltaRepack(job)) {
-            warn!("delta_repack dispatch failed: {e}");
-            let _ = reply.send(Err(e));
-            return;
-        }
-        self.parked.delta_repack = Some(reply);
-    }
-
     /// Run the reclaim prep on the actor and dispatch the heavy middle
     /// (body reads + re-hash + re-compress + segment assembly) to the
     /// worker. Reply is parked until [`crate::volume::ReclaimResult`]
@@ -899,7 +844,6 @@ impl VolumeActor {
             || self.pipeline.promote_segments_in_flight > 0
             || self.parked.handoff_in_flight
             || self.parked.repack.is_some()
-            || self.parked.delta_repack.is_some()
             || self.parked.sign_snapshot_manifest.is_some()
             || self.parked.reclaim.is_some()
     }
@@ -912,20 +856,33 @@ impl VolumeActor {
             WorkerResult::Promote(Ok(result)) => {
                 self.pipeline.promotes_in_flight -= 1;
                 let ulid = result.segment_ulid;
-                self.lock_volume().apply_promote(&result);
+                let apply = self.lock_volume().apply_promote(&result);
+                if let Err(e) = &apply {
+                    // The segment is committed and the old WAL was kept, so
+                    // reads stay resolvable; the in-memory maps are missing
+                    // this apply. Parked repliers get the error so the
+                    // coordinator aborts its tick.
+                    error!("apply of promoted segment {ulid} failed: {e}");
+                }
                 self.publish_snapshot();
                 // Resolve parked flushes only after apply + publish
                 // so the caller observes the old WAL deleted and the
                 // new snapshot visible — not just the durability barrier.
                 self.on_promote_success();
 
+                let clone_apply = |apply: &io::Result<()>| match apply {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                };
                 // Complete any parked operations waiting for this ULID.
                 // GC checkpoint.
                 if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
                     let own_segments = Some(self.lock_volume().own_segments_commitment());
-                    let _ = parked.reply.send(Ok(crate::volume_ipc::GcCheckpointReply {
-                        bucket_ulids: parked.u_buckets,
-                        own_segments,
+                    let _ = parked.reply.send(clone_apply(&apply).map(|()| {
+                        crate::volume_ipc::GcCheckpointReply {
+                            bucket_ulids: parked.u_buckets,
+                            own_segments,
+                        }
                     }));
                 }
                 // PromoteWal callers.
@@ -933,7 +890,7 @@ impl VolumeActor {
                 while i < self.pipeline.parked_promote_wal.len() {
                     if self.pipeline.parked_promote_wal[i].segment_ulid == ulid {
                         let parked = self.pipeline.parked_promote_wal.swap_remove(i);
-                        let _ = parked.reply.send(Ok(()));
+                        let _ = parked.reply.send(clone_apply(&apply));
                     } else {
                         i += 1;
                     }
@@ -1042,19 +999,6 @@ impl VolumeActor {
                     Ok(r) => self.apply_repack_and_publish(r),
                     Err(e) => {
                         warn!("worker repack failed: {e}");
-                        Err(e)
-                    }
-                };
-                if let Some(reply) = reply {
-                    let _ = reply.send(outcome);
-                }
-            }
-            WorkerResult::DeltaRepack(result) => {
-                let reply = self.parked.delta_repack.take();
-                let outcome = match result {
-                    Ok(r) => self.apply_delta_repack_and_publish(r),
-                    Err(e) => {
-                        warn!("worker delta_repack failed: {e}");
                         Err(e)
                     }
                 };
@@ -1213,15 +1157,6 @@ impl VolumeActor {
                                     .send(Err(io::Error::other("concurrent repack not allowed")));
                             } else {
                                 self.start_repack(reply);
-                            }
-                        }
-                        VolumeRequest::DeltaRepackPostSnapshot { reply } => {
-                            if self.parked.delta_repack.is_some() {
-                                let _ = reply.send(Err(io::Error::other(
-                                    "concurrent delta_repack not allowed",
-                                )));
-                            } else {
-                                self.start_delta_repack(reply);
                             }
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
@@ -1600,19 +1535,6 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))?
     }
 
-    /// Rewrite post-snapshot pending segments with zstd-dictionary deltas
-    /// against same-LBA extents from the latest sealed snapshot.  Blocks
-    /// until the actor replies.
-    pub fn delta_repack_post_snapshot(&self) -> io::Result<DeltaRepackStats> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::DeltaRepackPostSnapshot { reply: reply_tx })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
-    }
-
     /// Apply any pending GC handoff files via the actor.  Blocks until the
     /// actor replies.  The actor republishes the snapshot if any handoffs were
     /// applied so that reads immediately reflect the updated extent index.
@@ -1881,9 +1803,12 @@ impl VolumeReader {
 /// `result_tx`.  Exits when `job_rx` disconnects (actor dropped the sender)
 /// or `result_tx` disconnects (actor gone).
 fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
+    let mut prior_cache = PriorReaderCache::default();
     while let Ok(job) = job_rx.recv() {
         let msg = match job {
-            WorkerJob::Promote(job) => WorkerResult::Promote(execute_promote(job)),
+            WorkerJob::Promote(job) => {
+                WorkerResult::Promote(execute_promote(job, &mut prior_cache))
+            }
             WorkerJob::GcPlan(job) => WorkerResult::GcPlan(execute_gc_plan_apply(job)),
             WorkerJob::PromoteSegment(job) => {
                 let ulid = job.ulid;
@@ -1891,7 +1816,6 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::PromoteSegment { ulid, result }
             }
             WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
-            WorkerJob::DeltaRepack(job) => WorkerResult::DeltaRepack(execute_delta_repack(job)),
             WorkerJob::SignSnapshotManifest(job) => {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
@@ -2046,7 +1970,7 @@ fn cancelled_result(
 /// `BodyResolver` impl that holds borrowed references to the volume's
 /// segment-resolution dependencies. Used both by the worker-thread GC
 /// apply path (which doesn't have a live Volume to borrow) and by
-/// synchronous, on-actor rewriters (sweep / repack / delta_repack)
+/// synchronous, on-actor rewriters (sweep / repack)
 /// that hold a `&Volume` and can lend its fields.
 pub(crate) struct WorkerBodyResolver<'a> {
     pub(crate) base_dir: &'a std::path::Path,
@@ -2104,17 +2028,60 @@ impl crate::rewrite_apply::BodyResolver for WorkerBodyResolver<'_> {
     }
 }
 
+/// Snapshot-pinned [`BlockReader`] reused across promote jobs on one
+/// thread, keyed by the sealed snapshot ULID it was opened against.
+/// Rebuilding the reader walks the provenance chain and every `.idx` in
+/// the lineage, so paying that once per snapshot rather than once per
+/// promote matters under sustained write load. The worker thread owns
+/// one across its job loop; inline promote sites pass a fresh default.
+#[derive(Default)]
+pub(crate) struct PriorReaderCache {
+    cached: Option<(Ulid, crate::block_reader::BlockReader)>,
+}
+
+impl PriorReaderCache {
+    /// Reader for `snap_ulid`, rebuilding when the cached one was opened
+    /// against a different snapshot. No fetcher: a source body missing
+    /// locally is a skipped candidate, never an S3 fetch.
+    fn reader_for(
+        &mut self,
+        base_dir: &std::path::Path,
+        snap_ulid: Ulid,
+    ) -> io::Result<&crate::block_reader::BlockReader> {
+        if self.cached.as_ref().is_none_or(|(u, _)| *u != snap_ulid) {
+            let reader = crate::block_reader::BlockReader::open_snapshot(
+                base_dir,
+                &snap_ulid,
+                Box::new(|_| None),
+            )?;
+            self.cached = Some((snap_ulid, reader));
+        }
+        // The line above just populated the cache on the miss path.
+        Ok(&self
+            .cached
+            .as_ref()
+            .expect("prior reader cache populated")
+            .1)
+    }
+}
+
 /// Execute a promote job: fsync the old WAL, materialise pending bodies
-/// from it, and write + commit the pending segment.
+/// from it, delta-classify against the sealed snapshot, and write +
+/// commit the pending segment.
 ///
 /// On failure the job is returned intact inside [`PromoteFailure`] so the
 /// caller can retry it — the old WAL on disk stays the durable copy of the
 /// epoch, and a retry rewrites the same `pending/<ulid>.tmp` idempotently.
+/// The delta conversion mutates only the materialised pendings, never
+/// `job.entries`, so a failed promote restores cleanly.
 ///
 /// Also reachable from the inline (on-actor) `Volume::flush_wal_to_pending_as`
 /// path and the startup recovery promote in `Volume::open_impl`, so all
 /// three execution sites share one write pass.
-pub(crate) fn execute_promote(job: PromoteJob) -> Result<PromoteResult, PromoteFailure> {
+pub(crate) fn execute_promote(
+    job: PromoteJob,
+    prior_cache: &mut PriorReaderCache,
+) -> Result<PromoteResult, PromoteFailure> {
     fn fail(error: io::Error, job: PromoteJob) -> PromoteFailure {
         PromoteFailure {
             error,
@@ -2129,7 +2096,7 @@ pub(crate) fn execute_promote(job: PromoteJob) -> Result<PromoteResult, PromoteF
     // Body bytes for entries written via `write_commit` live only in the
     // WAL between commit and promote. Pair them with their WAL bytes via
     // `body_offsets` for write_and_commit to consume.
-    let pendings = match crate::volume::materialise_pending_bodies(
+    let mut pendings = match crate::volume::materialise_pending_bodies(
         &job.old_wal_path,
         &job.entries,
         &job.body_offsets,
@@ -2138,20 +2105,68 @@ pub(crate) fn execute_promote(job: PromoteJob) -> Result<PromoteResult, PromoteF
         Err(e) => return Err(fail(e, job)),
     };
 
+    // Delta tier: convert single-block Data entries whose same-LBA prior
+    // extent beats the stored size as a zstd dictionary. Best-effort on
+    // reader construction (a promote must not fail because the delta
+    // optimisation's snapshot reader broke); conversion errors are real
+    // corruption and fail the promote.
+    let mut delta_body: Vec<u8> = Vec::new();
+    if let Some(prior_spec) = &job.delta_prior {
+        match prior_cache.reader_for(&prior_spec.base_dir, prior_spec.snap_ulid) {
+            Ok(prior) => {
+                match crate::delta_compute::delta_pendings_against_prior(&mut pendings, prior) {
+                    Ok((body, stats)) => {
+                        if stats.entries_converted > 0 {
+                            log::info!(
+                                "formation {}: {} delta entries vs snapshot {}, {} → {} bytes",
+                                job.segment_ulid,
+                                stats.entries_converted,
+                                prior_spec.snap_ulid,
+                                stats.original_body_bytes,
+                                stats.delta_body_bytes,
+                            );
+                        }
+                        delta_body = body;
+                    }
+                    Err(e) => return Err(fail(e, job)),
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "formation {}: snapshot {} reader unavailable, skipping delta tier: {e}",
+                    job.segment_ulid, prior_spec.snap_ulid
+                );
+            }
+        }
+    }
+
     match segment::write_and_commit(
         &job.pending_dir,
         job.segment_ulid,
         pendings,
+        &delta_body,
         job.signer.as_ref(),
     ) {
-        Ok((body_section_start, entries)) => Ok(PromoteResult {
-            segment_ulid: job.segment_ulid,
-            old_wal_ulid: job.old_wal_ulid,
-            old_wal_path: job.old_wal_path,
-            body_section_start,
-            entries,
-            pre_promote_offsets: job.pre_promote_offsets,
-        }),
+        Ok((body_section_start, entries)) => {
+            let delta_region_body_length: u64 = if delta_body.is_empty() {
+                0
+            } else {
+                entries
+                    .iter()
+                    .filter(|e| e.kind == segment::EntryKind::Data)
+                    .map(|e| e.stored_length as u64)
+                    .sum()
+            };
+            Ok(PromoteResult {
+                segment_ulid: job.segment_ulid,
+                old_wal_ulid: job.old_wal_ulid,
+                old_wal_path: job.old_wal_path,
+                body_section_start,
+                entries,
+                pre_promote_offsets: job.pre_promote_offsets,
+                delta_region_body_length,
+            })
+        }
         Err(e) => Err(fail(e, job)),
     }
 }
@@ -2666,142 +2681,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         stats,
         buckets: result_buckets,
     })
-}
-
-/// Worker-thread execution of a [`DeltaRepackJob`]. Constructs the
-/// snapshot-pinned `BlockReader`, iterates every post-snapshot segment
-/// in `pending/`, and invokes
-/// [`crate::delta_compute::rewrite_post_snapshot_with_prior`] against
-/// the prior-snapshot reader. Segments with an LBA claim superseded by
-/// a later pending segment are skipped — see the guard below.
-///
-/// Per-segment errors are logged and the segment is skipped so one bad
-/// segment can't derail the whole pass — mirrors the pre-offload
-/// behaviour. The worker never updates the extent index; that's the
-/// apply phase's job.
-pub(crate) fn execute_delta_repack(job: DeltaRepackJob) -> io::Result<DeltaRepackResult> {
-    use crate::block_reader::BlockReader;
-    use crate::delta_compute;
-
-    let DeltaRepackJob {
-        base_dir,
-        pending_dir,
-        snap_ulid,
-        ceiling,
-        output_ulids,
-        lbamap,
-        signer,
-        verifying_key,
-        segment_cache,
-    } = job;
-
-    // Snapshot-pinned reader on the prior sealed snapshot. We pass a
-    // `None` fetcher: delta repack is best-effort, and if a source body
-    // is evicted locally we skip it rather than pull bytes off S3 just
-    // to seed a dictionary.
-    let prior = BlockReader::open_snapshot(&base_dir, &snap_ulid, Box::new(|_| None))?;
-
-    let mut seg_paths = match segment::collect_segment_files(&pending_dir) {
-        Ok(v) => v,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    seg_paths.sort();
-
-    let mut stats = DeltaRepackStats::default();
-    let mut segments: Vec<DeltaRepackedSegment> = Vec::new();
-    let mut next_output_idx: usize = 0;
-
-    for seg_path in seg_paths {
-        let seg_filename = seg_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| io::Error::other("bad segment filename"))?;
-        let seg_id =
-            Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
-
-        // Skip segments at or below the latest snapshot — they are
-        // snapshot-frozen and must not be rewritten.
-        if seg_id <= snap_ulid {
-            continue;
-        }
-        // Skip segments minted after prep — rewriting one under a
-        // pre-minted output ULID (which sorts below `ceiling`) would
-        // let apply delete the input file while leaving the lbamap
-        // claimant pointing at the deleted ULID. Same shape of
-        // protection as `execute_repack`'s ceiling filter.
-        if seg_id > ceiling {
-            continue;
-        }
-
-        stats.segments_scanned += 1;
-
-        // Rewriting re-emits every entry at a fresh ULID that sorts
-        // above all other pending segments, so it is only sound when
-        // this segment still holds every LBA it claims — a claim
-        // superseded by a later pending segment would be resurrected
-        // on the last-writer-wins lbamap rebuild. Skip the segment
-        // otherwise; the delta conversion is an optimisation only.
-        let parsed = match segment_cache.read_and_verify(&seg_path, &verifying_key) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("delta_repack: seg {seg_id} read failed: {e} — leaving segment unchanged");
-                continue;
-            }
-        };
-        let claims_held = parsed.entries.iter().all(|e| {
-            e.kind.is_canonical_only()
-                || (e.start_lba..e.start_lba + e.lba_length as u64)
-                    .all(|lba| lbamap.claimant_at(lba) == Some(seg_id))
-        });
-        if !claims_held {
-            stats.segments_skipped_superseded += 1;
-            continue;
-        }
-
-        // Pre-mint a fresh output ULID for this rewrite. We only pop
-        // an ULID if we'll actually use it; rewriters that decline
-        // skip the consumption.
-        let new_ulid = match output_ulids.get(next_output_idx) {
-            Some(u) => *u,
-            None => {
-                warn!(
-                    "delta_repack: ran out of pre-minted output ULIDs at seg {seg_id} — skipping"
-                );
-                continue;
-            }
-        };
-        let output_path = pending_dir.join(new_ulid.to_string());
-
-        let rewritten = match delta_compute::rewrite_post_snapshot_with_prior(
-            &seg_path,
-            &output_path,
-            &prior,
-            signer.as_ref(),
-            &verifying_key,
-            &segment_cache,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("delta_repack: seg {seg_id} rewrite failed: {e} — leaving segment unchanged");
-                continue;
-            }
-        };
-        let Some(rewrite) = rewritten else {
-            continue;
-        };
-
-        // Successful rewrite — consume the pre-minted ULID slot.
-        next_output_idx += 1;
-        segments.push(DeltaRepackedSegment {
-            input_ulid: seg_id,
-            input_path: seg_path,
-            new_ulid,
-            rewrite,
-        });
-    }
-
-    Ok(DeltaRepackResult { stats, segments })
 }
 
 /// Execute a snapshot-manifest sign job: enumerate `index/`, drop

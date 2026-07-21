@@ -1822,13 +1822,15 @@ pub fn write_and_commit(
     pending_dir: &Path,
     ulid: ulid::Ulid,
     entries: Vec<PendingEntry>,
+    delta_body: &[u8],
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let ulid_str = ulid.to_string();
     let tmp_path = pending_dir.join(format!("{ulid_str}.tmp"));
     let final_path = pending_dir.join(&ulid_str);
 
-    let (body_section_start, entries) = write_segment(&tmp_path, entries, signer)?;
+    let (body_section_start, entries) =
+        write_segment_with_delta_body(&tmp_path, entries, delta_body, signer)?;
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
@@ -1852,7 +1854,7 @@ pub fn promote(
     entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
-    let written = write_and_commit(pending_dir, ulid, entries, signer)?;
+    let written = write_and_commit(pending_dir, ulid, entries, &[], signer)?;
     // WAL is now redundant; segment is the sole copy.
     fs::remove_file(wal_path)?;
     Ok(written)

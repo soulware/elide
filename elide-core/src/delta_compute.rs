@@ -26,7 +26,6 @@ use crate::segment::{
     self, DeltaOption, EntryKind, SegmentEntry, SegmentSigner, populate_inline_bodies,
     read_and_verify_segment_index, read_body_section_bodies, write_segment_with_delta_body,
 };
-use crate::segment_cache::SegmentIndexCache;
 use crate::signing::{self, VerifyingKey};
 use crate::volume;
 
@@ -453,92 +452,23 @@ pub struct SegmentDeltaStats {
     pub delta_body_bytes: u64,
 }
 
-/// A single entry rewritten by [`rewrite_post_snapshot_with_prior`]. Carries
-/// both the post-rewrite entry and the pre-rewrite (kind, stored_offset)
-/// pair so the apply phase can CAS against the source location.
-pub struct RewrittenEntry {
-    /// Entry kind before the rewrite.
-    pub pre_kind: EntryKind,
-    /// `stored_offset` before the rewrite (CAS key for the apply phase).
-    pub pre_stored_offset: u64,
-    /// Entry after the rewrite.
-    pub post: SegmentEntry,
-}
-
-/// Result of rewriting one segment. The apply phase uses `entries` +
-/// `new_body_section_start` + `delta_region_body_length` to update the
-/// extent index; `stats` feeds the aggregated pass stats.
-pub struct RewrittenSegment {
-    pub entries: Vec<RewrittenEntry>,
-    pub new_body_section_start: u64,
-    /// Length of the tail body region that holds the Data entries
-    /// re-emitted verbatim; the delta region starts at
-    /// `new_body_section_start + delta_region_body_length`.
-    pub delta_region_body_length: u64,
-    pub stats: SegmentDeltaStats,
-}
-
-/// Rewrite one post-snapshot pending segment, converting single-block
-/// `Data` entries to thin `Delta` entries whenever the prior sealed
-/// snapshot holds a same-LBA extent that compresses well as a zstd
-/// dictionary.
+/// Convert single-block `Data` pendings to thin `Delta` entries wherever
+/// `prior` holds a different same-LBA extent whose body is locally
+/// present and the zstd-dict delta beats the stored size. Runs at segment
+/// formation, on the materialised pendings, before the segment is
+/// written.
 ///
-/// `prior` must be a snapshot-pinned `BlockReader` opened against the
-/// latest sealed snapshot. For each single-block `Data` entry in
-/// `seg_path`, we resolve `prior.hash_for_lba(lba)` to find the
-/// candidate source hash, read the full source plaintext via
-/// `prior.read_extent_body`, and compress the child body with that
-/// source as the zstd dictionary. Conversions with `delta_len >=
-/// stored_length` are skipped; multi-block entries are left alone (a
-/// Tier 2 refinement relaxes that).
+/// `prior` must be a snapshot-pinned [`BlockReader`] on the latest sealed
+/// snapshot, opened without a fetcher — a source body missing locally is
+/// skipped, never fetched from S3 to seed a dictionary. Multi-block
+/// entries are left alone.
 ///
-/// Returns the rewritten entries (with their fresh `stored_offset`
-/// values), the new `body_section_start`, and a stats struct. The
-/// caller is responsible for updating the in-memory extent index —
-/// this function only touches the segment file.
-///
-/// `output_path` is the destination the rewritten segment is renamed
-/// to. Pre-PR-272 callers passed `seg_path` itself (in-place rewrite,
-/// reusing the input ULID); the migrated call site passes
-/// `pending/<u_dr>` for a freshly-minted output ULID so concurrent
-/// VolumeReaders holding the pre-rewrite snapshot can't observe a
-/// same-path / different-body alias mid-flight.
-pub fn rewrite_post_snapshot_with_prior(
-    seg_path: &Path,
-    output_path: &Path,
+/// Returns the delta body region (each converted entry's `delta_offset`
+/// indexes into it) and the conversion stats.
+pub fn delta_pendings_against_prior(
+    pendings: &mut [segment::PendingEntry],
     prior: &BlockReader,
-    signer: &dyn SegmentSigner,
-    vk: &VerifyingKey,
-    segment_cache: &SegmentIndexCache,
-) -> io::Result<Option<RewrittenSegment>> {
-    let parsed = segment_cache.read_and_verify(seg_path, vk)?;
-    let body_section_start = parsed.body_section_start;
-    let mut entries = parsed.entries.clone();
-    // Capture pre-rewrite (kind, stored_offset) per entry so the apply
-    // phase can CAS against the source location. Paired by index with
-    // the post-rewrite entries returned below.
-    let pre_meta: Vec<(EntryKind, u64)> =
-        entries.iter().map(|e| (e.kind, e.stored_offset)).collect();
-
-    // Early out: does any single-block Data entry have a same-LBA prior hash?
-    let any_candidate = entries.iter().any(|e| {
-        e.kind == EntryKind::Data && e.lba_length == 1 && prior.hash_for_lba(e.start_lba).is_some()
-    });
-    if !any_candidate {
-        return Ok(None);
-    }
-
-    // Load all body-section bodies — both the ones we might convert and
-    // the ones we need to re-emit verbatim, plus inline bytes so the
-    // rewrite can emit the inline section. Same pattern as
-    // `maybe_rewrite_segment`.
-    let has_inline = entries.iter().any(|e| e.kind.is_inline());
-    if has_inline {
-        let inline_bytes = read_inline_section(seg_path, &entries)?;
-        populate_inline_bodies(&mut entries, &inline_bytes)?;
-    }
-    let mut pendings = read_body_section_bodies(seg_path, body_section_start, entries)?;
-
+) -> io::Result<(Vec<u8>, SegmentDeltaStats)> {
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
     let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
@@ -616,48 +546,5 @@ pub fn rewrite_post_snapshot_with_prior(
         pending.body = None;
     }
 
-    if stats.entries_converted == 0 {
-        return Ok(None);
-    }
-
-    let tmp_path = {
-        let mut name = output_path
-            .file_name()
-            .ok_or_else(|| io::Error::other("output path has no filename"))?
-            .to_owned();
-        name.push(".delta.tmp");
-        output_path.with_file_name(name)
-    };
-    let _ = fs::remove_file(&tmp_path);
-    let (new_body_section_start, entries) =
-        write_segment_with_delta_body(&tmp_path, pendings, &delta_body, signer)?;
-    fs::rename(&tmp_path, output_path)?;
-    segment::fsync_dir(output_path)?;
-
-    // Delta region starts at `new_body_section_start + delta_region_body_length`.
-    // Compute it from post-rewrite stored_length on Data entries; that's the
-    // same sum `write_segment_with_delta_body` used when laying out the
-    // body section.
-    let delta_region_body_length: u64 = entries
-        .iter()
-        .filter(|e| e.kind == EntryKind::Data)
-        .map(|e| e.stored_length as u64)
-        .sum();
-
-    let rewritten = entries
-        .into_iter()
-        .zip(pre_meta)
-        .map(|(post, (pre_kind, pre_stored_offset))| RewrittenEntry {
-            pre_kind,
-            pre_stored_offset,
-            post,
-        })
-        .collect();
-
-    Ok(Some(RewrittenSegment {
-        entries: rewritten,
-        new_body_section_start,
-        delta_region_body_length,
-        stats,
-    }))
+    Ok((delta_body, stats))
 }
