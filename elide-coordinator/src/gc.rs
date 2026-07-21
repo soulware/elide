@@ -2,8 +2,8 @@
 //
 // Per-tick first-fit-decreasing bin-pack across cache-resident eligible
 // segments, emitting up to `max_buckets_per_tick` output plans (each ≤
-// SWEEP_LIVE_CAP = 32 MiB live bytes / SWEEP_ENTRY_CAP = 8192 entries).
-// See `docs/design/gc-bucket-unification.md`.
+// SWEEP_MATERIALISE_CAP = 32 MiB materialised bytes / SWEEP_ENTRY_CAP =
+// 8192 entries). See `docs/design/gc-bucket-unification.md`.
 //
 //   Eligibility:
 //     * dead input — live_lba_bytes == 0, includable at zero rewrite cost
@@ -25,15 +25,16 @@
 //
 //   Packing:
 //     Tombstones fold for free into the first bucket (no body bytes).
-//     Other candidates sort descending by live_lba_bytes (FFD), placed
-//     into the first bucket with enough remaining live + entry budget;
-//     a new bucket is opened up to the cap. Each bucket emits one
-//     `gc/<u_bucket_i>.plan`. Per-bucket skip-check drops trivially-
-//     pointless buckets (single dense non-sparse non-tombstone input).
+//     Other candidates sort descending by materialised_bytes (FFD),
+//     placed into the first bucket with enough remaining materialise +
+//     entry budget; a new bucket is opened up to the cap. Each bucket
+//     emits one `gc/<u_bucket_i>.plan`. Per-bucket skip-check drops
+//     trivially-pointless buckets (single dense non-sparse non-tombstone
+//     input).
 //
-// Per-tick work is bounded by `max_buckets × (32 MiB live + 8192 entries)`
-// of cache-resident input, plus O(1)-per-input tombstone bookkeeping on
-// the apply side.
+// Per-tick work is bounded by `max_buckets × (32 MiB materialised +
+// 8192 entries)` of cache-resident input, plus O(1)-per-input tombstone
+// bookkeeping on the apply side.
 //
 // Handoff protocol (plan-based, crash-safe, filesystem-only coordination —
 // see docs/design/gc-plan-handoff.md for the full design):
@@ -83,23 +84,30 @@ use elide_core::volume::latest_snapshot;
 
 use crate::config::GcConfig;
 
-/// Maximum total live bytes included in one small-segment sweep pass.
-/// Matches the volume's FLUSH_THRESHOLD to keep output segment size bounded.
+/// Maximum bytes one bucket's plan requires the volume to materialise at
+/// apply time (kept bodies + canonical bodies + partial-death run slices).
+/// Bounds both the output segment's body size and the apply's resident
+/// memory, and matches the volume's FLUSH_THRESHOLD so GC outputs sit at
+/// the same scale as promoted segments.
 ///
 /// `compact_segments` writes a single output segment with no internal
 /// splitting, so this cap is the only bound on output size.
-const SWEEP_LIVE_CAP: u64 = 32 * 1024 * 1024;
+///
+/// Live LBA bytes are the wrong unit for this budget: a segment whose
+/// extents are almost entirely LBA-dead can still require every composite
+/// body materialised to slice out the surviving runs, and a demoted
+/// canonical carries its full body at zero live bytes.
+const SWEEP_MATERIALISE_CAP: u64 = 32 * 1024 * 1024;
 
 /// Live-bytes threshold at or below which a segment is treated as a "small"
-/// sweep candidate. Set at half of [`SWEEP_LIVE_CAP`] so two smalls always
-/// combine to fit, and the merged output exits the small set permanently —
-/// no infinite re-pack loop.
-const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_LIVE_CAP / 2;
+/// sweep candidate. An eligibility test, so it stays in live-LBA units —
+/// distinct from the materialise budget the packing charges.
+const SWEEP_SMALL_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 /// Entry-count cap on the merged GC output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` (volume.rs) so GC outputs sit at the same scale
 /// as freshly-flushed segments — packing stops when either this cap or
-/// [`SWEEP_LIVE_CAP`] would be exceeded. Bounds the index region for
+/// [`SWEEP_MATERIALISE_CAP`] would be exceeded. Bounds the index region for
 /// dedup-heavy workloads where many thin entries would otherwise pack
 /// without advancing the byte budget.
 const SWEEP_ENTRY_CAP: usize = 8192;
@@ -452,11 +460,11 @@ fn select_buckets(
         // rewriting it never pays for itself. Leave for retention.
     }
 
-    // FFD: descending by live_lba_bytes. Ties broken by ULID for
+    // FFD: descending by materialised_bytes. Ties broken by ULID for
     // determinism.
     candidates.sort_by(|a, b| {
-        b.live_lba_bytes
-            .cmp(&a.live_lba_bytes)
+        b.materialised_bytes
+            .cmp(&a.materialised_bytes)
             .then_with(|| a.ulid_str.cmp(&b.ulid_str))
     });
 
@@ -471,19 +479,18 @@ fn select_buckets(
         let entries_needed = c.estimated_output_entries();
         let placement = buckets
             .iter()
-            .position(|b| c.live_lba_bytes <= b.budget && entries_needed <= b.entry_budget);
+            .position(|b| c.materialised_bytes <= b.budget && entries_needed <= b.entry_budget);
         if let Some(idx) = placement {
             let b = &mut buckets[idx];
-            b.budget -= c.live_lba_bytes;
+            b.budget -= c.materialised_bytes;
             b.entry_budget -= entries_needed;
             b.items.push(c);
         } else if buckets.len() < max_buckets {
             // Single oversize input goes into a solo bucket. Even if it
-            // exceeds SWEEP_LIVE_CAP — better one bloated output than
-            // skipping reclamation entirely. Rare in practice (live
-            // bytes > 32 MiB on a snapshot-floor-eligible segment).
+            // exceeds SWEEP_MATERIALISE_CAP — better one bloated output
+            // than skipping reclamation entirely.
             buckets.push(OpenBucket {
-                budget: SWEEP_LIVE_CAP.saturating_sub(c.live_lba_bytes),
+                budget: SWEEP_MATERIALISE_CAP.saturating_sub(c.materialised_bytes),
                 entry_budget: SWEEP_ENTRY_CAP.saturating_sub(entries_needed),
                 items: vec![c],
             });
@@ -501,7 +508,7 @@ fn select_buckets(
         if buckets.is_empty() {
             buckets.push(OpenBucket {
                 items: tombstones,
-                budget: SWEEP_LIVE_CAP,
+                budget: SWEEP_MATERIALISE_CAP,
                 entry_budget: SWEEP_ENTRY_CAP,
             });
         } else {
@@ -530,6 +537,7 @@ fn select_buckets(
         let candidates = items.len();
         let bytes_freed: u64 = items.iter().map(|s| s.dead_lba_bytes()).sum();
         let live_bytes: u64 = items.iter().map(|s| s.live_lba_bytes).sum();
+        let materialised: u64 = items.iter().map(|s| s.materialised_bytes).sum();
         let live_entries: usize = items.iter().map(|s| s.live_entries.len()).sum();
         let removed_hashes: usize = items.iter().map(|s| s.removed_hashes.len()).sum();
         let dead_cleaned = items
@@ -539,8 +547,9 @@ fn select_buckets(
         let input_ulids: Vec<&str> = items.iter().map(|s| s.ulid_str.as_str()).collect();
         tracing::info!(
             "[gc] bucket: [{}] inputs={candidates} live_lba={live_bytes} \
-             dead_lba={bytes_freed} live_entries={live_entries} \
-             removed_hashes={removed_hashes} dead_folded={dead_cleaned}",
+             dead_lba={bytes_freed} materialised={materialised} \
+             live_entries={live_entries} removed_hashes={removed_hashes} \
+             dead_folded={dead_cleaned}",
             input_ulids.join(", "),
         );
 
@@ -793,6 +802,12 @@ struct SegmentStats {
     /// (DATA, dedup_ref, zero_extent).  Dedup refs and zero extents are included
     /// so that a segment full of live dedup refs is not treated as density=0.
     live_lba_bytes: u64,
+    /// Bytes the volume must materialise to apply a plan that includes this
+    /// input: kept and canonical body bytes plus partial-death run slices.
+    /// The packing budget ([`SWEEP_MATERIALISE_CAP`]) charges this, since it
+    /// is what bounds both the output segment size and the apply's resident
+    /// memory. Thin entries (DedupRef keeps, Zero) contribute nothing.
+    materialised_bytes: u64,
     /// Logical total bytes: lba_length * BLOCK_BYTES summed over all entries.
     total_lba_bytes: u64,
     /// True if the segment contains at least one DATA entry (live, stale, or fully dead).
@@ -873,6 +888,34 @@ impl SegmentStats {
     }
 }
 
+/// Bytes the volume materialises to carry `entry` into the output unchanged
+/// (a plan `Keep`). Body-owning kinds copy their stored bytes; a Delta
+/// copies its delta blobs; DedupRef and Zero copy nothing.
+fn keep_cost(entry: &SegmentEntry) -> u64 {
+    match entry.kind {
+        EntryKind::Data
+        | EntryKind::Inline
+        | EntryKind::CanonicalData
+        | EntryKind::CanonicalInline => entry.stored_length as u64,
+        EntryKind::Delta => entry
+            .delta_options
+            .iter()
+            .map(|o| o.delta_length as u64)
+            .sum(),
+        EntryKind::DedupRef | EntryKind::Zero => 0,
+    }
+}
+
+/// Bytes the volume materialises to emit `entry` as a canonical output
+/// (a plan `Canonical`). A demoted Delta reconstructs its full composite;
+/// other kinds carry their stored bytes.
+fn canonical_cost(entry: &SegmentEntry) -> u64 {
+    match entry.kind {
+        EntryKind::Delta => entry.lba_length as u64 * BLOCK_BYTES,
+        _ => entry.stored_length as u64,
+    }
+}
+
 /// Scan `index/` and compute liveness stats for each committed segment.
 /// Returns segments in ULID (chronological) order; snapshot-frozen segments
 /// are excluded.
@@ -932,6 +975,7 @@ fn collect_stats(
         let mut live_lba_bytes: u64 = 0;
         let mut total_lba_bytes: u64 = 0;
         let mut physical_body_bytes: u64 = 0;
+        let mut materialised_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
         let mut live_entry_indices: Vec<u32> = Vec::new();
         let mut partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> = Vec::new();
@@ -982,6 +1026,7 @@ fn collect_stats(
             match elide_core::segment_classify::classify_entry(&entry, &classify_ctx) {
                 EntryClassification::FullyLive => {
                     live_lba_bytes += lba_bytes;
+                    materialised_bytes += keep_cost(&entry);
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
                     partial_death_runs.push(None);
@@ -990,6 +1035,7 @@ fn collect_stats(
                     // LBA-dead but hash still externally referenced.
                     // Demote so the body survives for dedup resolution
                     // without making a (now-stale) LBA claim.
+                    materialised_bytes += canonical_cost(&entry);
                     live_entries.push(entry.into_canonical());
                     live_entry_indices.push(entry_idx);
                     partial_death_runs.push(None);
@@ -1014,6 +1060,17 @@ fn collect_stats(
                     let live_blocks: u64 =
                         live_runs.iter().map(|r| r.range_end - r.range_start).sum();
                     live_lba_bytes += live_blocks * BLOCK_BYTES;
+                    // Run slices are materialised as uncompressed blocks;
+                    // an owned-body entry whose hash is still LBA-live also
+                    // emits its full composite as a canonical output.
+                    materialised_bytes += live_blocks * BLOCK_BYTES;
+                    let emits_canonical = matches!(
+                        entry.kind,
+                        EntryKind::Data | EntryKind::Inline | EntryKind::Delta
+                    ) && live_hashes.contains(&entry.hash);
+                    if emits_canonical {
+                        materialised_bytes += canonical_cost(&entry);
+                    }
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
                     partial_death_runs.push(Some(live_runs));
@@ -1167,6 +1224,7 @@ fn collect_stats(
             ulid_str,
             has_body_entries: physical_body_bytes > 0 || has_inline,
             live_lba_bytes,
+            materialised_bytes,
             total_lba_bytes,
             live_entries,
             live_entry_indices,
@@ -1529,8 +1587,9 @@ mod tests {
     /// Build a `SegmentStats` fixture from a stub specification.
     ///
     /// `live_data_entries` is the number of live `Data` entries the segment
-    /// claims to have (each accounted as `BLOCK_BYTES` of live LBA). The
-    /// total LBA bytes is taken as `live_lba_bytes + dead_lba_bytes`.
+    /// claims to have (each accounted as `BLOCK_BYTES` of live LBA and of
+    /// materialised bytes). The total LBA bytes is taken as
+    /// `live_lba_bytes + dead_lba_bytes`.
     ///
     /// `live_data_entries == 0` produces a tombstone-shaped input
     /// (no live entries, no removed hashes).
@@ -1542,7 +1601,9 @@ mod tests {
     ) -> SegmentStats {
         let live_lba_bytes = live_data_entries as u64 * BLOCK_BYTES;
         let total_lba_bytes = live_lba_bytes + dead_lba_bytes;
-        // Allocate dummy bodies above INLINE_THRESHOLD (256) so kind = Data.
+        // Block-sized dummy bodies: above INLINE_THRESHOLD (256) so
+        // kind = Data, and sized so each entry's materialised cost equals
+        // its live LBA bytes.
         let live_entries: Vec<SegmentEntry> = (0..live_data_entries)
             .map(|i| {
                 SegmentEntry::new_data(
@@ -1550,11 +1611,12 @@ mod tests {
                     i as u64,
                     1,
                     elide_core::segment::SegmentFlags::empty(),
-                    vec![0u8; 512],
+                    vec![0u8; BLOCK_BYTES as usize],
                 )
                 .entry
             })
             .collect();
+        let materialised_bytes: u64 = live_entries.iter().map(keep_cost).sum();
         let live_entry_indices: Vec<u32> = (0..live_data_entries as u32).collect();
         let partial_death_runs: Vec<Option<Arc<[lbamap::ExtentRead]>>> =
             vec![None; live_data_entries];
@@ -1571,6 +1633,7 @@ mod tests {
         SegmentStats {
             ulid_str: ulid.to_string(),
             live_lba_bytes,
+            materialised_bytes,
             total_lba_bytes,
             has_body_entries: live_data_entries > 0,
             live_entries,
@@ -1607,8 +1670,9 @@ mod tests {
         let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
         let mint = std::sync::Mutex::new(mint);
         let next = || mint.lock().unwrap().next();
-        // 17 MiB live each (each individually fits SWEEP_LIVE_CAP=32 MiB
-        // but two together don't). Sparse so they're eligible.
+        // 17 MiB live/materialised each (each individually fits
+        // SWEEP_MATERIALISE_CAP=32 MiB but two together don't). Sparse so
+        // they're eligible.
         let entries = (17 * 1024 * 1024 / BLOCK_BYTES) as usize;
         let dead = 17 * 1024 * 1024;
         let a = make_stats(next(), entries, dead, true);
@@ -1617,6 +1681,23 @@ mod tests {
         assert_eq!(buckets.len(), 2, "FFD opens a second bucket when needed");
         assert_eq!(buckets[0].candidates, 1);
         assert_eq!(buckets[1].candidates, 1);
+    }
+
+    #[test]
+    fn select_buckets_separates_confetti_dead_inputs_by_materialised_bytes() {
+        // Two inputs whose live LBA is tiny (16 KiB) but whose apply must
+        // materialise ~20 MiB of composite bodies each (partial-death
+        // canonicals). The budget charges materialised bytes, so they
+        // can't share a bucket.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let mut a = make_stats(next(), 4, 256 * 1024 * 1024, true);
+        a.materialised_bytes = 20 * 1024 * 1024;
+        let mut b = make_stats(next(), 4, 256 * 1024 * 1024, true);
+        b.materialised_bytes = 20 * 1024 * 1024;
+        let buckets = select_buckets(vec![a, b], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 2, "materialised budget splits the pair");
     }
 
     #[test]
@@ -1701,6 +1782,7 @@ mod tests {
         let stats = SegmentStats {
             ulid_str: ulid.to_string(),
             live_lba_bytes: BLOCK_BYTES,
+            materialised_bytes: 0,
             total_lba_bytes: BLOCK_BYTES,
             has_body_entries: false,
             live_entries: vec![SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 0, 1)],
