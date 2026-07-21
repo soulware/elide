@@ -1057,6 +1057,75 @@ fn failed_promote_restore_keeps_formation_minted_dedup_ref() {
 }
 
 #[test]
+fn recovery_promote_of_extra_wal_classifies_dedup() {
+    // A crash can leave multiple WAL files; open promotes every non-latest
+    // WAL directly. That path must classify duplicates like a live promote.
+    let base = keyed_temp_dir();
+    let data: Vec<u8> = (0..4096).map(|i| (i * 23 + 9) as u8).collect();
+    let fresh: Vec<u8> = (0..4096).map(|i| (i * 29 + 17) as u8).collect();
+
+    let canonical_ulid = {
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &data).unwrap();
+        vol.promote_for_test().unwrap();
+        pending_ulids(&base)[0]
+    };
+
+    // Two hand-written WALs: the older holds a duplicate of the canonical,
+    // the newer holds fresh content and stays the live WAL after open.
+    let mut mint = crate::ulid_mint::UlidMint::new(canonical_ulid);
+    let wal_a_ulid = mint.next();
+    let wal_b_ulid = mint.next();
+    let mut wal_a =
+        writelog::WriteLog::create(&base.join("wal").join(wal_a_ulid.to_string())).unwrap();
+    wal_a
+        .append_data(
+            8,
+            1,
+            &blake3::hash(&data),
+            writelog::WalFlags::empty(),
+            &data,
+        )
+        .unwrap();
+    drop(wal_a);
+    let mut wal_b =
+        writelog::WriteLog::create(&base.join("wal").join(wal_b_ulid.to_string())).unwrap();
+    wal_b
+        .append_data(
+            12,
+            1,
+            &blake3::hash(&fresh),
+            writelog::WalFlags::empty(),
+            &fresh,
+        )
+        .unwrap();
+    drop(wal_b);
+
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.dedup_mint_stats().minted_entries,
+        1,
+        "recovery promote of the extra WAL must classify the duplicate"
+    );
+
+    let recovery_seg = *pending_ulids(&base)
+        .iter()
+        .find(|u| **u != canonical_ulid)
+        .expect("recovery-promoted segment in pending/");
+    let seg_path = base.join("pending").join(recovery_seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, segment::EntryKind::DedupRef);
+
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+    assert_eq!(vol.read(8, 1).unwrap(), data);
+    assert_eq!(vol.read(12, 1).unwrap(), fresh);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn legacy_ref_wal_record_replays_and_promotes() {
     let base = keyed_temp_dir();
     let data: Vec<u8> = (0..4096).map(|i| (i * 19 + 11) as u8).collect();

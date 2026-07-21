@@ -194,6 +194,44 @@ fn snapshot_pre_promote_offsets(
         .collect()
 }
 
+/// Classify pending entries at segment formation: a `Data` or `Inline`
+/// entry whose hash resolves in the extent index to a body other than its
+/// own WAL record — a canonical in a committed or ancestor segment, or an
+/// earlier write of the same bytes in this WAL epoch — becomes a thin
+/// `DedupRef`, and its WAL body bytes are dropped at the segment write.
+/// Inline-sized duplicates dedup like any other: a DedupRef costs zero
+/// bytes where an Inline entry would put its body in the `.idx`.
+///
+/// Must run before `snapshot_pre_promote_offsets`: the offsets snapshot
+/// keys off `entry.kind`, so a converted entry must already read as
+/// DedupRef when the CAS tokens are taken. Returns the counters for this
+/// formation.
+fn classify_pending_dedup_entries(
+    entries: &mut [segment::SegmentEntry],
+    body_offsets: &mut [Option<u64>],
+    extent_index: &extentindex::ExtentIndex,
+    wal_ulid: Ulid,
+) -> DedupMintStats {
+    let mut stats = DedupMintStats::default();
+    for (entry, body_offset) in entries.iter_mut().zip(body_offsets.iter_mut()) {
+        if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+            continue;
+        }
+        let Some(loc) = extent_index.lookup(&entry.hash) else {
+            continue;
+        };
+        if loc.segment_id == wal_ulid && Some(loc.body_offset) == *body_offset {
+            continue;
+        }
+        stats.minted_entries += 1;
+        stats.wal_body_bytes += entry.stored_length as u64;
+        *entry =
+            segment::SegmentEntry::new_dedup_ref(entry.hash, entry.start_lba, entry.lba_length);
+        *body_offset = None;
+    }
+    stats
+}
+
 /// Apply a committed promote to the in-memory maps: CAS each body-bearing
 /// entry in the extent index from its WAL-relative location to the new
 /// segment (skipping entries a concurrent write or GC handoff has
@@ -427,8 +465,8 @@ pub struct NoopSkipStats {
     pub skipped_bytes: u64,
 }
 
-/// Counters for DedupRef minting at segment formation. Reset to zero on
-/// `Volume::open`.
+/// Counters for DedupRef minting at segment formation. Counted since
+/// `Volume::open`; open-time recovery promotes contribute.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DedupMintStats {
     /// Data entries converted to DedupRef by `classify_pending_dedup`.
@@ -576,17 +614,26 @@ impl Volume {
         } else {
             Vec::new()
         };
+        let mut recovery_dedup_stats = DedupMintStats::default();
         for wal_path in wal_files_to_promote {
             let wal::WalReplay {
                 ulid: old_wal_ulid,
                 valid_size: _,
-                pending_entries,
-                body_offsets,
+                mut pending_entries,
+                mut body_offsets,
             } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index)?;
             if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
             }
+            let minted = classify_pending_dedup_entries(
+                &mut pending_entries,
+                &mut body_offsets,
+                &extent_index,
+                old_wal_ulid,
+            );
+            recovery_dedup_stats.minted_entries += minted.minted_entries;
+            recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
             let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
             let result = crate::actor::execute_promote(PromoteJob {
                 segment_ulid: mint.next(),
@@ -661,7 +708,7 @@ impl Volume {
             fetcher: None,
             mint,
             noop_stats: NoopSkipStats::default(),
-            dedup_mint_stats: DedupMintStats::default(),
+            dedup_mint_stats: recovery_dedup_stats,
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
@@ -2699,46 +2746,24 @@ impl Volume {
         Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
     }
 
-    /// Classify pending entries at segment formation: a `Data` or `Inline`
-    /// entry whose hash resolves in the extent index to a body other than
-    /// its own WAL record — a canonical in a committed or ancestor segment,
-    /// or an earlier write of the same bytes in this WAL epoch — becomes a
-    /// thin `DedupRef`, and its WAL body bytes are dropped at the segment
-    /// write. Inline-sized duplicates dedup like any other: a DedupRef costs
-    /// zero bytes where an Inline entry would put its body in the `.idx`.
-    ///
-    /// Runs under the volume lock, before `snapshot_pre_promote_offsets`:
-    /// the offsets snapshot keys off `entry.kind`, so a converted entry
-    /// must already read as DedupRef when the CAS tokens are taken.
+    /// Run [`classify_pending_dedup_entries`] over the pending entries
+    /// under the volume lock, folding the counters into
+    /// `self.dedup_mint_stats`.
     fn classify_pending_dedup(&mut self, wal_ulid: Ulid) {
-        let mut minted: u64 = 0;
-        let mut wal_body_bytes: u64 = 0;
-        for (entry, body_offset) in self
-            .pending_entries
-            .iter_mut()
-            .zip(self.pending_body_offsets.iter_mut())
-        {
-            if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
-                continue;
-            }
-            let Some(loc) = self.extent_index.lookup(&entry.hash) else {
-                continue;
-            };
-            if loc.segment_id == wal_ulid && Some(loc.body_offset) == *body_offset {
-                continue;
-            }
-            minted += 1;
-            wal_body_bytes += entry.stored_length as u64;
-            *entry =
-                segment::SegmentEntry::new_dedup_ref(entry.hash, entry.start_lba, entry.lba_length);
-            *body_offset = None;
-        }
-        if minted > 0 {
-            self.dedup_mint_stats.minted_entries += minted;
-            self.dedup_mint_stats.wal_body_bytes += wal_body_bytes;
+        let stats = classify_pending_dedup_entries(
+            &mut self.pending_entries,
+            &mut self.pending_body_offsets,
+            &self.extent_index,
+            wal_ulid,
+        );
+        if stats.minted_entries > 0 {
+            self.dedup_mint_stats.minted_entries += stats.minted_entries;
+            self.dedup_mint_stats.wal_body_bytes += stats.wal_body_bytes;
             log::info!(
-                "formation {wal_ulid}: {minted} dedup-ref minted, {wal_body_bytes} WAL body \
-                 bytes dropped (cumulative {} entries / {} bytes)",
+                "formation {wal_ulid}: {} dedup-ref minted, {} WAL body bytes dropped \
+                 (cumulative {} entries / {} bytes)",
+                stats.minted_entries,
+                stats.wal_body_bytes,
                 self.dedup_mint_stats.minted_entries,
                 self.dedup_mint_stats.wal_body_bytes
             );
