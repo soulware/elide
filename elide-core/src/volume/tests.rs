@@ -3771,6 +3771,93 @@ fn promote_segment_recovers_mid_apply_crash() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Simulates the crash window one step earlier than
+/// `promote_segment_recovers_mid_apply_crash`: the kill lands after
+/// `extract_idx` but before `promote_to_cache` completes. On reopen the
+/// leaked idx classifies the entries `Cached`, so the fetch paths may
+/// start building `cache/<ulid>.body` incrementally — here simulated by
+/// a short partial file with no `.present` bits. The promote retry must
+/// rebuild the complete cache form from the surviving pending source,
+/// not early-return on the partial fetch-created body and then serve
+/// short reads from it.
+#[test]
+fn promote_segment_retry_rebuilds_partial_fetch_created_body() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let block_a = high_entropy_block(0xB1);
+    let block_b = high_entropy_block(0xB2);
+    vol.write(0, &block_a).unwrap();
+    vol.write(1, &block_b).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let pending_dir = base.join("pending");
+    let ulid_str = fs::read_dir(&pending_dir)
+        .unwrap()
+        .flatten()
+        .find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (!name.contains('.')).then_some(name)
+        })
+        .unwrap();
+    let ulid = Ulid::from_string(&ulid_str).unwrap();
+    let pending_path = pending_dir.join(&ulid_str);
+
+    let index_dir = base.join("index");
+    fs::create_dir_all(&index_dir).unwrap();
+    segment::extract_idx(&pending_path, &index_dir.join(format!("{ulid_str}.idx"))).unwrap();
+
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    fs::write(&body_path, b"partial fetch in flight").unwrap();
+
+    drop(vol);
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.promote_segment(ulid).unwrap();
+
+    assert!(!pending_path.exists(), "pending source survived retry");
+    assert_eq!(vol.read(0, 1).unwrap(), block_a, "LBA 0 readback wrong");
+    assert_eq!(vol.read(1, 1).unwrap(), block_b, "LBA 1 readback wrong");
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A completed promote whose source has already been reaped must stay a
+/// no-op: `promote_to_cache` on a missing source with the cache form in
+/// place returns Ok without touching the files.
+#[test]
+fn promote_to_cache_noop_after_source_reaped() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &high_entropy_block(0xC7)).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let pending_dir = base.join("pending");
+    let ulid_str = fs::read_dir(&pending_dir)
+        .unwrap()
+        .flatten()
+        .find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (!name.contains('.')).then_some(name)
+        })
+        .unwrap();
+    let pending_path = pending_dir.join(&ulid_str);
+
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    let present_path = cache_dir.join(format!("{ulid_str}.present"));
+    segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+
+    fs::remove_file(&pending_path).unwrap();
+    segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+    assert!(body_path.exists());
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn all_inline_segment_readable() {
     // A segment where every entry is inline (body_length = 0).

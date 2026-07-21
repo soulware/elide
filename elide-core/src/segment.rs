@@ -1952,6 +1952,30 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
     write_file_atomic(idx_path, &buf)
 }
 
+/// Return `true` when the cache form at `body_path`/`present_path` is a
+/// completed promote of a segment with these `entries`: every data
+/// entry's bit is set in `.present`, and `.delta` exists when the
+/// segment carries a delta section. A missing or short `.present`
+/// counts as incomplete.
+fn promote_is_complete(
+    entries: &[SegmentEntry],
+    delta_length: u32,
+    body_path: &Path,
+    present_path: &Path,
+) -> io::Result<bool> {
+    if delta_length > 0 && !body_path.with_extension("delta").try_exists()? {
+        return Ok(false);
+    }
+    let present = match fs::read(present_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(entries.iter().enumerate().all(|(i, entry)| {
+        !entry.kind.is_data() || present.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0)
+    }))
+}
+
 /// Copy a segment body into the local cache, preserving sparseness.
 ///
 /// Reads `src_path` (a full segment in `pending/` or `gc/`) and writes
@@ -1971,21 +1995,26 @@ pub fn extract_idx(segment_path: &Path, idx_path: &Path) -> io::Result<()> {
 /// size = body_length) and a pull host can demand-fetch just the
 /// delta region by creating `.delta` without touching `.body`.
 ///
-/// All files are written via tmp+rename for crash safety. `.body` is
-/// written **last** so its existence acts as a commit marker for the
-/// whole promote — any crash before the final rename is recovered by
-/// re-running the promote, since the idempotence guard at the top
-/// only triggers once `.body` is in place. Callers can therefore
-/// trust that if `body_path` exists, `.delta` (when `delta_length >
-/// 0`) and `.present` also exist.
+/// All files are written via tmp+rename for crash safety, `.body`
+/// last. A prior run's output is reused only when it is provably
+/// complete — `.present` covers every data entry, and `.delta` exists
+/// for segments with a delta section. Bare `.body` existence is not
+/// enough: demand-fetch and full-warm build `cache/<id>.body`
+/// incrementally in place, so when a crash leaks `index/<id>.idx`
+/// before the body promote finishes, a partial fetch-created body can
+/// sit at `body_path` when the promote is retried.
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
-    if body_path.try_exists()? {
-        return Ok(());
-    }
-
-    let mut src = fs::File::open(src_path)?;
+    let body_exists = body_path.try_exists()?;
+    let mut src = match fs::File::open(src_path) {
+        Ok(f) => f,
+        // Only a completed promote lets the source be reaped, so a
+        // missing source with `.body` in place means there is nothing
+        // left to redo.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && body_exists => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let mut header = [0u8; HEADER_LEN as usize];
     src.read_exact(&mut header)?;
     if &header[0..8] != MAGIC {
@@ -2012,6 +2041,10 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         inline_length,
         delta_length,
     )?;
+
+    if body_exists && promote_is_complete(&entries, delta_length, body_path, present_path)? {
+        return Ok(());
+    }
 
     // Build the sparse body in a temp file but do not rename yet —
     // the rename is the last step so `.body`'s existence implies

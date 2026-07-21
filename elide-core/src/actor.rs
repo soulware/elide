@@ -2254,11 +2254,12 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     }
 
     // Both writes are idempotent: extract_idx early-returns when idx_path
-    // exists; promote_to_cache early-returns when body_path exists. This
-    // covers the mid-apply crash retry window described in
-    // docs/plans/promote-segment-offload-plan.md — the source survives, prep
-    // picks it up, the worker re-parses (cheap) and the file writes
-    // short-circuit.
+    // exists; promote_to_cache early-returns when its cache form is
+    // provably complete (not on bare `.body` existence — that may be a
+    // partial fetch-created file). This covers the mid-apply crash retry
+    // window described in docs/plans/promote-segment-offload-plan.md —
+    // the source survives, prep picks it up, the worker re-parses
+    // (cheap) and the file writes short-circuit.
     segment::extract_idx(&job.src_path, &job.idx_path)?;
     segment::promote_to_cache(&job.src_path, &job.body_path, &job.present_path)?;
 
