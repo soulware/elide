@@ -1,8 +1,13 @@
 // Write log: the in-progress segment before it is promoted to a local segment.
 //
-// Each record is either:
+// The write path appends two record kinds:
 //   DATA — a new extent with its (optionally compressed) payload
-//   REF  — a dedup reference: an LBA mapping to an already-stored extent
+//   ZERO — an LBA range that reads as zeros, no payload
+//
+// scan() additionally parses REF — a thin dedup reference no writer emits.
+// Dedup is decided at segment formation (`Volume::classify_pending_dedup`),
+// not on the write path; the parse arm keeps WALs recorded by binaries
+// with write-path dedup recoverable, and dies at the next format bump.
 //
 // The log is an append-only file living in wal/<ULID>. On promotion, the
 // promotion step reads the WAL and writes a clean segment file at
@@ -17,7 +22,7 @@
 //   data_length (u32 varint)  byte length of payload (compressed size if FLAG_COMPRESSED)
 //   data        (data_length bytes)
 //
-// Record layout (REF, FLAG_DEDUP_REF set — thin, no body):
+// Record layout (REF, FLAG_DEDUP_REF set — thin, no body, parse-only):
 //   hash        (32 bytes)    BLAKE3 hash of the extent
 //   start_lba   (u64 varint)
 //   lba_length  (u32 varint)
@@ -50,7 +55,7 @@ bitflags! {
     pub struct WalFlags: u8 {
         /// Payload is lz4-compressed; data_length is the compressed size.
         const COMPRESSED = 0x01;
-        /// REF record; carries a materialised body payload (same layout as DATA).
+        /// REF record; thin dedup reference, parse-only (never appended).
         const DEDUP_REF  = 0x02;
         /// No data payload; this LBA range reads as zeros. Hash field is ZERO_HASH.
         const ZERO       = 0x04;
@@ -144,7 +149,7 @@ impl WriteLog {
     ) -> io::Result<u64> {
         debug_assert!(
             !flags.contains(WalFlags::DEDUP_REF),
-            "use append_ref for dedup references"
+            "DEDUP_REF is a parse-only record kind"
         );
 
         let mut header = [0u8; HEADER_BUF_LEN];
@@ -163,10 +168,10 @@ impl WriteLog {
         Ok(body_offset)
     }
 
-    /// Append a thin dedup reference (no body bytes).
-    ///
-    /// Only the hash + LBA mapping is recorded. The extent body stays in
-    /// the canonical segment; reads resolve via the extent index.
+    /// Append a thin dedup reference (no body bytes). Test-only: production
+    /// writers never emit REF records; this exists to construct REF-bearing
+    /// WALs for the replay-compat tests.
+    #[cfg(test)]
     pub fn append_ref(
         &mut self,
         start_lba: u64,

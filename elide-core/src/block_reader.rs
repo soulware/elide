@@ -137,7 +137,9 @@ impl BlockReader {
                         data,
                     } => {
                         lbamap.insert(start_lba, lba_length, hash, ulid);
-                        extent_index.insert(
+                        // If-absent mirrors `write_commit`: an already
+                        // resolvable hash keeps its owner.
+                        extent_index.insert_if_absent(
                             hash,
                             extentindex::ExtentLocation {
                                 segment_id: ulid,

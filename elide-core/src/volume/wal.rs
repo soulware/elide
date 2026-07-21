@@ -77,8 +77,11 @@ pub(super) fn replay_wal_records(
                     segment::SegmentFlags::empty()
                 };
                 lbamap.insert(start_lba, lba_length, hash, ulid);
-                // Temporary WAL offset — updated to segment offset on promotion.
-                extent_index.insert(
+                // Temporary WAL offset — updated to segment offset on
+                // promotion. If-absent mirrors `write_commit`: a hash that
+                // already resolves keeps its owner and this record is
+                // minted as a DedupRef at formation.
+                extent_index.insert_if_absent(
                     hash,
                     extentindex::ExtentLocation {
                         segment_id: ulid,

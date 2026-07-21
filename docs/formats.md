@@ -26,7 +26,7 @@ data_length (u32 varint)  byte length of payload (compressed size if FLAG_COMPRE
 data        (data_length bytes)
 ```
 
-*REF record* — a thin dedup reference; no data payload:
+*REF record* — a thin dedup reference; no data payload. **Parse-only:** the write path appends only DATA and ZERO records — dedup is decided at segment formation, not at write time — and no code emits REF. The scan arm keeps WALs recorded by binaries with write-path dedup recoverable, and dies at the next WAL format bump.
 ```
 hash         (32 bytes)    BLAKE3 hash of the extent
 start_lba    (u64 varint)
@@ -34,7 +34,7 @@ lba_length   (u32 varint)
 flags        (u8)          FLAG_DEDUP_REF set; no further fields
 ```
 
-REF records carry no body bytes anywhere — not in the WAL, not in `pending/`, not in `cache/`, not in the uploaded S3 object. The hash is a key into the extent index (`hash → canonical segment ULID + body offset`), which is used to serve reads from the canonical body. The DedupRef index entry has `stored_offset = 0` and `stored_length = 0`; it reserves no body space and the segment's `body_length` excludes it entirely. See § Segment File Format — FLAG_DEDUP_REF for the two invariants (first-snapshot pinning and canonical presence) that make thin DedupRef sound.
+A replayed REF record carries no body bytes; its hash is a key into the extent index (`hash → canonical segment ULID + body offset`), which serves reads from the canonical body. Segment-level DedupRef entries are minted at formation from ordinary DATA records: the index entry has `stored_offset = 0` and `stored_length = 0`, reserves no body space, and the segment's `body_length` excludes it entirely. See § Segment File Format — FLAG_DEDUP_REF for the two invariants (first-snapshot pinning and canonical presence) that make thin DedupRef sound.
 
 *ZERO record* — a zero extent; no data payload, maps an LBA range to zeros:
 ```
@@ -48,7 +48,7 @@ Zero extents differ from unwritten regions in one important way: an unwritten LB
 
 **Flag bits:**
 - `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
-- `0x02` `FLAG_DEDUP_REF` — REF record; no data payload (thin; body lives in canonical segment)
+- `0x02` `FLAG_DEDUP_REF` — REF record; no data payload (thin; body lives in canonical segment; parse-only)
 - `0x04` `FLAG_ZERO` — ZERO record; no data payload; hash field is ZERO_HASH
 
 **Flag namespace note:** WAL flag bits and segment index flag bits are **distinct namespaces with different values**. When promoting WAL records to segment entries, `recover_wal` must translate between them:
@@ -61,7 +61,7 @@ Zero extents differ from unwritten regions in one important way: an unwritten LB
 
 The segment format also has `FLAG_INLINE` (`0x01`) and `FLAG_HAS_DELTAS` (`0x02`), which have no WAL equivalents. Never copy a WAL `flags` byte directly into a segment index entry.
 
-For DATA and REF records, the hash is computed before the dedup check and stored in the log record. Recovery can reconstruct the LBA map without re-reading or re-hashing the data. ZERO records carry ZERO_HASH as a fixed sentinel — no hash computation is performed.
+DATA records store the extent hash in the log record, so recovery can reconstruct the LBA map without re-reading or re-hashing the data. ZERO records carry ZERO_HASH as a fixed sentinel — no hash computation is performed.
 
 ### Pre-log coalescing
 
@@ -75,7 +75,7 @@ write arrives → in-memory coalescing buffer
                count limit or fsync
                         │
                         ▼
-               hash → local dedup check → append_data / append_ref / append_zero → bufio (OS buffer)
+               hash → append_data / append_zero → bufio (OS buffer)
                         │
                     guest fsync
                         │
