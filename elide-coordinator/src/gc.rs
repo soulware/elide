@@ -15,6 +15,12 @@
 //     Snapshot-floor and partial-LBA-death-Delta-deferred segments are
 //     ineligible.
 //
+//   Pools:
+//     Candidates split into a journal pool (every live entry falls in the
+//     journal window) and a stable pool, packed separately so each output
+//     is pure. The journal pool admits on segment count rather than size
+//     or density. See `docs/design/gc-journal-segregation.md`.
+//
 //   Cache-residency filter:
 //     A candidate is eligible only when its body is fully resolvable
 //     without an S3 GET — `cache/<ulid>.body` exists AND every body-
@@ -238,6 +244,10 @@ pub fn gc_fork(
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
 
+    // Census the whole eligible population, before residency narrows it to
+    // what this pass can act on.
+    log_journal_census(&pass.eligible_stats, &pass.journal);
+
     // Cache-residency filter: drop candidates whose bodies aren't fully
     // resolvable from local cache. Cold candidates wait for organic
     // warming; GC never issues an S3 GET purely to enable a rewrite.
@@ -337,6 +347,7 @@ struct PassState {
     live_hashes: HashSet<blake3::Hash>,
     total_segments: usize,
     deferred_count: usize,
+    journal: elide_core::journal::JournalRanges,
 }
 
 fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
@@ -374,8 +385,16 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     let live_hashes = lbamap.lba_referenced_hashes();
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
-    let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
-        .context("collecting segment stats")?;
+    let all_stats = collect_stats(
+        fork_dir,
+        &vk,
+        &index,
+        &live_hashes,
+        &lbamap,
+        floor,
+        &journal.ranges,
+    )
+    .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
     // Segments with a partial-LBA-death Delta entry whose sources don't
@@ -402,6 +421,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         live_hashes,
         total_segments,
         deferred_count,
+        journal: journal.ranges,
     })
 }
 
@@ -413,8 +433,110 @@ struct PackedBucket {
     dead_cleaned: usize,
 }
 
-/// First-fit-decreasing bin-pack across all eligible cache-resident
-/// segments, capped at `max_buckets` outputs.
+/// Census of the journal pool, emitted once per pass.
+///
+/// GC never rewrites a journal segment, so the only thing that removes one
+/// is the filesystem overwriting every journal LBA it holds. Whether that
+/// settles at a bounded population, and how long the oldest segment
+/// lingers once writing stops, is what decides whether the pool ever needs
+/// a compaction trigger. `mixed` counts stable-pool segments still holding
+/// journal content, so the migration backlog is visible draining to zero,
+/// and `tombstones` is the reap path those segments leave by.
+fn log_journal_census(stats: &[SegmentStats], journal: &elide_core::journal::JournalRanges) {
+    if journal.is_empty() {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let pool: Vec<&SegmentStats> = stats
+        .iter()
+        .filter(|s| s.pool == SegmentPool::Journal)
+        .collect();
+    let stable = stats
+        .iter()
+        .filter(|s| s.pool == SegmentPool::Stable)
+        .count();
+    let tombstones = stats
+        .iter()
+        .filter(|s| s.pool == SegmentPool::Tombstone)
+        .count();
+    let pool_blocks: u64 = pool.iter().map(|s| s.journal_blocks).sum();
+    let mixed: Vec<&SegmentStats> = stats
+        .iter()
+        .filter(|s| s.pool == SegmentPool::Stable && s.journal_blocks > 0)
+        .collect();
+    let mixed_blocks: u64 = mixed.iter().map(|s| s.journal_blocks).sum();
+    let window_blocks = journal.lba_count();
+
+    // Age of the oldest segment the pool is holding. A population that
+    // churns keeps this near the wrap interval; one that has stalled lets
+    // it climb without bound.
+    let oldest_age_s = pool
+        .iter()
+        .filter_map(|s| Ulid::from_string(&s.ulid_str).ok())
+        .map(|u| u.timestamp_ms())
+        .min()
+        .map(|ms| now_ms.saturating_sub(ms) / 1000);
+
+    tracing::info!(
+        "[gc] journal census: segments={} blocks={pool_blocks}/{window_blocks} \
+         oldest_age_s={} mixed={} mixed_blocks={mixed_blocks} stable={stable} \
+         tombstones={tombstones}",
+        pool.len(),
+        oldest_age_s.map_or_else(|| "-".to_owned(), |s| s.to_string()),
+        mixed.len(),
+    );
+}
+
+/// Which pool a candidate belongs to. Total over every segment
+/// `collect_stats` returns, and assigned once, so no later stage
+/// re-derives it. See `docs/design/gc-journal-segregation.md`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SegmentPool {
+    /// Holds live content outside the journal window, or a mix of both.
+    /// The only pool GC packs.
+    Stable,
+    /// Every live entry falls in the journal window. Journal content is
+    /// cyclically overwritten, so the segment dies whole and is reaped
+    /// as a tombstone rather than rewritten. Never packed.
+    Journal,
+    /// Nothing live and nothing to remove, so the segment is deleted
+    /// rather than rewritten. It reaches a plan as a `PlanOutput::Drop`
+    /// contributing no output content, since being named as a plan input
+    /// is what consumes a segment. This is how a journal segment leaves
+    /// the system once its LBAs are overwritten.
+    Tombstone,
+}
+
+/// Route each labelled segment to its pool, capped at `max_buckets`
+/// outputs.
+///
+/// The journal pool is never passed to the packer, so no bucket can hold
+/// a journal input and every output is pure by construction. Tombstones
+/// reach the packer as their own list, which is how a dead journal
+/// segment is reaped without any journal content being rewritten.
+fn select_buckets(
+    eligible: Vec<SegmentStats>,
+    config: &GcConfig,
+    max_buckets: usize,
+) -> Vec<PackedBucket> {
+    let mut stable: Vec<SegmentStats> = Vec::new();
+    let mut tombstones: Vec<SegmentStats> = Vec::new();
+    for s in eligible {
+        match s.pool {
+            SegmentPool::Stable => stable.push(s),
+            SegmentPool::Tombstone => tombstones.push(s),
+            SegmentPool::Journal => {}
+        }
+    }
+    pack_stable(stable, tombstones, config, max_buckets)
+}
+
+/// First-fit-decreasing bin-pack across the stable pool, capped at
+/// `max_buckets` outputs.
 ///
 /// The classic FFD shape: candidates sort descending by `live_lba_bytes`,
 /// each placed in the first bucket with enough remaining live + entry
@@ -424,30 +546,26 @@ struct PackedBucket {
 /// Per-bucket skip-check drops trivially-pointless buckets (a single
 /// dense non-sparse non-tombstone input is a pointless rewrite). The
 /// caller treats an empty result as `GcStrategy::None(NoCandidates)`.
-fn select_buckets(
+fn pack_stable(
     eligible: Vec<SegmentStats>,
+    tombstones: Vec<SegmentStats>,
     config: &GcConfig,
     max_buckets: usize,
 ) -> Vec<PackedBucket> {
-    if max_buckets == 0 {
+    if max_buckets == 0 || (eligible.is_empty() && tombstones.is_empty()) {
         return Vec::new();
     }
 
     let density_threshold = config.density_threshold;
 
-    // Partition into tombstones, residency-OK candidates whose rewrite is
-    // worth pursuing, and the rest (dropped here — a dense large input
-    // with no dead bytes never warrants a rewrite, regardless of bucket
-    // headroom). `has_data_content` excludes pure DedupRef/Zero/Inline
-    // segments where rewriting reclaims no physical body — they pack
-    // only as part of a tombstone-fold or a small-with-dead bucket.
-    let mut tombstones: Vec<SegmentStats> = Vec::new();
+    // Keep the candidates whose rewrite is worth pursuing and drop the
+    // rest here — a dense large input with no dead bytes never warrants a
+    // rewrite, regardless of bucket headroom. `has_data_content` excludes
+    // pure DedupRef/Zero/Inline segments where rewriting reclaims no
+    // physical body — they pack only as part of a tombstone-fold or a
+    // small-with-dead bucket.
     let mut candidates: Vec<SegmentStats> = Vec::new();
     for s in eligible {
-        if s.live_entries.is_empty() && s.removed_hashes.is_empty() {
-            tombstones.push(s);
-            continue;
-        }
         let is_small = s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD;
         let is_sparse =
             s.density() < density_threshold && s.dead_lba_bytes() > 0 && s.has_data_content();
@@ -517,9 +635,7 @@ fn select_buckets(
     // Per-bucket skip-check + accounting + per-bucket log line.
     let mut packed_out: Vec<PackedBucket> = Vec::new();
     for OpenBucket { mut items, .. } in buckets {
-        let has_dead = items
-            .iter()
-            .any(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty());
+        let has_dead = items.iter().any(|s| s.pool == SegmentPool::Tombstone);
         let has_sparse = items.iter().any(|s| s.density() < density_threshold);
         if !has_dead && !has_sparse && items.len() < 2 {
             // Single dense non-sparse non-tombstone input: pointless
@@ -540,7 +656,7 @@ fn select_buckets(
         let removed_hashes: usize = items.iter().map(|s| s.removed_hashes.len()).sum();
         let dead_cleaned = items
             .iter()
-            .filter(|s| s.live_entries.is_empty() && s.removed_hashes.is_empty())
+            .filter(|s| s.pool == SegmentPool::Tombstone)
             .count();
         let input_ulids: Vec<&str> = items.iter().map(|s| s.ulid_str.as_str()).collect();
         tracing::info!(
@@ -849,6 +965,14 @@ struct SegmentStats {
     /// death is always handled in-band via `partial_death_runs` and does
     /// not set this flag.
     has_partial_death: bool,
+    /// Which pool this segment packs in. Assigned once, here, so no later
+    /// stage re-derives it from entry counts.
+    pool: SegmentPool,
+    /// Blocks claimed by live entries that fall in the journal window. Zero
+    /// for a pure stable segment; every claimed block for a journal one.
+    /// A stable segment with a non-zero count is a mixed segment awaiting
+    /// migration, so the census tracks the backlog draining.
+    journal_blocks: u64,
 }
 
 impl SegmentStats {
@@ -940,6 +1064,7 @@ fn collect_stats(
     live_hashes: &HashSet<blake3::Hash>,
     lba_map: &LbaMap,
     floor: Option<Ulid>,
+    journal: &elide_core::journal::JournalRanges,
 ) -> io::Result<Vec<SegmentStats>> {
     let index_dir = fork_dir.join("index");
     let mut idx_files = segment::collect_idx_files(&index_dir)?;
@@ -1225,8 +1350,29 @@ fn collect_stats(
             }
         }
 
+        // Tombstone is tested first, so the journal arm never sees an
+        // empty entry list and `all` is never vacuously true.
+        let pool = if live_entries.is_empty() {
+            if removed_hashes.is_empty() {
+                SegmentPool::Tombstone
+            } else {
+                SegmentPool::Stable
+            }
+        } else if live_entries.iter().all(|e| journal.owns_entry(e)) {
+            SegmentPool::Journal
+        } else {
+            SegmentPool::Stable
+        };
+        let journal_blocks: u64 = live_entries
+            .iter()
+            .filter(|e| journal.owns_entry(e))
+            .map(|e| e.lba_length as u64)
+            .sum();
+
         result.push(SegmentStats {
             ulid_str,
+            pool,
+            journal_blocks,
             has_body_entries: physical_body_bytes > 0 || has_inline,
             live_lba_bytes,
             materialised_bytes,
@@ -1646,6 +1792,14 @@ mod tests {
             removed_hashes: Vec::new(),
             partial_death_runs,
             has_partial_death: false,
+            // Mirrors what `collect_stats` assigns: no live entries and no
+            // removed hashes is a tombstone.
+            pool: if live_data_entries == 0 {
+                SegmentPool::Tombstone
+            } else {
+                SegmentPool::Stable
+            },
+            journal_blocks: 0,
         }
     }
 
@@ -1776,6 +1930,59 @@ mod tests {
         assert!(select_buckets(vec![small], &make_config(0.70), 0).is_empty());
     }
 
+    // --- pool separation ---
+
+    /// Small and sparse, so the stable pool would take every one.
+    fn make_journal_stats(ulid: Ulid, live_data_entries: usize) -> SegmentStats {
+        SegmentStats {
+            pool: SegmentPool::Journal,
+            ..make_stats(ulid, live_data_entries, BLOCK_BYTES * 8, true)
+        }
+    }
+
+    #[test]
+    fn select_buckets_never_packs_a_journal_segment() {
+        let mint = std::sync::Mutex::new(elide_core::ulid_mint::UlidMint::new(Ulid::nil()));
+        let next = || mint.lock().unwrap().next();
+        let inputs: Vec<SegmentStats> = (0..32).map(|_| make_journal_stats(next(), 2)).collect();
+        assert!(select_buckets(inputs, &make_config(0.70), 4).is_empty());
+    }
+
+    #[test]
+    fn select_buckets_packs_stable_segments_alongside_journal_ones() {
+        let mint = std::sync::Mutex::new(elide_core::ulid_mint::UlidMint::new(Ulid::nil()));
+        let next = || mint.lock().unwrap().next();
+        let mut inputs: Vec<SegmentStats> =
+            (0..32).map(|_| make_journal_stats(next(), 2)).collect();
+        inputs.push(make_stats(next(), 4, BLOCK_BYTES * 8, true));
+        inputs.push(make_stats(next(), 4, BLOCK_BYTES * 8, true));
+
+        let buckets = select_buckets(inputs, &make_config(0.70), 8);
+        assert!(!buckets.is_empty());
+        let packed: Vec<&SegmentStats> = buckets.iter().flat_map(|b| b.bucket.iter()).collect();
+        assert_eq!(packed.len(), 2, "only the two stable inputs pack");
+        assert!(packed.iter().all(|s| s.pool == SegmentPool::Stable));
+    }
+
+    /// The reap path for journal segments. A journal segment whose LBAs
+    /// have all been overwritten holds nothing live, so it is a tombstone
+    /// rather than a journal segment, and it folds into a bucket to be
+    /// consumed. Were it labelled journal it would never be reaped.
+    #[test]
+    fn select_buckets_reaps_a_dead_journal_segment() {
+        let mint = std::sync::Mutex::new(elide_core::ulid_mint::UlidMint::new(Ulid::nil()));
+        let next = || mint.lock().unwrap().next();
+        let dead = make_stats(next(), 0, BLOCK_BYTES * 8, false);
+        assert_eq!(dead.pool, SegmentPool::Tombstone);
+
+        let live_journal = make_journal_stats(next(), 2);
+        let buckets = select_buckets(vec![live_journal, dead], &make_config(0.70), 4);
+
+        let packed: Vec<&SegmentStats> = buckets.iter().flat_map(|b| b.bucket.iter()).collect();
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0].pool, SegmentPool::Tombstone);
+    }
+
     #[test]
     fn is_cache_resident_returns_true_for_dedup_only_segment() {
         // No body-bearing entries → no cache file needed.
@@ -1795,6 +2002,8 @@ mod tests {
             removed_hashes: Vec::new(),
             partial_death_runs: vec![None],
             has_partial_death: false,
+            pool: SegmentPool::Stable,
+            journal_blocks: 0,
         };
         assert!(is_cache_resident(&cache, &stats));
     }
@@ -2150,7 +2359,16 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &elide_core::journal::EMPTY,
+        )
+        .unwrap();
 
         // Both segments should have 1 live entry each.
         // S1: DATA(LBA 0→H101) — not extent-canonical (H101→S2), but lba_live.
@@ -2173,6 +2391,87 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A segment goes in the journal pool only when a rewrite would carry
+    /// all of it into a journal output. A mixed segment goes in the stable
+    /// pool, where the output split sheds its journal content.
+    #[test]
+    fn collect_stats_pools_only_wholly_journal_segments_as_journal() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let window = elide_core::journal::JournalWindow {
+            ranges: elide_core::journal::JournalRanges::new(vec![(96, 8)]),
+            activation: None,
+        };
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+        // S1: wholly inside the window.
+        vol.write(96, &[1u8; 4096]).unwrap();
+        vol.write(97, &[2u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        // S2: wholly outside it.
+        vol.write(0, &[3u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        // S3: one of each.
+        vol.write(98, &[4u8; 4096]).unwrap();
+        vol.write(1, &[5u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
+            .collect();
+        ulids.sort();
+        for ulid in &ulids {
+            vol.promote_segment(*ulid).unwrap();
+        }
+
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain, &window).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &window.ranges,
+        )
+        .unwrap();
+        assert_eq!(stats.len(), 3);
+
+        let journal: Vec<&SegmentStats> = stats
+            .iter()
+            .filter(|s| s.pool == SegmentPool::Journal)
+            .collect();
+        assert_eq!(
+            journal.len(),
+            1,
+            "only the wholly-in-window segment pools as journal"
+        );
+        let lbas: Vec<u64> = journal[0]
+            .live_entries
+            .iter()
+            .map(|e| e.start_lba)
+            .collect();
+        assert_eq!(lbas, vec![96, 97]);
     }
 
     /// Bug H reproduction (DIRECT collect_stats level):
@@ -2280,7 +2579,16 @@ mod tests {
         assert_eq!(lbamap.hash_at(1), Some(h2), "LBA 1 must be h2");
         assert!(live_hashes.contains(&h2), "h2 must be live (via LBA 1)");
 
-        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &elide_core::journal::EMPTY,
+        )
+        .unwrap();
 
         // Find S1's stats.
         let s1_stats = stats
@@ -2409,7 +2717,16 @@ mod tests {
             "LBA 3000 must still be zero"
         );
 
-        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &elide_core::journal::EMPTY,
+        )
+        .unwrap();
 
         let s1_stats = stats
             .iter()
@@ -2688,7 +3005,16 @@ mod tests {
             "[{shape}] test precondition: at least one LBA of S1's range must still resolve to h"
         );
 
-        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &elide_core::journal::EMPTY,
+        )
+        .unwrap();
 
         let s1_stats = stats
             .iter()

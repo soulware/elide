@@ -86,6 +86,16 @@ impl JournalRanges {
         &self.ranges
     }
 
+    /// Whether `entry` holds journal content. Canonicals make no LBA
+    /// claim, so they never do.
+    ///
+    /// A segment where this holds for every live entry is one formation
+    /// wrote as a journal segment, and the predicate GC pools its
+    /// candidates by.
+    pub fn owns_entry(&self, entry: &crate::segment::SegmentEntry) -> bool {
+        !entry.kind.is_canonical_only() && self.contains(entry.start_lba)
+    }
+
     /// Total LBAs covered.
     pub fn lba_count(&self) -> u64 {
         self.ranges.iter().map(|&(_, len)| len).sum()
