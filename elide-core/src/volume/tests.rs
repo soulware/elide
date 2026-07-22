@@ -1136,6 +1136,142 @@ fn format_mid_session_flips_window_at_promote_take() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Reformatting away from ext4 clears the stored `[journal]` section:
+/// the first reopen parses an affirmative "not ext4" and removes the
+/// section (this session keeps the set its rebuild used); the next
+/// reopen starts never-derived.
+#[test]
+fn reformat_away_from_ext4_clears_stored_window() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    write_ext4_image(&mut vol, &crate::ext4_scan::test_support::journal_image());
+    vol.promote_for_test().unwrap();
+    assert!(
+        crate::config::VolumeConfig::read(&base)
+            .unwrap()
+            .journal
+            .is_some(),
+        "precondition: window derived",
+    );
+
+    // "Reformat away": overwrite the superblock block.
+    vol.write(0, &[0u8; 4096]).unwrap();
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert!(
+        crate::config::VolumeConfig::read(&base)
+            .unwrap()
+            .journal
+            .is_none(),
+        "affirmative not-ext4 must clear the stored section",
+    );
+    // The clearing session keeps the set its rebuild used and does not
+    // resume polling.
+    assert!(vol.journal_derived);
+    assert!(!vol.journal.ranges.is_empty());
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert!(!vol.journal_derived, "next open starts never-derived");
+    assert!(vol.journal.ranges.is_empty());
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A stamped window with LBA 0 never written must survive reopen: an
+/// unwritten superblock block reads as zeros from the void (blank or
+/// discarded device), which is absence of evidence, not an affirmative
+/// "not ext4".
+#[test]
+fn unwritten_superblock_keeps_stored_window() {
+    let base = keyed_temp_dir();
+    let vol = Volume::open(&base, &base).unwrap();
+    drop(vol);
+    set_journal_ranges(&base, vec![(100, 4)]);
+
+    let vol = Volume::open(&base, &base).unwrap();
+    assert!(vol.journal_derived);
+    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    assert_eq!(
+        cfg.journal.map(|j| j.ranges),
+        Some(crate::journal::JournalRanges::new(vec![(100, 4)])),
+        "unwritten LBA 0 must not clear the stored window",
+    );
+    drop(vol);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// An unreadable device must NOT clear the stored window: only an
+/// affirmative parse answer changes it. Arranged by evicting the cache
+/// bodies of the ext4 metadata blocks and reopening with no fetcher —
+/// the superblock read errors instead of parsing.
+#[test]
+fn unreadable_device_keeps_stored_window() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Incompressible slack keeps the metadata blocks out of the inline
+    // tier so their bodies live in (and can be evicted from) cache/.
+    let mut img = crate::ext4_scan::test_support::journal_image();
+    for block in [0usize, 1, 4] {
+        let entropy = high_entropy_block(0xE0 + block as u8);
+        let base_off = block * 4096;
+        img[base_off..base_off + 1024].copy_from_slice(&entropy[..1024]);
+        img[base_off + 2048..base_off + 4096].copy_from_slice(&entropy[2048..]);
+    }
+    // Re-stamp the structures the slack fill just clobbered.
+    let sb = 1024;
+    crate::ext4_scan::test_support::put_u16(&mut img, sb + 0x38, 0xef53);
+    let gd_entropy = high_entropy_block(0xE1);
+    img[4096..8192].copy_from_slice(&gd_entropy);
+    crate::ext4_scan::test_support::put_u32(&mut img, 4096 + 0x08, 4);
+
+    write_ext4_image(&mut vol, &img);
+    vol.promote_for_test().unwrap();
+    let stored = crate::config::VolumeConfig::read(&base)
+        .unwrap()
+        .journal
+        .expect("precondition: window derived");
+    assert!(!stored.ranges.is_empty());
+
+    // Drain the pending segment to cache form, then evict its body so
+    // reads need a fetcher the reopened volume will not have.
+    let pending_dir = base.join("pending");
+    let ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (!name.contains('.'))
+                .then(|| Ulid::from_string(&name).ok())
+                .flatten()
+        })
+        .collect();
+    for ulid in ulids {
+        vol.promote_segment(ulid).unwrap();
+    }
+    drop(vol);
+    for entry in fs::read_dir(base.join("cache")).unwrap().flatten() {
+        let name = entry.file_name().into_string().unwrap();
+        if name.ends_with(".body") || name.ends_with(".present") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let vol = Volume::open(&base, &base).unwrap();
+    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    assert_eq!(
+        cfg.journal.map(|j| j.ranges),
+        Some(stored.ranges),
+        "unreadable superblock must keep the stored window",
+    );
+    drop(vol);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// An authoritative "no internal journal" parse persists as
 /// derived-empty — distinct from never-derived — and ends the polling.
 #[test]

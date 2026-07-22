@@ -933,19 +933,34 @@ impl Volume {
     /// already-derived volume whose window changed (reformat), the
     /// in-memory set stays what this open's rebuild used — the derived
     /// window takes effect at the next open, keeping the live index and
-    /// the drift checker on one consistent range set per session.
-    /// Best-effort: not-ext4, an unreadable block (e.g. evicted body
-    /// with no fetcher), or a config write failure keeps the stored set.
+    /// the drift checker on one consistent range set per session. An
+    /// affirmative "not ext4" clears the stored section, so a volume
+    /// reformatted away from ext4 reverts to never-derived at the next
+    /// open instead of keeping a stale window forever. Best-effort: an
+    /// unreadable block (e.g. evicted body with no fetcher) or a
+    /// config write failure keeps the stored set.
     fn refresh_journal_ranges(&mut self) {
         if !self.journal_derived {
             self.poll_derive_and_flip();
             return;
         }
+        // An unwritten superblock block reads as zeros from the void
+        // (blank or discarded device) — absence of evidence, not an
+        // affirmative "not ext4". Only written content can clear the
+        // stored window below.
+        let superblock_written = self.lbamap.lookup(0).is_some();
         let mut reader = read::VolumeExt4Reader { volume: self };
         let derived = match crate::ext4_scan::journal_lba_ranges(&mut reader) {
-            // "No opinion" (not ext4, or unparseable layout): keep the
-            // stored window.
-            Ok(None) => return,
+            // The device read fine and does not parse as ext4: the
+            // stored window describes a filesystem that is gone.
+            // Clearing reverts to never-derived at the next open;
+            // this session keeps the set its rebuild used.
+            Ok(None) => {
+                if superblock_written {
+                    self.clear_stored_window();
+                }
+                return;
+            }
             Ok(Some(r)) => r,
             Err(e) => {
                 log::warn!("[journal] window derivation failed, keeping stored set: {e}");
@@ -974,6 +989,29 @@ impl Volume {
             "[journal] window changed: {} range(s), {} LBAs (was {} range(s), {} LBAs); effective next open",
             derived.as_slice().len(),
             derived.lba_count(),
+            self.journal.ranges.as_slice().len(),
+            self.journal.ranges.lba_count(),
+        );
+    }
+
+    /// Remove the `[journal]` section from `volume.toml`.
+    fn clear_stored_window(&self) {
+        let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[journal] reading volume.toml for window clear failed: {e}");
+                return;
+            }
+        };
+        if cfg.journal.take().is_none() {
+            return;
+        }
+        if let Err(e) = cfg.write(&self.base_dir) {
+            log::warn!("[journal] clearing stored window failed: {e}");
+            return;
+        }
+        log::info!(
+            "[journal] filesystem no longer parses as ext4; cleared stored window ({} range(s), {} LBAs); effective next open",
             self.journal.ranges.as_slice().len(),
             self.journal.ranges.lba_count(),
         );
