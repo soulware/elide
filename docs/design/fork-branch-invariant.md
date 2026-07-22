@@ -1,6 +1,6 @@
 # Design: the fork branch invariant
 
-**Status:** Proposed.
+**Status:** Implemented.
 
 ## The invariant
 
@@ -41,53 +41,38 @@ The invariant applies to both cutoff-bounded edge kinds. A child's
 bounded ancestor layers by `walk_extent_ancestors`, and they name snapshots on
 the same terms.
 
-## Where it is not enforced
+## Enforcement
 
-`ForkSource::Pinned` and `ForkSource::PinnedName` carry a caller-supplied
-`snap_ulid` through `resolve_snapshot` into `fork_volume_at` with no existence
-check at any hop.
-
-`fork_volume_at` declines to require a local marker, and prefetch ordering is
-why. `pull_chain` pulls skeletons, reading `meta/<ulid>.{provenance,pub}` only;
-snapshot manifests arrive in `surface_prefetch`, which runs after `mint_fork`.
-A pulled source's branch manifest is not on disk when the fork is minted.
-
-What holds today is the shape of the other two source forms. A writable source
-takes a fresh implicit snapshot at fork time, so its branch ULID is its floor.
-A readonly source is never rewritten, because GC runs only on a supervised
-`fork_dir` behind a live-daemon `gc_checkpoint` call. Neither is a check.
-
-Nothing stops a pinned fork against a running writable volume at a ULID above
-that volume's floor. The volume then collects segments the child still
-resolves, and the child reads wrong bytes.
-
-## Design
-
-`resolve_snapshot` validates the pinned forms against the source's snapshots
-before the fork is minted, and rejects a `snap_ulid` that names none.
+`resolve_snapshot` validates the pinned source forms — `ForkSource::Pinned` and
+`ForkSource::PinnedName` — against the source's own snapshots before the fork is
+minted, and rejects a `snap_ulid` that names none.
 
 The check is answerable exactly where it is needed, because the two source
 classes differ in both respects at once.
 
 A supervised writable volume created every snapshot it has, so they are all
 local, and the check needs nothing prefetch has not already done. It is also
-the only class a rewriter touches.
+the only class a rewriter touches: an unbacked pin against a running writable
+volume names a branch above that volume's floor, and the volume then collects
+segments the child still resolves.
 
-A readonly skeleton has no daemon, so `gc_checkpoint` never answers and no
-rewriter reaches it. Its branch manifest may legitimately be absent at mint
-time, and nothing depends on its floor.
+A readonly skeleton is exempt. It has no daemon, so `gc_checkpoint` never
+answers and no rewriter reaches it, and its branch manifest is legitimately
+absent at mint time — `pull_chain` reads `meta/<ulid>.{provenance,pub}` only,
+and snapshot manifests arrive in `surface_prefetch`, which runs after
+`mint_fork`. `fork_volume_at` requires no local marker for the same reason.
 
-This is the same distinction that already decides whether a volume is
-rewritten at all, so the validation reads off an existing artefact class
-rather than introducing an axis.
+This is the same distinction that decides whether a volume is rewritten at all,
+so the validation reads off an existing artefact class rather than introducing
+an axis.
 
-The `snap_ulid` is parsed with `Ulid::from_string` and looked up through
-`signing::snapshot_manifest_filename`, so a stop-snapshot suffix cannot satisfy
-it. Stop snapshots do not raise the floor either, since `latest_snapshot`
-parses the stem as a ULID and `<ulid>-stop` fails.
+The `snap_ulid` is parsed with `Ulid::from_string` at the CLI boundary and
+looked up through `signing::snapshot_manifest_filename`, so a stop-snapshot
+suffix cannot satisfy it. Stop snapshots do not raise the floor either, since
+`latest_snapshot` parses the stem as a ULID and `<ulid>-stop` fails.
 
-Nothing else changes. The floor keeps its definition, the three rewriter sites
-keep calling `latest_snapshot`, and no new on-disk state appears.
+The floor keeps its definition, the three rewriter sites call `latest_snapshot`,
+and no new on-disk state appears.
 
 ## Snapshot release
 
@@ -105,16 +90,23 @@ and belong in the same query.
 
 ## Verification
 
+`elide-coordinator/src/fork.rs`:
+
 - A pinned fork against a local writable source at a ULID that names no
   snapshot is rejected, and the rejection names the source and the ULID.
 - A pinned fork at a real snapshot of a writable source succeeds.
 - A pinned fork against a readonly skeleton succeeds with no local manifest,
   which pins the prefetch ordering the exemption exists for.
 - A stop-snapshot ULID does not satisfy the check.
-- A GC test asserting a source leaves its child's reachable range alone, so the
-  floor property is stated somewhere other than this document.
-- The existing `fork_proptest` and `gc_proptest` oracles cover whether a
-  rewrite removes bytes a fork still resolves.
+
+`elide-coordinator/tests/gc_test.rs`:
+
+- `gc_leaves_a_forks_reachable_range_alone` — a source sweeps after a child
+  branched at its snapshot, and the branch-time segment stays out of the pass,
+  keeps its `.idx` and its cache body, and still serves the child's read.
+
+The `fork_proptest` and `gc_proptest` oracles cover whether a rewrite removes
+bytes a fork still resolves.
 
 ## Related
 
