@@ -248,10 +248,7 @@ pub fn gc_fork(
         .partition(|s| is_cache_resident(&cache_dir, s));
     let deferred_cold = cold_stats.len();
     if deferred_cold > 0 {
-        let cold_ulids: Vec<String> = cold_stats
-            .iter()
-            .map(|s| s.ulid_str[..8].to_string())
-            .collect();
+        let cold_ulids: Vec<&str> = cold_stats.iter().map(|s| s.ulid_str.as_str()).collect();
         tracing::info!(
             "[gc] deferring {deferred_cold} cold-cache segment(s): [{}]",
             cold_ulids.join(", ")
@@ -392,10 +389,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
     if !deferred.is_empty() {
-        let deferred_ulids: Vec<String> = deferred
-            .iter()
-            .map(|s| s.ulid_str[..8].to_string())
-            .collect();
+        let deferred_ulids: Vec<&str> = deferred.iter().map(|s| s.ulid_str.as_str()).collect();
         tracing::info!(
             "[gc] deferring {} segment(s) with unresolvable partial-LBA-death Delta entries: [{}]",
             deferred_count,
