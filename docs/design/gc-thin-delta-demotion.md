@@ -1,0 +1,120 @@
+# Design: thin delta demotion
+
+**Status:** Proposed.
+
+## Problem
+
+Demoting a Delta entry materialises its composite. `into_canonical` maps
+every body-owning kind to `CanonicalData`, so an LBA-dead hash-live Delta —
+stored as a few KB of delta blob — is reconstructed and carried as its full
+composite body, typically ~250× larger. The rewrite undoes, entry by entry,
+exactly the compression the delta tier performed.
+
+Measured on the 2026-07-21 ladder: a bucket of `live_lba=2MB` priced at
+`materialised=982MB`, from 943 demoted Delta entries at ~1MB composite each.
+The budget was honest (#751 made it so); the solo-oversize path emitted the
+bucket anyway, the apply held ~940MB of output bodies, and the result is a
+982MB segment in cache and S3. A 1.4GB precedent exists from July 19.
+
+The same amplification runs through partial death: a Delta with surviving
+runs and a live hash emits its full composite as a canonical alongside the
+run slices.
+
+## Design
+
+A demoted Delta stays a delta. New entry kind `CanonicalDelta`: the delta's
+options and blobs, no LBA claim — to `Delta` what `CanonicalData` is to
+`Data`.
+
+The cost collapses from `lba_length × 4096` to the sum of `delta_length`.
+The 982MB bucket prices at a few MB, packs as an ordinary bucket member, and
+the solo-oversize escape hatch is never taken for this shape.
+
+### Wire encoding
+
+Entry kinds serialise as a flags byte, so `CanonicalDelta` is the
+`DELTA | CANONICAL_ONLY` combination (plus `HAS_DELTAS`) — a new legal
+combination, not a new discriminant, and no format version bump.
+`start_lba` and `lba_length` serialise as zero like every canonical kind.
+The composite's length is not stored anywhere: reads recover it from the
+delta decode itself, and `DeltaLocation` carries no length today.
+
+A binary without the new kind decodes the combination as `Delta` with a
+zero-length claim — it claims nothing on rebuild and registers the hash in
+the deltas map, which is the correct read behaviour. That is a property of
+the encoding, not a compatibility path.
+
+### Demotion and carry
+
+`SegmentEntry::into_canonical` maps `Delta → CanonicalDelta`, keeping the
+options and zeroing the claim. Classification is unchanged: the Delta arm
+still returns `DemoteToCanonical`, and the plan still records `Canonical`.
+
+`emit_canonical`'s Delta arm stops resolving the composite. It copies the
+entry's blobs into the output's delta body and re-bases the options'
+offsets — the same mechanics as `emit_keep`'s Delta arm — and emits
+`CanonicalDelta`. `emit_keep` gains a `CanonicalDelta` arm doing the same,
+so the entry survives later rewrites.
+
+The partial-death canonical emission goes through the same `Canonical` plan
+record, so it thins with no separate change: run slices still materialise
+through the composite slot, and the canonical companion carries blobs.
+
+### Reads
+
+`read_block` resolves a hash through the data index and falls through to
+the deltas map, so a DedupRef pointing at a delta-stored hash reconstructs
+today. `CanonicalDelta` registers in the deltas map exactly as `Delta`
+does; the claim skip is `is_canonical_only()`, which the kind joins.
+
+The trade is per-read: a dedup read of a demoted hash reconstructs through
+the delta path (source body + blob decode) instead of slicing a
+materialised body, amortised by the `.dmat` materialisation cache. That is
+the same cost the hash had before its claim died, when it was a live Delta.
+
+### Source survival
+
+No new gate. The demoted entry's hash is in `live_hashes` — that is why it
+demotes rather than drops — and the live-hash computation unions in the
+sources of every live delta in the deltas map. A hash in `live_hashes` is
+never removed by a rewrite, so the source stays resolvable for as long as
+the demoted delta is referenced, and the output segment's rebuild puts the
+`CanonicalDelta` back in the deltas map where the next pass's union finds
+it. A source that already fails to resolve reads as a loud error, exactly
+as it does for a live Delta today.
+
+`CanonicalDelta` cannot itself become a source: delta sources resolve
+through the data index only, and Data-entry demotion still produces
+materialised `CanonicalData`.
+
+## Out of scope
+
+The two oversize canonical segments already in the fleet store full
+composites; there is no delta to re-thin. They stay frozen (the skip-check
+requires something dead) until their canonicals die and they tombstone.
+Bounding apply memory for genuinely large plans is streaming apply,
+a separate design.
+
+## Verification
+
+- A GC pass over a fully-LBA-dead, hash-live Delta emits `CanonicalDelta`,
+  and the bucket's materialised price is the blob bytes, not the composite.
+- A DedupRef whose target was demoted reads back correctly after the
+  rewrite, across a reopen.
+- A second rewrite carries a `CanonicalDelta` forward intact.
+- A partial-death Delta emits run slices plus a thin canonical, and the
+  runs still read correctly.
+- An unreferenced `CanonicalDelta` is dropped and its hash removed, like
+  any canonical.
+- `gc_proptest` and the crash-recovery oracles at raised cases; the
+  delta-over-snapshot shapes in `volume_proptest` cover the seal
+  interaction.
+
+## Related
+
+- [`delta-compression.md`](delta-compression.md) for the delta tier that
+  mints the entries being demoted.
+- [`gc-partial-death-compaction.md`](gc-partial-death-compaction.md) for
+  the run-slice machinery the thin canonical sits beside.
+- [`gc-bucket-unification.md`](gc-bucket-unification.md) for the budget
+  the new pricing feeds.
