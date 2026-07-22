@@ -973,6 +973,15 @@ pub fn rebuild(
     Ok(index)
 }
 
+/// The `(inner_owners, delta_owners, live_segments)` triple returned by
+/// [`rebuild_owners_unverified`].
+#[cfg(feature = "volume-invariants")]
+pub type RebuiltOwners = (
+    HashMap<blake3::Hash, Ulid>,
+    HashMap<blake3::Hash, Ulid>,
+    std::collections::HashSet<Ulid>,
+);
+
 /// Rebuild just the hash → owning-segment-ULID mapping from disk,
 /// without signature verification, inline data, presence bitmaps, or
 /// any of the BodySource detail.
@@ -1005,11 +1014,7 @@ pub fn rebuild(
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
     journal: &crate::journal::JournalWindow,
-) -> io::Result<(
-    HashMap<blake3::Hash, Ulid>,
-    HashMap<blake3::Hash, Ulid>,
-    std::collections::HashSet<Ulid>,
-)> {
+) -> io::Result<RebuiltOwners> {
     let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
     let mut journal_owned: std::collections::HashSet<blake3::Hash> =
         std::collections::HashSet::new();
@@ -1018,11 +1023,11 @@ pub fn rebuild_owners_unverified(
 
     // Mirror of `insert_if_absent`: first write wins, except a
     // non-journal copy displaces a journal owner.
-    let mut admit_owner = |owners: &mut HashMap<blake3::Hash, Ulid>,
-                           journal_owned: &mut std::collections::HashSet<blake3::Hash>,
-                           hash: blake3::Hash,
-                           ulid: Ulid,
-                           journal: bool| {
+    let admit_owner = |owners: &mut HashMap<blake3::Hash, Ulid>,
+                       journal_owned: &mut std::collections::HashSet<blake3::Hash>,
+                       hash: blake3::Hash,
+                       ulid: Ulid,
+                       journal: bool| {
         match owners.entry(hash) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(ulid);
