@@ -5,6 +5,7 @@
 // a stable LBA exists (`ExtentIndex::insert_if_absent`).
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// Sorted, coalesced set of journal LBA ranges. Empty means no journal
 /// awareness: unknown filesystem, external journal, or parse failure.
@@ -18,6 +19,37 @@ pub struct JournalRanges {
 /// `static` (not an associated const) so `&EMPTY` has a `'static`
 /// lifetime.
 pub static EMPTY: JournalRanges = JournalRanges { ranges: Vec::new() };
+
+/// Journal window plus the live-flip activation marker.
+///
+/// A segment entry is journal-classified when its LBA falls in the
+/// window AND its segment ULID is at or above `activation`. The marker
+/// is set when a session flips the window on live (None→derived at a
+/// promote take): segments minted before the flip were stamped under
+/// the empty window, and comparing against the activation ULID lets
+/// every rebuild — the drift checker, a readonly open, the
+/// coordinator's GC pass — reproduce those stamps exactly. `None`
+/// applies the window to every segment (the steady state: the next
+/// open reclassifies uniformly and clears the marker).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalWindow {
+    pub ranges: JournalRanges,
+    pub activation: Option<Ulid>,
+}
+
+/// The no-awareness window (`&'static` counterpart of `EMPTY`).
+pub static NO_WINDOW: JournalWindow = JournalWindow {
+    ranges: JournalRanges { ranges: Vec::new() },
+    activation: None,
+};
+
+impl JournalWindow {
+    /// Whether an entry at `lba` in the segment `segment_ulid` is
+    /// journal-classified.
+    pub fn is_journal(&self, lba: u64, segment_ulid: Ulid) -> bool {
+        self.ranges.contains(lba) && self.activation.is_none_or(|a| segment_ulid >= a)
+    }
+}
 
 impl JournalRanges {
     /// Normalise `(start_lba, lba_count)` pairs: drop empties, sort,

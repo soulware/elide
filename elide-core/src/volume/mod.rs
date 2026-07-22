@@ -292,7 +292,7 @@ fn apply_promoted_entries(
     extent_index: &mut extentindex::ExtentIndex,
     lbamap: &mut lbamap::LbaMap,
     result: &PromoteResult,
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<()> {
     apply_promoted_partition(
         extent_index,
@@ -306,7 +306,7 @@ fn apply_promoted_entries(
             pre_promote_offsets: &result.pre_promote_offsets,
             journal_segment: false,
         },
-        journal_ranges,
+        journal,
     )?;
     if let Some(j) = &result.journal {
         apply_promoted_partition(
@@ -321,7 +321,7 @@ fn apply_promoted_entries(
                 pre_promote_offsets: &j.pre_promote_offsets,
                 journal_segment: true,
             },
-            journal_ranges,
+            journal,
         )?;
     }
     Ok(())
@@ -343,7 +343,7 @@ fn apply_promoted_partition(
     lbamap: &mut lbamap::LbaMap,
     old_wal_ulid: Ulid,
     part: ApplyPartition<'_>,
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<()> {
     let ApplyPartition {
         segment_ulid,
@@ -362,7 +362,7 @@ fn apply_promoted_partition(
             body_length: delta_region_body_length,
         }),
         inline: extentindex::InlineSource::EntryInline,
-        journal_ranges,
+        journal,
     };
     let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
     for (raw_idx, (entry, old_wal_offset)) in entries
@@ -424,7 +424,7 @@ fn apply_promoted_partition(
                 body_source: BodySource::Local,
                 body_section_start,
                 inline_data: idata,
-                journal: journal_ranges.contains(entry.start_lba),
+                journal: journal.is_journal(entry.start_lba, segment_ulid),
             },
         );
     }
@@ -592,8 +592,14 @@ pub struct Volume {
     /// `volume.toml` before the extent-index rebuild (which needs it for
     /// the non-journal ownership preference), re-derived from the
     /// filesystem after the maps are built, and persisted back when it
-    /// changed. Empty when the volume has no parseable ext4 journal.
-    pub(in crate::volume) journal_ranges: crate::journal::JournalRanges,
+    /// changed. Carries the activation marker while this session has
+    /// flipped the window on live (`poll_derive_and_flip`).
+    pub(in crate::volume) journal: crate::journal::JournalWindow,
+    /// Whether `volume.toml` holds an authoritative derivation answer.
+    /// While `false`, every promote take re-attempts derivation so a
+    /// filesystem formatted mid-session gains journal awareness without
+    /// a reopen.
+    pub(in crate::volume) journal_derived: bool,
     /// Shared LRU of parsed+verified segment indices. Keyed by
     /// `(path, file_len)`. Cloned into worker jobs so the actor thread
     /// and the worker thread hit the same cache. See
@@ -680,12 +686,23 @@ impl Volume {
         // The journal window persisted by the previous session. The
         // extent-index rebuild needs it before the filesystem is
         // parseable; a freshly derived window is persisted at the end of
-        // open for the next session (`refresh_journal_ranges`).
-        let journal_ranges = crate::config::VolumeConfig::read(base_dir)?.journal_ranges;
+        // open for the next session (`refresh_journal_ranges`). Any
+        // live-flip activation marker from the previous session is
+        // cleared first: this open reclassifies uniformly under the
+        // stored window, and everything rebuilding from `volume.toml`
+        // during the new session must see the same rule.
+        let mut cfg = crate::config::VolumeConfig::read(base_dir)?;
+        if let Some(j) = cfg.journal.as_mut()
+            && j.activation.take().is_some()
+        {
+            cfg.write(base_dir)?;
+        }
+        let journal_derived = cfg.journal.is_some();
+        let journal = cfg.journal_window();
 
         // Walk the origin chain and rebuild maps from all committed segments.
         let (ancestor_layers, mut lbamap, mut extent_index) =
-            open_read_state(base_dir, by_id_dir, &journal_ranges)?;
+            open_read_state(base_dir, by_id_dir, &journal)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -782,7 +799,7 @@ impl Volume {
                 valid_size: _,
                 mut pending_entries,
                 mut body_offsets,
-            } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index, &journal_ranges)?;
+            } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index, &journal)?;
             if pending_entries.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
@@ -796,17 +813,17 @@ impl Volume {
             recovery_dedup_stats.minted_entries += minted.minted_entries;
             recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
             let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
-            let (primary, journal) = partition_journal_pending(
+            let (primary, jpart) = partition_journal_pending(
                 pending_entries,
                 pre_promote_offsets,
                 body_offsets,
-                &journal_ranges,
+                &journal.ranges,
             );
             // Primary ULID first: the journal segment must sort above the
             // data segment (see `JournalPartition`).
             let segment_ulid = mint.next();
-            let journal =
-                journal.map(
+            let jpart =
+                jpart.map(
                     |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
                         segment_ulid: mint.next(),
                         entries,
@@ -829,12 +846,12 @@ impl Volume {
                     // through an Arc'd extent-index snapshot, and the
                     // open path holds the index by value at this point.
                     delta_prior: None,
-                    journal,
+                    journal: jpart,
                 },
                 &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
-            apply_promoted_entries(&mut extent_index, &mut lbamap, &result, &journal_ranges)?;
+            apply_promoted_entries(&mut extent_index, &mut lbamap, &result, &journal)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers the recovery-promoted segments.
             let max_promoted = result
@@ -862,7 +879,7 @@ impl Volume {
                     path,
                     pending_entries,
                     body_offsets,
-                } = recover_wal(path, &mut lbamap, &mut extent_index, &journal_ranges)?;
+                } = recover_wal(path, &mut lbamap, &mut extent_index, &journal)?;
                 (
                     Some(OpenWal { wal, ulid, path }),
                     pending_entries,
@@ -875,7 +892,7 @@ impl Volume {
         let has_new_segments = !pending_entries.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
 
-        let ret = Self {
+        let mut ret = Self {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
             lock_file,
@@ -895,7 +912,8 @@ impl Volume {
             mint,
             noop_stats: NoopSkipStats::default(),
             dedup_mint_stats: recovery_dedup_stats,
-            journal_ranges,
+            journal,
+            journal_derived,
             segment_cache: Arc::new(segment_cache::SegmentIndexCache::new(
                 SEGMENT_INDEX_CACHE_CAPACITY,
             )),
@@ -907,13 +925,22 @@ impl Volume {
     }
 
     /// Derive the journal window from the guest filesystem and persist
-    /// it to `volume.toml` when it differs from the stored value. The
+    /// it to `volume.toml` when it differs from the stored value.
+    ///
+    /// Never-derived volumes route through `poll_derive_and_flip`: a
+    /// successful parse takes effect immediately in this session (with
+    /// the activation marker keeping rebuilds consistent). For an
+    /// already-derived volume whose window changed (reformat), the
     /// in-memory set stays what this open's rebuild used — the derived
     /// window takes effect at the next open, keeping the live index and
     /// the drift checker on one consistent range set per session.
     /// Best-effort: not-ext4, an unreadable block (e.g. evicted body
     /// with no fetcher), or a config write failure keeps the stored set.
-    fn refresh_journal_ranges(&self) {
+    fn refresh_journal_ranges(&mut self) {
+        if !self.journal_derived {
+            self.poll_derive_and_flip();
+            return;
+        }
         let mut reader = read::VolumeExt4Reader { volume: self };
         let derived = match crate::ext4_scan::journal_lba_ranges(&mut reader) {
             // "No opinion" (not ext4, or unparseable layout): keep the
@@ -925,7 +952,7 @@ impl Volume {
                 return;
             }
         };
-        if derived == self.journal_ranges {
+        if derived == self.journal.ranges {
             return;
         }
         let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
@@ -935,7 +962,10 @@ impl Volume {
                 return;
             }
         };
-        cfg.journal_ranges = derived.clone();
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: derived.clone(),
+            activation: None,
+        });
         if let Err(e) = cfg.write(&self.base_dir) {
             log::warn!("[journal] persisting window failed: {e}");
             return;
@@ -944,9 +974,78 @@ impl Volume {
             "[journal] window changed: {} range(s), {} LBAs (was {} range(s), {} LBAs); effective next open",
             derived.as_slice().len(),
             derived.lba_count(),
-            self.journal_ranges.as_slice().len(),
-            self.journal_ranges.lba_count(),
+            self.journal.ranges.as_slice().len(),
+            self.journal.ranges.lba_count(),
         );
+    }
+
+    /// While the window has never been derived, attempt derivation and
+    /// flip it live on success. Called at the end of open and from
+    /// every promote take, so a filesystem formatted mid-session gains
+    /// journal awareness within one drain tick. On a blank device the
+    /// attempt costs a single read of LBA 0 (the superblock-magic
+    /// probe fails before any deeper parsing).
+    fn poll_derive_and_flip(&mut self) {
+        let mut reader = read::VolumeExt4Reader { volume: self };
+        match crate::ext4_scan::journal_lba_ranges(&mut reader) {
+            // "No opinion" (not ext4, or not ext4 *yet*): stay
+            // never-derived, retry at the next take.
+            Ok(None) => {}
+            Ok(Some(ranges)) => self.flip_window(ranges),
+            Err(e) => {
+                // Transient mid-format states can fail past the magic
+                // probe (e.g. a superblock restored before its inode
+                // table); the next attempt sees more of the image.
+                log::debug!("[journal] window derivation failed, will retry: {e}");
+            }
+        }
+    }
+
+    /// Persist a first-ever derivation answer and activate a non-empty
+    /// window in this session.
+    ///
+    /// The activation ULID is minted after every existing segment and
+    /// before anything minted later (WALs, segments), so journal
+    /// classification — `window.contains(lba) && segment_ulid >=
+    /// activation` — reproduces this session's stamps in every rebuild:
+    /// pre-flip segments were stamped under the empty window and sort
+    /// below the marker. The config write comes first; if it fails the
+    /// volume stays never-derived so no rebuild can disagree with the
+    /// live index.
+    fn flip_window(&mut self, ranges: crate::journal::JournalRanges) {
+        let activation = (!ranges.is_empty()).then(|| self.mint.next());
+        let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[journal] reading volume.toml for window flip failed: {e}");
+                return;
+            }
+        };
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: ranges.clone(),
+            activation,
+        });
+        if let Err(e) = cfg.write(&self.base_dir) {
+            log::warn!("[journal] persisting window flip failed: {e}");
+            return;
+        }
+        self.journal_derived = true;
+        match activation {
+            Some(a) => {
+                log::info!(
+                    "[journal] window derived live: {} range(s), {} LBAs; active from segment {a}",
+                    ranges.as_slice().len(),
+                    ranges.lba_count(),
+                );
+                self.journal = crate::journal::JournalWindow {
+                    ranges,
+                    activation: Some(a),
+                };
+            }
+            None => {
+                log::info!("[journal] derived: filesystem has no internal journal");
+            }
+        }
     }
 
     /// Write `data` starting at logical block address `lba`.
@@ -1098,7 +1197,7 @@ impl Volume {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: self.journal_ranges.contains(lba),
+                journal: self.journal.ranges.contains(lba),
             },
         );
         self.pending_entries
@@ -1610,14 +1709,14 @@ impl Volume {
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         let delta_body_source =
             extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
-        let journal_ranges = self.journal_ranges.clone();
+        let journal = self.journal.clone();
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: new_ulid,
             body_section_start: new_bss,
             body_tier: extentindex::RegistrationBodyTier::Cached,
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
-            journal_ranges: &journal_ranges,
+            journal: &journal,
         };
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
@@ -1980,7 +2079,7 @@ impl Volume {
             .collect();
         chain.push((self.base_dir.clone(), None));
         let (disk_inner, disk_deltas, live_segments) =
-            match extentindex::rebuild_owners_unverified(&chain, &self.journal_ranges) {
+            match extentindex::rebuild_owners_unverified(&chain, &self.journal) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("assert_extent_index_consistent[{caller}]: rebuild failed: {e}");
@@ -3045,26 +3144,31 @@ impl Volume {
                 snap_ulid,
                 extent_index: Arc::clone(&self.extent_index),
                 search_dirs,
-                journal_ranges: self.journal_ranges.clone(),
+                journal_ranges: self.journal.ranges.clone(),
             }
         });
-        let (primary, journal) = partition_journal_pending(
+        let (primary, jpart) = partition_journal_pending(
             std::mem::take(&mut self.pending_entries),
             pre_promote_offsets,
             std::mem::take(&mut self.pending_body_offsets),
-            &self.journal_ranges,
+            &self.journal.ranges,
         );
         // The journal segment ULID is minted after the primary's, so it
         // sorts above the data segment (see `JournalPartition`).
-        let journal =
-            journal.map(
-                |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
-                    segment_ulid: self.mint.next(),
-                    entries,
-                    pre_promote_offsets,
-                    body_offsets,
-                },
-            );
+        let jpart = jpart.map(
+            |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
+                segment_ulid: self.mint.next(),
+                entries,
+                pre_promote_offsets,
+                body_offsets,
+            },
+        );
+        // Poll for a first-ever window derivation while the taken epoch
+        // is fully staged: any activation ULID minted here sorts above
+        // this epoch's segment ULIDs and below the next WAL's.
+        if !self.journal_derived {
+            self.poll_derive_and_flip();
+        }
         Ok(PromoteJob {
             segment_ulid,
             old_wal_ulid: open.ulid,
@@ -3075,7 +3179,7 @@ impl Volume {
             signer: Arc::clone(&self.signer),
             pending_dir: self.base_dir.join("pending"),
             delta_prior,
-            journal,
+            journal: jpart,
         })
     }
 
@@ -3102,7 +3206,7 @@ impl Volume {
             Arc::make_mut(&mut self.extent_index),
             Arc::make_mut(&mut self.lbamap),
             result,
-            &self.journal_ranges,
+            &self.journal,
         )?;
 
         // Delete old WAL — only after the extent index is updated.

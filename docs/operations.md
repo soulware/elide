@@ -331,7 +331,7 @@ S3 repacking is a locality optimisation and is not subject to the leaf-only cons
 
 Because Elide controls the block device, it sees every write including ext4 metadata (superblock, group descriptors, inode tables, extent trees, journal).
 
-**Journal-window awareness** is implemented: the jbd2 journal's LBA ranges are derived from the filesystem at open, persisted in `volume.toml`, and drive the extent index's canonical-ownership rule (see `docs/design/delta-compression.md` § Journal-region awareness and `docs/architecture.md` § Dedup).
+**Journal-window awareness** is implemented: the jbd2 journal's LBA ranges are derived from the filesystem — at open, and while never derived, at every promote take, so a volume formatted mid-session flips the window live without a reopen — persisted in `volume.toml`, and drive the extent index's canonical-ownership rule (see `docs/design/delta-compression.md` § Journal-region awareness and `docs/architecture.md` § Dedup).
 
 Further opportunities (future):
 

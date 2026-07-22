@@ -731,41 +731,21 @@ pub fn scan(image: &Path) -> io::Result<Ext4Scan> {
 }
 
 #[cfg(test)]
-mod journal_tests {
+pub(crate) mod test_support {
     use super::*;
 
-    /// In-memory image implementing `Ext4Read`.
-    struct VecReader(Vec<u8>);
-
-    impl Ext4Read for VecReader {
-        fn read(
-            &mut self,
-            start_byte: u64,
-            dst: &mut [u8],
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let start = start_byte as usize;
-            let end = start + dst.len();
-            let src = self
-                .0
-                .get(start..end)
-                .ok_or_else(|| io::Error::other("read past end of image"))?;
-            dst.copy_from_slice(src);
-            Ok(())
-        }
-    }
-
-    fn put_u16(img: &mut [u8], off: usize, v: u16) {
+    pub(crate) fn put_u16(img: &mut [u8], off: usize, v: u16) {
         img[off..off + 2].copy_from_slice(&v.to_le_bytes());
     }
 
-    fn put_u32(img: &mut [u8], off: usize, v: u32) {
+    pub(crate) fn put_u32(img: &mut [u8], off: usize, v: u32) {
         img[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
 
     /// Minimal ext4 image: superblock + one block group descriptor +
     /// inode table holding an extent-mapped journal inode 8 with two
-    /// extents.
-    fn journal_image() -> Vec<u8> {
+    /// extents — journal window `[(40, 8), (56, 4)]`.
+    pub(crate) fn journal_image() -> Vec<u8> {
         let mut img = vec![0u8; 64 * 4096];
         let sb = SUPERBLOCK_OFFSET as usize;
         put_u16(&mut img, sb + 0x38, EXT4_MAGIC);
@@ -798,6 +778,32 @@ mod journal_tests {
         put_u16(&mut img, eh + 30, 0);
         put_u32(&mut img, eh + 32, 56);
         img
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::test_support::{journal_image, put_u32};
+    use super::*;
+
+    /// In-memory image implementing `Ext4Read`.
+    struct VecReader(Vec<u8>);
+
+    impl Ext4Read for VecReader {
+        fn read(
+            &mut self,
+            start_byte: u64,
+            dst: &mut [u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let start = start_byte as usize;
+            let end = start + dst.len();
+            let src = self
+                .0
+                .get(start..end)
+                .ok_or_else(|| io::Error::other("read past end of image"))?;
+            dst.copy_from_slice(src);
+            Ok(())
+        }
     }
 
     #[test]

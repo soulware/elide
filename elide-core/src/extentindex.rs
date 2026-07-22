@@ -203,9 +203,10 @@ pub struct SegmentRegistrationCtx<'a> {
     pub delta_body_source: Option<DeltaBodySource>,
     pub inline: InlineSource<'a>,
     /// Journal window of the guest filesystem, for stamping
-    /// `ExtentLocation::journal` per entry. Empty disables the
-    /// non-journal ownership preference.
-    pub journal_ranges: &'a crate::journal::JournalRanges,
+    /// `ExtentLocation::journal` per entry (classified against this
+    /// segment's ULID). An empty window disables the non-journal
+    /// ownership preference.
+    pub journal: &'a crate::journal::JournalWindow,
 }
 
 /// Admission policy for [`ExtentIndex::register_entry`].
@@ -675,7 +676,7 @@ impl ExtentIndex {
                 } else {
                     None
                 };
-                let journal = ctx.journal_ranges.contains(entry.start_lba);
+                let journal = ctx.journal.is_journal(entry.start_lba, ctx.segment_id);
                 let admitted = match admission {
                     // First-write-wins with the non-journal preference,
                     // matching `insert_if_absent`.
@@ -859,11 +860,12 @@ impl Default for ExtentIndex {
 /// registered every canonical a DedupRef can name by the time it is
 /// reached.
 ///
-/// `journal_ranges` is the persisted journal window from
-/// `volume.toml`; empty reproduces plain lowest-ULID-wins.
+/// `journal` is the persisted journal window from `volume.toml`
+/// (ranges plus any live-flip activation marker); an empty window
+/// reproduces plain lowest-ULID-wins.
 pub fn rebuild(
     forks: &[(PathBuf, Option<String>)],
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
@@ -960,7 +962,7 @@ pub fn rebuild(
                 body_tier,
                 delta_body_source,
                 inline: InlineSource::Section(&inline_bytes),
-                journal_ranges,
+                journal,
             };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
@@ -1002,7 +1004,7 @@ pub fn rebuild(
 #[cfg(feature = "volume-invariants")]
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
-    journal_ranges: &crate::journal::JournalRanges,
+    journal: &crate::journal::JournalWindow,
 ) -> io::Result<(
     HashMap<blake3::Hash, Ulid>,
     HashMap<blake3::Hash, Ulid>,
@@ -1058,7 +1060,7 @@ pub fn rebuild_owners_unverified(
                             &mut journal_owned,
                             entry.hash,
                             sref.ulid,
-                            journal_ranges.contains(entry.start_lba),
+                            journal.is_journal(entry.start_lba, sref.ulid),
                         );
                     }
                     EntryKind::Delta => {
@@ -1107,7 +1109,7 @@ pub fn rebuild_owners_unverified(
                             &mut journal_owned,
                             hash,
                             wal_ulid,
-                            journal_ranges.contains(start_lba),
+                            journal.is_journal(start_lba, wal_ulid),
                         );
                     }
                 }
@@ -1441,7 +1443,7 @@ mod tests {
                 body_length: 4096,
             }),
             inline: InlineSource::EntryInline,
-            journal_ranges: &crate::journal::EMPTY,
+            journal: &crate::journal::NO_WINDOW,
         }
     }
 
@@ -1674,7 +1676,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         // body_offset is body-relative (= stored_offset); body_section_start carries bss.
@@ -1712,7 +1714,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         // Only Data indexed; DedupRef skipped.
         assert_eq!(index.len(), 1);
         assert!(index.lookup(&ref_hash).is_none());
@@ -1767,7 +1769,7 @@ mod tests {
             .unwrap();
         }
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         // Oldest segment (lowest ULID) wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset1);
@@ -1780,7 +1782,7 @@ mod tests {
     fn rebuild_empty_dirs_returns_empty() {
         let base = temp_dir();
         std::fs::create_dir_all(&base).unwrap();
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         assert!(index.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1819,7 +1821,7 @@ mod tests {
 
         let index = rebuild(
             &[(ancestor.clone(), None), (live.clone(), None)],
-            &crate::journal::EMPTY,
+            &crate::journal::NO_WINDOW,
         )
         .unwrap();
         assert_eq!(index.len(), 1);
@@ -1857,7 +1859,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();
@@ -1899,7 +1901,7 @@ mod tests {
         segment::extract_idx(&seg_path, &idx_path).unwrap();
         std::fs::remove_file(&seg_path).unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::EMPTY).unwrap();
+        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();

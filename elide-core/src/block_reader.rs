@@ -114,10 +114,11 @@ impl BlockReader {
         search_dirs.dedup();
 
         let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
-        // Rebuild with the volume's persisted journal window so the
-        // live view resolves canonicals exactly as the volume does.
-        let journal_ranges = crate::config::VolumeConfig::read(&dir)?.journal_ranges;
-        let mut extent_index = extentindex::rebuild(&rebuild_chain, &journal_ranges)?;
+        // Rebuild with the volume's persisted journal window (including
+        // any live-flip activation marker) so the live view resolves
+        // canonicals exactly as the volume does.
+        let journal = crate::config::VolumeConfig::read(&dir)?.journal_window();
+        let mut extent_index = extentindex::rebuild(&rebuild_chain, &journal)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
         // partial tails that may exist on a currently-running volume.
@@ -153,7 +154,7 @@ impl BlockReader {
                                 body_source: extentindex::BodySource::Local,
                                 body_section_start: 0,
                                 inline_data: None,
-                                journal: journal_ranges.contains(start_lba),
+                                journal: journal.is_journal(start_lba, ulid),
                             },
                         );
                     }
@@ -854,14 +855,13 @@ fn apply_snapshot_layer(
         // Snapshot-pinned views keep plain lowest-ULID-wins: ownership
         // preference never changes which bytes a hash resolves to, and
         // a pinned view has no live path to stay consistent with.
-        let no_ranges = crate::journal::JournalRanges::default();
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: *seg,
             body_section_start,
             body_tier: extentindex::RegistrationBodyTier::Cached,
             delta_body_source: Some(DeltaBodySource::Cached),
             inline: extentindex::InlineSource::Section(&inline_bytes),
-            journal_ranges: &no_ranges,
+            journal: &crate::journal::NO_WINDOW,
         };
         for (raw_idx, entry) in entries.iter().enumerate() {
             lbamap.register_entry(entry, *seg);
