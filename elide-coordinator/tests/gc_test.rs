@@ -1591,3 +1591,145 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
         "LBA {m}: expected h2 (DedupRef write); got something else"
     );
 }
+
+/// A deterministic, incompressible 4096-byte block keyed by `seed`.
+fn incompressible_block(seed: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let key = [seed; 32];
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        chunk.copy_from_slice(&hash.as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    buf
+}
+
+/// `incompressible_block(base_seed)` with the first 32 bytes set to `tweak`.
+/// Two blocks sharing `base_seed` differ by ~32 bytes, which is what lets the
+/// formation delta tier store the second as a thin `Delta` against the first.
+fn variant_block(base_seed: u8, tweak: u8) -> Vec<u8> {
+    let mut buf = incompressible_block(base_seed);
+    buf[..32].fill(tweak);
+    buf
+}
+
+/// Count `Delta` entries across every segment file in `dir`, matching
+/// `want_ext` (`Some("idx")` for `index/`, `None` for bare `pending/`).
+fn delta_count_in(dir: &std::path::Path, want_ext: Option<&str>) -> usize {
+    let mut n = 0;
+    for e in fs::read_dir(dir).unwrap().flatten() {
+        let path = e.path();
+        if path.extension().and_then(|s| s.to_str()) != want_ext {
+            continue;
+        }
+        let (_, entries, _) = elide_core::segment::read_segment_index(&path).unwrap();
+        n += entries
+            .iter()
+            .filter(|x| x.kind == elide_core::segment::EntryKind::Delta)
+            .count();
+    }
+    n
+}
+
+fn pending_delta_count(fork_dir: &std::path::Path) -> usize {
+    delta_count_in(&fork_dir.join("pending"), None)
+}
+
+fn index_delta_count(fork_dir: &std::path::Path) -> usize {
+    delta_count_in(&fork_dir.join("index"), Some("idx"))
+}
+
+/// A `Delta` entry's body is reconstructed against the body of a *different*
+/// hash — `delta_options[*].source_hash` — so that source must survive GC even
+/// though no LBA maps to it. `live_index_segments` carries live-Delta source
+/// hashes into its live set for exactly this reason; the rewriters build
+/// `live_hashes` from `lba_referenced_hashes()` alone, which does not.
+///
+/// Overwriting an LBA with a near-duplicate leaves the original as the delta
+/// source with no LBA claim of its own, which is the shape that exercises it.
+#[test]
+fn gc_keeps_live_delta_source() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    let key = elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    elide_core::signing::write_provenance(
+        fork_dir,
+        &key,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        &elide_core::signing::ProvenanceLineage::default(),
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    // A is the delta source; B differs from it by ~32 bytes. Sealing A
+    // under a snapshot is what lets the next promote's delta tier pick it
+    // as a dictionary — see `formation_deltas_post_seal_near_duplicate`.
+    let a = incompressible_block(1);
+    let b = variant_block(1, 0x7E);
+
+    vol.write(0, &a).unwrap();
+    vol.snapshot().unwrap();
+
+    // B overwrites A's LBA, so A keeps no LBA claim of its own. The delta
+    // tier runs during formation, inside promote — not in `flush_wal`.
+    vol.write(0, &b).unwrap();
+    vol.promote_for_test().unwrap();
+    assert!(
+        pending_delta_count(fork_dir) > 0,
+        "no Delta entry formed at promote — this test cannot exercise delta-source liveness"
+    );
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+    assert!(
+        index_delta_count(fork_dir) > 0,
+        "Delta did not survive the promote into index/ — nothing to protect"
+    );
+
+    // Release the snapshot. Until now A's segment sat at or below the
+    // snapshot floor, and `collect_stats` skips everything there — that
+    // floor, not any liveness reasoning, is what has been keeping the
+    // delta's source alive. Dropping the manifest drops the floor and
+    // leaves the source's fate entirely to `live_hashes`.
+    for e in fs::read_dir(fork_dir.join("snapshots")).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("manifest") {
+            fs::remove_file(&p).unwrap();
+        }
+    }
+
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    let st = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    assert!(
+        st.candidates >= 2,
+        "both segments must be GC candidates once the floor is gone, got {}",
+        st.candidates
+    );
+    vol.apply_gc_handoffs().unwrap();
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
+
+    // Reopen so the read rebuilds from disk rather than serving from the
+    // live volume's in-memory state and cached file handles.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let got = vol.read(0, 1).expect("read lba=0 after GC");
+    assert_eq!(
+        got.as_slice(),
+        b.as_slice(),
+        "lba=0 lost its value: GC dropped the body the live Delta reconstructs against"
+    );
+}

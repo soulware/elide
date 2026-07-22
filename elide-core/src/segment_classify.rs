@@ -132,11 +132,10 @@ pub struct ClassifyCtx<'a> {
 /// only matters for the dead branch (whether to demote to Canonical or
 /// drop).
 ///
-/// `CanonicalData` / `CanonicalInline` are not expected to reach this
-/// classifier — they have `lba_length == 0` and make no LBA claim, so
-/// rewriters that include them simply pass them through. Callers may
-/// route them as `FullyLive` for that purpose; the classifier does so
-/// here as a safety net.
+/// `CanonicalData` / `CanonicalInline` have `lba_length == 0` and make no
+/// LBA claim, so the matching-blocks accounting does not apply to them.
+/// They are decided on hash liveness alone: kept when something still
+/// resolves against their body, dropped as garbage otherwise.
 pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClassification {
     if entry.kind == EntryKind::Zero {
         let end_lba = entry.start_lba + entry.lba_length as u64;
@@ -149,11 +148,28 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
     }
 
     if entry.kind.is_canonical_only() {
-        // Canonical entries already make no LBA claim. Pass them through
-        // (subject to hash-liveness checks at the caller's discretion —
-        // this classifier doesn't know whether the caller is a stripping
-        // rewrite that wants to drop unreferenced canonicals).
-        return EntryClassification::FullyLive;
+        // A canonical makes no LBA claim of its own — it exists purely so
+        // some other entry can resolve against its body. `live_hashes`
+        // covers both ways that happens (a DedupRef's LBA carries the
+        // canonical's hash, and a live Delta's source hashes are
+        // refcounted into the set by `LbaMap::lba_referenced_hashes`), so
+        // a canonical outside it is reachable by nothing and is garbage.
+        //
+        // Keeping such an entry is not free: it is body-bearing, so every
+        // consumer that requires a rewrite input to be cache-resident
+        // keeps demanding bytes that no read path will ever fetch.
+        if ctx.live_hashes.contains(&entry.hash) {
+            return EntryClassification::FullyLive;
+        }
+        let extent_live = ctx
+            .extent_index
+            .lookup(&entry.hash)
+            .is_some_and(|loc| loc.segment_id == ctx.segment_id);
+        return if extent_live {
+            EntryClassification::DropAndRemoveHash
+        } else {
+            EntryClassification::Drop
+        };
     }
 
     let end_lba = entry.start_lba + entry.lba_length as u64;
@@ -240,5 +256,98 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
             // is_canonical_only() and short-circuited above.
             _ => EntryClassification::FullyLive,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extentindex::{BodySource, ExtentLocation};
+    use crate::segment::SegmentFlags;
+
+    fn canonical(hash: blake3::Hash) -> SegmentEntry {
+        SegmentEntry::new_data_no_body(hash, 7, 1, SegmentFlags::empty(), 4096).into_canonical()
+    }
+
+    fn location(segment_id: Ulid) -> ExtentLocation {
+        ExtentLocation {
+            segment_id,
+            body_offset: 0,
+            body_length: 4096,
+            compressed: false,
+            body_source: BodySource::Local,
+            body_section_start: 0,
+            inline_data: None,
+            journal: false,
+        }
+    }
+
+    /// While something still resolves against a canonical's body — a
+    /// DedupRef carrying its hash, or a live Delta sourcing from it, both of
+    /// which land in `live_hashes` — the rewrite must carry it forward.
+    #[test]
+    fn referenced_canonical_is_kept() {
+        let seg = Ulid::new();
+        let hash = blake3::hash(b"referenced");
+        let mut index = ExtentIndex::default();
+        index.insert(hash, location(seg));
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &live,
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&canonical(hash), &ctx),
+            EntryClassification::FullyLive
+        ));
+    }
+
+    /// A canonical makes no LBA claim, so once its hash leaves `live_hashes`
+    /// nothing can reach its body: no read resolves it and no warm path
+    /// fetches it. Carrying it forward strands body bytes that every
+    /// cache-residency check keeps demanding. This segment owns the hash, so
+    /// the hash must also leave the extent index.
+    #[test]
+    fn unreferenced_canonical_owned_here_is_dropped_and_hash_removed() {
+        let seg = Ulid::new();
+        let hash = blake3::hash(b"unreferenced");
+        let mut index = ExtentIndex::default();
+        index.insert(hash, location(seg));
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &HashSet::new(),
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&canonical(hash), &ctx),
+            EntryClassification::DropAndRemoveHash
+        ));
+    }
+
+    /// Same, but the extent index points the hash at a different segment.
+    /// Dropping the entry here must not disturb that owner's mapping.
+    #[test]
+    fn unreferenced_canonical_owned_elsewhere_is_dropped_without_touching_index() {
+        let seg = Ulid::new();
+        let other = Ulid::new();
+        let hash = blake3::hash(b"owned elsewhere");
+        let mut index = ExtentIndex::default();
+        index.insert(hash, location(other));
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &HashSet::new(),
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&canonical(hash), &ctx),
+            EntryClassification::Drop
+        ));
     }
 }
