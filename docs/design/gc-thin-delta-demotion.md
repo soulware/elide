@@ -62,15 +62,21 @@ through the composite slot, and the canonical companion carries blobs.
 
 ### Reads
 
-`read_block` resolves a hash through the data index and falls through to
-the deltas map, so a DedupRef pointing at a delta-stored hash reconstructs
-today. `CanonicalDelta` registers in the deltas map exactly as `Delta`
-does; the claim skip is `is_canonical_only()`, which the kind joins.
+Resolution is content-addressed: the extent index holds one home per hash
+(body form in the data map, recipe form in the deltas map), and every
+claim on that hash resolves through it. A recipe home's dependents are
+duplicate encodings of the same content — the dedup tier consults the
+data map only, so a hash whose home is a recipe is re-encoded on a second
+write, the duplicate's registration is refused, and its claim resolves
+through the home. `read_block` falls through data map to deltas map, so
+those reads reconstruct today while the home is a live `Delta`.
 
-The trade is per-read: a dedup read of a demoted hash reconstructs through
-the delta path (source body + blob decode) instead of slicing a
-materialised body, amortised by the `.dmat` materialisation cache. That is
-the same cost the hash had before its claim died, when it was a live Delta.
+`CanonicalDelta` registers in the deltas map exactly as `Delta` does; the
+claim skip is `is_canonical_only()`, which the kind joins. Reads of the
+dependent claims cost what they always cost: one reconstruction (source
+body + blob decode), amortised by the `.dmat` materialisation cache.
+Demotion stops changing the hash's storage form — the home loses its
+claim, and that is all.
 
 ### Source survival
 
@@ -85,7 +91,8 @@ as it does for a live Delta today.
 
 `CanonicalDelta` cannot itself become a source: delta sources resolve
 through the data index only, and Data-entry demotion still produces
-materialised `CanonicalData`.
+materialised `CanonicalData`. Resolution depth stays bounded at
+recipe → body: a claim resolves in at most two hops.
 
 ## Out of scope
 
@@ -99,7 +106,7 @@ a separate design.
 
 - A GC pass over a fully-LBA-dead, hash-live Delta emits `CanonicalDelta`,
   and the bucket's materialised price is the blob bytes, not the composite.
-- A DedupRef whose target was demoted reads back correctly after the
+- A duplicate claim on the demoted hash reads back correctly after the
   rewrite, across a reopen.
 - A second rewrite carries a `CanonicalDelta` forward intact.
 - A partial-death Delta emits run slices plus a thin canonical, and the
