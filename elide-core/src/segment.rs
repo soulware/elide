@@ -1976,6 +1976,19 @@ fn promote_is_complete(
     }))
 }
 
+/// `<path>.tmp`, the scratch sibling an atomic write renames from.
+///
+/// Public so the coordinator can unlink a leaked tmp when it drops a
+/// segment's cache files, without restating the naming.
+pub fn tmp_sibling(path: &Path) -> io::Result<PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("path has no filename"))?
+        .to_owned();
+    name.push(".tmp");
+    Ok(path.with_file_name(name))
+}
+
 /// Copy a segment body into the local cache, preserving sparseness.
 ///
 /// Reads `src_path` (a full segment in `pending/` or `gc/`) and writes
@@ -2003,16 +2016,6 @@ fn promote_is_complete(
 /// incrementally in place, so when a crash leaks `index/<id>.idx`
 /// before the body promote finishes, a partial fetch-created body can
 /// sit at `body_path` when the promote is retried.
-/// `<path>.tmp`, the scratch sibling an atomic write renames from.
-fn tmp_sibling(path: &Path) -> io::Result<PathBuf> {
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("path has no filename"))?
-        .to_owned();
-    name.push(".tmp");
-    Ok(path.with_file_name(name))
-}
-
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
@@ -2665,6 +2668,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The coordinator derives the tmp to unlink from the body path when it
+    /// drops a consumed input's cache files, so this naming is a contract
+    /// between the two crates rather than a local detail.
+    #[test]
+    fn tmp_sibling_appends_to_the_full_filename() {
+        let body = Path::new("/v/cache/01ARZ3NDEKTSV4RRFFQ69G5FAV.body");
+        assert_eq!(
+            tmp_sibling(body).unwrap(),
+            Path::new("/v/cache/01ARZ3NDEKTSV4RRFFQ69G5FAV.body.tmp")
+        );
+    }
 
     /// Generate a fresh Ed25519 keypair for use in tests.
     fn test_signer() -> (Arc<dyn SegmentSigner>, VerifyingKey) {

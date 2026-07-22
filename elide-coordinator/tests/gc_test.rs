@@ -272,7 +272,11 @@ fn simulate_coord_cache_evict(fork_dir: &std::path::Path) {
         };
         for old in &inputs {
             let s = old.to_string();
-            let _ = fs::remove_file(cache_dir.join(format!("{s}.body")));
+            let body = cache_dir.join(format!("{s}.body"));
+            if let Ok(tmp) = elide_core::segment::tmp_sibling(&body) {
+                let _ = fs::remove_file(tmp);
+            }
+            let _ = fs::remove_file(body);
             let _ = fs::remove_file(cache_dir.join(format!("{s}.present")));
         }
     }
