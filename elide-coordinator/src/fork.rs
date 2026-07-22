@@ -345,7 +345,8 @@ impl ForkOrchestrator {
     ///
     /// Resolution order:
     ///   - Pinned source (`Pinned` / `PinnedName`): use the explicit
-    ///     `snap_hint`.
+    ///     `snap_hint`, validated against a writable source's own
+    ///     snapshots (`docs/design/fork-branch-invariant.md`).
     ///   - Readonly source: use the latest local snapshot, falling back
     ///     to the `names/<name>` record's `latest_snapshot`.
     ///   - Writable source: take an implicit snapshot. If the source
@@ -363,13 +364,31 @@ impl ForkOrchestrator {
         let source_ulid_str = source_vol_ulid.to_string();
         let source_dir = resolve_ancestor_dir(&self.by_id_dir, &source_ulid_str);
 
+        let readonly = source_dir.join("volume.readonly").exists();
+
         if let Some(snap) = source.snap_hint {
-            // Pinned source already names the snapshot.
+            // A branch ULID names a snapshot of the source. A writable
+            // source created every snapshot it has, so the manifest is
+            // on disk, and it is the only class a rewriter touches: an
+            // unbacked pin leaves the child resolving segments the
+            // source is free to collect. A readonly skeleton is exempt
+            // — no daemon rewrites it, and `surface_prefetch` pulls its
+            // manifests after the fork is minted.
+            if !readonly {
+                let manifest = source_dir
+                    .join("snapshots")
+                    .join(elide_core::signing::snapshot_manifest_filename(&snap));
+                if !manifest.exists() {
+                    return Err(IpcError::not_found(format!(
+                        "source volume {source_ulid_str} has no snapshot {snap}"
+                    )));
+                }
+            }
             self.snap_ulid = Some(snap);
             return Ok(());
         }
 
-        if source_dir.join("volume.readonly").exists() {
+        if readonly {
             let snap_ulid = if let Some(snap) = elide_core::volume::latest_snapshot(&source_dir)
                 .map_err(|e| IpcError::internal(format!("reading local snapshots: {e}")))?
             {
@@ -846,7 +865,9 @@ mod tests {
     use elide_coordinator::ipc::IpcErrorKind;
     use elide_coordinator::stores::{PassthroughStores, ScopedStores};
     use elide_core::name_record::{NameRecord, NameState};
-    use elide_core::signing::{ProvenanceLineage, VOLUME_PROVENANCE_FILE, write_provenance};
+    use elide_core::signing::{
+        ProvenanceLineage, SnapshotKind, VOLUME_PROVENANCE_FILE, write_provenance,
+    };
     use object_store::PutPayload;
     use object_store::path::Path as StorePath;
     use rand_core::OsRng;
@@ -988,6 +1009,138 @@ mod tests {
         orch.pull_chain().await.unwrap();
         orch.resolve_snapshot().await.unwrap();
         assert_eq!(orch.snap_ulid, Some(pinned), "pin wins over record latest");
+    }
+
+    /// A supervised writable source: a `by_id/<ulid>` directory with no
+    /// `volume.readonly` marker, holding a signed manifest per entry of
+    /// `snaps`.
+    fn local_writable_source(data_dir: &Path, snaps: &[(Ulid, SnapshotKind)]) -> Ulid {
+        let vol_ulid = Ulid::new();
+        let vol_dir = data_dir.join("by_id").join(vol_ulid.to_string());
+        std::fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
+        let (signer, _) = elide_core::signing::generate_ephemeral_signer();
+        for (snap_ulid, kind) in snaps {
+            match kind {
+                SnapshotKind::User => elide_core::signing::write_snapshot_manifest(
+                    &vol_dir,
+                    signer.as_ref(),
+                    snap_ulid,
+                    &[],
+                ),
+                SnapshotKind::Stop => elide_core::signing::write_stop_snapshot_manifest(
+                    &vol_dir,
+                    signer.as_ref(),
+                    snap_ulid,
+                    &[],
+                ),
+            }
+            .unwrap();
+        }
+        vol_ulid
+    }
+
+    #[tokio::test]
+    async fn pinned_writable_source_accepts_its_own_snapshot() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (ctx, data_dir) = fixture(Arc::clone(&mem));
+        let source = local_writable_source(data_dir.path(), &[(snap(), SnapshotKind::User)]);
+
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Pinned {
+                vol_ulid: source,
+                snap_ulid: snap(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        orch.resolve_snapshot().await.unwrap();
+        assert_eq!(orch.snap_ulid, Some(snap()));
+    }
+
+    #[tokio::test]
+    async fn pinned_writable_source_refuses_snapshot_it_never_took() {
+        // The branch ULID names a snapshot of the source. A writable
+        // source is rewritten down to its own floor, so a pin the
+        // source never took leaves the child resolving segments the
+        // source is free to collect.
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (ctx, data_dir) = fixture(Arc::clone(&mem));
+        let source = local_writable_source(data_dir.path(), &[(snap(), SnapshotKind::User)]);
+        let unbacked = Ulid::from_string("01J2222222222222222222222V").unwrap();
+
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Pinned {
+                vol_ulid: source,
+                snap_ulid: unbacked,
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        let err = orch
+            .resolve_snapshot()
+            .await
+            .expect_err("a pin naming no snapshot must refuse");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        assert!(err.message.contains(&source.to_string()), "{err}");
+        assert!(err.message.contains(&unbacked.to_string()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pinned_writable_source_refuses_stop_snapshot() {
+        // A stop-snapshot does not raise the floor, so it cannot anchor
+        // a branch. `<ulid>-stop.manifest` must not satisfy a pin at
+        // `<ulid>`.
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (ctx, data_dir) = fixture(Arc::clone(&mem));
+        let source = local_writable_source(data_dir.path(), &[(snap(), SnapshotKind::Stop)]);
+
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Pinned {
+                vol_ulid: source,
+                snap_ulid: snap(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        let err = orch
+            .resolve_snapshot()
+            .await
+            .expect_err("a stop-snapshot must not satisfy a pin");
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn pinned_readonly_skeleton_needs_no_local_manifest() {
+        // Prefetch ordering: `pull_chain` pulls `meta/<ulid>.*` only,
+        // and snapshot manifests arrive in `surface_prefetch`, after
+        // the fork is minted. No rewriter reaches a skeleton, so the
+        // pin stands on a directory with an empty `snapshots/`.
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let source = Ulid::new();
+        upload_root_skeleton(&mem, source).await;
+
+        let (ctx, data_dir) = fixture(Arc::clone(&mem));
+        let mut orch = orchestrator(
+            ctx,
+            ForkSource::Pinned {
+                vol_ulid: source,
+                snap_ulid: snap(),
+            },
+        );
+        orch.resolve_source().await.unwrap();
+        orch.pull_chain().await.unwrap();
+        orch.resolve_snapshot().await.unwrap();
+        assert_eq!(orch.snap_ulid, Some(snap()));
+        let snapshots = data_dir
+            .path()
+            .join("by_id")
+            .join(source.to_string())
+            .join("snapshots")
+            .join(elide_core::signing::snapshot_manifest_filename(&snap()));
+        assert!(!snapshots.exists(), "skeleton has no local manifest");
     }
 
     #[tokio::test]

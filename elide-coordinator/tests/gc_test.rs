@@ -1737,3 +1737,114 @@ fn gc_keeps_live_delta_source() {
         "lba=0 lost its value: GC dropped the body the live Delta reconstructs against"
     );
 }
+
+/// The fork branch invariant from the rewriter's side: a source's GC
+/// leaves every segment a child can reach alone
+/// (`docs/design/fork-branch-invariant.md`).
+///
+/// The child branches at a snapshot of the source, so the source's
+/// rewrite floor sits at or above the branch ULID and `collect_stats`
+/// skips everything the child's cutoff admits. The rewriters never
+/// reason about children, and this is why they do not have to.
+#[test]
+fn gc_leaves_a_forks_reachable_range_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let by_id = dir.path();
+    let source_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+    let child_dir = by_id.join("01BBBBBBBBBBBBBBBBBBBBBBBB");
+
+    fs::create_dir_all(&source_dir).unwrap();
+    let key = elide_core::signing::generate_keypair(
+        &source_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+    elide_core::signing::write_provenance(
+        &source_dir,
+        &key,
+        elide_core::signing::VOLUME_PROVENANCE_FILE,
+        &elide_core::signing::ProvenanceLineage::default(),
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    let branch_bytes = incompressible_block(1);
+    let post_branch_bytes = incompressible_block(2);
+
+    let mut source = Volume::open(&source_dir, by_id).unwrap();
+    source.write(0, &branch_bytes).unwrap();
+    source.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(
+        &mut source,
+        ulid::Ulid::nil(),
+        &store,
+    ));
+    let branch_ulid = source.snapshot().unwrap();
+    let reachable: Vec<_> = fs::read_dir(source_dir.join("index"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("idx"))
+        .collect();
+    assert!(!reachable.is_empty(), "source has no segment to branch at");
+
+    elide_core::volume::fork_volume(&child_dir, &source_dir).unwrap();
+
+    // The source overwrites the branch-time value. Nothing maps to the
+    // old bytes any more, so only the floor stands between them and the
+    // sweep.
+    source.write(0, &post_branch_bytes).unwrap();
+    source.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(
+        &mut source,
+        ulid::Ulid::nil(),
+        &store,
+    ));
+
+    let u_gc = source.gc_checkpoint_for_test().unwrap();
+    let st = gc_fork(&source_dir, by_id, &gc_config, vec![u_gc]).unwrap();
+    assert_eq!(
+        st.total_segments, 1,
+        "the branch-time segment sits below the floor and must not enter the pass"
+    );
+    source.apply_gc_handoffs().unwrap();
+    rt.block_on(apply_done_handoffs(&source_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
+    simulate_coord_cache_evict(&source_dir);
+
+    for idx in &reachable {
+        let seg_ulid: ulid::Ulid = idx.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+        assert!(
+            seg_ulid <= branch_ulid,
+            "test built a source segment above the branch ULID: {seg_ulid} > {branch_ulid}"
+        );
+        assert!(
+            idx.exists(),
+            "GC removed index/{seg_ulid}.idx, which the child still resolves"
+        );
+        assert!(
+            source_dir
+                .join("cache")
+                .join(format!("{seg_ulid}.body"))
+                .exists(),
+            "GC evicted cache/{seg_ulid}.body, which the child still reads through"
+        );
+    }
+
+    drop(source);
+    let child = Volume::open(&child_dir, by_id).unwrap();
+    assert_eq!(
+        child
+            .read(0, 1)
+            .expect("child reads lba=0 through its branch"),
+        branch_bytes,
+        "child lost the bytes its branch ULID admits"
+    );
+}
