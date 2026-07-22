@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
 use super::AncestorLayer;
+use crate::signing::{SnapshotKind, parse_snapshot_filename};
 
 /// Resolve an ancestor volume directory by ULID.
 ///
@@ -267,10 +268,14 @@ pub fn lineage_ulids(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Vec<Ulid>>
     Ok(out)
 }
 
-/// Return the latest snapshot ULID for a fork, or `None` if no
-/// snapshots exist. Snapshots are recorded as `<ulid>.manifest` files
-/// under `fork_dir/snapshots/`; the manifest's presence is the
+/// Return the latest stable snapshot ULID for a fork, or `None` if no
+/// stable snapshots exist. Snapshots are recorded as `<ulid>.manifest`
+/// files under `fork_dir/snapshots/`; the manifest's presence is the
 /// snapshot's existence.
+///
+/// Only [`SnapshotKind::User`] counts. An ephemeral
+/// `<ulid>-stop.manifest` checkpoint anchors neither a fork's branch
+/// point nor a rewrite floor.
 pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
     let snapshots_dir = fork_dir.join("snapshots");
     let iter = match fs::read_dir(&snapshots_dir) {
@@ -280,12 +285,12 @@ pub fn latest_snapshot(fork_dir: &Path) -> io::Result<Option<Ulid>> {
     };
     let latest = iter
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name();
-            let s = name.to_str()?;
-            let stem = s.strip_suffix(".manifest")?;
-            Ulid::from_string(stem).ok()
-        })
+        .filter_map(
+            |e| match parse_snapshot_filename(e.file_name().to_str()?)? {
+                (ulid, SnapshotKind::User) => Some(ulid),
+                (_, SnapshotKind::Stop) => None,
+            },
+        )
         .max();
     Ok(latest)
 }
@@ -552,5 +557,65 @@ mod tests {
         let chain = lineage_ulids(&c_dir, &by_id).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0], Ulid::from_string(p_ulid).unwrap());
+    }
+
+    // --- latest_snapshot tests ---
+
+    fn write_snapshot(vol_dir: &Path, name: String) {
+        let snap_dir = vol_dir.join("snapshots");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join(name), b"").unwrap();
+    }
+
+    #[test]
+    fn latest_snapshot_none_without_snapshots_dir() {
+        let by_id = temp_dir();
+        assert!(
+            latest_snapshot(&by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn latest_snapshot_ignores_stop_checkpoints() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let mut mint = crate::ulid_mint::UlidMint::new(Ulid::nil());
+        let user = mint.next();
+        let stop = mint.next();
+
+        write_snapshot(&vol_dir, crate::signing::snapshot_manifest_filename(&user));
+        write_snapshot(
+            &vol_dir,
+            crate::signing::stop_snapshot_manifest_filename(&stop),
+        );
+
+        // The stop checkpoint sorts above the user snapshot, so a
+        // kind-blind scan would return it.
+        assert!(stop > user);
+        assert_eq!(latest_snapshot(&vol_dir).unwrap(), Some(user));
+    }
+
+    #[test]
+    fn latest_snapshot_none_when_only_stop_checkpoints() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        write_snapshot(
+            &vol_dir,
+            crate::signing::stop_snapshot_manifest_filename(&Ulid::new()),
+        );
+        assert_eq!(latest_snapshot(&vol_dir).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_snapshot_ignores_non_manifest_entries() {
+        let by_id = temp_dir();
+        let vol_dir = by_id.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
+        let user = Ulid::new();
+        write_snapshot(&vol_dir, crate::signing::snapshot_manifest_filename(&user));
+        write_snapshot(&vol_dir, format!("{}.filemap", Ulid::new()));
+        write_snapshot(&vol_dir, "LATEST".to_owned());
+        assert_eq!(latest_snapshot(&vol_dir).unwrap(), Some(user));
     }
 }

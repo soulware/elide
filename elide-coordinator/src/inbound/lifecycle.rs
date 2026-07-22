@@ -1494,9 +1494,10 @@ fn self_heal_key_shadow(
 /// The stop-snapshot from the preceding `stop` is no longer needed as
 /// a recovery basis and is cleaned up here.
 ///
-/// Best-effort: a cleanup failure leaves the stop-snapshot in S3 (and
-/// pinning the GC floor) until the next `stop` overwrites it. The
-/// volume continues to serve regardless.
+/// Best-effort: a cleanup failure leaves the stop-snapshot on disk and
+/// in S3 until the next `stop` overwrites it. It anchors no rewrite
+/// floor while it sits there, and the volume continues to serve
+/// regardless.
 pub(crate) async fn notify_volume_ready_op(
     vol_ulid: ulid::Ulid,
     data_dir: &Path,
@@ -1541,8 +1542,7 @@ async fn cleanup_stop_snapshots(
     // (`docs/plans/list-elimination-plan.md` § *Identity axes*). A `-stop`
     // with no local trace (only reachable via the old prefix LIST) is
     // not swept here: it is best-effort residue the next `stop`
-    // overwrites and the GC floor tolerates, never a correctness
-    // datum.
+    // overwrites, never a correctness datum.
     let snap_dir = fork_dir.join("snapshots");
     let sentinel_dir = fork_dir.join("uploaded").join("snapshots");
 
