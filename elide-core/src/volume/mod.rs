@@ -692,14 +692,13 @@ impl Volume {
         // stored window, and everything rebuilding from `volume.toml`
         // during the new session must see the same rule.
         let mut cfg = crate::config::VolumeConfig::read(base_dir)?;
-        if cfg.journal_activation.take().is_some() {
+        if let Some(j) = cfg.journal.as_mut()
+            && j.activation.take().is_some()
+        {
             cfg.write(base_dir)?;
         }
-        let journal_derived = cfg.journal_ranges.is_some();
-        let journal = crate::journal::JournalWindow {
-            ranges: cfg.journal_ranges.unwrap_or_default(),
-            activation: None,
-        };
+        let journal_derived = cfg.journal.is_some();
+        let journal = cfg.journal_window();
 
         // Walk the origin chain and rebuild maps from all committed segments.
         let (ancestor_layers, mut lbamap, mut extent_index) =
@@ -963,7 +962,10 @@ impl Volume {
                 return;
             }
         };
-        cfg.journal_ranges = Some(derived.clone());
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: derived.clone(),
+            activation: None,
+        });
         if let Err(e) = cfg.write(&self.base_dir) {
             log::warn!("[journal] persisting window failed: {e}");
             return;
@@ -1019,8 +1021,10 @@ impl Volume {
                 return;
             }
         };
-        cfg.journal_ranges = Some(ranges.clone());
-        cfg.journal_activation = activation;
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: ranges.clone(),
+            activation,
+        });
         if let Err(e) = cfg.write(&self.base_dir) {
             log::warn!("[journal] persisting window flip failed: {e}");
             return;

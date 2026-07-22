@@ -748,8 +748,7 @@ impl ClaimOrchestrator {
                     ublk: elide_coordinator::ublk_sweep::ublk_capable()
                         .then(elide_core::config::UblkConfig::default),
                     lazy: None,
-                    journal_ranges: Default::default(),
-                    journal_activation: None,
+                    journal: None,
                 }
                 .write(&new_fork_dir)
                 .map_err(|e| IpcError::internal(format!("writing volume.toml: {e}")))?;

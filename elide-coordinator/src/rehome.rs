@@ -356,8 +356,7 @@ mod tests {
             size: None,
             ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),
             lazy: None,
-            journal_ranges: Default::default(),
-            journal_activation: None,
+            journal: None,
         }
         .write(&fork_dir)
         .unwrap();

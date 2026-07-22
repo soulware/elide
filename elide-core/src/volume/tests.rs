@@ -1026,7 +1026,10 @@ fn duplicate_of_promoted_canonical_minted_at_formation() {
 
 fn set_journal_ranges(base: &Path, ranges: Vec<(u64, u64)>) {
     let mut cfg = crate::config::VolumeConfig::read(base).unwrap();
-    cfg.journal_ranges = Some(crate::journal::JournalRanges::new(ranges));
+    cfg.journal = Some(crate::config::JournalConfig {
+        ranges: crate::journal::JournalRanges::new(ranges),
+        activation: None,
+    });
     cfg.write(base).unwrap();
 }
 
@@ -1052,7 +1055,7 @@ fn format_mid_session_flips_window_at_promote_take() {
     assert!(
         crate::config::VolumeConfig::read(&base)
             .unwrap()
-            .journal_ranges
+            .journal
             .is_none(),
         "fresh volume must start never-derived",
     );
@@ -1065,7 +1068,7 @@ fn format_mid_session_flips_window_at_promote_take() {
     assert!(
         crate::config::VolumeConfig::read(&base)
             .unwrap()
-            .journal_ranges
+            .journal
             .is_none(),
         "no filesystem yet — still never-derived",
     );
@@ -1073,10 +1076,13 @@ fn format_mid_session_flips_window_at_promote_take() {
     write_ext4_image(&mut vol, &crate::ext4_scan::test_support::journal_image());
     vol.promote_for_test().unwrap();
 
-    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
-    let ranges = cfg.journal_ranges.expect("window derived at take");
+    let jcfg = crate::config::VolumeConfig::read(&base)
+        .unwrap()
+        .journal
+        .expect("window derived at take");
+    let ranges = jcfg.ranges;
     assert_eq!(ranges.as_slice(), &[(40, 8), (56, 4)]);
-    let activation = cfg.journal_activation.expect("activation marker persisted");
+    let activation = jcfg.activation.expect("activation marker persisted");
     assert_eq!(vol.journal.activation, Some(activation));
     assert_eq!(vol.journal.ranges, ranges);
 
@@ -1119,7 +1125,9 @@ fn format_mid_session_flips_window_at_promote_take() {
     assert!(
         crate::config::VolumeConfig::read(&base)
             .unwrap()
-            .journal_activation
+            .journal
+            .unwrap()
+            .activation
             .is_none(),
         "open must clear the activation marker",
     );
@@ -1141,13 +1149,12 @@ fn derived_empty_window_persists_and_stops_polling() {
     write_ext4_image(&mut vol, &img);
     vol.promote_for_test().unwrap();
 
-    let cfg = crate::config::VolumeConfig::read(&base).unwrap();
-    assert_eq!(
-        cfg.journal_ranges,
-        Some(crate::journal::JournalRanges::default()),
-        "authoritative empty answer must persist as derived",
-    );
-    assert_eq!(cfg.journal_activation, None);
+    let jcfg = crate::config::VolumeConfig::read(&base)
+        .unwrap()
+        .journal
+        .expect("authoritative empty answer must persist as derived");
+    assert!(jcfg.ranges.is_empty());
+    assert_eq!(jcfg.activation, None);
     assert!(vol.journal_derived);
     assert!(vol.journal.ranges.is_empty());
 

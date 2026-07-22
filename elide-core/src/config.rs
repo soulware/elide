@@ -30,23 +30,31 @@ pub struct VolumeConfig {
     /// false) eagerly warms every live extent from S3 in the background.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lazy: Option<bool>,
-    /// LBA ranges of the guest filesystem's jbd2 journal (inode 8's
-    /// extents), derived at open — and, while `None`, re-attempted at
-    /// every promote take so a filesystem formatted mid-session gains
-    /// awareness without a reopen. Consulted by the extent index's
-    /// canonical-ownership rule before the filesystem is parseable.
-    /// `None` = never derived (keep attempting); `Some` (possibly
-    /// empty) = an authoritative parse answered, including "ext4 with
-    /// no internal journal".
+    /// The guest filesystem's journal window (`[journal]`). Absent =
+    /// never derived: derivation is re-attempted at open and at every
+    /// promote take, so a filesystem formatted mid-session gains
+    /// awareness without a reopen. Present = an authoritative parse
+    /// answered, including "no internal journal" (empty `ranges`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_ranges: Option<crate::journal::JournalRanges>,
-    /// First segment ULID minted after a mid-session None→window flip
-    /// of `journal_ranges`. While present, journal classification
-    /// applies the window only to segments at or above this ULID, so
-    /// rebuilds during the flip session reproduce the live stamps. The
-    /// next open reclassifies uniformly and clears it.
+    pub journal: Option<JournalConfig>,
+}
+
+/// The derived journal window within `volume.toml` (`[journal]`).
+///
+/// Consulted by the extent index's canonical-ownership rule before the
+/// filesystem is parseable.
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct JournalConfig {
+    /// LBA ranges of the journal (for ext4, inode 8's extents). Empty
+    /// means the filesystem has no internal journal.
+    pub ranges: crate::journal::JournalRanges,
+    /// First segment ULID minted after a mid-session flip of the
+    /// window. While present, journal classification applies the
+    /// window only to segments at or above this ULID, so rebuilds
+    /// during the flip session reproduce the live stamps. The next
+    /// open reclassifies uniformly and clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_activation: Option<ulid::Ulid>,
+    pub activation: Option<ulid::Ulid>,
 }
 
 /// ublk server configuration within `volume.toml`.
@@ -86,6 +94,19 @@ impl VolumeConfig {
         let s = toml::to_string(self)
             .map_err(|e| io::Error::other(format!("serializing {CONFIG_FILE}: {e}")))?;
         crate::segment::write_file_atomic(&dir.join(CONFIG_FILE), s.as_bytes())
+    }
+
+    /// The stored journal window as a [`crate::journal::JournalWindow`],
+    /// including any live-flip activation marker. Never-derived reads
+    /// as the empty window.
+    pub fn journal_window(&self) -> crate::journal::JournalWindow {
+        match &self.journal {
+            Some(j) => crate::journal::JournalWindow {
+                ranges: j.ranges.clone(),
+                activation: j.activation,
+            },
+            None => crate::journal::JournalWindow::default(),
+        }
     }
 
     /// Read the bound ublk device id, if any.
@@ -240,26 +261,25 @@ mod tests {
     }
 
     #[test]
-    fn toml_without_journal_ranges_parses_never_derived() {
+    fn toml_without_journal_section_parses_never_derived() {
         let tmp = TempDir::new().unwrap();
         write_config(tmp.path(), "size = 1024\n");
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert_eq!(cfg.journal_ranges, None);
-        assert_eq!(cfg.journal_activation, None);
+        assert_eq!(cfg.journal, None);
     }
 
     #[test]
     fn journal_ranges_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
-        cfg.journal_ranges = Some(crate::journal::JournalRanges::new(vec![
-            (100, 16),
-            (300, 4),
-        ]));
+        cfg.journal = Some(JournalConfig {
+            ranges: crate::journal::JournalRanges::new(vec![(100, 16), (300, 4)]),
+            activation: None,
+        });
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         assert_eq!(
-            cfg.journal_ranges.unwrap().as_slice(),
+            cfg.journal.unwrap().ranges.as_slice(),
             &[(100, 16), (300, 4)]
         );
     }
@@ -268,13 +288,10 @@ mod tests {
     fn journal_derived_empty_roundtrips_distinct_from_never_derived() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
-        cfg.journal_ranges = Some(crate::journal::JournalRanges::default());
+        cfg.journal = Some(JournalConfig::default());
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert_eq!(
-            cfg.journal_ranges,
-            Some(crate::journal::JournalRanges::default())
-        );
+        assert_eq!(cfg.journal, Some(JournalConfig::default()));
     }
 
     #[test]
@@ -282,11 +299,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
         let activation = ulid::Ulid::from_parts(1234, 42);
-        cfg.journal_ranges = Some(crate::journal::JournalRanges::new(vec![(100, 16)]));
-        cfg.journal_activation = Some(activation);
+        cfg.journal = Some(JournalConfig {
+            ranges: crate::journal::JournalRanges::new(vec![(100, 16)]),
+            activation: Some(activation),
+        });
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert_eq!(cfg.journal_activation, Some(activation));
+        assert_eq!(cfg.journal.unwrap().activation, Some(activation));
     }
 
     #[test]

@@ -359,12 +359,9 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_path_buf(), None)))
         .collect();
-    let cfg = elide_core::config::VolumeConfig::read(fork_dir)
-        .context("reading volume.toml for journal window")?;
-    let journal = elide_core::journal::JournalWindow {
-        ranges: cfg.journal_ranges.unwrap_or_default(),
-        activation: cfg.journal_activation,
-    };
+    let journal = elide_core::config::VolumeConfig::read(fork_dir)
+        .context("reading volume.toml for journal window")?
+        .journal_window();
     let index =
         extentindex::rebuild(&rebuild_chain, &journal).context("rebuilding extent index")?;
     let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;

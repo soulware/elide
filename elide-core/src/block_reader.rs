@@ -117,11 +117,7 @@ impl BlockReader {
         // Rebuild with the volume's persisted journal window (including
         // any live-flip activation marker) so the live view resolves
         // canonicals exactly as the volume does.
-        let cfg = crate::config::VolumeConfig::read(&dir)?;
-        let journal = crate::journal::JournalWindow {
-            ranges: cfg.journal_ranges.unwrap_or_default(),
-            activation: cfg.journal_activation,
-        };
+        let journal = crate::config::VolumeConfig::read(&dir)?.journal_window();
         let mut extent_index = extentindex::rebuild(&rebuild_chain, &journal)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
