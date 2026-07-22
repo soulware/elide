@@ -52,11 +52,24 @@ MIXED  01KY4Y7DZ2FP450X2CJAMH71KF  in=16   out=8086
 MIXED  01KY4Y1FZ1XAZJKSTCD8ZZVM6N  in=776  out=5650
 ```
 
-Journal content lands at roughly 2 to 5 percent of each output. Small, and the
-worst possible share: it is guaranteed to die within a wrap, spread across
-every segment GC produces. Each output therefore starts life unable to be fully
-live, with density bleeding downward from birth, which returns it to candidacy
-sooner. Every pass re-mixes fresh journal content into the survivors.
+Journal content lands at roughly 2 to 5 percent of each output, and every pass
+re-mixes fresh journal content into the survivors.
+
+The cost is not the density those blocks consume. A share that small decays a
+segment by 2 to 5 percent and stops, nowhere near the sparse threshold, and
+what actually makes those outputs candidates is `is_small`. The cost is that
+mixing converts free reclamation into paid reclamation. A pure journal segment
+dies whole and is deleted with no rewrite. A mixed one never dies, because
+long-lived data sits alongside the journal blocks, so its journal garbage is
+reclaimable only by a rewrite that copies all the surviving data too.
+
+That garbage arrives at the journal write rate. The window is 16384 blocks, so
+every wrap turns 64 MiB into garbage, and journal-shaped segments were
+disappearing in about two minutes. Treating that as the wrap interval puts the
+figure in the tens of GB per day, all of it reclaimable only through segment
+rewrites, which is write amplification scaling with the dominant write stream
+on an fsync-per-commit workload. The daily number is an extrapolation from one
+observed segment lifetime, not a measurement.
 
 ## Design
 
@@ -67,135 +80,119 @@ the window, so it labels each segment as journal or stable in the same pass at
 no extra I/O. `select_buckets` then runs per pool. A bucket's inputs are
 therefore all-journal or all-stable, and its output is pure by construction.
 
-### The journal pool inverts the trigger
+### The journal pool packs nothing
 
-The pools share the selection machinery and differ in what triggers it. The
-journal region is a fixed extent, cyclically overwritten, whose content is
-guaranteed to die within a wrap, and two of the stable pool's heuristics are
-wrong there.
+The pools share the selection machinery and differ in what admits a candidate
+to it. Both of the stable pool's triggers are wrong for a fixed extent that is
+cyclically overwritten.
 
 Density asks whether it is worth rewriting live bytes to reclaim dead ones.
-For journal content the answer is almost always no, because the dead-segment
-path reclaims it for free once the wrap comes round.
+For journal content the answer is no, because the dead-segment path reclaims it
+for free once the wrap comes round.
 
 The unconditional small-segment sweep exists to stop small-file proliferation.
 Journal segments are small by design and short-lived, so that rule guarantees
 GC keeps picking them up and rewriting data that was about to disappear.
 
-So the journal pool packs on **segment count** and never on density. Segments
-are left to die and be reaped whole, which is the cheapest outcome and the one
-segregation exists to enable. The count trigger stays as relief for file-count
-pressure if journal segments ever accumulate, which happens when a filesystem
-goes quiet with a partially-written region lingering.
+So the journal pool has no trigger at all. Segments are left to die and be
+reaped whole, which is the cheapest outcome and the one segregation exists to
+enable.
+
+Merging them would also work against the mechanism that makes reaping cheap. A
+journal segment dies whole because its blocks were written together in time and
+are overwritten together in time. A merged segment can only die once the
+youngest member's blocks have all been overwritten, so it dies later and spends
+longer partially dead. If a trigger is ever wanted, it should pack ULID-adjacent
+runs rather than the bin-pack's descending-by-size order, so the members still
+die together.
 
 The stable pool keeps today's heuristics unchanged.
 
-### Splitting the materialised output
+### The existing backlog ages out
 
-Pure pools mean pure outputs, so the split is not what maintains the invariant
-in the steady state. It does two other jobs.
+Every segment mixed before this design, both the pre-awareness backlog and
+everything GC has mixed to date, stays mixed and is left alone. Its journal
+entries die as the log wraps over their LBAs, and the segment is a pure stable
+segment from then on. That happens at the wrap interval, minutes on the soak
+volume, without a rewrite.
 
-It is the **migration path**. Segments mixed before this design existed, both
-the pre-awareness backlog and everything GC has mixed to date, go in the stable
-pool and shed their journal content on first rewrite. After that every input is
-pure and the split stops emitting anything.
+Rewriting them to shed the journal content would have meant a second output
+ULID per bucket, a plan format that names two outputs, and an apply result that
+reports which were written. All of it to accelerate something that resolves on
+its own, and all of it permanent, since a plan cannot know in advance whether a
+bucket will split.
 
-It is also the **structural guarantee**. Keeping it permanently costs nothing
-when no entry falls in the window, and it makes "no segment is ever mixed" a
-property of the code that writes segments rather than of pool discipline being
-correct at every call site.
+The residue is a segment whose journal LBA is never rewritten, which is the
+same lingering case the journal pool has. It holds one impure segment rather
+than one lingering segment.
 
-`Materialised::partition_journal` implements it. Destination is a pure function
-of the entry's LBA, as journal classification is everywhere else:
-`materialise_plan` produces `Vec<PendingEntry>`, each carrying its own
-`start_lba` and its own body. Canonicals stay with the stable share, since they
-make no LBA claim and a journal DedupRef resolving against one must point
-backward to a lower ULID.
+### Nothing re-mixes
 
-Splitting there rather than in the plan builder puts it at the seam every
-rewriter shares. `materialise_plan` serves coordinator GC, redact,
-sweep_pending, repack and delta_repack, so no plan builder can forget to
-classify, and repack gains the same guarantee — it merges pending segments and
-can mix them exactly as GC does.
+The invariant holds without a split because no writer merges journal content
+into a stable segment.
 
-Only the delta body needs care. `DeltaOption.delta_offset` indexes the
-segment's delta section, so each share rebuilds its own delta body and re-bases
-the offsets it carries. Journal entries are never Delta at formation (the tier
-skips the journal partition structurally), so this is the pre-awareness and
-defensive case rather than the common one.
+Formation partitions the epoch (`partition_journal_pending`, at both the
+promote take and the WAL-recovery path). GC pools keep journal segments out of
+stable buckets. Repack mints one output ULID per input segment
+(`prepare_repack`), so it rewrites in place and never merges two.
 
-### The plan format
+### Reaping is unchanged
 
-`RewritePlan` carries one `new_ulid` and a `Vec<PlanOutput>`, where each
-`PlanOutput` is a per-record instruction naming the input it reads from. The
-records are the output segment's contents, not a list of output segments, so a
-plan produces exactly one segment today.
-
-Emitting a pair therefore extends the plan with a second output ULID, and needs
-no per-record destination because destination is derived at materialise time.
-The coordinator provisions both ULIDs per bucket from `gc_checkpoint`, since it
-uploads `gc/<ulid>` and calls `promote_segment` per output and so must know
-both names in advance. An unused second ULID only advances the volume's mint.
-
-Two plans over the same inputs does not work. `plan.inputs()` feeds the
-divergence and resolvability checks, and applying a plan consumes its inputs by
-deleting `index/<input>.idx`, so a second plan over the same inputs would find
-them gone. Inputs being consumed exactly once is load-bearing, not incidental.
-
-The format change is cheap. A plan is emitted per tick, applied, and deleted by
-`finalize_gc_handoff`, so nothing persisted needs migrating, and the
-serialisation already carries a version tag.
-
-### Reporting
-
-A plan stops fully describing what gets written, because the split happens
-after the coordinator has emitted it. Plan-emission logging and `GcStats` say
-what was actually produced rather than assuming one output per bucket, and
-`GcPlanApplyResult` reports which outputs exist so the coordinator uploads and
-promotes only those.
+A journal segment that has fully died has no live entries, so it is not
+journal-labelled at all. It is a tombstone, it goes in the stable pool, and it
+folds into a bucket and is reaped exactly as before. That is the entire
+lifecycle for journal segments, and it is why the pool packing nothing does not
+strand them.
 
 ## Open
 
 The steady-state journal segment count is unmeasured, and it decides whether
-the count trigger needs a considered threshold or is a safety valve that never
-fires. The soak volume showed 7 journal-shaped segments against 55 stable, with
-individual ones vanishing within about two minutes, which suggests reap-only
-suffices. That is one workload at one moment, and postgres with an fsync per
-commit is near the worst case for journal traffic, so it bounds the answer
-rather than giving it. Watching the journal pool's count across a soak settles
-it.
+the pool ever needs a compaction trigger. The soak volume showed 7
+journal-shaped segments against 55 stable, with individual ones vanishing
+within about two minutes, but that number is from the mixed world: those
+segments hold a fraction of the window, and the rest of it lives inside the 62
+mixed segments. Once segregation holds, those LBAs migrate to journal segments
+and the population is set by how many blocks a formation epoch covers, which
+was 2 to 22.
+
+The per-pass census reports the pool's size, the blocks it holds against the
+window, the age of its oldest member, and the count of stable segments still
+mixed. A settled population with a bounded oldest age says reap-only suffices.
+A climbing oldest age says segments are stranded, and a count that grows
+without one says file-count pressure is real.
 
 ## Alternatives
 
-**Exclude journal segments from GC entirely.** Never rewrite the
-shortest-lived data on the device and let it tombstone. This is the journal
-pool's behaviour minus the count trigger, so it is the same design without
-relief for file-count pressure.
+**A count trigger on the journal pool.** Pack journal segments once enough of
+them accumulate, as relief for file-count pressure. The threshold has no
+measurement behind it, so it would ship as a number picked against the mixed
+world, and it fires on a signal that cannot distinguish a busy journal from a
+stalled one. The census exists to answer this before the trigger is written.
 
-**Partition the output only.** Leaves journal segments as unconditional
-candidates in one pool, so each pass pulls a journal segment into a data
-bucket and splits it back out, rewriting content that was about to die. The
-split fires forever instead of converging.
+**Partition the output.** Split a rewrite's materialised entries into a stable
+share and a journal share, so a mixed input sheds its journal content on first
+rewrite. It costs a second output ULID per bucket permanently, since a plan
+cannot know in advance whether a bucket will split, and it buys migration of a
+backlog that ages out on its own.
+
+**Partition the output only, without pools.** Leaves journal segments as
+unconditional candidates, so each pass pulls one into a data bucket and splits
+it back out, rewriting content that was about to die. The split fires forever
+instead of converging.
 
 ## Verification
 
-- A bucket whose inputs are all stable emits one segment.
-- A mixed pre-awareness segment passed through GC comes out as a pair, and the
-  journal segment's ULID sorts above the primary's.
-- Journal candidates never appear in a stable bucket's inputs, and the stable
-  pool's bucket selection is unchanged for a volume with no journal window.
-- The journal pool packs only once its count trigger is reached, and a
-  fully-dead journal segment is reaped without being packed at all.
-- Re-running the entry scan on the soak volume finds no mixed segment above the
-  first post-change GC output.
-- `gc_proptest` and the crash-recovery oracles cover whether the split loses or
-  duplicates any entry.
+- Journal candidates never appear in any bucket's inputs, and the stable pool's
+  bucket selection is unchanged for a volume with no journal window.
+- A fully-dead journal segment is reaped without being packed.
+- A GC output on a volume with a journal window contains no live in-window
+  entry that was not already in one of its inputs.
+- Re-running the entry scan on the soak volume finds the mixed count falling
+  and no new mixed segment above the first post-change GC output.
 
 ## Related
 
 - [`delta-compression.md`](delta-compression.md) § *Journal-region awareness*
   for the window, the ownership rule, and formation's segregation.
-- [`gc-ulid-ordering.md`](gc-ulid-ordering.md) for the output-ULID rules the
-  pair mints under.
-- [`gc-bucket-unification.md`](gc-bucket-unification.md) for the bin-pack each
-  pool runs.
+- [`gc-bucket-unification.md`](gc-bucket-unification.md) for the bin-pack the
+  stable pool runs.
