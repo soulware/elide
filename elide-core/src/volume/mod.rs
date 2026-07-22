@@ -467,13 +467,28 @@ fn apply_promoted_partition(
     Ok(())
 }
 
+/// How many `(lba, hash)` pairs a resolvability refusal names in its log
+/// line. The count it reports is separate and unbounded.
+pub(in crate::volume) const REFUSAL_SAMPLE_LIMIT: usize = 8;
+
+/// Unresolvable lbamap claims found by
+/// [`Volume::unresolvable_lbamap_hashes`]: how many there are, and the
+/// first few for the log line. `total` is the severity signal —
+/// `sample.len()` saturates at the caller's limit and so cannot
+/// distinguish a handful from thousands.
+#[derive(Default)]
+pub(in crate::volume) struct UnresolvableHashes {
+    pub total: usize,
+    pub sample: Vec<(u64, blake3::Hash)>,
+}
+
 /// Outcome of [`Volume::mutate_gated_on_resolvability`].
 pub(in crate::volume) enum ResolvabilityGate {
     /// The mutation is in place.
     Applied,
-    /// The mutation was rolled back: committing it would have left
-    /// these `(lba, hash)` claims unresolvable (first 8 reported).
-    Refused(Vec<(u64, blake3::Hash)>),
+    /// The mutation was rolled back: committing it would have left this
+    /// many `(lba, hash)` claims unresolvable.
+    Refused(UnresolvableHashes),
 }
 
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
@@ -1798,6 +1813,7 @@ impl Volume {
 
         if let ResolvabilityGate::Refused(orphaned) = gate {
             let detail = orphaned
+                .sample
                 .iter()
                 .map(
                     |(lba, hash)| match to_remove.iter().find(|(h, _)| h == hash) {
@@ -1809,11 +1825,12 @@ impl Volume {
                 )
                 .collect::<Vec<_>>()
                 .join(", ");
-            log::error!(
+            log::warn!(
                 "plan {new_ulid}: refusing fold — {} lbamap-referenced hash(es) would \
-                 be unresolvable through the extent index after apply: [{detail}]; \
-                 dropping output and plan",
-                orphaned.len(),
+                 be unresolvable through the extent index after apply, first {}: \
+                 [{detail}]; dropping output and plan",
+                orphaned.total,
+                orphaned.sample.len(),
             );
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
@@ -2187,10 +2204,11 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_extent_index_consistent(&self, _caller: &'static str) {}
 
-    /// Collect up to `limit` lbamap entries whose hash resolves through
-    /// neither the extent index's DATA-style map nor its Delta-canonical
-    /// map — the two lookups the read path performs. An unresolvable
-    /// hash means a read of that LBA fails at the extent_index lookup.
+    /// Count every lbamap entry whose hash resolves through neither the
+    /// extent index's DATA-style map nor its Delta-canonical map — the
+    /// two lookups the read path performs — and keep the first
+    /// `sample_limit` of them for diagnostics. An unresolvable hash
+    /// means a read of that LBA fails at the extent_index lookup.
     ///
     /// Pure in-memory check (no disk rebuild) — linear in lbamap entry
     /// count, two HashMap lookups per entry. Catches the bug class
@@ -2200,10 +2218,17 @@ impl Volume {
     /// the pre-commit refusal in `apply_plan_apply_result` and the
     /// stress invariant below.
     ///
+    /// The scan runs to completion rather than stopping once the sample
+    /// is full: `total` is what separates a handful of stranded claims
+    /// (the concurrent-dedup race the gate exists to absorb) from a
+    /// systemic loss, and the clean case — every hash resolving — walks
+    /// every entry anyway, so the count is free on the path that runs
+    /// constantly.
+    ///
     /// `ZERO_HASH` is a sentinel meaning "this LBA reads as all zeros";
     /// it never resolves through extent_index by design. Skipped here.
-    fn unresolvable_lbamap_hashes(&self, limit: usize) -> Vec<(u64, blake3::Hash)> {
-        let mut unresolved: Vec<(u64, blake3::Hash)> = Vec::new();
+    fn unresolvable_lbamap_hashes(&self, sample_limit: usize) -> UnresolvableHashes {
+        let mut found = UnresolvableHashes::default();
         for (lba, _len, hash, _anchor) in self.lbamap.iter_entries() {
             if hash == ZERO_HASH {
                 continue;
@@ -2214,12 +2239,12 @@ impl Volume {
             if self.extent_index.lookup_delta(&hash).is_some() {
                 continue;
             }
-            unresolved.push((lba, hash));
-            if unresolved.len() >= limit {
-                break;
+            found.total += 1;
+            if found.sample.len() < sample_limit {
+                found.sample.push((lba, hash));
             }
         }
-        unresolved
+        found
     }
 
     /// Run an in-memory extent-index/lbamap mutation behind the
@@ -2247,8 +2272,8 @@ impl Volume {
             self.lbamap = pre_lbamap;
             return Err(e);
         }
-        let orphaned = self.unresolvable_lbamap_hashes(8);
-        if orphaned.is_empty() {
+        let orphaned = self.unresolvable_lbamap_hashes(REFUSAL_SAMPLE_LIMIT);
+        if orphaned.total == 0 {
             return Ok(ResolvabilityGate::Applied);
         }
         self.extent_index = pre_index;
@@ -2260,14 +2285,14 @@ impl Volume {
     /// finds any entry after a structural op.
     #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, caller: &'static str) {
-        let unresolved = self.unresolvable_lbamap_hashes(8);
-        if !unresolved.is_empty() {
+        let unresolved = self.unresolvable_lbamap_hashes(REFUSAL_SAMPLE_LIMIT);
+        if unresolved.total > 0 {
             let mut msg = format!(
                 "lbamap-hashes-resolvable invariant violation after [{caller}]: \
                  {} hash(es) unresolvable through extent_index",
-                unresolved.len()
+                unresolved.total
             );
-            for (lba, hash) in &unresolved {
+            for (lba, hash) in &unresolved.sample {
                 msg.push_str(&format!("\n  lba={lba} hash={}", hash.to_hex()));
             }
             panic!("{msg}");

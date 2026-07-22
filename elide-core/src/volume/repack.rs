@@ -295,15 +295,17 @@ impl Volume {
 
             if let ResolvabilityGate::Refused(orphaned) = gate {
                 let detail = orphaned
+                    .sample
                     .iter()
                     .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
                     .collect::<Vec<_>>()
                     .join(", ");
-                log::error!(
+                log::warn!(
                     "repack [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
-                     would be unresolvable through the extent index after apply: [{detail}]; \
-                     dropping output and keeping inputs",
-                    orphaned.len(),
+                     would be unresolvable through the extent index after apply, first {}: \
+                     [{detail}]; dropping output and keeping inputs",
+                    orphaned.total,
+                    orphaned.sample.len(),
                 );
                 stats.buckets_refused += 1;
                 if let Some(out) = &bucket.output {
