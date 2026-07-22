@@ -2003,6 +2003,16 @@ fn promote_is_complete(
 /// incrementally in place, so when a crash leaks `index/<id>.idx`
 /// before the body promote finishes, a partial fetch-created body can
 /// sit at `body_path` when the promote is retried.
+/// `<path>.tmp`, the scratch sibling an atomic write renames from.
+fn tmp_sibling(path: &Path) -> io::Result<PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("path has no filename"))?
+        .to_owned();
+    name.push(".tmp");
+    Ok(path.with_file_name(name))
+}
+
 pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
@@ -2011,8 +2021,13 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
         Ok(f) => f,
         // Only a completed promote lets the source be reaped, so a
         // missing source with `.body` in place means there is nothing
-        // left to redo.
-        Err(e) if e.kind() == io::ErrorKind::NotFound && body_exists => return Ok(()),
+        // left to redo. Any `.body.tmp` still sitting here was leaked by
+        // a promote that died before its rename, and this branch is the
+        // one path that never reclaims it by writing through it.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && body_exists => {
+            let _ = fs::remove_file(tmp_sibling(body_path)?);
+            return Ok(());
+        }
         Err(e) => return Err(e),
     };
     let mut header = [0u8; HEADER_LEN as usize];
@@ -2049,14 +2064,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     // Build the sparse body in a temp file but do not rename yet —
     // the rename is the last step so `.body`'s existence implies
     // `.delta` and `.present` are both already committed.
-    let body_tmp = {
-        let mut name = body_path
-            .file_name()
-            .ok_or_else(|| io::Error::other("path has no filename"))?
-            .to_owned();
-        name.push(".tmp");
-        body_path.with_file_name(name)
-    };
+    let body_tmp = tmp_sibling(body_path)?;
     {
         let mut dst = fs::OpenOptions::new()
             .write(true)
@@ -2084,14 +2092,7 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     // guaranteed to be in place.
     if delta_length > 0 {
         let delta_path = body_path.with_extension("delta");
-        let delta_tmp = {
-            let mut name = delta_path
-                .file_name()
-                .ok_or_else(|| io::Error::other("path has no filename"))?
-                .to_owned();
-            name.push(".tmp");
-            delta_path.with_file_name(name)
-        };
+        let delta_tmp = tmp_sibling(&delta_path)?;
         {
             let mut dst = fs::OpenOptions::new()
                 .write(true)

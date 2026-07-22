@@ -3989,6 +3989,57 @@ fn promote_to_cache_noop_after_source_reaped() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// A promote that dies between writing `.body.tmp` and renaming it
+/// leaves the scratch file behind. Every other promote path reclaims it
+/// by opening it `truncate(true)` and renaming it away, but the
+/// source-reaped no-op returns before touching it — so without an
+/// explicit unlink the leak is permanent and costs a whole segment body
+/// of disk. Observed on the soak rig as a stranded 34MB
+/// `cache/<ulid>.body.tmp`.
+#[test]
+fn promote_to_cache_noop_removes_leaked_body_tmp() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(0, &high_entropy_block(0xD3)).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let pending_dir = base.join("pending");
+    let ulid_str = fs::read_dir(&pending_dir)
+        .unwrap()
+        .flatten()
+        .find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (!name.contains('.')).then_some(name)
+        })
+        .unwrap();
+    let pending_path = pending_dir.join(&ulid_str);
+
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let body_path = cache_dir.join(format!("{ulid_str}.body"));
+    let present_path = cache_dir.join(format!("{ulid_str}.present"));
+    segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+
+    let body_tmp = cache_dir.join(format!("{ulid_str}.body.tmp"));
+    fs::write(
+        &body_tmp,
+        b"leaked by a promote that died before its rename",
+    )
+    .unwrap();
+    fs::remove_file(&pending_path).unwrap();
+
+    segment::promote_to_cache(&pending_path, &body_path, &present_path).unwrap();
+
+    assert!(body_path.exists(), "completed cache body was disturbed");
+    assert!(
+        !body_tmp.exists(),
+        "leaked .body.tmp survived the no-op promote"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn all_inline_segment_readable() {
     // A segment where every entry is inline (body_length = 0).
