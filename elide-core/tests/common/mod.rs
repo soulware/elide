@@ -117,6 +117,101 @@ pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &
     }
 }
 
+/// Simulate a crash one step earlier than `half_promote_first_pending`:
+/// after `segment::extract_idx` commits `index/<ulid>.idx` and before
+/// `promote_to_cache` renames `cache/<ulid>.body` into place, for the
+/// lowest-ULID pending segment (if any).
+///
+/// The segment body is also captured into `store_dir` so the attached
+/// `CapturedBodyFetcher` can serve it: production reaches this state with
+/// the object already uploaded, which is what lets a post-rebuild fetch
+/// build `cache/<ulid>.body` incrementally underneath the surviving
+/// pending source.
+///
+/// No-op when no pending segment exists. Returns the chosen ULID for
+/// diagnostics, or `None` if nothing was done.
+pub fn leak_promote_idx_first_pending(base_dir: &Path, store_dir: &Path) -> Option<Ulid> {
+    let ulid = *pending_ulids(base_dir).first()?;
+    let ulid_str = ulid.to_string();
+    let pending_path = base_dir.join("pending").join(&ulid_str);
+
+    let index_dir = base_dir.join("index");
+    let _ = fs::create_dir_all(&index_dir);
+    let _ = fs::create_dir_all(store_dir);
+
+    let idx_path = index_dir.join(format!("{ulid_str}.idx"));
+    if segment::extract_idx(&pending_path, &idx_path).is_err() {
+        return None;
+    }
+
+    let store_body = store_dir.join(format!("{ulid_str}.body"));
+    let store_present = store_dir.join(format!("{ulid_str}.present"));
+    if segment::promote_to_cache(&pending_path, &store_body, &store_present).is_err() {
+        return None;
+    }
+    let _ = fs::remove_file(&store_present);
+
+    Some(ulid)
+}
+
+/// Every present bit that is set must be backed by bytes on disk: for
+/// each `cache/<ulid>.present`, every set bit whose `index/<ulid>.idx`
+/// entry is a data entry must have `cache/<ulid>.body` long enough to
+/// cover that entry's `[stored_offset, stored_offset + stored_length)`.
+///
+/// A bit set over a body that does not reach the entry's extent makes
+/// the read path skip the fetcher and short-read the cache file, which
+/// surfaces to the guest as EIO.
+///
+/// Returns a description of the first violation found.
+pub fn check_presence_truthful(fork_dir: &Path) -> Result<(), String> {
+    let cache_dir = fork_dir.join("cache");
+    let index_dir = fork_dir.join("index");
+    let Ok(vk) = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE) else {
+        return Ok(());
+    };
+    let Ok(entries) = fs::read_dir(&cache_dir) else {
+        return Ok(());
+    };
+    for dirent in entries.flatten() {
+        let name = dirent.file_name();
+        let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".present")) else {
+            continue;
+        };
+        let Ok(ulid) = Ulid::from_string(stem) else {
+            continue;
+        };
+        let Ok((_bss, parsed, _inputs)) =
+            segment::read_and_verify_segment_index(&index_dir.join(format!("{stem}.idx")), &vk)
+        else {
+            continue;
+        };
+        let Ok(present) = fs::read(dirent.path()) else {
+            continue;
+        };
+        let body_len = fs::metadata(cache_dir.join(format!("{stem}.body")))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        for (i, entry) in parsed.iter().enumerate() {
+            if !entry.kind.is_data() || entry.stored_length == 0 {
+                continue;
+            }
+            if present.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) == 0) {
+                continue;
+            }
+            let end = entry.stored_offset + entry.stored_length as u64;
+            if body_len < end {
+                return Err(format!(
+                    "segment {ulid} entry {i} ({:?}) marked present but body is {body_len} bytes, \
+                     entry extent ends at {end}",
+                    entry.kind,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Collect sorted ULIDs of full segment files in pending/.
 pub fn pending_ulids(base_dir: &Path) -> Vec<Ulid> {
     let pending_dir = base_dir.join("pending");
@@ -461,11 +556,13 @@ pub fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut lbamap::LbaMap) {
 /// that would arise from capturing a pre-redact `pending/<id>` (where
 /// the pre-redact bss differs from the post-redact bss in `.idx`).
 ///
-/// `fetch_extent` copies the captured body file back into `cache/`
-/// (whole-segment copy, no range slicing) and sets the requested
-/// `entry_idx`'s present bit. Subsequent fetches against other
-/// entries find the body file already present and only flip more
-/// bits — matching the per-entry `.present` granularity.
+/// `fetch_extent` writes only the requested extent's byte range at its
+/// body-relative offset, sets that `entry_idx`'s present bit, and
+/// re-syncs the in-memory bitset from the file it just wrote — the
+/// shape `elide_fetch::fetch_one_extent` produces. The cache body
+/// therefore grows one extent at a time and is short of the full body
+/// length until the highest-offset extent is fetched, so a body built
+/// this way is distinguishable from a promoted one.
 pub struct CapturedBodyFetcher {
     pub store_dir: PathBuf,
 }
@@ -475,22 +572,45 @@ impl segment::SegmentFetcher for CapturedBodyFetcher {
         &self,
         segment_id: Ulid,
         _owner_vol_id: Ulid,
-        _index_dir: &Path,
+        index_dir: &Path,
         body_dir: &Path,
         extent: &segment::ExtentFetch,
-        _presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
+        presence: Option<std::sync::Arc<elide_core::extentindex::SegmentPresence>>,
     ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        // The read path builds this call's `ExtentFetch` with
+        // `body_offset`/`body_length` both zero and only `entry_idx`
+        // set (see `find_segment` in volume/read.rs), so the byte range
+        // comes from the segment's own `.idx` — the same source
+        // `elide_fetch::fetch_one_extent` reads.
         let sid = segment_id.to_string();
-        let body_path = body_dir.join(format!("{sid}.body"));
-        if !body_path.exists() {
-            let store_body = self.store_dir.join(format!("{sid}.body"));
-            fs::copy(&store_body, &body_path)?;
+        let (_, entries, _) = segment::read_segment_index(&index_dir.join(format!("{sid}.idx")))?;
+        let entry = entries.get(extent.entry_idx as usize).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "fetch {sid}: entry_idx {} out of range",
+                extent.entry_idx
+            ))
+        })?;
+
+        let store_body = self.store_dir.join(format!("{sid}.body"));
+        let src = fs::File::open(&store_body)?;
+        let mut buf = vec![0u8; entry.stored_length as usize];
+        src.read_exact_at(&mut buf, entry.stored_offset)?;
+
+        let dst = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(body_dir.join(format!("{sid}.body")))?;
+        dst.write_all_at(&buf, entry.stored_offset)?;
+        dst.sync_data()?;
+
+        let present_path = body_dir.join(format!("{sid}.present"));
+        segment::set_present_bit(&present_path, extent.entry_idx, extent.entry_idx + 1)?;
+        if let Some(p) = presence {
+            p.replace_from_bytes(&fs::read(&present_path)?);
         }
-        segment::set_present_bit(
-            &body_dir.join(format!("{sid}.present")),
-            extent.entry_idx,
-            extent.entry_idx + 1,
-        )?;
         Ok(())
     }
 
@@ -499,11 +619,14 @@ impl segment::SegmentFetcher for CapturedBodyFetcher {
         segment_id: Ulid,
         _owner_vol_id: Ulid,
         _index_dir: &Path,
-        _body_dir: &Path,
+        body_dir: &Path,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::other(format!(
-            "CapturedBodyFetcher: fetch_delta_body unused (seg {segment_id})"
-        )))
+        let sid = segment_id.to_string();
+        fs::copy(
+            self.store_dir.join(format!("{sid}.delta")),
+            body_dir.join(format!("{sid}.delta")),
+        )?;
+        Ok(())
     }
 }
 
@@ -560,8 +683,16 @@ pub fn capture_and_evict_cache_body(
     if !body_dst.exists() {
         fs::copy(&body_src, &body_dst).ok()?;
     }
+    // A delta segment's body lives in a sibling `.delta`; capture it too
+    // so `fetch_delta_body` can serve it back after eviction.
+    let delta_src = cache_dir.join(format!("{sid}.delta"));
+    let delta_dst = store_dir.join(format!("{sid}.delta"));
+    if delta_src.exists() && !delta_dst.exists() {
+        fs::copy(&delta_src, &delta_dst).ok()?;
+    }
 
     let _ = fs::remove_file(&body_src);
+    let _ = fs::remove_file(&delta_src);
     let _ = fs::remove_file(cache_dir.join(format!("{sid}.present")));
 
     let (_, ei) = vol.snapshot_maps();
