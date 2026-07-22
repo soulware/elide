@@ -720,7 +720,14 @@ impl HandoffCursor<'_> {
         // sole deleter, so this does not race the volume's apply path.
         for old_ulid in &inputs {
             let old_ulid_str = old_ulid.to_string();
-            let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.body")));
+            let body = self.cache_dir.join(format!("{old_ulid_str}.body"));
+            // An interrupted promote leaves the scratch sibling behind. Once
+            // the input is consumed nothing will rename it into place, so it
+            // outlives every other trace of the segment.
+            if let Ok(tmp) = elide_core::segment::tmp_sibling(&body) {
+                let _ = fs::remove_file(tmp);
+            }
+            let _ = fs::remove_file(body);
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.present")));
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.dmat")));
         }
