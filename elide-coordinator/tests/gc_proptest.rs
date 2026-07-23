@@ -431,7 +431,7 @@ fn snapshot_after_gc_apply_covers_fold_output() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig::default())]
 
     /// Segment cleanup: after GC runs, every consumed input segment must be
     /// deleted from segments/.
