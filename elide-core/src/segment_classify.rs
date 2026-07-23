@@ -205,9 +205,21 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         let delta = r.range_start.checked_sub(entry.start_lba);
         delta == Some(r.payload_block_offset as u64)
     };
+    // A run keeps this entry alive when its hash and anchor agree — and, for a
+    // journal entry, when this segment is still the LBA's claimant. Journal
+    // content is never in `inner`, so `owns_home` is always false and the
+    // hash+anchor match is the only liveness signal; without the claimant gate
+    // a repetitive jbd2 block that a newer segment now claims would keep the
+    // old segment FullyLive forever and it would never reap. Durable entries
+    // are disambiguated by `owns_home`, so the claimant gate does not apply.
+    let block_is_live = |r: &ExtentRead| -> bool {
+        r.hash == entry.hash
+            && anchor_matches(r)
+            && (!entry.journal || r.claimant_ulid == ctx.segment_id)
+    };
     let matching_blocks: u64 = runs
         .iter()
-        .filter(|r| r.hash == entry.hash && anchor_matches(r))
+        .filter(|r| block_is_live(r))
         .map(|r| r.range_end - r.range_start)
         .sum();
     let total_blocks = entry.lba_length as u64;
@@ -230,10 +242,7 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         // logic decides how the caller turns it into output records.
         // Use the same anchor-aware filter so split sub-runs only
         // include LBAs whose anchor agrees with the input entry.
-        let live_runs: Arc<[ExtentRead]> = runs
-            .into_iter()
-            .filter(|r| r.hash == entry.hash && anchor_matches(r))
-            .collect();
+        let live_runs: Arc<[ExtentRead]> = runs.into_iter().filter(|r| block_is_live(r)).collect();
         match entry.kind {
             EntryKind::Data | EntryKind::Inline => EntryClassification::PartialDeath {
                 live_runs,
@@ -499,6 +508,73 @@ mod tests {
         assert!(matches!(
             classify_entry(&entry, &ctx),
             EntryClassification::Drop
+        ));
+    }
+
+    fn journal_data(hash: blake3::Hash, start_lba: u64) -> SegmentEntry {
+        let mut e = SegmentEntry::new_data_no_body(hash, start_lba, 1, SegmentFlags::empty(), 4096);
+        e.journal = true;
+        e
+    }
+
+    /// Reap-whole repro. A journal segment is superseded when a newer segment
+    /// takes over its LBA — the lbamap claimant moves — even though jbd2's
+    /// repetitive content leaves the same hash resolving at that LBA. Journal
+    /// content is never in `inner`, so `owns_home` is always false and the
+    /// hash+anchor match is the *only* liveness signal; keyed on that alone the
+    /// old segment stays `FullyLive` forever and never reaps. It must classify
+    /// `Drop`, gated on the claimant no longer being this segment.
+    #[test]
+    fn journal_entry_dies_when_a_newer_segment_claims_its_lba() {
+        let mut mint = crate::ulid_mint::UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let s2 = mint.next();
+        let hash = blake3::hash(b"repetitive jbd2 block");
+
+        // LBA 100 still resolves to `hash`, but the claimant is now the newer s2.
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(100, 1, hash, s2);
+
+        let index = ExtentIndex::default();
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let ctx = ClassifyCtx {
+            lba_map: &lba_map,
+            extent_index: &index,
+            live_hashes: &live,
+            segment_id: s1,
+        };
+        assert!(
+            matches!(
+                classify_entry(&journal_data(hash, 100), &ctx),
+                EntryClassification::Drop
+            ),
+            "a journal entry whose LBA is now claimed by a newer segment must be \
+             dead so the old segment reaps whole",
+        );
+    }
+
+    /// Positive control: while the journal segment still claims its own LBA it
+    /// stays `FullyLive` — the claimant gate must not over-reap live content.
+    #[test]
+    fn journal_entry_stays_live_while_it_still_claims_its_lba() {
+        let mut mint = crate::ulid_mint::UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let hash = blake3::hash(b"still owned");
+
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(100, 1, hash, s1);
+
+        let index = ExtentIndex::default();
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let ctx = ClassifyCtx {
+            lba_map: &lba_map,
+            extent_index: &index,
+            live_hashes: &live,
+            segment_id: s1,
+        };
+        assert!(matches!(
+            classify_entry(&journal_data(hash, 100), &ctx),
+            EntryClassification::FullyLive
         ));
     }
 }
