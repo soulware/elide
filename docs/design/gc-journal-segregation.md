@@ -1,6 +1,7 @@
 # Design: maintaining journal segregation across GC
 
-**Status:** Proposed.
+**Status:** Pool separation implemented. The as-is rule below is proposed, after
+a fresh-volume soak measured pool separation alone stranding journal content.
 
 ## The invariant
 
@@ -108,87 +109,118 @@ die together.
 
 The stable pool keeps today's heuristics unchanged.
 
-### The existing backlog ages out
+### Pool separation is not sufficient
 
-Every segment mixed before this design, both the pre-awareness backlog and
-everything GC has mixed to date, stays mixed and is left alone. Its journal
-entries die as the log wraps over their LBAs, and the segment is a pure stable
-segment from then on. That happens at the wrap interval, minutes on the soak
-volume, without a rewrite.
+Keeping journal segments out of stable buckets stops one loss path. A second
+survives it, because liveness is by content hash and jbd2 content is
+repetitive.
 
-Rewriting them to shed the journal content would have meant a second output
-ULID per bucket, a plan format that names two outputs, and an apply result that
-reports which were written. All of it to accelerate something that resolves on
-its own, and all of it permanent, since a plan cannot know in advance whether a
-bucket will split.
+`collect_stats` reads liveness from `lbamap.lba_referenced_hashes()`. When the
+log wraps over a journal LBA the entry that held it is LBA-dead, but its content
+hash is still referenced by another current journal LBA, so `classify_entry`
+returns `DemoteToCanonical` and keeps the body for dedup resolution. A canonical
+has `start_lba` 0, and `owns_entry` is false for it, so the segment is no longer
+all-journal. The classifier moves it to the stable pool, where a small segment
+is an unconditional sweep candidate, and the next pass welds the journal-content
+canonical into a data bucket. A `Delta` follows the same path through
+`CanonicalDelta`.
 
-The residue is a segment whose journal LBA is never rewritten, which is the
-same lingering case the journal pool has. It holds one impure segment rather
-than one lingering segment.
+A journal segment therefore does not age into a pure stable segment. It ages
+into a stable segment that still carries its journal content, which is then
+rewritten into ever-larger data segments. The reap-whole path never runs,
+because demotion keeps the segment alive. That the backlog ages out and that no
+writer re-mixes both assumed a journal entry dies when the log wraps over its
+LBA, which hash liveness prevents.
 
-### Nothing re-mixes
+Measured on a fresh volume under a fifteen-minute pgbench run, 2026-07-23,
+v0.1.28: no journal segment reached the tombstone state, `mixed_blocks` grew
+from 1114 to 3867 and did not fall when writes stopped, and the journal pool
+held only shares that had not yet had an entry demoted.
 
-The invariant holds without a split because no writer merges journal content
-into a stable segment.
+### Journal content is stored as-is
 
-Formation partitions the epoch (`partition_journal_pending`, at both the
-promote take and the WAL-recovery path). GC pools keep journal segments out of
-stable buckets. Repack mints one output ULID per input segment
-(`prepare_repack`), so it rewrites in place and never merges two.
+The journal is a circular buffer whose content is overwritten every wrap. Dedup
+and delta keep content alive for as long as a reference exists, which is the
+opposite of what a circular buffer wants. Demotion is that opposition surfacing.
 
-### Reaping is unchanged
+Journal and durable content are disjoint tiers. They never share a segment, and
+they never reference each other's bodies.
 
-A journal segment that has fully died has no live entries, so it is not
-journal-labelled at all. It is a tombstone, it goes in the stable pool, and it
-folds into a bucket and is reaped exactly as before. That is the entire
-lifecycle for journal segments, and it is why the pool packing nothing does not
-strand them.
+A journal-window entry is always `Data` or `Inline`. Formation writes journal
+blocks verbatim, skipping dedup classification and delta formation, so a journal
+segment holds only own-body entries. Nothing outside a journal segment
+references journal content, because a journal-window body is never offered as a
+dedup or delta source. An overwritten journal LBA then classifies dead, not
+canonical, because nothing points at it, and the segment reaps whole once its
+last entry dies. Repetitive journal blocks that share a hash each keep their own
+body, so dropping a dead one loses nothing a live one needs.
+
+Both directions matter. A journal write that deduped against a durable body
+would tie the two tiers' lifetimes together, and a durable body kept alive only
+by an ephemeral journal reference would outlive its own use. Forbidding journal
+content as either source or target keeps the tiers independent and makes durable
+content never depend on the journal.
+
+The cost is that identical journal blocks, and a journal block that matches a
+durable page, are stored more than once. The window is 16384 transient blocks,
+so the saving foregone is small and short-lived, against reap-whole reclamation
+of the dominant write stream.
+
+### Reaping
+
+A journal segment dies once every one of its LBAs has been overwritten and no
+entry remains live. Under the as-is rule its entries are never kept for dedup,
+so death by LBA is death: the segment has no live entries, becomes a tombstone,
+and is reaped whole with no rewrite. This is the outcome pool separation aims at
+and that demotion prevented.
 
 ## Open
 
-The steady-state journal segment count is unmeasured, and it decides whether
-the pool ever needs a compaction trigger. The soak volume showed 7
-journal-shaped segments against 55 stable, with individual ones vanishing
-within about two minutes, but that number is from the mixed world: those
-segments hold a fraction of the window, and the rest of it lives inside the 62
-mixed segments. Once segregation holds, those LBAs migrate to journal segments
-and the population is set by how many blocks a formation epoch covers, which
-was 2 to 22.
+The steady state under pool separation alone is measured, and journal content
+strands. The fresh-volume run showed the climbing-oldest-age and growing-count
+shape and did not settle, because demotion keeps journal segments alive. The
+as-is rule is what lets them die.
 
-The per-pass census reports the pool's size, the blocks it holds against the
-window, the age of its oldest member, and the count of stable segments still
-mixed. A settled population with a bounded oldest age says reap-only suffices.
-A climbing oldest age says segments are stranded, and a count that grows
-without one says file-count pressure is real.
+The steady-state population under the as-is rule is not yet measured. It is set
+by how many blocks a formation epoch covers, which was 2 to 22, against the wrap
+interval that reaps them. The per-pass census reports the pool's size, the
+blocks it holds against the window, the age of its oldest member, and the count
+of stable segments still mixed. A settled population with a bounded oldest age
+says reap-only suffices; a climbing oldest age, or a count that grows without
+one, says a compaction trigger is wanted.
 
-## Alternatives
+**Preserve the journal label through demotion.** Keep a demoted journal entry
+in the journal pool rather than letting the canonical flip it to stable, so GC
+never welds it into data. It stops the welding but not the stranding, because
+the canonical is still live and the segment still never reaps whole. It treats
+the symptom and leaves the write amplification the as-is rule removes.
 
 **A count trigger on the journal pool.** Pack journal segments once enough of
-them accumulate, as relief for file-count pressure. The threshold has no
-measurement behind it, so it would ship as a number picked against the mixed
-world, and it fires on a signal that cannot distinguish a busy journal from a
-stalled one. The census exists to answer this before the trigger is written.
+them accumulate, as relief for file-count pressure. Under the as-is rule the
+population is bounded by the formation rate against the wrap interval, so a
+trigger is a fallback for a journal that does not wrap, not the mechanism. If it
+is ever written it should pack ULID-adjacent runs, whose members die together,
+rather than the bin-pack's descending-by-size order.
 
 **Partition the output.** Split a rewrite's materialised entries into a stable
 share and a journal share, so a mixed input sheds its journal content on first
-rewrite. It costs a second output ULID per bucket permanently, since a plan
-cannot know in advance whether a bucket will split, and it buys migration of a
-backlog that ages out on its own.
-
-**Partition the output only, without pools.** Leaves journal segments as
-unconditional candidates, so each pass pulls one into a data bucket and splits
-it back out, rewriting content that was about to die. The split fires forever
-instead of converging.
+rewrite. Under the as-is rule no stable output holds journal content to shed, so
+it is unnecessary, and it costs a second output ULID per bucket permanently
+since a plan cannot know in advance whether a bucket will split.
 
 ## Verification
 
+- A journal segment holds only `Data` and `Inline` entries. No `DedupRef`,
+  `Delta`, or canonical form appears in one.
+- No entry outside a journal segment references a journal-window body, and no
+  journal entry references a body outside its own segment. Assertable at rebuild
+  and in the proptest oracle, which the demotion regression would have tripped.
 - Journal candidates never appear in any bucket's inputs, and the stable pool's
   bucket selection is unchanged for a volume with no journal window.
-- A fully-dead journal segment is reaped without being packed.
-- A GC output on a volume with a journal window contains no live in-window
-  entry that was not already in one of its inputs.
-- Re-running the entry scan on the soak volume finds the mixed count falling
-  and no new mixed segment above the first post-change GC output.
+- A journal segment whose LBAs are all overwritten reaches the tombstone state
+  and is reaped whole, with no rewrite.
+- On the fresh-volume soak, `mixed_blocks` falls to the pre-activation residue
+  and `tombstones` accrue as the log wraps, rather than stranding.
 
 ## Related
 
