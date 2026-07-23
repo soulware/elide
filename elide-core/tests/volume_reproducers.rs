@@ -707,3 +707,99 @@ fn gc_apply_double_fold_claimant_adopted() {
         }
     }
 }
+
+/// Guards `check_presence_truthful`'s presence test against production's
+/// `check_present_bit`. After evict, a demand-fetch of one entry writes a
+/// `.present` bitmap sized to that entry's index, so a higher-index `Data`
+/// entry lies beyond the bitmap — unfetched, which the read path resolves
+/// by fetching, not a lying present bit. Reading the demoted layout this
+/// 20-op sequence (shrunk from `gc_interleaved_oracle`) produces used to
+/// trip the oracle because the check read a byte past the short bitmap as
+/// present. Reads must stay correct and the invariant must not fire.
+#[test]
+fn gc_interleaved_short_present_bitmap_not_a_violation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir = tmp.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_dir = fork_dir.as_path();
+    let store_dir = tmp.path().join("_store");
+    common::write_test_keypair(fork_dir);
+
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal = Some(elide_core::config::JournalConfig {
+        ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
+        activation: None,
+    });
+    cfg.write(fork_dir).unwrap();
+
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+
+    let coord_gc = |vol: &mut elide_core::volume::Volume, n: usize| {
+        common::drain_with_repack(vol);
+        let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+        let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, n)
+            .map(|(_, _, p)| p)
+            .unwrap_or_default();
+        if vol.apply_gc_handoffs().unwrap_or(0) > 0 {
+            for p in &to_delete {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    };
+
+    // Write{0,40}, Flush, DrainWithRedact
+    let _ = vol.write(0, &[40u8; 4096]);
+    let _ = vol.flush_wal();
+    common::drain_with_repack(&mut vol);
+    // Write{1,41}, Flush, DrainWithRedact
+    let _ = vol.write(1, &[41u8; 4096]);
+    let _ = vol.flush_wal();
+    common::drain_with_repack(&mut vol);
+    // CoordGcLocal{2}
+    coord_gc(&mut vol, 2);
+    // PopulateFetched{0,0}: actual_lba=16, seed=0x80
+    common::drain_with_repack(&mut vol);
+    let u = vol.gc_checkpoint_for_test().unwrap();
+    common::populate_cache(fork_dir, u, 16, 0x80);
+    drop(vol);
+    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    // PopulateFetched{1,0}: actual_lba=17, seed=0x90
+    common::drain_with_repack(&mut vol);
+    let u = vol.gc_checkpoint_for_test().unwrap();
+    common::populate_cache(fork_dir, u, 17, 0x90);
+    drop(vol);
+    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    // WriteNearDup{0,0,0}: actual_lba=52
+    let _ = vol.write(52, &common::variant_block(0, 0));
+    // DedupWrite{0,4,0}
+    let _ = vol.write(0, &[0u8; 4096]);
+    let _ = vol.write(4, &[0u8; 4096]);
+    // DedupWrite{0,5,0}
+    let _ = vol.write(0, &[0u8; 4096]);
+    let _ = vol.write(5, &[0u8; 4096]);
+    // WriteNearDup{1,0,0}: actual_lba=53
+    let _ = vol.write(53, &common::variant_block(0, 0));
+    // JournalDupWrite{false,0}: first=97, second=96
+    let d = common::incompressible_block(0);
+    let _ = vol.write(97, &d);
+    let _ = vol.write(96, &d);
+    // DedupWrite{0,4,1}
+    let _ = vol.write(0, &[1u8; 4096]);
+    let _ = vol.write(4, &[1u8; 4096]);
+    // WriteLarge{0,1}: actual_lba=24
+    let _ = vol.write(24, &common::incompressible_block(1));
+    // Snapshot
+    let _ = vol.snapshot();
+    // Write{0,0}
+    let _ = vol.write(0, &[0u8; 4096]);
+    // EvictCacheBody
+    let _ = common::capture_and_evict_cache_body(&vol, fork_dir, &store_dir);
+    // ReadAfterDrain{96}: the demand-fetch must serve the right bytes...
+    assert_eq!(
+        vol.read(96, 1).unwrap().as_slice(),
+        common::incompressible_block(0).as_slice(),
+        "lba 96 wrong after evict + demand-fetch"
+    );
+    // ...and the short present bitmap it leaves is not a presence violation.
+    common::check_presence_truthful(fork_dir).expect("presence truth violated");
+}

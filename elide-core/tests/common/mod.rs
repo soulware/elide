@@ -196,7 +196,13 @@ pub fn check_presence_truthful(fork_dir: &Path) -> Result<(), String> {
             if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
-            if present.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) == 0) {
+            // Presence test must match production's `check_present_bit`: a
+            // byte past the end of a short bitmap reads as absent (the read
+            // path fetches on demand), not present. Demand-fetch sizes the
+            // bitmap to the fetched entry's index, so higher entries can lie
+            // beyond it — those are unfetched, not lying present bits.
+            let is_present = present.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0);
+            if !is_present {
                 continue;
             }
             let end = entry.stored_offset + entry.stored_length as u64;
