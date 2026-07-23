@@ -513,8 +513,8 @@ fn log_journal_census(
         .map(|ms| now_ms.saturating_sub(ms) / 1000);
 
     tracing::info!(
-        "[gc {fork}] journal census: segments={} blocks={pool_blocks}/{window_blocks} \
-         oldest_age_s={} mixed={} mixed_blocks={mixed_blocks} stable={stable} \
+        "[gc {fork}] journal census: journal={} journal_blocks={pool_blocks}/{window_blocks} \
+         oldest_age_s={} stable={stable} mixed={} mixed_blocks={mixed_blocks} \
          tombstones={tombstones}",
         pool.len(),
         oldest_age_s.map_or_else(|| "-".to_owned(), |s| s.to_string()),
