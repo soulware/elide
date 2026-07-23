@@ -189,7 +189,10 @@ fn snapshot_pre_promote_offsets(
             | EntryKind::Inline
             | EntryKind::CanonicalData
             | EntryKind::CanonicalInline => extent_index.lookup(&e.hash).map(|loc| loc.body_offset),
-            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => None,
+            EntryKind::DedupRef
+            | EntryKind::Zero
+            | EntryKind::Delta
+            | EntryKind::CanonicalDelta => None,
         })
         .collect()
 }
@@ -374,7 +377,8 @@ fn apply_promoted_partition(
             EntryKind::Data
             | EntryKind::Inline
             | EntryKind::CanonicalData
-            | EntryKind::CanonicalInline => {}
+            | EntryKind::CanonicalInline
+            | EntryKind::CanonicalDelta => {}
             // A Delta with a CAS token was a Data entry at prep time that
             // the worker's delta tier converted: drop the WAL-pointing
             // DATA location, then register the Delta as the disk rebuild
@@ -454,7 +458,9 @@ fn apply_promoted_partition(
             EntryKind::Zero => zero += 1,
             EntryKind::Inline => inline += 1,
             EntryKind::Delta => delta += 1,
-            EntryKind::CanonicalData | EntryKind::CanonicalInline => canonical += 1,
+            EntryKind::CanonicalData | EntryKind::CanonicalInline | EntryKind::CanonicalDelta => {
+                canonical += 1
+            }
         }
     }
     let _ = canonical;
@@ -2536,7 +2542,7 @@ impl Volume {
             // reclaim that re-pointed the hash at a newer segment
             // wins.
             for entry in entries.iter() {
-                if entry.kind != EntryKind::Delta {
+                if !entry.kind.is_delta() {
                     continue;
                 }
                 Arc::make_mut(&mut self.extent_index)
@@ -2575,7 +2581,7 @@ impl Volume {
             // Cached`. CAS against `segment_id == ulid` so a
             // concurrent repoint at a newer segment wins.
             for entry in entries.iter() {
-                if entry.kind != EntryKind::Delta {
+                if !entry.kind.is_delta() {
                     continue;
                 }
                 Arc::make_mut(&mut self.extent_index)
@@ -2748,7 +2754,10 @@ impl Volume {
                         | EntryKind::Inline
                         | EntryKind::CanonicalData
                         | EntryKind::CanonicalInline => {}
-                        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => continue,
+                        EntryKind::DedupRef
+                        | EntryKind::Zero
+                        | EntryKind::Delta
+                        | EntryKind::CanonicalDelta => continue,
                     }
                     if let Some(old_wal_offset) = old_wal_offset {
                         index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);

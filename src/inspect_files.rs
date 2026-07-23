@@ -133,6 +133,7 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             EntryKind::Delta => "delta",
             EntryKind::CanonicalData => "canon-data",
             EntryKind::CanonicalInline => "canon-inline",
+            EntryKind::CanonicalDelta => "canon-delta",
         };
         println!(
             "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {:<8}  {}",
