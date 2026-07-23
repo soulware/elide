@@ -353,9 +353,6 @@ fn apply_promoted_partition(
         pre_promote_offsets,
         journal_segment,
     } = part;
-    if entries.is_empty() {
-        return Ok(());
-    }
     let delta_ctx = extentindex::SegmentRegistrationCtx {
         segment_id: segment_ulid,
         body_section_start,
@@ -1797,12 +1794,14 @@ impl Volume {
             }
 
             // Merge the GC output into the lbamap by per-entry conditional
-            // insert. `insert_consuming_inputs` installs only on sub-ranges
+            // insert. `insert_consuming_inputs` installs on a sub-range
             // whose existing claimant is one of the inputs this apply
-            // consumes and tears down; every other claimant — above OR
-            // below `new_ulid` — keeps its sub-range, because it marks a
-            // write the plan did not carry (a WAL whose flush promote
-            // failed keeps stamping claims below `new_ulid`). See
+            // consumes and tears down, or which holds this entry's hash at
+            // a lower ULID (identical bytes — adopting the higher ULID
+            // matches the rebuild). A claimant with different content, or a
+            // higher ULID, keeps its sub-range: it marks a write the plan
+            // did not carry (a WAL whose flush promote failed keeps
+            // stamping claims below `new_ulid`). See
             // `docs/design/lbamap-claimant-tracking.md`,
             // `docs/finding-sweep-flush-claimant-bug.md`,
             // `gc_output_loses_to_live_write_applied_after_gc`, and
@@ -1876,11 +1875,18 @@ impl Volume {
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
-    /// if it diverges from `self.lbamap`. Called at the end of every
-    /// **structural** op (segment-shape mutations: repack apply, promote,
-    /// GC plan apply, checkpoint flush, volume open) so any drift trips at
-    /// the introducing site, not three operations later as a stale-cancel
-    /// or oracle mismatch.
+    /// if the **content** (per-LBA hash) diverges from `self.lbamap`.
+    /// Called at the end of every **structural** op (segment-shape
+    /// mutations: repack apply, promote, GC plan apply, checkpoint flush,
+    /// volume open) so any drift trips at the introducing site, not three
+    /// operations later as a stale-cancel or oracle mismatch.
+    ///
+    /// Panics on any difference from the rebuild, in content or claimant.
+    /// Apply installs claims by the rebuild's highest-ULID-wins rule (a
+    /// same-hash lower-ULID claim is adopted, not preserved — see
+    /// `LbaMap::insert_consuming_inputs`), so the two agree by
+    /// construction and a claimant difference is a real defect, not a
+    /// benign ordering hint.
     ///
     /// Deliberately **not** called from `write` / `write_zeroes` — those
     /// are high-frequency incremental `lbamap.insert` updates that have
@@ -1990,7 +1996,8 @@ impl Volume {
         }
         if !diverging.is_empty() {
             let mut msg = format!(
-                "lbamap drift after [{caller}]: {} LBA(s) diverge",
+                "lbamap drift after [{caller}]: {} LBA(s) diverge from the disk rebuild \
+                 on content or claimant",
                 diverging.len()
             );
             for d in &diverging {

@@ -226,11 +226,14 @@ impl LbaMap {
     }
 
     /// [`insert_if_newer`] variant for rewrite apply paths (GC fold /
-    /// sweep / repack): installs only on sub-ranges whose current claimant
-    /// is one of the `consumed_inputs` this apply consumes and deletes. A
-    /// consumed claimant is overridable at any ULID order — e.g. the
-    /// `u_flush` segment a sweep bin-packs sits *above* the output ULID
-    /// (see `docs/finding-sweep-flush-claimant-bug.md`) — while every
+    /// sweep / repack): installs on a sub-range whose current claimant is
+    /// one of the `consumed_inputs` this apply consumes and deletes, or
+    /// which holds our hash at a lower ULID. A consumed claimant is
+    /// overridable at any ULID order — e.g. the `u_flush` segment a sweep
+    /// bin-packs sits *above* the output ULID (see
+    /// `docs/finding-sweep-flush-claimant-bug.md`). A same-hash lower-ULID
+    /// claimant names a segment with identical bytes, so adopting the
+    /// higher ULID matches the rebuild's highest-ULID-wins claim. Every
     /// other claimant keeps its sub-range: it marks a write the rewrite's
     /// plan did not carry.
     pub fn insert_consuming_inputs(
@@ -361,13 +364,18 @@ impl LbaMap {
         let new_end = start_lba + lba_length as u64;
         // With a consumed set, an existing entry blocks the install unless
         // its claimant is one of the inputs this apply consumes and
-        // deletes: a rewrite output may only replace claims owned by its
-        // own inputs, and any other claimant — whatever its ULID order —
-        // marks a write the rewrite's plan did not carry. Without a
-        // consumed set, a claimant `>=` ours blocks.
-        let blocks = |existing: Ulid| -> bool {
+        // deletes, or it holds our hash at a lower ULID. The first is a
+        // claim the rewrite tears down; the second names a segment with
+        // identical bytes sorting below ours, so adopting the higher ULID
+        // matches the rebuild's highest-ULID-wins claim and changes no
+        // read. Distinct content or a higher ULID blocks: that marks a
+        // write the plan did not carry. Without a consumed set, a claimant
+        // `>=` ours blocks.
+        let blocks = |existing: Ulid, existing_hash: blake3::Hash| -> bool {
             match consumed_inputs {
-                Some(set) => !set.contains(&existing),
+                Some(set) => {
+                    !(set.contains(&existing) || existing_hash == hash && existing < claimant)
+                }
                 None => existing >= claimant,
             }
         };
@@ -380,13 +388,13 @@ impl LbaMap {
 
         if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
             let pred_end = pred_start + pred.lba_length as u64;
-            if pred_end > start_lba && blocks(pred.claimant_ulid) {
+            if pred_end > start_lba && blocks(pred.claimant_ulid, pred.hash) {
                 blocked.push((start_lba, pred_end.min(new_end)));
             }
         }
 
         for (&k, e) in self.inner.range(start_lba..new_end) {
-            if blocks(e.claimant_ulid) {
+            if blocks(e.claimant_ulid, e.hash) {
                 let k_end = k + e.lba_length as u64;
                 blocked.push((k, k_end.min(new_end)));
             }
@@ -1635,15 +1643,47 @@ mod tests {
     fn insert_consuming_inputs_preserves_lower_nonconsumed_claimant() {
         // Existing claimant u(3) sorts BELOW the rewrite output's u(5)
         // but is not a consumed input — e.g. a claim stamped through a
-        // WAL minted before the pass's checkpoint. The rewrite's plan
-        // never saw that write, so the install must leave it untouched;
-        // ULID order alone grants no override.
+        // WAL minted before the pass's checkpoint — and holds different
+        // content (h(1) vs the carried h(2)). The rewrite's plan never
+        // saw that write, so the install must leave it untouched: a lower
+        // ULID grants no override once the content differs.
         let mut map = LbaMap::new();
         map.insert(0, 4, h(1), u(3));
         let consumed: HashSet<Ulid> = std::iter::once(u(2)).collect();
         map.insert_consuming_inputs(0, 4, h(2), u(5), &consumed);
         assert_eq!(map.lookup(0), Some((h(1), 0)));
         assert_eq!(map.claimant_at(0), Some(u(3)));
+    }
+
+    #[test]
+    fn insert_consuming_inputs_adopts_lower_nonconsumed_same_hash_claimant() {
+        // Existing claimant u(3) sorts below the output u(5), is not a
+        // consumed input, but holds the SAME hash — a second segment with
+        // identical bytes (implicit dedup). The rebuild walks ascending
+        // and lands on u(5); apply must adopt it too, or the in-memory
+        // claimant drifts from the disk rebuild. The bytes are unchanged.
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(3));
+        let consumed: HashSet<Ulid> = std::iter::once(u(2)).collect();
+        map.insert_consuming_inputs(0, 4, h(1), u(5), &consumed);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.claimant_at(0), Some(u(5)));
+    }
+
+    #[test]
+    fn insert_delta_consuming_inputs_adopts_lower_nonconsumed_same_hash_claimant() {
+        // Delta form of the adoption rule: a lower-ULID non-consumed delta
+        // claim with the same composite hash is adopted at the output ULID,
+        // and the source refcount stays at one — the old claim's source is
+        // released as the output's is installed, not double-counted.
+        let src: Arc<[blake3::Hash]> = Arc::from([h(9)]);
+        let mut map = LbaMap::new();
+        map.insert_delta(0, 4, h(1), u(3), Arc::clone(&src));
+        let consumed: HashSet<Ulid> = std::iter::once(u(2)).collect();
+        map.insert_delta_consuming_inputs(0, 4, h(1), u(5), Arc::clone(&src), &consumed);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.claimant_at(0), Some(u(5)));
+        assert_eq!(map.delta_source_refcount(&h(9)), 1);
     }
 
     #[test]
