@@ -2927,10 +2927,22 @@ fn is_index_entry_live(
         | EntryKind::Inline
         | EntryKind::CanonicalData
         | EntryKind::CanonicalInline => {
-            live_hashes.contains(&entry.hash)
-                && extent_index.lookup(&entry.hash).is_some_and(|loc| {
-                    loc.segment_id == seg_ulid && loc.body_offset == entry.stored_offset
-                })
+            // Journal-tier bodies own a `(segment, hash)` slot in the
+            // disjoint journal map, never `inner`; a journal segment with a
+            // live journal LBA must stay in the manifest so a rebuild from
+            // the snapshot reproduces its journal map. Durable bodies own
+            // `inner`.
+            if entry.journal {
+                live_hashes.contains(&entry.hash)
+                    && extent_index
+                        .lookup_journal(seg_ulid, &entry.hash)
+                        .is_some_and(|loc| loc.body_offset == entry.stored_offset)
+            } else {
+                live_hashes.contains(&entry.hash)
+                    && extent_index.lookup(&entry.hash).is_some_and(|loc| {
+                        loc.segment_id == seg_ulid && loc.body_offset == entry.stored_offset
+                    })
+            }
         }
     }
 }

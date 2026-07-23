@@ -1044,10 +1044,11 @@ fn write_ext4_image(vol: &mut Volume, img: &[u8]) {
 }
 
 /// Mid-session derivation end to end: a fresh volume is never-derived,
-/// polls harmlessly while blank, flips the window live at the first
-/// promote take after the filesystem appears, and classifies with the
-/// activation marker so pre-flip stamps survive rebuild. The next open
-/// clears the marker and reclassifies uniformly.
+/// polls harmlessly while blank, and flips the window live at the first
+/// promote take after the filesystem appears. Routing is by the entry's
+/// persisted journal flag (set at write time from the window), so a write
+/// that happened before the window was derived stays durable, and a rebuild
+/// reproduces the tiers exactly with no reclassification.
 #[test]
 fn format_mid_session_flips_window_at_promote_take() {
     let base = keyed_temp_dir();
@@ -1086,52 +1087,45 @@ fn format_mid_session_flips_window_at_promote_take() {
     assert_eq!(vol.journal.activation, Some(activation));
     assert_eq!(vol.journal.ranges, ranges);
 
-    // The pre-flip window-LBA entry keeps its non-journal stamp: its
-    // segment sorts below the activation marker.
+    let _ = activation;
+    // The pre-flip window write happened before the window was derived
+    // (ranges were empty), so its persisted flag is clear: it lives in the
+    // durable tier as the pre-activation residue, resolvable through `inner`.
     let pre_hash = blake3::hash(&pre_flip);
-    let pre_loc = vol.extent_index.lookup(&pre_hash).unwrap().clone();
-    assert!(!pre_loc.journal);
-    assert!(pre_loc.segment_id < activation);
+    assert!(
+        vol.extent_index.lookup(&pre_hash).is_some(),
+        "pre-derivation window write is durable, not journal",
+    );
 
-    // A post-flip window write partitions into a journal segment above
-    // the marker.
+    // A post-derivation window write partitions into the journal tier: its
+    // flag is set, so it lives in the journal map, never `inner`.
     let post_flip = high_entropy_block(0xD2);
     vol.write(56, &post_flip).unwrap();
     let home = high_entropy_block(0xD3);
     vol.write(200, &home).unwrap();
     vol.promote_for_test().unwrap();
-    let post_loc = vol
-        .extent_index
-        .lookup(&blake3::hash(&post_flip))
-        .unwrap()
-        .clone();
-    assert!(post_loc.journal);
-    assert!(post_loc.segment_id > activation);
+    let post_hash = blake3::hash(&post_flip);
+    assert!(
+        vol.extent_index.lookup(&post_hash).is_none(),
+        "post-derivation window write is journal-tier, absent from inner",
+    );
+    assert_eq!(vol.read(56, 1).unwrap(), post_flip);
+    assert_eq!(vol.read(40, 1).unwrap(), pre_flip);
 
-    // A mid-session rebuild honouring the marker (what the coordinator's
-    // GC pass and a readonly open do) reproduces the live stamps.
-    let window = crate::journal::JournalWindow {
-        ranges: ranges.clone(),
-        activation: Some(activation),
-    };
-    let disk = extentindex::rebuild(&[(base.clone(), None)], &window).unwrap();
-    assert!(!disk.lookup(&pre_hash).unwrap().journal);
-    assert!(disk.lookup(&blake3::hash(&post_flip)).unwrap().journal);
-
-    // Reopen: marker cleared, uniform reclassification under the plain
-    // window heals the pre-flip stamp.
+    // Reopen: the persisted flags drive routing, so the tiers are
+    // reproduced exactly — no reclassification of the pre-activation write.
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
     assert!(
-        crate::config::VolumeConfig::read(&base)
-            .unwrap()
-            .journal
-            .unwrap()
-            .activation
-            .is_none(),
-        "open must clear the activation marker",
+        vol.extent_index.lookup(&pre_hash).is_some(),
+        "durable residue stays durable across rebuild",
     );
-    assert!(vol.extent_index.lookup(&pre_hash).unwrap().journal);
+    assert!(
+        vol.extent_index.lookup(&post_hash).is_none(),
+        "journal-tier content stays out of inner across rebuild",
+    );
+    assert_eq!(vol.read(56, 1).unwrap(), post_flip);
+    assert_eq!(vol.read(40, 1).unwrap(), pre_flip);
 
     fs::remove_dir_all(base).unwrap();
 }
@@ -1298,24 +1292,23 @@ fn derived_empty_window_persists_and_stops_polling() {
 }
 
 #[test]
-fn journal_write_loses_ownership_to_same_epoch_home_write() {
+fn journal_and_home_store_separate_bodies_same_epoch() {
     let base = keyed_temp_dir();
     set_journal_ranges(&base, vec![(100, 16)]);
     let mut vol = Volume::open(&base, &base).unwrap();
 
-    // Journal copy first (jbd2 commit order), home checkpoint second,
-    // same epoch. The write path re-owns the hash to the home copy, so
-    // formation mints the journal entry as the DedupRef — canonical
-    // bytes live at the stable LBA, the journal claim dies at wrap.
+    // Journal copy first (jbd2 commit order), home checkpoint second, same
+    // epoch, identical bytes. Journal content is stored as-is: it never
+    // dedups against the home copy, so both segments carry a full Data body
+    // and the tiers stay disjoint.
     let data: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
     vol.write(100, &data).unwrap();
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    // Segregation splits the epoch: the home copy owns as Data in the
-    // data segment (lower ULID), the journal copy is the DedupRef in the
-    // journal segment (higher ULID) — pointing backward as DedupRefs
-    // must.
+    // Segregation splits the epoch: home as Data in the data segment (lower
+    // ULID), the journal copy as its own Data body in the journal segment
+    // (higher ULID) — never a DedupRef.
     let ulids = pending_ulids(&base);
     assert_eq!(ulids.len(), 2);
     let (data_seg, journal_seg) = (ulids[0], ulids[1]);
@@ -1328,29 +1321,40 @@ fn journal_write_loses_ownership_to_same_epoch_home_write() {
     let data_entries = read_entries(data_seg);
     assert_eq!(data_entries.len(), 1);
     assert_eq!(data_entries[0].kind, segment::EntryKind::Data);
-    assert_eq!(data_entries[0].start_lba, 0, "home copy owns");
+    assert_eq!(data_entries[0].start_lba, 0, "home copy is a Data body");
+    assert!(!data_entries[0].journal);
     let journal_entries = read_entries(journal_seg);
     assert_eq!(journal_entries.len(), 1);
-    assert_eq!(journal_entries[0].kind, segment::EntryKind::DedupRef);
     assert_eq!(
-        journal_entries[0].start_lba, 100,
-        "journal copy is the DedupRef"
+        journal_entries[0].kind,
+        segment::EntryKind::Data,
+        "journal copy stored as-is, not a DedupRef"
     );
+    assert_eq!(journal_entries[0].start_lba, 100);
+    assert!(journal_entries[0].journal, "journal entry carries the flag");
 
-    let seg = data_seg;
-    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
-    assert_eq!(loc.segment_id, seg);
-    assert!(!loc.journal);
+    let hash = blake3::hash(&data);
+    // Home owns the durable `inner` slot; the journal copy lives in the
+    // disjoint journal map keyed by its own segment.
+    assert_eq!(vol.extent_index.lookup(&hash).unwrap().segment_id, data_seg);
+    assert!(
+        vol.extent_index
+            .lookup_journal(journal_seg, &hash)
+            .is_some()
+    );
 
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(100, 1).unwrap(), data);
 
-    // Rebuild picks the same owner.
+    // Rebuild reproduces the disjoint tiers.
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
-    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
-    assert_eq!(loc.segment_id, seg);
-    assert!(!loc.journal);
+    assert_eq!(vol.extent_index.lookup(&hash).unwrap().segment_id, data_seg);
+    assert!(
+        vol.extent_index
+            .lookup_journal(journal_seg, &hash)
+            .is_some()
+    );
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(100, 1).unwrap(), data);
 
@@ -1358,51 +1362,63 @@ fn journal_write_loses_ownership_to_same_epoch_home_write() {
 }
 
 #[test]
-fn home_write_displaces_committed_journal_canonical() {
+fn journal_and_home_own_separate_tiers_across_epochs() {
     let base = keyed_temp_dir();
     set_journal_ranges(&base, vec![(100, 16)]);
     let mut vol = Volume::open(&base, &base).unwrap();
 
-    // Journal copy commits in epoch 1 and becomes canonical; the home
-    // checkpoint write lands in epoch 2 and displaces it.
+    // Journal copy commits in epoch 1 into the journal tier — it never
+    // enters `inner`. The home checkpoint lands in epoch 2 and owns `inner`
+    // independently; there is no displacement because the tiers never shared
+    // a slot.
     let data: Vec<u8> = (0..4096).map(|i| (i * 11 + 5) as u8).collect();
     vol.write(100, &data).unwrap();
     vol.promote_for_test().unwrap();
     let s1 = pending_ulids(&base)[0];
     let hash = blake3::hash(&data);
-    let loc = vol.extent_index.lookup(&hash).unwrap();
-    assert_eq!(loc.segment_id, s1);
-    assert!(loc.journal, "journal copy owns while no stable copy exists");
+    assert!(
+        vol.extent_index.lookup(&hash).is_none(),
+        "journal content is not in inner"
+    );
+    assert!(
+        vol.extent_index.lookup_journal(s1, &hash).is_some(),
+        "journal copy owns its journal-map slot"
+    );
+    assert_eq!(vol.read(100, 1).unwrap(), data);
 
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
     let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
 
-    // The epoch-2 segment carries a full Data owner, not a DedupRef
-    // into the journal-claimed body.
+    // The epoch-2 segment carries a full Data owner in inner.
     let seg_path = base.join("pending").join(s2.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].kind, segment::EntryKind::Data);
 
-    let loc = vol.extent_index.lookup(&hash).unwrap();
     assert_eq!(
-        loc.segment_id, s2,
-        "home copy displaced the journal canonical"
+        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        s2,
+        "home owns inner"
     );
-    assert!(!loc.journal);
+    assert!(
+        vol.extent_index.lookup_journal(s1, &hash).is_some(),
+        "journal copy still owns its tier"
+    );
 
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(100, 1).unwrap(), data);
 
-    // Rebuild walks s1 (lower ULID, journal) before s2 and still picks
-    // s2 — the displacement rule is identical live and at rebuild.
+    // Rebuild reproduces both tiers.
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
-    let loc = vol.extent_index.lookup(&hash).unwrap();
-    assert_eq!(loc.segment_id, s2, "rebuild agrees with the live path");
-    assert!(!loc.journal);
+    assert_eq!(
+        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        s2,
+        "rebuild agrees with the live path"
+    );
+    assert!(vol.extent_index.lookup_journal(s1, &hash).is_some());
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(100, 1).unwrap(), data);
 
@@ -1410,13 +1426,15 @@ fn home_write_displaces_committed_journal_canonical() {
 }
 
 #[test]
-fn journal_write_dedups_against_stable_canonical() {
+fn journal_write_stores_own_body_not_dedup_against_stable() {
     let base = keyed_temp_dir();
     set_journal_ranges(&base, vec![(100, 16)]);
     let mut vol = Volume::open(&base, &base).unwrap();
 
-    // Home copy already canonical; a journal write of the same bytes
-    // dedups against it (journal → stable direction is the good one).
+    // Home copy already canonical in inner; a journal write of the same
+    // bytes does NOT dedup against it — journal content is stored as-is, so
+    // durable content never depends on an ephemeral journal reference and a
+    // journal segment reaps whole.
     let data: Vec<u8> = (0..4096).map(|i| (i * 13 + 9) as u8).collect();
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
@@ -1430,12 +1448,26 @@ fn journal_write_dedups_against_stable_canonical() {
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].kind, segment::EntryKind::DedupRef);
+    assert_eq!(
+        entries[0].kind,
+        segment::EntryKind::Data,
+        "journal write stored as-is, not a DedupRef"
+    );
+    assert!(entries[0].journal);
 
-    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
-    assert_eq!(loc.segment_id, s1, "stable canonical keeps ownership");
+    let hash = blake3::hash(&data);
+    assert_eq!(
+        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        s1,
+        "stable canonical unchanged in inner"
+    );
+    assert!(
+        vol.extent_index.lookup_journal(s2, &hash).is_some(),
+        "journal copy has its own body"
+    );
 
     assert_eq!(vol.read(100, 1).unwrap(), data);
+    assert_eq!(vol.read(0, 1).unwrap(), data);
     fs::remove_dir_all(base).unwrap();
 }
 
@@ -2613,8 +2645,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 let rebuild_chain = vec![(fork_dir.clone(), None)];
                 let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
                 let _live_hashes = lba_map.lba_referenced_hashes();
-                let extent_index =
-                    extentindex::rebuild(&rebuild_chain, &crate::journal::NO_WINDOW).unwrap();
+                let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
 
                 let vk =
                     crate::signing::load_verifying_key(&fork_dir, crate::signing::VOLUME_PUB_FILE)

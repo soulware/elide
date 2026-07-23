@@ -118,7 +118,7 @@ impl BlockReader {
         // any live-flip activation marker) so the live view resolves
         // canonicals exactly as the volume does.
         let journal = crate::config::VolumeConfig::read(&dir)?.journal_window();
-        let mut extent_index = extentindex::rebuild(&rebuild_chain, &journal)?;
+        let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
         // partial tails that may exist on a currently-running volume.
@@ -141,22 +141,23 @@ impl BlockReader {
                         data,
                     } => {
                         lbamap.insert(start_lba, lba_length, hash, ulid);
-                        // The admission mirrors `write_commit`: an already
-                        // resolvable hash keeps its owner unless the owner
-                        // is a journal copy and this record is not.
-                        extent_index.insert_if_absent(
-                            hash,
-                            extentindex::ExtentLocation {
-                                segment_id: ulid,
-                                body_offset,
-                                body_length: data.len() as u32,
-                                compressed: flags.contains(writelog::WalFlags::COMPRESSED),
-                                body_source: extentindex::BodySource::Local,
-                                body_section_start: 0,
-                                inline_data: None,
-                                journal: journal.is_journal(start_lba, ulid),
-                            },
-                        );
+                        // Mirrors `write_commit`: a journal-window record goes
+                        // to the disjoint journal tier keyed by `(ulid, hash)`;
+                        // a durable record uses `insert_if_absent`.
+                        let location = extentindex::ExtentLocation {
+                            segment_id: ulid,
+                            body_offset,
+                            body_length: data.len() as u32,
+                            compressed: flags.contains(writelog::WalFlags::COMPRESSED),
+                            body_source: extentindex::BodySource::Local,
+                            body_section_start: 0,
+                            inline_data: None,
+                        };
+                        if journal.ranges.contains(start_lba) {
+                            extent_index.insert_journal_if_absent(ulid, hash, location);
+                        } else {
+                            extent_index.insert_if_absent(hash, location);
+                        }
                     }
                     writelog::LogRecord::Ref {
                         hash,
@@ -245,7 +246,7 @@ impl BlockReader {
     ///   inconsistency. Loud errors are required so corruption surfaces
     ///   instead of being read as a hole.
     pub fn read_block(&self, lba: u64) -> io::Result<[u8; 4096]> {
-        let Some((hash, block_offset)) = self.lbamap.lookup(lba) else {
+        let Some((hash, block_offset, claimant)) = self.lbamap.lookup_with_claimant(lba) else {
             return Ok([0u8; 4096]);
         };
         if hash == volume::ZERO_HASH {
@@ -254,7 +255,13 @@ impl BlockReader {
         if let Some(block) = self.materialised_block(&hash, block_offset) {
             return Ok(block);
         }
-        if let Some(loc) = self.extent_index.lookup(&hash) {
+        // Journal-tier extents resolve through the `(claimant, hash)` map;
+        // durable claimants miss it and fall through to `inner`.
+        if let Some(loc) = self
+            .extent_index
+            .lookup_journal(claimant, &hash)
+            .or_else(|| self.extent_index.lookup(&hash))
+        {
             return self.read_data_block(&hash, &loc.clone(), block_offset);
         }
         if let Some(delta_loc) = self.extent_index.lookup_delta(&hash) {
@@ -861,7 +868,6 @@ fn apply_snapshot_layer(
             body_tier: extentindex::RegistrationBodyTier::Cached,
             delta_body_source: Some(DeltaBodySource::Cached),
             inline: extentindex::InlineSource::Section(&inline_bytes),
-            journal: &crate::journal::NO_WINDOW,
         };
         for (raw_idx, entry) in entries.iter().enumerate() {
             lbamap.register_entry(entry, *seg);

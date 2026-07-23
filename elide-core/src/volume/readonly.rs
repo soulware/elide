@@ -45,11 +45,8 @@ impl ReadonlyVolume {
     /// replay the WAL. WAL records from an active writer on the same volume will
     /// not be visible. Intended for the `--readonly` serve path.
     pub fn open(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
-        // Honour a live-flip activation marker so this view classifies
-        // exactly as the writing session does.
-        let journal = crate::config::VolumeConfig::read(fork_dir)?.journal_window();
         let (ancestor_layers, lbamap, extent_index) =
-            super::open_state::open_read_state(fork_dir, by_id_dir, &journal)?;
+            super::open_state::open_read_state(fork_dir, by_id_dir)?;
         Ok(Self {
             base_dir: fork_dir.to_owned(),
             ancestor_layers,

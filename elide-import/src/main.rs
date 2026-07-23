@@ -181,10 +181,7 @@ fn load_parent_extent_index(vol_dir: &Path) -> anyhow::Result<Option<ExtentIndex
         .into_iter()
         .map(|l| (l.dir, l.branch_ulid))
         .collect();
-    // Parent-source resolution only — ownership preference is
-    // irrelevant to which bytes a hash resolves to.
-    let idx = elide_core::extentindex::rebuild(&chain, &elide_core::journal::NO_WINDOW)
-        .context("rebuild parent extent index")?;
+    let idx = elide_core::extentindex::rebuild(&chain).context("rebuild parent extent index")?;
     Ok(Some(idx))
 }
 

@@ -44,6 +44,11 @@ pub struct ExtentRead {
     /// Block offset within the stored payload for `range_start`.
     /// Byte offset into the payload = `payload_block_offset as u64 * 4096`.
     pub payload_block_offset: u32,
+    /// ULID of the segment (or WAL) that staked this LBA claim. The read
+    /// path uses it to resolve a journal-tier extent through the extent
+    /// index's `(segment, hash)` journal map, where a hash repeated across
+    /// journal segments has a distinct body per segment.
+    pub claimant_ulid: Ulid,
 }
 
 /// Value stored per LBA map entry.
@@ -681,6 +686,7 @@ impl LbaMap {
                     range_start: start_lba,
                     range_end: entry_end.min(end_lba),
                     payload_block_offset: e.payload_block_offset + (start_lba - key) as u32,
+                    claimant_ulid: e.claimant_ulid,
                 })
             });
 
@@ -692,6 +698,7 @@ impl LbaMap {
                 range_start: key,
                 range_end,
                 payload_block_offset: e.payload_block_offset,
+                claimant_ulid: e.claimant_ulid,
             }
         });
 
@@ -731,6 +738,22 @@ impl LbaMap {
         let (&start, &e) = self.inner.range(..=lba).next_back()?;
         if lba < start + e.lba_length as u64 {
             Some((e.hash, e.payload_block_offset + (lba - start) as u32))
+        } else {
+            None
+        }
+    }
+
+    /// [`lookup`](Self::lookup) plus the claiming segment ULID, for readers
+    /// that resolve journal-tier extents through the extent index's
+    /// `(segment, hash)` journal map.
+    pub fn lookup_with_claimant(&self, lba: u64) -> Option<(blake3::Hash, u32, Ulid)> {
+        let (&start, &e) = self.inner.range(..=lba).next_back()?;
+        if lba < start + e.lba_length as u64 {
+            Some((
+                e.hash,
+                e.payload_block_offset + (lba - start) as u32,
+                e.claimant_ulid,
+            ))
         } else {
             None
         }
@@ -1019,6 +1042,7 @@ mod tests {
             stored_length: 0,
             inline: None,
             delta_options: Vec::new(),
+            journal: false,
         }
     }
 

@@ -164,10 +164,20 @@ fn assert_manifest_filter_correct(
             | EntryKind::Inline
             | EntryKind::CanonicalData
             | EntryKind::CanonicalInline => {
-                live_hashes.contains(&e.hash)
-                    && extent_index.lookup(&e.hash).is_some_and(|loc| {
-                        loc.segment_id == *seg_ulid && loc.body_offset == e.stored_offset
-                    })
+                // Journal-tier bodies own a `(segment, hash)` slot in the
+                // disjoint journal map, never `inner`; durable bodies own
+                // `inner`. Resolve each through its own tier.
+                if e.journal {
+                    live_hashes.contains(&e.hash)
+                        && extent_index
+                            .lookup_journal(*seg_ulid, &e.hash)
+                            .is_some_and(|loc| loc.body_offset == e.stored_offset)
+                } else {
+                    live_hashes.contains(&e.hash)
+                        && extent_index.lookup(&e.hash).is_some_and(|loc| {
+                            loc.segment_id == *seg_ulid && loc.body_offset == e.stored_offset
+                        })
+                }
             }
         });
 

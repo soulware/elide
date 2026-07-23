@@ -185,6 +185,7 @@ mod tests {
                 kind: EntryKind::Data,
                 inline: None,
                 delta_options: Vec::new(),
+                journal: false,
             },
             body: Some(vec![0xAB; 8]),
         }
