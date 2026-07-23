@@ -257,7 +257,21 @@ pub(crate) fn read_extents(
             continue;
         }
 
-        let loc = match extent_index.lookup(&er.hash) {
+        // Journal-tier extents resolve through the `(claimant, hash)` journal
+        // map: a hash repeated across journal segments has a distinct body
+        // per segment, and the claimant names the reader's own copy. The
+        // claimant of a durable extent is a durable segment, absent from the
+        // journal map, so the probe misses and falls through to `inner` —
+        // making the tiers disjoint without the read path knowing the window.
+        // Gated on a non-empty journal map so non-ext4 volumes pay nothing.
+        let resolved = if extent_index.journal_is_empty() {
+            extent_index.lookup(&er.hash)
+        } else {
+            extent_index
+                .lookup_journal(er.claimant_ulid, &er.hash)
+                .or_else(|| extent_index.lookup(&er.hash))
+        };
+        let loc = match resolved {
             Some(loc) => loc,
             None => {
                 // No direct DATA/Inline entry. Try a Delta entry.

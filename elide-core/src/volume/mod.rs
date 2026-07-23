@@ -220,6 +220,13 @@ fn classify_pending_dedup_entries(
         if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
             continue;
         }
+        // Journal-tier entries are stored as-is: never a dedup target, so
+        // durable content and journal content never share a body and a
+        // journal segment reaps whole. They also never appear in `inner`,
+        // so a durable write below can never dedup against journal content.
+        if entry.journal {
+            continue;
+        }
         let Some(loc) = extent_index.lookup(&entry.hash) else {
             continue;
         };
@@ -267,12 +274,14 @@ fn partition_journal_pending(
     }
     let mut primary = (Vec::new(), Vec::new(), Vec::new());
     let mut journal = (Vec::new(), Vec::new(), Vec::new());
-    for ((entry, pre), body) in entries
+    for ((mut entry, pre), body) in entries
         .into_iter()
         .zip(pre_promote_offsets)
         .zip(body_offsets)
     {
-        let dst = if journal_ranges.contains(entry.start_lba) {
+        let is_journal = journal_ranges.contains(entry.start_lba);
+        entry.journal = is_journal;
+        let dst = if is_journal {
             &mut journal
         } else {
             &mut primary
@@ -295,7 +304,6 @@ fn apply_promoted_entries(
     extent_index: &mut extentindex::ExtentIndex,
     lbamap: &mut lbamap::LbaMap,
     result: &PromoteResult,
-    journal: &crate::journal::JournalWindow,
 ) -> io::Result<()> {
     apply_promoted_partition(
         extent_index,
@@ -309,7 +317,6 @@ fn apply_promoted_entries(
             pre_promote_offsets: &result.pre_promote_offsets,
             journal_segment: false,
         },
-        journal,
     )?;
     if let Some(j) = &result.journal {
         apply_promoted_partition(
@@ -324,7 +331,6 @@ fn apply_promoted_entries(
                 pre_promote_offsets: &j.pre_promote_offsets,
                 journal_segment: true,
             },
-            journal,
         )?;
     }
     Ok(())
@@ -346,7 +352,6 @@ fn apply_promoted_partition(
     lbamap: &mut lbamap::LbaMap,
     old_wal_ulid: Ulid,
     part: ApplyPartition<'_>,
-    journal: &crate::journal::JournalWindow,
 ) -> io::Result<()> {
     let ApplyPartition {
         segment_ulid,
@@ -365,7 +370,6 @@ fn apply_promoted_partition(
             body_length: delta_region_body_length,
         }),
         inline: extentindex::InlineSource::EntryInline,
-        journal,
     };
     let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
     for (raw_idx, (entry, old_wal_offset)) in entries
@@ -403,6 +407,32 @@ fn apply_promoted_partition(
             }
             EntryKind::DedupRef | EntryKind::Zero => continue,
         }
+        let idata = if entry.kind.is_inline() {
+            entry.inline.clone()
+        } else {
+            None
+        };
+        // Journal-tier entries live in the disjoint `(segment, hash)` map,
+        // keyed at write time under the WAL ULID. Move the body to the
+        // segment key. No body-offset CAS: the key is specific to this
+        // volume's promote, and journal writes are serialised through the WAL.
+        if entry.journal {
+            extent_index.rekey_journal(
+                old_wal_ulid,
+                segment_ulid,
+                entry.hash,
+                extentindex::ExtentLocation {
+                    segment_id: segment_ulid,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    compressed: entry.compressed,
+                    body_source: BodySource::Local,
+                    body_section_start,
+                    inline_data: idata,
+                },
+            );
+            continue;
+        }
         let Some(old_wal_offset) = old_wal_offset else {
             // No prior extent index entry for this hash. write_commit
             // always inserts a Data/Inline hash before pushing the
@@ -410,11 +440,6 @@ fn apply_promoted_partition(
             // removed the entry out-of-band between the write and the
             // flush — treat it like a failed CAS and leave it alone.
             continue;
-        };
-        let idata = if entry.kind.is_inline() {
-            entry.inline.clone()
-        } else {
-            None
         };
         extent_index.replace_if_matches(
             entry.hash,
@@ -428,7 +453,6 @@ fn apply_promoted_partition(
                 body_source: BodySource::Local,
                 body_section_start,
                 inline_data: idata,
-                journal: journal.is_journal(entry.start_lba, segment_ulid),
             },
         );
     }
@@ -722,8 +746,7 @@ impl Volume {
         let journal = cfg.journal_window();
 
         // Walk the origin chain and rebuild maps from all committed segments.
-        let (ancestor_layers, mut lbamap, mut extent_index) =
-            open_read_state(base_dir, by_id_dir, &journal)?;
+        let (ancestor_layers, mut lbamap, mut extent_index) = open_read_state(base_dir, by_id_dir)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -872,7 +895,7 @@ impl Volume {
                 &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
-            apply_promoted_entries(&mut extent_index, &mut lbamap, &result, &journal)?;
+            apply_promoted_entries(&mut extent_index, &mut lbamap, &result)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers the recovery-promoted segments.
             let max_promoted = result
@@ -1239,34 +1262,39 @@ impl Volume {
             (offset, open.ulid)
         };
         Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
-        // Temporary extent index entry: points into the WAL at the raw payload
-        // offset, updated to segment file offsets after promotion. Admission:
-        // a hash that already resolves (a prior canonical, or an earlier write
-        // of the same bytes in this WAL epoch) keeps its owner — unless that
-        // owner is a journal-window copy and this write is not, in which case
-        // this write displaces it. The non-owner is minted as a DedupRef at
-        // formation (`classify_pending_dedup`).
-        Arc::make_mut(&mut self.extent_index).insert_if_absent(
+        // Temporary extent index entry: points into the WAL at the raw
+        // payload offset, updated to segment file offsets after promotion.
+        // A journal-window write goes to the disjoint journal tier keyed by
+        // `(wal_ulid, hash)` — never `inner` — so durable content never
+        // dedups against it. A durable write uses `insert_if_absent`: a hash
+        // that already resolves (a prior canonical, or an earlier write of
+        // the same bytes in this epoch) keeps its owner, and the non-owner is
+        // minted as a DedupRef at formation (`classify_pending_dedup`).
+        let is_journal = self.journal.ranges.contains(lba);
+        let location = extentindex::ExtentLocation {
+            segment_id: wal_ulid,
+            body_offset,
+            body_length: stored_length,
+            compressed: is_compressed,
+            body_source: BodySource::Local,
+            body_section_start: 0,
+            inline_data: None,
+        };
+        let ei = Arc::make_mut(&mut self.extent_index);
+        if is_journal {
+            ei.insert_journal_if_absent(wal_ulid, hash, location);
+        } else {
+            ei.insert_if_absent(hash, location);
+        }
+        let mut entry = segment::SegmentEntry::new_data_no_body(
             hash,
-            extentindex::ExtentLocation {
-                segment_id: wal_ulid,
-                body_offset,
-                body_length: stored_length,
-                compressed: is_compressed,
-                body_source: BodySource::Local,
-                body_section_start: 0,
-                inline_data: None,
-                journal: self.journal.ranges.contains(lba),
-            },
+            lba,
+            lba_length,
+            seg_flags,
+            stored_length,
         );
-        self.pending_entries
-            .push(segment::SegmentEntry::new_data_no_body(
-                hash,
-                lba,
-                lba_length,
-                seg_flags,
-                stored_length,
-            ));
+        entry.journal = is_journal;
+        self.pending_entries.push(entry);
         self.pending_body_offsets.push(Some(body_offset));
 
         Ok(())
@@ -1768,14 +1796,12 @@ impl Volume {
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         let delta_body_source =
             extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
-        let journal = self.journal.clone();
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: new_ulid,
             body_section_start: new_bss,
             body_tier: extentindex::RegistrationBodyTier::Cached,
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
-            journal: &journal,
         };
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
@@ -1796,6 +1822,14 @@ impl Volume {
                     // `assert_extent_index_consistent` on
                     // `gc_delta_partial_death_compaction`.
                     index.remove_owner_at(hash, *old_ulid);
+                }
+                // Journal-tier bodies are keyed by segment, so a consumed
+                // input's journal entries are dropped by segment rather than
+                // by hash. A journal segment is only ever a bucket input as a
+                // whole-dead tombstone, so this drops nothing still live; for
+                // a durable input it is a no-op.
+                for old_ulid in &consumed {
+                    index.purge_journal_segment(*old_ulid);
                 }
             }
 
@@ -2149,7 +2183,7 @@ impl Volume {
             .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
             .collect();
         chain.push((self.base_dir.clone(), None));
-        let (disk_inner, disk_deltas, live_segments) =
+        let (disk_inner, disk_deltas, disk_journal, live_segments) =
             match extentindex::rebuild_owners_unverified(&chain, &self.journal) {
                 Ok(v) => v,
                 Err(e) => {
@@ -2201,6 +2235,27 @@ impl Volume {
                 ));
             }
         }
+        // Journal-tier: every in-memory `(segment, hash)` body must be owned
+        // by the disk walk at the same key and name a live segment. A
+        // durable rebuild that mistakenly placed a journal hash in `inner`
+        // (or vice versa) shows here as a phantom, so this is the executable
+        // form of the tier-disjointness invariant.
+        for ((seg, hash), _loc) in self.extent_index.journal_iter() {
+            if diverging.len() >= 8 {
+                break;
+            }
+            if !disk_journal.contains(&(*seg, *hash)) {
+                diverging.push(format!(
+                    "  journal seg={seg} hash={} disk=None (phantom journal)",
+                    hash.to_hex(),
+                ));
+            } else if !live_segments.contains(seg) {
+                diverging.push(format!(
+                    "  journal seg={seg} hash={} (stale journal: points at deleted segment)",
+                    hash.to_hex(),
+                ));
+            }
+        }
 
         if !diverging.is_empty() {
             let mut msg = format!(
@@ -2245,8 +2300,14 @@ impl Volume {
     /// it never resolves through extent_index by design. Skipped here.
     fn unresolvable_lbamap_hashes(&self, sample_limit: usize) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
-        for (lba, _len, hash, _anchor) in self.lbamap.iter_entries() {
+        for (lba, _len, hash, _anchor, claimant) in self.lbamap.iter_entries_with_claimant() {
             if hash == ZERO_HASH {
+                continue;
+            }
+            // A journal-tier LBA resolves through the `(claimant, hash)`
+            // journal map, exactly as the read path does; a durable LBA
+            // resolves through `inner` or the delta map.
+            if self.extent_index.lookup_journal(claimant, &hash).is_some() {
                 continue;
             }
             if self.extent_index.lookup(&hash).is_some() {
@@ -2495,19 +2556,19 @@ impl Volume {
             );
 
             for (i, entry) in entries.iter().enumerate() {
-                if !entry.kind.has_body_bytes() {
+                if !entry.kind.has_body_bytes() || entry.journal {
                     continue;
                 }
-                // Ownership does not change here (the CAS is gated on this
-                // segment already owning the hash), so the journal flag
-                // carries over from the current location.
-                let Some(journal) = self
+                // Durable entries only: the CAS is gated on this segment
+                // already owning the hash in `inner`. Journal-tier entries
+                // are flipped to Cached below via the journal map.
+                let owns = self
                     .extent_index
                     .lookup(&entry.hash)
-                    .and_then(|loc| (loc.segment_id == ulid).then_some(loc.journal))
-                else {
+                    .is_some_and(|loc| loc.segment_id == ulid);
+                if !owns {
                     continue;
-                };
+                }
                 let idata = if entry.kind.is_inline() {
                     let start = entry.stored_offset as usize;
                     let end = start + entry.stored_length as usize;
@@ -2529,10 +2590,17 @@ impl Volume {
                         body_source: BodySource::Cached(i as u32),
                         body_section_start,
                         inline_data: idata,
-                        journal,
                     },
                 );
             }
+            // Flip journal-tier bodies for this segment from Local to
+            // Cached, mirroring the durable loop above. The presence-bitmap
+            // index for each hash is its first entry position.
+            Arc::make_mut(&mut self.extent_index).promote_journal_segment_to_cache(
+                ulid,
+                body_section_start,
+                |h| entries.iter().position(|e| &e.hash == h).map(|p| p as u32),
+            );
 
             // Delta entries: the delta blob has moved from inline in
             // the now-deleted pending file to the standalone
@@ -2759,7 +2827,12 @@ impl Volume {
                         | EntryKind::Delta
                         | EntryKind::CanonicalDelta => continue,
                     }
-                    if let Some(old_wal_offset) = old_wal_offset {
+                    if entry.journal {
+                        // Journal bodies live in the disjoint `(segment, hash)`
+                        // map keyed under the WAL ULID; re-key them to the
+                        // restored WAL identity alongside the lbamap claimant.
+                        index.rekey_journal_owner(job.old_wal_ulid, new_ulid, entry.hash);
+                    } else if let Some(old_wal_offset) = old_wal_offset {
                         index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);
                     }
                 }
@@ -3288,7 +3361,6 @@ impl Volume {
             Arc::make_mut(&mut self.extent_index),
             Arc::make_mut(&mut self.lbamap),
             result,
-            &self.journal,
         )?;
 
         // Delete old WAL — only after the extent index is updated.

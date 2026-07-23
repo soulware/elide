@@ -79,34 +79,38 @@ pub(super) fn replay_wal_records(
                 };
                 lbamap.insert(start_lba, lba_length, hash, ulid);
                 // Temporary WAL offset — updated to segment offset on
-                // promotion. The admission mirrors `write_commit`: a hash
-                // that already resolves keeps its owner (unless the owner
-                // is a journal copy and this record is not) and the loser
-                // is minted as a DedupRef at formation.
-                extent_index.insert_if_absent(
-                    hash,
-                    extentindex::ExtentLocation {
-                        segment_id: ulid,
-                        body_offset,
-                        body_length,
-                        compressed,
-                        body_source: BodySource::Local,
-                        body_section_start: 0,
-                        inline_data: None,
-                        journal: journal.is_journal(start_lba, ulid),
-                    },
-                );
+                // promotion. Mirrors `write_commit`: a journal-window record
+                // goes to the disjoint journal tier keyed by `(ulid, hash)`,
+                // never `inner`; a durable record uses `insert_if_absent`
+                // (first owner wins, loser minted as a DedupRef at formation).
+                let is_journal = journal.ranges.contains(start_lba);
+                let location = extentindex::ExtentLocation {
+                    segment_id: ulid,
+                    body_offset,
+                    body_length,
+                    compressed,
+                    body_source: BodySource::Local,
+                    body_section_start: 0,
+                    inline_data: None,
+                };
+                if is_journal {
+                    extent_index.insert_journal_if_absent(ulid, hash, location);
+                } else {
+                    extent_index.insert_if_absent(hash, location);
+                }
                 // Drop the body bytes here — they live in the WAL at
                 // `body_offset` and the promote path reads them via that
                 // sidecar offset rather than carrying them in memory.
                 drop(data);
-                pending_entries.push(segment::SegmentEntry::new_data_no_body(
+                let mut entry = segment::SegmentEntry::new_data_no_body(
                     hash,
                     start_lba,
                     lba_length,
                     seg_flags,
                     body_length,
-                ));
+                );
+                entry.journal = is_journal;
+                pending_entries.push(entry);
                 body_offsets.push(Some(body_offset));
             }
             writelog::LogRecord::Ref {

@@ -80,11 +80,6 @@ pub struct ExtentLocation {
     /// Reads return this directly with zero file I/O.  `None` for non-inline
     /// entries (the normal case).
     pub inline_data: Option<Box<[u8]>>,
-    /// True when the entry's LBA falls inside the guest filesystem's
-    /// journal window (`JournalRanges`). A journal copy owns its hash
-    /// slot only while no non-journal copy exists — see
-    /// [`ExtentIndex::insert_if_absent`].
-    pub journal: bool,
 }
 
 // Inherent impl on SegmentBodyLayout that needs ExtentLocation. Lives here
@@ -202,11 +197,6 @@ pub struct SegmentRegistrationCtx<'a> {
     /// without it is an error.
     pub delta_body_source: Option<DeltaBodySource>,
     pub inline: InlineSource<'a>,
-    /// Journal window of the guest filesystem, for stamping
-    /// `ExtentLocation::journal` per entry (classified against this
-    /// segment's ULID). An empty window disables the non-journal
-    /// ownership preference.
-    pub journal: &'a crate::journal::JournalWindow,
 }
 
 /// Admission policy for [`ExtentIndex::register_entry`].
@@ -329,6 +319,15 @@ pub struct ExtentIndex {
     /// hash of the bytes *after* decompression). Separate from
     /// `inner` so the hot-path DATA lookup stays untouched.
     deltas: Blake3HamtMap<DeltaLocation>,
+    /// Journal-tier bodies, keyed by `(segment, hash)` — a disjoint
+    /// tier from `inner`. Journal content is stored as-is and never
+    /// deduped across segments, so a single hash may have a distinct
+    /// body per journal segment; the segment component keeps them
+    /// separate. A journal-window LBA resolves here via its lbamap
+    /// claimant, never through `inner`, so durable content and journal
+    /// content never reference each other's bodies and a journal
+    /// segment reaps whole. See `docs/design/gc-journal-segregation.md`.
+    journal: imbl::HashMap<(Ulid, blake3::Hash), ExtentLocation>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -342,6 +341,7 @@ impl ExtentIndex {
         Self {
             inner: Blake3HamtMap::default(),
             deltas: Blake3HamtMap::default(),
+            journal: imbl::HashMap::new(),
             segment_presence: HashMap::new(),
         }
     }
@@ -377,15 +377,13 @@ impl ExtentIndex {
         self.deltas.remove(&hash);
     }
 
-    /// First-instance admission for `hash`: insert when absent, and
-    /// otherwise displace the existing owner only when it is a journal
-    /// copy and `location` is not. Journal-window bytes are cyclically
-    /// overwritten copies of blocks that also exist at stable LBAs, so
-    /// a non-journal copy always makes the better canonical — it keeps
-    /// durable references out of journal segments, which want to die
-    /// whole. Returns `true` when `location` is now the owner.
+    /// First-instance admission for `hash` in the durable data map:
+    /// insert when absent, keep the existing owner otherwise. Returns
+    /// `true` when `location` is now the owner. Journal-window content
+    /// never enters `inner` (it lives in the disjoint `journal` map), so
+    /// there is no cross-tier preference to apply here.
     ///
-    /// The same preference is applied by the rebuild walk
+    /// First-write-wins matches the rebuild walk
     /// ([`register_entry`](Self::register_entry) under `IfAbsent`), so
     /// the in-memory index always matches a fresh disk rebuild.
     pub fn insert_if_absent(&mut self, hash: blake3::Hash, location: ExtentLocation) -> bool {
@@ -395,15 +393,100 @@ impl ExtentIndex {
                 v.insert(location);
                 true
             }
-            Entry::Occupied(mut o) => {
-                if o.get().journal && !location.journal {
-                    o.insert(location);
-                    true
-                } else {
-                    false
-                }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Look up the journal-tier body for `hash` claimed by `segment`.
+    /// Journal content is keyed by `(segment, hash)` so a hash repeated
+    /// across journal segments resolves to the copy in the reader's own
+    /// claimant segment. Returns `None` for durable hashes (they live in
+    /// [`inner`](Self::lookup)).
+    pub fn lookup_journal(&self, segment: Ulid, hash: &blake3::Hash) -> Option<&ExtentLocation> {
+        self.journal.get(&(segment, *hash))
+    }
+
+    /// Insert a journal-tier body under `(segment, hash)`, keeping the
+    /// first when the same hash recurs within one segment (byte-identical
+    /// copies resolve to either). Journal segments are never compacted,
+    /// so the kept body persists on disk until the whole segment reaps.
+    pub fn insert_journal_if_absent(
+        &mut self,
+        segment: Ulid,
+        hash: blake3::Hash,
+        location: ExtentLocation,
+    ) -> bool {
+        use imbl::hashmap::Entry;
+        match self.journal.entry((segment, hash)) {
+            Entry::Vacant(v) => {
+                v.insert(location);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Re-key a journal body from `(from, hash)` to `(to, hash)`, applied
+    /// at promote when a WAL-resident journal entry moves into its
+    /// segment. The location's `segment_id`/`body_*` are replaced with
+    /// `to`'s. No-op when `(from, hash)` is absent (a concurrent writer
+    /// re-claimed it). `body_section_start` is the promoted segment's
+    /// body-section offset.
+    pub fn rekey_journal(
+        &mut self,
+        from: Ulid,
+        to: Ulid,
+        hash: blake3::Hash,
+        location: ExtentLocation,
+    ) {
+        if self.journal.remove(&(from, hash)).is_some() {
+            self.journal.insert((to, hash), location);
+        }
+    }
+
+    /// Re-key a journal body's owning segment from `from` to `to`,
+    /// preserving its body fields, applied when a WAL is restored under a
+    /// new identity after a failed promote (mirrors [`rekey_owner`] for the
+    /// durable map). No-op when `(from, hash)` is absent.
+    ///
+    /// [`rekey_owner`]: Self::rekey_owner
+    pub fn rekey_journal_owner(&mut self, from: Ulid, to: Ulid, hash: blake3::Hash) {
+        if let Some(mut loc) = self.journal.remove(&(from, hash)) {
+            loc.segment_id = to;
+            self.journal.insert((to, hash), loc);
+        }
+    }
+
+    /// Flip every journal body owned by `segment` from a `Local` body to
+    /// a `Cached(entry_idx)` body, applied when a journal segment's
+    /// pending file is promoted into the `cache/` read cache. The
+    /// `entry_idx` for each hash comes from `idx_of`.
+    pub fn promote_journal_segment_to_cache(
+        &mut self,
+        segment: Ulid,
+        body_section_start: u64,
+        idx_of: impl Fn(&blake3::Hash) -> Option<u32>,
+    ) {
+        let hashes: Vec<blake3::Hash> = self
+            .journal
+            .keys()
+            .filter(|(seg, _)| *seg == segment)
+            .map(|(_, h)| *h)
+            .collect();
+        for hash in hashes {
+            let Some(idx) = idx_of(&hash) else { continue };
+            if let Some(loc) = self.journal.get_mut(&(segment, hash)) {
+                loc.body_source = BodySource::Cached(idx);
+                loc.body_section_start = body_section_start;
             }
         }
+    }
+
+    /// Drop every journal body owned by `segment`, applied when a journal
+    /// segment is reaped whole. Keeps the journal map free of dead
+    /// segments so a rebuild reproduces it.
+    pub fn purge_journal_segment(&mut self, segment: Ulid) {
+        self.journal.retain(|(seg, _), _| *seg != segment);
     }
 
     /// Compare-and-replace: overwrite the entry for `hash` only if the current
@@ -676,14 +759,29 @@ impl ExtentIndex {
                 } else {
                     None
                 };
-                let journal = ctx.journal.is_journal(entry.start_lba, ctx.segment_id);
-                let admitted = match admission {
-                    // First-write-wins with the non-journal preference,
-                    // matching `insert_if_absent`.
-                    Admission::IfAbsent => match self.inner.get(&entry.hash) {
-                        None => true,
-                        Some(existing) => existing.journal && !journal,
+                let location = ExtentLocation {
+                    segment_id: ctx.segment_id,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    compressed: entry.compressed,
+                    body_source: match ctx.body_tier {
+                        RegistrationBodyTier::Local => BodySource::Local,
+                        RegistrationBodyTier::Cached => BodySource::Cached(raw_idx),
                     },
+                    body_section_start: ctx.body_section_start,
+                    inline_data,
+                };
+                // Journal-tier entries go to the disjoint `(segment, hash)`
+                // map, never `inner`. Their key is unique per segment, so
+                // admission is a plain first-in-segment-wins; a hash
+                // repeated within one segment keeps the first body.
+                if entry.journal {
+                    self.insert_journal_if_absent(ctx.segment_id, entry.hash, location);
+                    return Ok(());
+                }
+                let admitted = match admission {
+                    // First-write-wins, matching `insert_if_absent`.
+                    Admission::IfAbsent => !self.inner.contains_key(&entry.hash),
                     Admission::ConsumingInputs(inputs) => match self.inner.get(&entry.hash) {
                         None => true,
                         Some(loc) => inputs.contains(&loc.segment_id),
@@ -691,19 +789,6 @@ impl ExtentIndex {
                     Admission::Unconditional => true,
                 };
                 if admitted {
-                    let location = ExtentLocation {
-                        segment_id: ctx.segment_id,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        compressed: entry.compressed,
-                        body_source: match ctx.body_tier {
-                            RegistrationBodyTier::Local => BodySource::Local,
-                            RegistrationBodyTier::Cached => BodySource::Cached(raw_idx),
-                        },
-                        body_section_start: ctx.body_section_start,
-                        inline_data,
-                        journal,
-                    };
                     match admission {
                         Admission::IfAbsent => {
                             self.inner.insert(entry.hash, location);
@@ -822,6 +907,18 @@ impl ExtentIndex {
     pub fn deltas_iter(&self) -> impl Iterator<Item = (&blake3::Hash, &DeltaLocation)> {
         self.deltas.iter()
     }
+
+    /// Iterate `((segment, hash), location)` pairs for journal-tier
+    /// bodies. Ordering is unspecified.
+    pub fn journal_iter(&self) -> impl Iterator<Item = (&(Ulid, blake3::Hash), &ExtentLocation)> {
+        self.journal.iter()
+    }
+
+    /// True when no journal-tier body is registered — used by the
+    /// disjointness guard to short-circuit on non-ext4 volumes.
+    pub fn journal_is_empty(&self) -> bool {
+        self.journal.is_empty()
+    }
 }
 
 impl Default for ExtentIndex {
@@ -855,18 +952,14 @@ impl Default for ExtentIndex {
 /// ascending order with first-write-wins insert plus the non-journal
 /// displacement rule (`insert_if_absent`), so the earliest segment
 /// holding a stable-LBA copy becomes canonical, and a journal-window
-/// copy owns only while no stable copy exists. A DedupRef always
 /// refers to a segment with a lower ULID than itself, so the walk has
 /// registered every canonical a DedupRef can name by the time it is
 /// reached.
 ///
-/// `journal` is the persisted journal window from `volume.toml`
-/// (ranges plus any live-flip activation marker); an empty window
-/// reproduces plain lowest-ULID-wins.
-pub fn rebuild(
-    forks: &[(PathBuf, Option<String>)],
-    journal: &crate::journal::JournalWindow,
-) -> io::Result<ExtentIndex> {
+/// Journal-tier entries route to the disjoint `(segment, hash)` journal
+/// map by their persisted `JOURNAL` flag, so no window argument is
+/// needed — the routing is self-describing in each entry.
+pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in forks {
@@ -962,7 +1055,6 @@ pub fn rebuild(
                 body_tier,
                 delta_body_source,
                 inline: InlineSource::Section(&inline_bytes),
-                journal,
             };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
@@ -973,12 +1065,14 @@ pub fn rebuild(
     Ok(index)
 }
 
-/// The `(inner_owners, delta_owners, live_segments)` triple returned by
-/// [`rebuild_owners_unverified`].
+/// The `(inner_owners, delta_owners, journal_owners, live_segments)` tuple
+/// returned by [`rebuild_owners_unverified`]. `journal_owners` is the set of
+/// `(segment, hash)` keys the disk walk assigns to the disjoint journal map.
 #[cfg(feature = "volume-invariants")]
 pub type RebuiltOwners = (
     HashMap<blake3::Hash, Ulid>,
     HashMap<blake3::Hash, Ulid>,
+    std::collections::HashSet<(Ulid, blake3::Hash)>,
     std::collections::HashSet<Ulid>,
 );
 
@@ -1016,31 +1110,23 @@ pub fn rebuild_owners_unverified(
     journal: &crate::journal::JournalWindow,
 ) -> io::Result<RebuiltOwners> {
     let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
-    let mut journal_owned: std::collections::HashSet<blake3::Hash> =
+    let mut journal_owners: std::collections::HashSet<(Ulid, blake3::Hash)> =
         std::collections::HashSet::new();
     let mut delta_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
     let mut live_segments: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
 
-    // Mirror of `insert_if_absent`: first write wins, except a
-    // non-journal copy displaces a journal owner.
-    let admit_owner = |owners: &mut HashMap<blake3::Hash, Ulid>,
-                       journal_owned: &mut std::collections::HashSet<blake3::Hash>,
+    // Mirror of the live routing: journal-tier bodies land in the disjoint
+    // `(segment, hash)` map (first-in-segment-wins); durable bodies land in
+    // `inner` first-write-wins. The two tiers never share a slot.
+    let admit_owner = |inner_owners: &mut HashMap<blake3::Hash, Ulid>,
+                       journal_owners: &mut std::collections::HashSet<(Ulid, blake3::Hash)>,
                        hash: blake3::Hash,
                        ulid: Ulid,
                        journal: bool| {
-        match owners.entry(hash) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(ulid);
-                if journal {
-                    journal_owned.insert(hash);
-                }
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                if journal_owned.contains(&hash) && !journal {
-                    o.insert(ulid);
-                    journal_owned.remove(&hash);
-                }
-            }
+        if journal {
+            journal_owners.insert((ulid, hash));
+        } else {
+            inner_owners.entry(hash).or_insert(ulid);
         }
     };
 
@@ -1062,10 +1148,10 @@ pub fn rebuild_owners_unverified(
                     | EntryKind::CanonicalInline => {
                         admit_owner(
                             &mut inner_owners,
-                            &mut journal_owned,
+                            &mut journal_owners,
                             entry.hash,
                             sref.ulid,
-                            journal.is_journal(entry.start_lba, sref.ulid),
+                            entry.journal,
                         );
                     }
                     EntryKind::Delta | EntryKind::CanonicalDelta => {
@@ -1111,10 +1197,10 @@ pub fn rebuild_owners_unverified(
                     {
                         admit_owner(
                             &mut inner_owners,
-                            &mut journal_owned,
+                            &mut journal_owners,
                             hash,
                             wal_ulid,
-                            journal.is_journal(start_lba, wal_ulid),
+                            journal.ranges.contains(start_lba),
                         );
                     }
                 }
@@ -1122,7 +1208,7 @@ pub fn rebuild_owners_unverified(
         }
     }
 
-    Ok((inner_owners, delta_owners, live_segments))
+    Ok((inner_owners, delta_owners, journal_owners, live_segments))
 }
 
 // --- tests ---
@@ -1181,7 +1267,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: false,
             },
         );
         let loc = index.lookup(&hash).unwrap();
@@ -1214,7 +1299,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: false,
             },
         );
 
@@ -1231,7 +1315,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
-                journal: false,
             },
         );
         assert!(replaced);
@@ -1263,7 +1346,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
-                journal: false,
             },
         );
 
@@ -1280,7 +1362,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
-                journal: false,
             },
         );
         assert!(!replaced);
@@ -1307,7 +1388,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: false,
             },
         );
 
@@ -1323,7 +1403,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
-                journal: false,
             },
         );
         assert!(!replaced);
@@ -1347,7 +1426,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: false,
             },
         );
         assert!(!replaced);
@@ -1373,7 +1451,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
-                journal: false,
             },
         );
 
@@ -1402,7 +1479,6 @@ mod tests {
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
-                journal: false,
             },
         );
 
@@ -1448,7 +1524,6 @@ mod tests {
                 body_length: 4096,
             }),
             inline: InlineSource::EntryInline,
-            journal: &crate::journal::NO_WINDOW,
         }
     }
 
@@ -1461,7 +1536,6 @@ mod tests {
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,
-            journal: false,
         }
     }
 
@@ -1681,7 +1755,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         // body_offset is body-relative (= stored_offset); body_section_start carries bss.
@@ -1719,7 +1793,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         // Only Data indexed; DedupRef skipped.
         assert_eq!(index.len(), 1);
         assert!(index.lookup(&ref_hash).is_none());
@@ -1774,7 +1848,7 @@ mod tests {
             .unwrap();
         }
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         // Oldest segment (lowest ULID) wins; body_offset is body-relative.
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset1);
@@ -1787,7 +1861,7 @@ mod tests {
     fn rebuild_empty_dirs_returns_empty() {
         let base = temp_dir();
         std::fs::create_dir_all(&base).unwrap();
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert!(index.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1824,11 +1898,7 @@ mod tests {
             stored_offset = written[0].stored_offset;
         }
 
-        let index = rebuild(
-            &[(ancestor.clone(), None), (live.clone(), None)],
-            &crate::journal::NO_WINDOW,
-        )
-        .unwrap();
+        let index = rebuild(&[(ancestor.clone(), None), (live.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
         let loc = index.lookup(&hash).unwrap();
         assert_eq!(loc.body_offset, stored_offset);
@@ -1864,7 +1934,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();
@@ -1906,7 +1976,7 @@ mod tests {
         segment::extract_idx(&seg_path, &idx_path).unwrap();
         std::fs::remove_file(&seg_path).unwrap();
 
-        let index = rebuild(&[(base.clone(), None)], &crate::journal::NO_WINDOW).unwrap();
+        let index = rebuild(&[(base.clone(), None)]).unwrap();
         assert_eq!(index.len(), 1);
 
         let loc = index.lookup(&hash).unwrap();

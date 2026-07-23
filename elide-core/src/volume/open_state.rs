@@ -41,7 +41,6 @@ use super::ancestry::{verify_ancestor_manifests, walk_ancestors, walk_extent_anc
 pub(super) fn open_read_state(
     fork_dir: &Path,
     by_id_dir: &Path,
-    journal: &crate::journal::JournalWindow,
 ) -> std::io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
     let total_started = std::time::Instant::now();
 
@@ -85,7 +84,7 @@ pub(super) fn open_read_state(
     }
     let hash_chain_len = hash_chain.len();
     let extent_rebuild_started = std::time::Instant::now();
-    let extent_index = extentindex::rebuild(&hash_chain, journal)?;
+    let extent_index = extentindex::rebuild(&hash_chain)?;
     let extent_rebuild_elapsed = extent_rebuild_started.elapsed();
 
     // The returned `ancestor_layers` unifies fork parents and extent

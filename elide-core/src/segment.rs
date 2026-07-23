@@ -373,6 +373,13 @@ bitflags! {
         /// Co-exists with `INLINE` (body in inline section) or without it
         /// (body in body section). See `docs/formats.md`.
         const CANONICAL_ONLY = 0x40;
+        /// Journal-tier entry: bytes belong to the jbd2 journal window and
+        /// are stored as-is (own body, never deduped or delta-encoded across
+        /// segments). Journal content is keyed by `(segment, hash)` in the
+        /// extent index's disjoint journal map, so it is never a dedup or
+        /// delta source for durable content and reaps whole with its segment.
+        /// See `docs/design/gc-journal-segregation.md`.
+        const JOURNAL      = 0x80;
     }
 }
 
@@ -543,6 +550,12 @@ pub struct SegmentEntry {
     /// Each option provides a zstd-dictionary-compressed alternative to the
     /// full body, using a different source extent as dictionary.
     pub delta_options: Vec<DeltaOption>,
+    /// Journal-tier entry (`SegmentFlags::JOURNAL`). Set for entries in a
+    /// journal-window partition; routes the entry to the extent index's
+    /// disjoint `(segment, hash)` journal map rather than the deduped data
+    /// map. Persisted in the entry flag byte, so a disk rebuild reproduces
+    /// the routing without recomputing any window predicate.
+    pub journal: bool,
 }
 
 /// A [`SegmentEntry`] paired with its body bytes while a segment is being
@@ -602,6 +615,7 @@ impl SegmentEntry {
                 stored_length,
                 inline,
                 delta_options: Vec::new(),
+                journal: false,
             },
             body,
         }
@@ -638,6 +652,7 @@ impl SegmentEntry {
             stored_length,
             inline: None,
             delta_options: Vec::new(),
+            journal: false,
         }
     }
 
@@ -658,6 +673,7 @@ impl SegmentEntry {
             stored_length: 0,
             inline: None,
             delta_options: Vec::new(),
+            journal: false,
         }
     }
 
@@ -673,6 +689,7 @@ impl SegmentEntry {
             stored_length: 0,
             inline: None,
             delta_options: Vec::new(),
+            journal: false,
         }
     }
 
@@ -730,6 +747,7 @@ impl SegmentEntry {
             stored_length: 0,
             inline: None,
             delta_options,
+            journal: false,
         }
     }
 }
@@ -962,6 +980,9 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     }
     if !e.delta_options.is_empty() {
         flags |= SegmentFlags::HAS_DELTAS;
+    }
+    if e.journal {
+        flags |= SegmentFlags::JOURNAL;
     }
     debug_assert!(
         !matches!(e.kind, EntryKind::Delta | EntryKind::CanonicalDelta)
@@ -1513,6 +1534,7 @@ fn parse_index_section(
             stored_length,
             inline: None,
             delta_options: Vec::new(),
+            journal: flags.contains(SegmentFlags::JOURNAL),
         });
     }
 
@@ -2902,6 +2924,36 @@ mod tests {
         assert_eq!(e.kind, EntryKind::DedupRef);
         assert_eq!(e.stored_offset, 0);
         assert_eq!(e.stored_length, 0);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn roundtrip_journal_flag() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let jdata = vec![0xCDu8; 8192];
+        let jhash = blake3::hash(&jdata);
+        let ddata = b"d".repeat(8192);
+        let dhash = blake3::hash(&ddata);
+
+        let mut journal_entry = SegmentEntry::new_data(jhash, 0, 2, SegmentFlags::empty(), jdata);
+        journal_entry.entry.journal = true;
+        let entries = vec![
+            journal_entry,
+            SegmentEntry::new_data(dhash, 2, 2, SegmentFlags::empty(), ddata),
+        ];
+
+        write_segment(&path, entries, signer.as_ref()).unwrap();
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back.len(), 2);
+        assert!(read_back[0].journal, "journal flag must round-trip as set");
+        assert!(
+            !read_back[1].journal,
+            "a non-journal entry must round-trip as clear"
+        );
 
         fs::remove_file(&path).unwrap();
     }

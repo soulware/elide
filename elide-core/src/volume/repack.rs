@@ -249,6 +249,11 @@ impl Volume {
                         &input.owned_hashes,
                         &carried_hashes,
                     );
+                    // Journal-tier bodies are keyed by segment, so a
+                    // consumed input's journal entries are dropped whole (a
+                    // journal segment is only ever folded as a whole-dead
+                    // tombstone; no-op for a durable input).
+                    index.purge_journal_segment(input.input_ulid);
                 }
 
                 // Register carried entries against the new bucket
@@ -263,7 +268,6 @@ impl Volume {
                         delta_body_source: delta_body_source
                             .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
                         inline: extentindex::InlineSource::EntryInline,
-                        journal: &vol.journal,
                     };
                     for (raw_idx, e) in out.out_entries.iter().enumerate() {
                         index.register_entry_consuming_inputs(

@@ -149,7 +149,7 @@ pub fn rewrite_pending_with_deltas(
             vec![(source_dir.clone(), Some(source_snap.clone()))];
         // Source-body resolution only — ownership preference is
         // irrelevant to which bytes a hash resolves to.
-        let source_index = extentindex::rebuild(&source_chain, &crate::journal::NO_WINDOW)?;
+        let source_index = extentindex::rebuild(&source_chain)?;
 
         match_filemaps_into(
             &child_filemap,
