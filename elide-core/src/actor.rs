@@ -2508,6 +2508,20 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             }
         }
 
+        // Journal segments are pool-isolated exactly as coordinator GC
+        // isolates them (`elide-coordinator::gc::select_buckets`): a journal
+        // segment is never merged into a rewrite — it reaps whole once every
+        // LBA it holds is overwritten. Pending segments are pure (formation
+        // partitions journal content into its own segment), so any
+        // journal-flagged entry means the whole segment is journal-tier. Skip
+        // it while it still holds live content; a fully-dead one (every entry
+        // classified Drop, `live_entry_count == 0`) falls through and reaps as
+        // an all-Drop bucket, carrying no journal entry into a rewrite output.
+        let is_journal_segment = entries.iter().any(|e| e.journal);
+        if is_journal_segment && live_entry_count > 0 {
+            continue;
+        }
+
         let owned_hashes: Vec<blake3::Hash> = entries
             .iter()
             .filter(|e| e.kind.owns_extent_hash())

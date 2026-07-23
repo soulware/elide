@@ -343,11 +343,45 @@ fn compact_candidates_inner(
     // that. The variant → `PlanOutput` mapping below mirrors production.
     use elide_core::segment_classify::{ClassifyCtx, EntryClassification, classify_entry};
 
+    // Mirror production's pool isolation
+    // (`elide-coordinator::gc::select_buckets`): a journal segment is never
+    // packed. Formation writes journal segments pure, so a candidate with any
+    // still-live journal entry is journal-pool and is left untouched this pass
+    // — compacting it would rewrite journal content as durable, which
+    // production never does and the materialiser rejects. A journal segment
+    // whose LBAs are all overwritten has no live entry and falls through to
+    // the ordinary fully-dead `Drop` path, reaped as a tombstone.
+    let loaded: Vec<(Ulid, PathBuf, Vec<_>)> = candidates
+        .iter()
+        .filter_map(|(ulid, path)| {
+            let (_bss, entries, _) = segment::read_and_verify_segment_index(path, &vk).ok()?;
+            Some((*ulid, path.clone(), entries))
+        })
+        .collect();
+    let compactable: Vec<(Ulid, PathBuf, Vec<_>)> = loaded
+        .into_iter()
+        .filter(|(ulid, _, entries)| {
+            let ctx = ClassifyCtx {
+                lba_map,
+                extent_index,
+                live_hashes,
+                segment_id: *ulid,
+            };
+            !entries.iter().any(|e| {
+                e.journal
+                    && matches!(
+                        classify_entry(e, &ctx),
+                        EntryClassification::FullyLive | EntryClassification::PartialDeath { .. }
+                    )
+            })
+        })
+        .collect();
+    if compactable.is_empty() {
+        return None;
+    }
+
     let mut outputs: Vec<PlanOutput> = Vec::new();
-    for (ulid, path) in &candidates {
-        let Ok((_bss, entries, _)) = segment::read_and_verify_segment_index(path, &vk) else {
-            continue;
-        };
+    for (ulid, _path, entries) in &compactable {
         let classify_ctx = ClassifyCtx {
             lba_map,
             extent_index,
@@ -422,7 +456,7 @@ fn compact_candidates_inner(
         }
     }
 
-    let mut inputs: Vec<Ulid> = candidates.iter().map(|(u, _)| *u).collect();
+    let mut inputs: Vec<Ulid> = compactable.iter().map(|(u, _, _)| *u).collect();
     inputs.sort();
 
     // Emit a `drop` record for any input that contributed no output — the
@@ -441,7 +475,7 @@ fn compact_candidates_inner(
         .ok()?;
 
     let consumed: Vec<Ulid> = inputs;
-    let to_delete = candidates.into_iter().map(|(_, p)| p).collect();
+    let to_delete = compactable.iter().map(|(_, p, _)| p.clone()).collect();
     Some((consumed, new_ulid, to_delete))
 }
 

@@ -15,11 +15,116 @@
 // The coordinator never reads or writes `index/` directly.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use elide_core::volume::Volume;
+use ulid::Ulid;
 
 mod common;
+
+/// Stamp a jbd2 journal window into `volume.toml` so writes inside `ranges`
+/// route to the disjoint journal tier.
+fn set_journal_window(fork_dir: &Path, ranges: Vec<(u64, u64)>) {
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal = Some(elide_core::config::JournalConfig {
+        ranges: elide_core::journal::JournalRanges::new(ranges),
+        activation: None,
+    });
+    cfg.write(fork_dir).unwrap();
+}
+
+/// Flush the WAL and promote the single segment it produced, returning its
+/// ULID. Each caller writes one all-journal epoch, which forms exactly one
+/// (journal) segment.
+fn promote_one_epoch(vol: &mut Volume, fork_dir: &Path) -> Ulid {
+    vol.flush_wal().unwrap();
+    let pend = common::pending_ulids(fork_dir);
+    assert_eq!(
+        pend.len(),
+        1,
+        "an all-journal epoch forms one journal segment"
+    );
+    let ulid = pend[0];
+    vol.promote_segment(ulid).unwrap();
+    ulid
+}
+
+/// A hash that recurs across two journal segments (the same block content
+/// reappearing as the jbd2 ring wraps) is keyed per segment in the extent
+/// index, so reaping one journal segment whole must not drop the other
+/// segment's copy. Here segment A holds H@100 and segment B holds H@101;
+/// overwriting LBA 100 kills A whole, and after GC reaps A the read of LBA
+/// 101 must still resolve H through B — never through the reaped A.
+/// See `docs/design/gc-journal-segregation.md`.
+#[test]
+fn reaping_one_journal_segment_keeps_a_hash_shared_with_another() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+    common::write_test_keypair(&fork_dir);
+    // Volume::open writes volume.toml; stamp the window then reopen so it is
+    // live for the writes below.
+    drop(Volume::open(&fork_dir, &fork_dir).unwrap());
+    set_journal_window(&fork_dir, vec![(100, 16)]);
+    let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+
+    let h_bytes: Vec<u8> = (0..4096).map(|i| (i * 7 + 3) as u8).collect();
+    // Epoch 1: H@100 → journal segment A.
+    vol.write(100, &h_bytes).unwrap();
+    let a = promote_one_epoch(&mut vol, &fork_dir);
+    // Epoch 2: the same bytes at LBA 101 → journal segment B (shares hash H).
+    vol.write(101, &h_bytes).unwrap();
+    let b = promote_one_epoch(&mut vol, &fork_dir);
+    // Epoch 3: overwrite LBA 100 with different bytes → journal segment C.
+    // A's only LBA is now superseded, so A is fully dead.
+    let h2_bytes: Vec<u8> = (0..4096).map(|i| (i * 5 + 1) as u8).collect();
+    vol.write(100, &h2_bytes).unwrap();
+    let _c = promote_one_epoch(&mut vol, &fork_dir);
+
+    assert_ne!(a, b);
+    let index_dir = fork_dir.join("index");
+    assert!(index_dir.join(format!("{a}.idx")).exists());
+    assert!(index_dir.join(format!("{b}.idx")).exists());
+
+    // One GC pass: A is the only compactable candidate (B and C hold live
+    // journal content and are pool-isolated), so A reaps whole.
+    let new_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let (consumed, produced, to_delete) =
+        common::simulate_coord_gc_local(&fork_dir, new_ulid, 3).unwrap();
+    assert_eq!(
+        consumed,
+        vec![a],
+        "only the fully-dead journal segment A is consumed"
+    );
+    vol.apply_gc_handoffs().unwrap();
+    for p in &to_delete {
+        let _ = fs::remove_file(p);
+    }
+    vol.promote_segment(produced).unwrap();
+
+    // A is gone; B (which shares hash H) is untouched.
+    assert!(
+        !index_dir.join(format!("{a}.idx")).exists(),
+        "journal segment A must be reaped whole"
+    );
+    assert!(
+        index_dir.join(format!("{b}.idx")).exists(),
+        "journal segment B must survive A's reap"
+    );
+
+    // The shared hash still resolves for B's LBA, through B, after A is gone.
+    assert_eq!(vol.read(101, 1).unwrap(), h_bytes, "LBA 101 resolves via B");
+    assert_eq!(
+        vol.read(100, 1).unwrap(),
+        h2_bytes,
+        "LBA 100 resolves via C"
+    );
+
+    // A fresh rebuild reproduces the journal tier without the reaped segment.
+    drop(vol);
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(101, 1).unwrap(), h_bytes, "rebuild keeps B's copy");
+    assert_eq!(vol.read(100, 1).unwrap(), h2_bytes);
+}
 
 /// After `apply_gc_handoffs`, old idx still present and new idx not yet written.
 /// After `promote_segment`, new idx is present and old idx is gone.
