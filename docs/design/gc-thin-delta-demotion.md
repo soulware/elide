@@ -47,8 +47,24 @@ the encoding, not a compatibility path.
 ### Demotion and carry
 
 `SegmentEntry::into_canonical` maps `Delta → CanonicalDelta`, keeping the
-options and zeroing the claim. Classification is unchanged: the Delta arm
-still returns `DemoteToCanonical`, and the plan still records `Canonical`.
+options and zeroing the claim.
+
+The classifier's ownership probe routes through the map that actually
+homes the entry: `lookup` for body kinds, `lookup_delta` for recipe
+kinds. A fully-dead hash-live Delta that owns its deltas-map slot
+classifies `DemoteToCanonical`; a duplicate encoding (its hash homed in
+another segment) classifies `Drop`, since its blobs are redundant. The
+data-map-only probe this replaces made ownership read as false for
+every recipe entry: the owner of a live hash classified `Drop`, the
+apply removed its deltas-map slot as an uncarried owned hash, and every
+duplicate claim on the hash lost its only resolvable home until a
+restart rebuilt the index and re-registered one of the duplicates.
+
+A demoted entry travels as a `Canonical` plan record, so the plan-emission
+arm that recognises demoted kinds admits `CanonicalDelta` beside
+`CanonicalData` and `CanonicalInline`; without it the record falls through
+to `Keep`, which re-reads the input entry by index and carries the original
+`Delta` claim forward instead of the demoted form.
 
 `emit_canonical`'s Delta arm stops resolving the composite. It copies the
 entry's blobs into the output's delta body and re-bases the options'
@@ -106,6 +122,8 @@ a separate design.
 
 - A GC pass over a fully-LBA-dead, hash-live Delta emits `CanonicalDelta`,
   and the bucket's materialised price is the blob bytes, not the composite.
+- A fully-LBA-dead Delta whose hash is homed in another segment drops,
+  and the home survives.
 - A duplicate claim on the demoted hash reads back correctly after the
   rewrite, across a reopen.
 - A second rewrite carries a `CanonicalDelta` forward intact.

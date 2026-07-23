@@ -140,7 +140,7 @@ impl DeltaBodySource {
         entries: &[segment::SegmentEntry],
         body_section_start: u64,
     ) -> io::Result<Option<Self>> {
-        if !entries.iter().any(|e| e.kind == EntryKind::Delta) {
+        if !entries.iter().any(|e| e.kind.is_delta()) {
             return Ok(None);
         }
         Ok(Some(DeltaBodySource::Full {
@@ -627,7 +627,7 @@ impl ExtentIndex {
     ) -> io::Result<()> {
         match entry.kind {
             EntryKind::DedupRef | EntryKind::Zero => {}
-            EntryKind::Delta => {
+            EntryKind::Delta | EntryKind::CanonicalDelta => {
                 let Some(body_source) = ctx.delta_body_source else {
                     return Err(io::Error::other(format!(
                         "registering delta entry for segment {} with no delta body source",
@@ -1068,7 +1068,7 @@ pub fn rebuild_owners_unverified(
                             journal.is_journal(entry.start_lba, sref.ulid),
                         );
                     }
-                    EntryKind::Delta => {
+                    EntryKind::Delta | EntryKind::CanonicalDelta => {
                         // Mirror the registration rule: skip if a DATA
                         // entry already claims this hash.
                         if !inner_owners.contains_key(&entry.hash) {

@@ -107,10 +107,10 @@ pub struct ClassifyCtx<'a> {
     /// committed; the classifier counts per-block matches via
     /// [`LbaMap::extents_in_range`].
     pub lba_map: &'a LbaMap,
-    /// Current hash → segment-location index. The classifier uses
-    /// `lookup(hash).segment_id == segment_id` to determine whether
-    /// the input segment still owns the canonical body for its
-    /// entry's hash.
+    /// Current hash → segment-location index. The classifier checks
+    /// whether the input segment still owns the home for its entry's
+    /// hash: `lookup` (the data map) for body-bearing kinds,
+    /// `lookup_delta` (the deltas map) for recipe kinds.
     pub extent_index: &'a ExtentIndex,
     /// Hashes the LBA map references at least once. Built once per
     /// classification pass via [`LbaMap::lba_referenced_hashes`] and
@@ -136,6 +136,21 @@ pub struct ClassifyCtx<'a> {
 /// LBA claim, so the matching-blocks accounting does not apply to them.
 /// They are decided on hash liveness alone: kept when something still
 /// resolves against their body, dropped as garbage otherwise.
+/// Whether the input segment still owns the extent-index home for
+/// `entry.hash`. Recipe kinds live in the deltas map, everything else
+/// in the data map.
+fn owns_home(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> bool {
+    if entry.kind.is_delta() {
+        ctx.extent_index
+            .lookup_delta(&entry.hash)
+            .is_some_and(|loc| loc.segment_id == ctx.segment_id)
+    } else {
+        ctx.extent_index
+            .lookup(&entry.hash)
+            .is_some_and(|loc| loc.segment_id == ctx.segment_id)
+    }
+}
+
 pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClassification {
     if entry.kind == EntryKind::Zero {
         let end_lba = entry.start_lba + entry.lba_length as u64;
@@ -161,11 +176,7 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         if ctx.live_hashes.contains(&entry.hash) {
             return EntryClassification::FullyLive;
         }
-        let extent_live = ctx
-            .extent_index
-            .lookup(&entry.hash)
-            .is_some_and(|loc| loc.segment_id == ctx.segment_id);
-        return if extent_live {
+        return if owns_home(entry, ctx) {
             EntryClassification::DropAndRemoveHash
         } else {
             EntryClassification::Drop
@@ -200,10 +211,7 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         .map(|r| r.range_end - r.range_start)
         .sum();
     let total_blocks = entry.lba_length as u64;
-    let extent_live = ctx
-        .extent_index
-        .lookup(&entry.hash)
-        .is_some_and(|loc| loc.segment_id == ctx.segment_id);
+    let extent_live = owns_home(entry, ctx);
 
     if matching_blocks == total_blocks {
         EntryClassification::FullyLive
@@ -262,11 +270,34 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extentindex::{BodySource, ExtentLocation};
-    use crate::segment::SegmentFlags;
+    use crate::extentindex::{BodySource, DeltaBodySource, DeltaLocation, ExtentLocation};
+    use crate::segment::{DeltaOption, SegmentFlags};
 
     fn canonical(hash: blake3::Hash) -> SegmentEntry {
         SegmentEntry::new_data_no_body(hash, 7, 1, SegmentFlags::empty(), 4096).into_canonical()
+    }
+
+    fn delta(hash: blake3::Hash) -> SegmentEntry {
+        SegmentEntry::new_delta(
+            hash,
+            7,
+            1,
+            vec![DeltaOption {
+                source_hash: blake3::hash(b"source"),
+                delta_offset: 0,
+                delta_length: 64,
+                delta_hash: blake3::hash(b"blob"),
+            }],
+        )
+    }
+
+    fn delta_location(segment_id: Ulid) -> DeltaLocation {
+        DeltaLocation {
+            segment_id,
+            entry_idx: 0,
+            body_source: DeltaBodySource::Cached,
+            options: Vec::new(),
+        }
     }
 
     fn location(segment_id: Ulid) -> ExtentLocation {
@@ -347,6 +378,127 @@ mod tests {
         };
         assert!(matches!(
             classify_entry(&canonical(hash), &ctx),
+            EntryClassification::Drop
+        ));
+    }
+
+    /// A Delta's home is the deltas map, so the ownership probe must
+    /// route through `lookup_delta`. A fully-LBA-dead Delta that owns
+    /// its slot and whose hash is still referenced demotes — dropping
+    /// it would remove the only resolvable home for every duplicate
+    /// claim on the hash.
+    #[test]
+    fn dead_delta_owning_home_with_live_hash_demotes() {
+        let seg = Ulid::new();
+        let hash = blake3::hash(b"delta owner");
+        let mut index = ExtentIndex::default();
+        index.insert_delta(hash, delta_location(seg));
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &live,
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&delta(hash), &ctx),
+            EntryClassification::DemoteToCanonical
+        ));
+    }
+
+    /// A duplicate Delta encoding — same hash, home owned by another
+    /// segment — is redundant blobs once its own claim dies. It drops
+    /// without touching the owner's slot, live hash or not.
+    #[test]
+    fn dead_delta_duplicate_encoding_drops() {
+        let seg = Ulid::new();
+        let other = Ulid::new();
+        let hash = blake3::hash(b"delta duplicate");
+        let mut index = ExtentIndex::default();
+        index.insert_delta(hash, delta_location(other));
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &live,
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&delta(hash), &ctx),
+            EntryClassification::Drop
+        ));
+    }
+
+    /// A fully-dead Delta owner with an unreferenced hash is garbage;
+    /// its deltas-map slot leaves with it.
+    #[test]
+    fn dead_delta_owner_unreferenced_drops_and_removes_hash() {
+        let seg = Ulid::new();
+        let hash = blake3::hash(b"delta unreferenced");
+        let mut index = ExtentIndex::default();
+        index.insert_delta(hash, delta_location(seg));
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &index,
+            live_hashes: &HashSet::new(),
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&delta(hash), &ctx),
+            EntryClassification::DropAndRemoveHash
+        ));
+    }
+
+    /// CanonicalDelta follows the canonical rules with the deltas-map
+    /// ownership probe: kept while referenced, dropped with hash
+    /// removal when this segment owns the slot, plain-dropped when the
+    /// home is elsewhere.
+    #[test]
+    fn canonical_delta_follows_canonical_rules() {
+        let seg = Ulid::new();
+        let other = Ulid::new();
+        let hash = blake3::hash(b"canonical delta");
+        let entry = delta(hash).into_canonical();
+        assert_eq!(entry.kind, EntryKind::CanonicalDelta);
+
+        let mut owned = ExtentIndex::default();
+        owned.insert_delta(hash, delta_location(seg));
+        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &owned,
+            live_hashes: &live,
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&entry, &ctx),
+            EntryClassification::FullyLive
+        ));
+
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &owned,
+            live_hashes: &HashSet::new(),
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&entry, &ctx),
+            EntryClassification::DropAndRemoveHash
+        ));
+
+        let mut elsewhere = ExtentIndex::default();
+        elsewhere.insert_delta(hash, delta_location(other));
+        let ctx = ClassifyCtx {
+            lba_map: &LbaMap::new(),
+            extent_index: &elsewhere,
+            live_hashes: &HashSet::new(),
+            segment_id: seg,
+        };
+        assert!(matches!(
+            classify_entry(&entry, &ctx),
             EntryClassification::Drop
         ));
     }

@@ -1041,15 +1041,15 @@ impl SegmentStats {
 }
 
 /// Bytes the volume materialises to carry `entry` into the output unchanged
-/// (a plan `Keep`). Body-owning kinds copy their stored bytes; a Delta
-/// copies its delta blobs; DedupRef and Zero copy nothing.
+/// (a plan `Keep`). Body-owning kinds copy their stored bytes; delta kinds
+/// copy their delta blobs; DedupRef and Zero copy nothing.
 fn keep_cost(entry: &SegmentEntry) -> u64 {
     match entry.kind {
         EntryKind::Data
         | EntryKind::Inline
         | EntryKind::CanonicalData
         | EntryKind::CanonicalInline => entry.stored_length as u64,
-        EntryKind::Delta => entry
+        EntryKind::Delta | EntryKind::CanonicalDelta => entry
             .delta_options
             .iter()
             .map(|o| o.delta_length as u64)
@@ -1059,11 +1059,11 @@ fn keep_cost(entry: &SegmentEntry) -> u64 {
 }
 
 /// Bytes the volume materialises to emit `entry` as a canonical output
-/// (a plan `Canonical`). A demoted Delta reconstructs its full composite;
-/// other kinds carry their stored bytes.
+/// (a plan `Canonical`). A demoted delta keeps its recipe form and copies
+/// only its blobs; other kinds carry their stored bytes.
 fn canonical_cost(entry: &SegmentEntry) -> u64 {
     match entry.kind {
-        EntryKind::Delta => entry.lba_length as u64 * BLOCK_BYTES,
+        EntryKind::Delta | EntryKind::CanonicalDelta => keep_cost(entry),
         _ => entry.stored_length as u64,
     }
 }
@@ -1510,11 +1510,17 @@ fn compact_segments(
                     });
                     zero_split_count += 1;
                 }
-                (None, EntryKind::CanonicalData | EntryKind::CanonicalInline) => {
+                (
+                    None,
+                    EntryKind::CanonicalData
+                    | EntryKind::CanonicalInline
+                    | EntryKind::CanonicalDelta,
+                ) => {
                     // `collect_stats` demotes fully-LBA-dead hash-live entries
                     // by calling `into_canonical()`, which flips the kind.
                     // Emit as `Canonical` — the materialise side reads the
-                    // stored bytes and writes a `Canonical*` in the output.
+                    // stored bytes (or carries the delta blob, for
+                    // `CanonicalDelta`) and writes a `Canonical*` in the output.
                     outputs.push(PlanOutput::Canonical {
                         input: input_ulid,
                         entry_idx,
@@ -3365,6 +3371,142 @@ mod tests {
             vol.read(103, 1).unwrap().as_slice(),
             &child_bytes[12288..16384],
             "LBA 103 must return child_bytes[12288..16384]"
+        );
+    }
+
+    /// A fully-LBA-dead Delta whose hash is still claimed by a duplicate
+    /// encoding in another segment must demote to a thin CanonicalDelta:
+    /// the output carries the delta blob (no materialised composite), the
+    /// deltas-map home moves to the output, and the duplicate's LBAs stay
+    /// readable across a reopen.
+    #[tokio::test]
+    async fn gc_demotes_dead_delta_owner_to_canonical_delta() {
+        use elide_core::segment::{DeltaOption, PendingEntry, write_segment_with_delta_body};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let signer =
+            elide_core::signing::load_signer(dir, elide_core::signing::VOLUME_KEY_FILE).unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut parent_bytes = vec![0u8; 4 * 4096];
+        for (i, b) in parent_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let parent_hash = blake3::hash(&parent_bytes);
+
+        let mut child_bytes = parent_bytes.clone();
+        for b in &mut child_bytes[0..256] {
+            *b = 0xCC;
+        }
+        let child_hash = blake3::hash(&child_bytes);
+
+        // ── S1: parent DATA at LBA 0..4, via the normal write path.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &parent_bytes).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // ── Two hand-crafted Delta segments encoding the same child
+        //    content: the owner (lowest ULID, takes the deltas-map home)
+        //    claims LBA 100..104; the duplicate claims LBA 200..204.
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+        let delta_blob = compressor.compress(&child_bytes).unwrap();
+        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let owner_ulid = mint.next();
+        let dup_ulid = mint.next();
+        for (ulid, start_lba) in [(owner_ulid, 100u64), (dup_ulid, 200u64)] {
+            let pending = dir.join("pending").join(ulid.to_string());
+            let opt = DeltaOption {
+                source_hash: parent_hash,
+                delta_offset: 0,
+                delta_length: delta_blob.len() as u32,
+                delta_hash: blake3::hash(&delta_blob),
+            };
+            let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+                child_hash,
+                start_lba,
+                4,
+                vec![opt],
+            ))];
+            write_segment_with_delta_body(&pending, entries, &delta_blob, signer.as_ref()).unwrap();
+            let bytes = fs::read(&pending).unwrap();
+            store
+                .put(
+                    &segment_key(Ulid::nil(), ulid),
+                    bytes::Bytes::from(bytes).into(),
+                )
+                .await
+                .unwrap();
+        }
+        drop(vol);
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.promote_segment(owner_ulid).unwrap();
+        vol.promote_segment(dup_ulid).unwrap();
+
+        // ── Overwrite the owner's whole claim. Its Delta entry is now
+        //    fully LBA-dead; child_hash stays live via the duplicate.
+        let overwrite_bytes = vec![0xFFu8; 4 * 4096];
+        vol.write(100, &overwrite_bytes).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        assert_eq!(stats.deferred, 0, "dead delta owner must not defer");
+        assert!(stats.candidates >= 1, "owner segment must be a candidate");
+
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert!(applied > 0, "GC handoff must be applied");
+        drop(vol);
+
+        // ── The output must carry the recipe, not a materialised body.
+        let mut demoted = None;
+        for f in fs::read_dir(dir.join("gc")).unwrap() {
+            let path = f.unwrap().path();
+            let Ok((_, entries, _)) = elide_core::segment::read_segment_index(&path) else {
+                continue;
+            };
+            for e in entries {
+                if e.hash == child_hash && e.kind == elide_core::segment::EntryKind::CanonicalDelta
+                {
+                    demoted = Some(e);
+                }
+            }
+        }
+        let demoted = demoted.expect("GC output must contain a CanonicalDelta for the dead owner");
+        assert_eq!(
+            demoted.stored_length, 0,
+            "no body bytes for a thin demotion"
+        );
+        assert_eq!(demoted.delta_options.len(), 1);
+        assert_eq!(demoted.delta_options[0].source_hash, parent_hash);
+
+        // ── The duplicate's claim must read back through the demoted home.
+        let vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        assert_eq!(
+            vol.read(200, 4).unwrap().as_slice(),
+            child_bytes.as_slice(),
+            "duplicate claim must reconstruct through the CanonicalDelta home"
+        );
+        assert_eq!(
+            vol.read(100, 4).unwrap().as_slice(),
+            overwrite_bytes.as_slice()
         );
     }
 

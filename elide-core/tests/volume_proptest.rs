@@ -119,14 +119,18 @@ fn assert_manifest_filter_correct(
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
     for (_seg_ulid, parsed) in &parsed_segments {
         for e in parsed {
-            if e.kind != EntryKind::Delta {
+            if !e.kind.is_delta() {
                 continue;
             }
-            let end = e.start_lba + e.lba_length as u64;
-            let lba_live = lbamap
-                .extents_in_range(e.start_lba, end)
-                .any(|r| r.hash == e.hash);
-            if !lba_live {
+            let live = if e.kind.is_canonical_only() {
+                live_hashes.contains(&e.hash)
+            } else {
+                let end = e.start_lba + e.lba_length as u64;
+                lbamap
+                    .extents_in_range(e.start_lba, end)
+                    .any(|r| r.hash == e.hash)
+            };
+            if !live {
                 continue;
             }
             for opt in &e.delta_options {
@@ -149,6 +153,12 @@ fn assert_manifest_filter_correct(
                 lbamap
                     .extents_in_range(e.start_lba, end)
                     .any(|r| r.hash == e.hash)
+            }
+            EntryKind::CanonicalDelta => {
+                live_hashes.contains(&e.hash)
+                    && extent_index
+                        .lookup_delta(&e.hash)
+                        .is_some_and(|loc| loc.segment_id == *seg_ulid)
             }
             EntryKind::Data
             | EntryKind::Inline

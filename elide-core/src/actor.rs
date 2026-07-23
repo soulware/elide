@@ -2839,23 +2839,28 @@ pub(crate) fn live_index_segments(
         parsed_segments.push((seg_ulid, parsed));
     }
 
-    // Pass 1: live_hashes = LBA-referenced hashes ∪ live-Delta source hashes.
+    // Pass 1: live_hashes = LBA-referenced hashes ∪ live-delta source hashes.
     //
     // A `Delta` entry is live when some LBA in its range still maps to
-    // `entry.hash`; in that case its `source_hash` body is needed to
-    // reconstruct the delta, so the source must be carried into
-    // `live_hashes` even if no LBA references the source directly.
+    // `entry.hash`; a claim-less `CanonicalDelta` is live when its hash is
+    // LBA-referenced through a DedupRef. Either way its `source_hash` body
+    // is needed to reconstruct the delta, so the source must be carried
+    // into `live_hashes` even if no LBA references the source directly.
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
     for (_seg_ulid, parsed) in &parsed_segments {
         for entry in &parsed.entries {
-            if entry.kind != segment::EntryKind::Delta {
+            if !entry.kind.is_delta() {
                 continue;
             }
-            let end = entry.start_lba + entry.lba_length as u64;
-            let lba_live = lbamap
-                .extents_in_range(entry.start_lba, end)
-                .any(|r| r.hash == entry.hash);
-            if !lba_live {
+            let live = if entry.kind.is_canonical_only() {
+                live_hashes.contains(&entry.hash)
+            } else {
+                let end = entry.start_lba + entry.lba_length as u64;
+                lbamap
+                    .extents_in_range(entry.start_lba, end)
+                    .any(|r| r.hash == entry.hash)
+            };
+            if !live {
                 continue;
             }
             for opt in &entry.delta_options {
@@ -2911,6 +2916,12 @@ fn is_index_entry_live(
             lbamap
                 .extents_in_range(entry.start_lba, end)
                 .any(|r| r.hash == entry.hash)
+        }
+        EntryKind::CanonicalDelta => {
+            live_hashes.contains(&entry.hash)
+                && extent_index
+                    .lookup_delta(&entry.hash)
+                    .is_some_and(|loc| loc.segment_id == seg_ulid)
         }
         EntryKind::Data
         | EntryKind::Inline

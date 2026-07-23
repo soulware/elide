@@ -271,7 +271,7 @@ fn apply_one_output(
             out_entries,
         ),
         PlanOutput::Canonical { input, entry_idx } => {
-            emit_canonical(*input, *entry_idx, ctx, out_entries, composite_slot)
+            emit_canonical(*input, *entry_idx, ctx, out_entries, delta_body)
         }
         PlanOutput::Run {
             input,
@@ -381,26 +381,8 @@ fn emit_keep(
             out_entries.push(built.into_canonical());
         }
         EntryKind::Delta => {
-            // Delta carries no body bytes of its own — the delta blob lives
-            // in the source segment's delta body section. Copy each of the
-            // entry's delta blobs into the output delta body and rewrite the
-            // options' `delta_offset` to point at the new location.
             let _ = entry_idx;
-            let mut new_options = Vec::with_capacity(entry.delta_options.len());
-            for opt in &entry.delta_options {
-                let blob = read_input_delta_blob(
-                    input_ulid,
-                    state,
-                    opt.delta_offset,
-                    opt.delta_length,
-                    ctx.resolver,
-                )?;
-                let new_offset = delta_body.len() as u64;
-                delta_body.extend_from_slice(&blob);
-                let mut new_opt = opt.clone();
-                new_opt.delta_offset = new_offset;
-                new_options.push(new_opt);
-            }
+            let new_options = carry_delta_blobs(input_ulid, state, entry, ctx, delta_body)?;
             out_entries.push(PendingEntry::from_entry(SegmentEntry::new_delta(
                 entry.hash,
                 entry.start_lba,
@@ -408,8 +390,43 @@ fn emit_keep(
                 new_options,
             )));
         }
+        EntryKind::CanonicalDelta => {
+            let new_options = carry_delta_blobs(input_ulid, state, entry, ctx, delta_body)?;
+            out_entries.push(
+                PendingEntry::from_entry(SegmentEntry::new_delta(entry.hash, 0, 0, new_options))
+                    .into_canonical(),
+            );
+        }
     }
     Ok(())
+}
+
+/// Copy each of `entry`'s delta blobs from the input segment into the
+/// output delta body and return the options re-based against it. Delta-kind
+/// entries carry no body bytes of their own — the blobs are the entry.
+fn carry_delta_blobs(
+    input_ulid: Ulid,
+    state: &InputState,
+    entry: &SegmentEntry,
+    ctx: &MaterialiseCtx<'_>,
+    delta_body: &mut Vec<u8>,
+) -> Result<Vec<segment::DeltaOption>, MaterialiseOutcome> {
+    let mut new_options = Vec::with_capacity(entry.delta_options.len());
+    for opt in &entry.delta_options {
+        let blob = read_input_delta_blob(
+            input_ulid,
+            state,
+            opt.delta_offset,
+            opt.delta_length,
+            ctx.resolver,
+        )?;
+        let new_offset = delta_body.len() as u64;
+        delta_body.extend_from_slice(&blob);
+        let mut new_opt = opt.clone();
+        new_opt.delta_offset = new_offset;
+        new_options.push(new_opt);
+    }
+    Ok(new_options)
 }
 
 fn emit_zero_split(
@@ -439,7 +456,7 @@ fn emit_canonical(
     entry_idx: u32,
     ctx: &MaterialiseCtx<'_>,
     out_entries: &mut Vec<PendingEntry>,
-    composite_slot: &mut Option<CompositeSlot>,
+    delta_body: &mut Vec<u8>,
 ) -> Result<(), MaterialiseOutcome> {
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     match entry.kind {
@@ -457,16 +474,16 @@ fn emit_canonical(
                 SegmentEntry::new_data(entry.hash, 0, 0, compression_flags(entry), bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
-        EntryKind::Delta => {
-            // Partial-death Delta with external ref: reconstruct the
-            // composite body and emit as a canonical full-body entry (not
-            // re-encoded as a Delta), so dedup reads resolve in O(1).
-            // Resolved through the slot so the entry's `Run` records that
-            // follow reuse the composite instead of recomputing it.
-            let composite =
-                resolve_composite_body(input_ulid, entry_idx, ctx, composite_slot)?.to_vec();
-            let built = SegmentEntry::new_data(entry.hash, 0, 0, SegmentFlags::empty(), composite);
-            out_entries.push(built.into_canonical());
+        EntryKind::Delta | EntryKind::CanonicalDelta => {
+            // The hash keeps its recipe form: the blobs are copied and
+            // re-based, and the composite is never reconstructed. Reads of
+            // duplicate claims on this hash keep resolving through the
+            // deltas map exactly as they did before the claim died.
+            let new_options = carry_delta_blobs(input_ulid, state, entry, ctx, delta_body)?;
+            out_entries.push(
+                PendingEntry::from_entry(SegmentEntry::new_delta(entry.hash, 0, 0, new_options))
+                    .into_canonical(),
+            );
         }
         other => {
             return Err(MaterialiseError::Internal(format!(

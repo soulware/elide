@@ -412,12 +412,21 @@ pub enum EntryKind {
     /// `CanonicalData` but the body lives in the inline section — emitted
     /// when demoting an `Inline` entry.
     CanonicalInline,
+    /// Canonical delta: the delta's options and blobs with **no LBA claim**
+    /// — to `Delta` what `CanonicalData` is to `Data`. Emitted when
+    /// demoting a `Delta` entry, so the hash stays resolvable through the
+    /// deltas map at delta-blob cost rather than being re-materialised as
+    /// its full composite. Serialises as `DELTA | CANONICAL_ONLY`.
+    CanonicalDelta,
 }
 
 impl EntryKind {
     /// True for entries that carry no LBA claim on rebuild.
     pub fn is_canonical_only(self) -> bool {
-        matches!(self, EntryKind::CanonicalData | EntryKind::CanonicalInline)
+        matches!(
+            self,
+            EntryKind::CanonicalData | EntryKind::CanonicalInline | EntryKind::CanonicalDelta
+        )
     }
 
     /// True for entries whose body bytes live in the body section — `Data`
@@ -438,8 +447,8 @@ impl EntryKind {
 
     /// True for entries that carry body bytes (in either the body section
     /// or the inline section): `Data`, `Inline`, `CanonicalData`,
-    /// `CanonicalInline`. Excludes `DedupRef`, `Zero`, and `Delta`, which
-    /// carry no body bytes of their own.
+    /// `CanonicalInline`. Excludes `DedupRef`, `Zero`, `Delta`, and
+    /// `CanonicalDelta`, which carry no body bytes of their own.
     pub fn has_body_bytes(self) -> bool {
         matches!(
             self,
@@ -450,9 +459,17 @@ impl EntryKind {
         )
     }
 
+    /// True for delta-kind entries — `Delta` and its canonical-only
+    /// demotion `CanonicalDelta`. Both carry options addressing blobs in
+    /// the delta body section and register in the deltas map.
+    pub fn is_delta(self) -> bool {
+        matches!(self, EntryKind::Delta | EntryKind::CanonicalDelta)
+    }
+
     /// True for entries whose hash the extent-index rebuild registers as
-    /// owned by their segment: body-bearing kinds in the DATA map,
-    /// `Delta` in the delta map. `DedupRef` and `Zero` register nothing.
+    /// owned by their segment: body-bearing kinds in the DATA map, `Delta`
+    /// and `CanonicalDelta` in the delta map. `DedupRef` and `Zero`
+    /// register nothing.
     pub fn owns_extent_hash(self) -> bool {
         matches!(
             self,
@@ -461,6 +478,7 @@ impl EntryKind {
                 | EntryKind::CanonicalData
                 | EntryKind::CanonicalInline
                 | EntryKind::Delta
+                | EntryKind::CanonicalDelta
         )
     }
 }
@@ -662,11 +680,14 @@ impl SegmentEntry {
     /// body-bearing entry whose LBA claim has been superseded but whose
     /// hash must survive for dedup resolution (DedupRef or Delta base).
     ///
-    /// Chooses `CanonicalInline` if the source was `Inline`, `CanonicalData`
-    /// otherwise. `start_lba` / `lba_length` are zeroed.
+    /// Chooses `CanonicalInline` if the source was `Inline`,
+    /// `CanonicalDelta` if it was `Delta` (the options and blobs are kept
+    /// — the composite is never materialised), `CanonicalData` otherwise.
+    /// `start_lba` / `lba_length` are zeroed.
     pub fn into_canonical(mut self) -> Self {
         self.kind = match self.kind {
             EntryKind::Inline | EntryKind::CanonicalInline => EntryKind::CanonicalInline,
+            EntryKind::Delta | EntryKind::CanonicalDelta => EntryKind::CanonicalDelta,
             _ => EntryKind::CanonicalData,
         };
         self.start_lba = 0;
@@ -904,11 +925,14 @@ fn assign_offsets(entries: &mut [SegmentEntry]) -> (u32, u32, u64) {
                 entry.stored_offset = body_cursor;
                 body_cursor += entry.stored_length as u64;
             }
-            EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {
-                // DedupRef, Zero, and Delta contribute nothing to the body
-                // section. stored_offset/stored_length stay 0. Delta
-                // entries' bytes live in the delta body section and are
-                // addressed via `delta_options`, not `stored_offset`.
+            EntryKind::DedupRef
+            | EntryKind::Zero
+            | EntryKind::Delta
+            | EntryKind::CanonicalDelta => {
+                // These contribute nothing to the body section.
+                // stored_offset/stored_length stay 0. Delta-kind entries'
+                // bytes live in the delta body section and are addressed
+                // via `delta_options`, not `stored_offset`.
             }
         }
     }
@@ -930,7 +954,7 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
         EntryKind::Inline | EntryKind::CanonicalInline => flags |= SegmentFlags::INLINE,
         EntryKind::DedupRef => flags |= SegmentFlags::DEDUP_REF,
         EntryKind::Zero => flags |= SegmentFlags::ZERO,
-        EntryKind::Delta => flags |= SegmentFlags::DELTA,
+        EntryKind::Delta | EntryKind::CanonicalDelta => flags |= SegmentFlags::DELTA,
         EntryKind::Data | EntryKind::CanonicalData => {}
     }
     if e.compressed {
@@ -940,8 +964,9 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
         flags |= SegmentFlags::HAS_DELTAS;
     }
     debug_assert!(
-        e.kind != EntryKind::Delta || flags.contains(SegmentFlags::HAS_DELTAS),
-        "Delta entry must carry at least one delta option"
+        !matches!(e.kind, EntryKind::Delta | EntryKind::CanonicalDelta)
+            || flags.contains(SegmentFlags::HAS_DELTAS),
+        "delta-kind entry must carry at least one delta option"
     );
 
     w.write_all(e.hash.as_bytes())?; // 32
@@ -1450,7 +1475,11 @@ fn parse_index_section(
         } else if flags.contains(SegmentFlags::DEDUP_REF) {
             EntryKind::DedupRef
         } else if flags.contains(SegmentFlags::DELTA) {
-            EntryKind::Delta
+            if canonical_only {
+                EntryKind::CanonicalDelta
+            } else {
+                EntryKind::Delta
+            }
         } else if canonical_only && inline {
             EntryKind::CanonicalInline
         } else if canonical_only {
@@ -1551,7 +1580,7 @@ fn validate_entry_bounds(
                 )));
             }
         }
-        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta => {
+        EntryKind::DedupRef | EntryKind::Zero | EntryKind::Delta | EntryKind::CanonicalDelta => {
             if stored_offset != 0 || stored_length != 0 {
                 return Err(io::Error::other(format!(
                     "entry {i}: thin entry ({kind:?}) must have zero offset/length, got \
@@ -3619,6 +3648,53 @@ mod tests {
         assert_eq!(delta_entry.delta_options[0].source_hash, source_hash);
         assert_eq!(delta_entry.delta_options[0].delta_offset, 0);
         assert_eq!(delta_entry.delta_options[0].delta_length, 128);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn canonical_delta_entry_roundtrip() {
+        // A demoted Delta keeps its recipe: `into_canonical` maps
+        // Delta → CanonicalDelta with the options intact and the claim
+        // zeroed, and the kind survives the write/read cycle via the
+        // DELTA | CANONICAL_ONLY flags combination.
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let seg_path = dir.join("01CCCCCCCCCCCCCCCCCCCCCCCC");
+        let (signer, vk) = test_signer();
+
+        let content_hash = blake3::hash(b"canonical-delta-content");
+        let source_hash = blake3::hash(b"canonical-delta-source");
+        let delta_body = vec![0x5Au8; 96];
+        let option = DeltaOption {
+            source_hash,
+            delta_offset: 0,
+            delta_length: delta_body.len() as u32,
+            delta_hash: blake3::hash(&delta_body),
+        };
+
+        let entry =
+            SegmentEntry::new_delta(content_hash, 42, 5, vec![option.clone()]).into_canonical();
+        assert_eq!(entry.kind, EntryKind::CanonicalDelta);
+        assert_eq!(entry.start_lba, 0);
+        assert_eq!(entry.lba_length, 0);
+
+        let entries = vec![PendingEntry::from_entry(entry)];
+        write_segment_with_delta_body(&seg_path, entries, &delta_body, signer.as_ref()).unwrap();
+
+        let (_, read_back, _) = read_and_verify_segment_index(&seg_path, &vk).unwrap();
+        assert_eq!(read_back.len(), 1);
+        let e = &read_back[0];
+        assert_eq!(e.kind, EntryKind::CanonicalDelta);
+        assert_eq!(e.hash, content_hash);
+        assert_eq!(e.start_lba, 0);
+        assert_eq!(e.lba_length, 0);
+        assert_eq!(e.stored_offset, 0);
+        assert_eq!(e.stored_length, 0);
+        assert_eq!(e.delta_options.len(), 1);
+        assert_eq!(e.delta_options[0].source_hash, source_hash);
+        assert_eq!(e.delta_options[0].delta_length, delta_body.len() as u32);
+        assert_eq!(e.delta_options[0].delta_hash, option.delta_hash);
 
         fs::remove_dir_all(dir).unwrap();
     }

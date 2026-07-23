@@ -531,7 +531,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
             EntryKind::CanonicalInline => canonical_count += 1,
-            EntryKind::Delta => delta_count += 1,
+            EntryKind::Delta | EntryKind::CanonicalDelta => delta_count += 1,
         }
     }
     let _ = canonical_count;
