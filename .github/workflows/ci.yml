@@ -1,13 +1,17 @@
 name: ci
 
-# Host-runner CI. Two parallel jobs:
+# Host-runner CI:
 #   - host-tests: fmt, clippy, and the workspace test suite (skipping the
 #     kernel-feature modules that run in ci-kernel.yml).
 #   - host-proptests: the feature-gated proptest suites, which take
-#     noticeably longer. Split so the faster job signals green quickly.
+#     noticeably longer. A matrix fans the targets across runners so the
+#     two heavyweight suites (volume_proptest, gc_proptest) run on their
+#     own runners instead of serially behind the rest.
+#   - attested-e2e: the cross-repo mint discharge loop.
 #
-# Both jobs share a Swatinem rust-cache via `shared-key: rust-build`, so
-# cold PR runs restore from the main-branch build cache.
+# host-tests and host-proptests share a Swatinem rust-cache via
+# `shared-key: rust-build`, so cold PR runs restore from the main-branch
+# build cache.
 
 on:
   push:
@@ -44,6 +48,69 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
+    name: host-proptests (${{ matrix.name }})
+
+    strategy:
+      # Report every cell's failures — a fault in one suite must not cancel
+      # the others, matching the per-run `--no-fail-fast`.
+      fail-fast: false
+      matrix:
+        include:
+          # Each cell is a single-crate `cargo test`. Keeping the crate
+          # boundary per invocation stops feature unification from activating
+          # `volume-invariants` on elide-core's own proptest binaries — those
+          # don't exercise the coordinator-layer paths the invariant protects,
+          # and the per-op disk-rebuild dominates their runtime. Named test
+          # binaries (not `--tests`) keep this lane to the proptest-gated
+          # targets; `--tests` would re-run the crate's regular unit +
+          # integration tests under `proptest`, duplicating them across lanes.
+
+          # volume_proptest is the elide-core long pole; it gets its own runner.
+          - name: core-volume
+            cmd: |
+              cargo test -p elide-core --features proptest --no-fail-fast \
+                --test volume_proptest
+
+          - name: core-rest
+            cmd: |
+              cargo test -p elide-core --features proptest --no-fail-fast \
+                --test actor_proptest \
+                --test dmat_proptest \
+                --test fork_proptest \
+                --test multi_volume_proptest
+
+          # The materialized reproducers and the lib suite run under the
+          # runtime drift checkers (`volume-invariants`): structural drift
+          # surfaces as a clean panic at the introducing call site rather than
+          # an oracle mismatch many ops later. The reproducers are short
+          # deterministic sequences; the lib suite covers the checker's own
+          # should_panic tests and rebuilds every structural op per call. Two
+          # feature sets, so two invocations in one cell.
+          - name: core-invariants
+            cmd: |
+              cargo test -p elide-core --features proptest,volume-invariants --no-fail-fast \
+                --test volume_reproducers
+              cargo test -p elide-core --features volume-invariants --no-fail-fast --lib
+
+          # `elide-coordinator/proptest` propagates `elide-core/volume-invariants`,
+          # so gc_proptest runs with drift detection. Its two heavyweight
+          # proptest fns (gc_oracle, gc_segment_cleanup) each run 256 cases with
+          # a per-op disk rebuild and contend for CPU/disk when co-located, so
+          # they split across two runners. The split is a complete partition by
+          # name: `gc-oracle` runs every test matching `gc_oracle` (the fn plus
+          # its repro units); `gc-rest` runs the complement via `--skip
+          # gc_oracle` (gc_segment_cleanup, the other units) plus
+          # segment_head_proptest. Any test added later lands in exactly one cell.
+          - name: coord-gc-oracle
+            cmd: |
+              cargo test -p elide-coordinator --features proptest --no-fail-fast \
+                --test gc_proptest -- gc_oracle
+
+          - name: coord-gc-rest
+            cmd: |
+              cargo test -p elide-coordinator --features proptest --no-fail-fast \
+                --test gc_proptest --test segment_head_proptest -- --skip gc_oracle
+
     steps:
       - uses: actions/checkout@v6
 
@@ -52,48 +119,8 @@ jobs:
         with:
           shared-key: rust-build
 
-      # Split per crate so feature unification doesn't activate
-      # `volume-invariants` for elide-core's own proptest binaries —
-      # those don't exercise the coordinator-layer paths the invariant
-      # protects, and the per-op disk-rebuild dominates their runtime.
-      # `elide-coordinator/proptest` propagates `elide-core/volume-invariants`
-      # so the gc_proptest run gets the drift detection.
-      #
-      # Each step targets named test binaries (not `--tests`) so this
-      # lane runs only the proptest-gated targets. `--tests` would also
-      # re-run every regular unit + integration test in the crate under
-      # the `proptest` feature, doubling those across the two lanes and
-      # producing duplicate failure rows for the same root cause.
-      - name: cargo test (elide-core proptests)
-        run: |
-          cargo test -p elide-core --features proptest --no-fail-fast \
-            --test actor_proptest \
-            --test dmat_proptest \
-            --test fork_proptest \
-            --test volume_proptest \
-            --test multi_volume_proptest
-
-      # The materialized reproducers are a handful of short, deterministic
-      # sequences — cheap enough to run with `volume-invariants` on, which
-      # turns structural drift into a clean panic at the introducing call
-      # site rather than an oracle mismatch many ops later. Scoped to the
-      # `volume_reproducers` target only; the randomized suites above stay
-      # invariants-off for speed.
-      - name: cargo test (elide-core reproducers, volume-invariants)
-        run: "cargo test -p elide-core --features proptest,volume-invariants --test volume_reproducers --no-fail-fast"
-
-      # Lib tests under the runtime drift checkers: covers the
-      # volume-invariants-gated unit tests (the checker's own
-      # should_panic coverage) and runs every structural op in the lib
-      # suite with per-op rebuild verification.
-      - name: cargo test (elide-core lib, volume-invariants)
-        run: "cargo test -p elide-core --features volume-invariants --lib --no-fail-fast"
-
-      - name: cargo test (elide-coordinator proptests)
-        run: |
-          cargo test -p elide-coordinator --features proptest --no-fail-fast \
-            --test gc_proptest \
-            --test segment_head_proptest
+      - name: cargo test
+        run: ${{ matrix.cmd }}
 
   # The attested-loop e2e composes two repos: a real mint daemon (the
   # hermetic `mint-e2e` harness, from github.com/soulware/mint), the
