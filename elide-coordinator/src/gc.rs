@@ -229,6 +229,7 @@ pub fn gc_fork(
 
     let gc_dir = fork_dir.join("gc");
     if has_pending_results(&gc_dir)? {
+        log_journal_census_deferred(fork_dir);
         return Ok(GcStats::none(NoneReason::PendingHandoffs, 0));
     }
 
@@ -249,7 +250,7 @@ pub fn gc_fork(
 
     // Census the whole eligible population, before residency narrows it to
     // what this pass can act on.
-    log_journal_census(&pass.eligible_stats, &pass.journal);
+    log_journal_census(fork_label(fork_dir), &pass.eligible_stats, &pass.journal);
 
     // Cache-residency filter: drop candidates whose bodies aren't fully
     // resolvable from local cache. Cold candidates wait for organic
@@ -444,7 +445,35 @@ struct PackedBucket {
 /// a compaction trigger. `mixed` counts stable-pool segments still holding
 /// journal content, so the migration backlog is visible draining to zero,
 /// and `tombstones` is the reap path those segments leave by.
-fn log_journal_census(stats: &[SegmentStats], journal: &elide_core::journal::JournalRanges) {
+/// Short identifier for a fork in log lines: the fork directory's basename,
+/// which is the volume ULID. Distinguishes per-volume census output when a
+/// coordinator hosts several volumes (map ULID to name with `elide volume list`).
+fn fork_label(fork_dir: &Path) -> &str {
+    fork_dir.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+}
+
+/// Compact census marker for a pass that defers on pending handoffs. The full
+/// census needs `load_pass_state`, which the defer skips — but a busy volume
+/// defers on nearly every tick, so without a line here it disappears from the
+/// census log exactly when it is most active. Journal volumes only.
+fn log_journal_census_deferred(fork_dir: &Path) {
+    let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) else {
+        return;
+    };
+    if cfg.journal_window().ranges.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "[gc {}] journal census: deferred (pending handoffs)",
+        fork_label(fork_dir)
+    );
+}
+
+fn log_journal_census(
+    fork: &str,
+    stats: &[SegmentStats],
+    journal: &elide_core::journal::JournalRanges,
+) {
     if journal.is_empty() {
         return;
     }
@@ -484,7 +513,7 @@ fn log_journal_census(stats: &[SegmentStats], journal: &elide_core::journal::Jou
         .map(|ms| now_ms.saturating_sub(ms) / 1000);
 
     tracing::info!(
-        "[gc] journal census: segments={} blocks={pool_blocks}/{window_blocks} \
+        "[gc {fork}] journal census: segments={} blocks={pool_blocks}/{window_blocks} \
          oldest_age_s={} mixed={} mixed_blocks={mixed_blocks} stable={stable} \
          tombstones={tombstones}",
         pool.len(),
