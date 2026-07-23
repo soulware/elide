@@ -62,7 +62,10 @@
 //   All-dead and removal-only handoffs collapse into a zero-entry GC output
 //   with a non-empty inputs list. promote_segment recognises this shape and
 //   skips writing index/<new>.idx / cache/<new>.body — the bare file is then
-//   deleted via finalize_gc_handoff the same as a live output.
+//   deleted via finalize_gc_handoff the same as a live output. The
+//   coordinator skips the S3 upload for this shape and keeps the output
+//   ULID out of the HEAD's `Added`; only the supersession edges are
+//   recorded.
 //
 // A pass is deferred if any .plan or bare gc/<ulid> files already exist
 // (at most one outstanding GC result per fork at a time).
@@ -738,13 +741,16 @@ pub async fn apply_done_handoffs(
     Ok(outcomes)
 }
 
-/// One GC handoff that completed end-to-end this tick: a new `output`
-/// segment was uploaded to S3 and promoted on the volume, and the
-/// `inputs` listed are now dead. Fed into the per-volume HEAD's `Added`
-/// (the output) and `Superseded` (one edge per input) by the
-/// orchestrator — see `docs/design/segment-index.md`.
+/// One GC handoff that completed end-to-end this tick: the `output`
+/// segment was promoted on the volume, and the `inputs` listed are now
+/// dead. The orchestrator records one `Superseded` edge per input, and
+/// records the output in the per-volume HEAD's `Added` only when
+/// `uploaded` — see `docs/design/segment-index.md`.
 pub struct HandoffOutcome {
     pub output: Ulid,
+    /// False for a zero-entry output: no S3 object exists, so listing
+    /// it in `Added` would point rebuilds at a 404.
+    pub uploaded: bool,
     pub inputs: Vec<Ulid>,
 }
 
@@ -812,14 +818,24 @@ impl HandoffCursor<'_> {
             "compacted segment {new_ulid_str}: malformed DedupRef/Zero entry"
         );
 
-        // Upload + promote are idempotent: if a previous pass already
-        // uploaded and promoted, the store PUT is a re-PUT of the same
-        // bytes and `promote_segment` short-circuits on cache body presence.
-        self.vd
-            .segments()
-            .put_from_file(new_ulid, gc_body)
-            .await
-            .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+        // A zero-entry output (all-dead or removal-only handoff) is not
+        // uploaded. Its effects are complete once the inputs are consumed:
+        // the volume realises the removals from the input `.idx` diff at
+        // apply time, and the reaper deletes the inputs from S3 via the
+        // supersession edges. The object itself would be a permanent
+        // orphan — with no `index/<new>.idx` written for it, no later GC
+        // pass can ever supersede it.
+        let uploaded = !gc_entries.is_empty();
+        if uploaded {
+            // Upload + promote are idempotent: if a previous pass already
+            // uploaded and promoted, the store PUT is a re-PUT of the same
+            // bytes and `promote_segment` short-circuits on cache body presence.
+            self.vd
+                .segments()
+                .put_from_file(new_ulid, gc_body)
+                .await
+                .with_context(|| format!("uploading compacted segment {new_ulid_str}"))?;
+        }
 
         // Promote IPC: volume writes index/<new>.idx, copies body to cache,
         // deletes stale index/<old>.idx for each input. The gc body stays
@@ -858,6 +874,7 @@ impl HandoffCursor<'_> {
 
         Ok(Some(HandoffOutcome {
             output: new_ulid,
+            uploaded,
             inputs,
         }))
     }
@@ -2301,6 +2318,69 @@ mod tests {
             plan.inputs(),
             expected_inputs,
             "gc plan must list all swept source ulids in sorted order"
+        );
+    }
+
+    /// A reap-only handoff (zero-entry output) completes without an S3
+    /// upload and without listing the output as `Added`: with no
+    /// `index/<new>.idx` ever written for it, no later GC pass could
+    /// supersede it, so an uploaded object would be a permanent orphan.
+    #[tokio::test]
+    async fn reap_only_handoff_uploads_nothing() {
+        use futures::TryStreamExt;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // S1: one committed segment. A later write to the same LBA stays
+        // in pending/, so the LBA map (which includes pending at highest
+        // priority) sees S1 as fully dead — the only candidate is a
+        // tombstone and the pass is reap-only.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &[0x11u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        let pending = elide_core::segment::read_ulid_dir_sorted(&dir.join("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        let s1 = pending[0];
+        vol.promote_segment(s1).unwrap();
+
+        vol.write(0, &[0x22u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        let config = crate::config::GcConfig {
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
+        let u_gc = Ulid::new();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        assert_eq!(stats.strategy, GcStrategy::Compact);
+        assert_eq!(stats.candidates, 1);
+
+        // Volume applies the plan, producing the bare zero-entry output.
+        let applied = vol.apply_gc_handoffs().unwrap();
+        assert_eq!(applied, 1);
+        drop(vol);
+
+        let _mock = spawn_mock_socket(dir.to_owned()).await;
+        let done = apply_done_handoffs(dir, Ulid::nil(), &store).await.unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(!done[0].uploaded, "reap-only handoff must not upload");
+        assert_eq!(done[0].output, u_gc);
+        assert_eq!(done[0].inputs, vec![s1], "supersession edge still names S1");
+
+        let keys: Vec<_> = store.list(None).try_collect().await.unwrap();
+        assert!(
+            keys.is_empty(),
+            "reap-only pass must leave no S3 object, found {keys:?}"
         );
     }
 

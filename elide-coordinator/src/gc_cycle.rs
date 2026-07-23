@@ -508,7 +508,9 @@ impl GcCycleOrchestrator {
                 // slack.
                 let since = Utc::now();
                 for outcome in outcomes {
-                    self.tick_added.push(outcome.output);
+                    if outcome.uploaded {
+                        self.tick_added.push(outcome.output);
+                    }
                     for input in outcome.inputs {
                         self.tick_superseded.push((input, outcome.output, since));
                     }
