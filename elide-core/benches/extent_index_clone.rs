@@ -60,7 +60,6 @@ fn dummy_location(seed: u32) -> ExtentLocation {
         body_source: BodySource::Local,
         body_section_start: 0,
         inline_data: None,
-        journal: false,
     }
 }
 
