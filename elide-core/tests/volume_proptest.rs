@@ -404,11 +404,12 @@ enum SimOp {
     /// LBA (96) and the fixed stable LBA (97), in randomized order.
     /// Every proptest fork stamps `journal_ranges = [(96, 1)]` into
     /// `volume.toml` before the first open, so this pair exercises the
-    /// non-journal ownership preference (whichever copy commits first,
-    /// the stable one must own or displace) and journal segment
-    /// segregation at the next promote — interleaved with every
-    /// GC/repack/drain/crash shape the suite generates. LBAs 96/97 are
-    /// disjoint from every other op range (highest otherwise is 64).
+    /// disjoint journal tier: the LBA-96 copy routes to the `(segment,
+    /// hash)` journal map and the LBA-97 copy to `inner`, never sharing a
+    /// slot, and the journal partition forms its own segment at the next
+    /// promote — interleaved with every GC/repack/drain/crash shape the
+    /// suite generates. LBAs 96/97 are disjoint from every other op range
+    /// (highest otherwise is 64).
     JournalDupWrite { journal_first: bool, seed: u8 },
 }
 

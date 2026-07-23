@@ -1549,6 +1549,67 @@ mod tests {
     }
 
     #[test]
+    fn purge_journal_segment_keeps_other_segments_sharing_a_hash() {
+        // Two journal segments hold the same hash (the same block content
+        // recurring as the journal ring wraps). The `(segment, hash)` key
+        // keeps them independent: reaping one whole must not disturb the
+        // other's copy — the reason journal content is keyed per segment
+        // rather than deduped to a single slot.
+        let mut index = ExtentIndex::new();
+        let a = useg(3);
+        let b = useg(5);
+        let shared = h(1);
+
+        index.insert_journal_if_absent(a, shared, data_loc(a));
+        index.insert_journal_if_absent(b, shared, data_loc(b));
+        assert_eq!(index.lookup_journal(a, &shared).unwrap().segment_id, a);
+        assert_eq!(index.lookup_journal(b, &shared).unwrap().segment_id, b);
+
+        index.purge_journal_segment(a);
+        assert!(
+            index.lookup_journal(a, &shared).is_none(),
+            "reaped segment's journal copy is gone"
+        );
+        assert_eq!(
+            index.lookup_journal(b, &shared).unwrap().segment_id,
+            b,
+            "the other segment's copy of the same hash survives the reap"
+        );
+    }
+
+    #[test]
+    fn insert_journal_if_absent_keeps_first_within_a_segment() {
+        // A hash repeated within one journal segment keeps the first body;
+        // the copies are byte-identical, and journal segments are never
+        // compacted, so the kept body persists until the whole segment reaps.
+        let mut index = ExtentIndex::new();
+        let seg = useg(4);
+        let first = ExtentLocation {
+            body_offset: 100,
+            ..data_loc(seg)
+        };
+        let second = ExtentLocation {
+            body_offset: 200,
+            ..data_loc(seg)
+        };
+        assert!(index.insert_journal_if_absent(seg, h(1), first));
+        assert!(!index.insert_journal_if_absent(seg, h(1), second));
+        assert_eq!(index.lookup_journal(seg, &h(1)).unwrap().body_offset, 100);
+    }
+
+    #[test]
+    fn rekey_journal_is_a_noop_when_source_absent() {
+        // A concurrent writer that re-claimed the hash leaves `(from, hash)`
+        // absent; the promote-time re-key must not conjure an entry.
+        let mut index = ExtentIndex::new();
+        let from = useg(3);
+        let to = useg(7);
+        index.rekey_journal(from, to, h(1), data_loc(to));
+        assert!(index.lookup_journal(to, &h(1)).is_none());
+        assert!(index.lookup_journal(from, &h(1)).is_none());
+    }
+
+    #[test]
     fn register_consuming_repoints_delta_owned_by_input() {
         let mut index = ExtentIndex::new();
         index.insert_delta(h(1), delta_loc(useg(3)));

@@ -2622,6 +2622,113 @@ mod tests {
         assert_eq!(lbas, vec![96, 97]);
     }
 
+    /// A multi-block journal entry that is only partially overwritten
+    /// classifies as `PartialDeath`, not fully dead — so the segment holding
+    /// it still has a live entry. It must stay in the journal pool (never the
+    /// stable pool) so `select_buckets` never packs it: a journal segment is
+    /// only ever consumed as a whole-dead tombstone, and the materialiser
+    /// rejects any journal-tier entry that reaches a rewrite. Without pool
+    /// isolation, the survivors would be rewritten as durable entries and the
+    /// journal flag silently lost. See `docs/design/gc-journal-segregation.md`.
+    #[test]
+    fn partially_overwritten_journal_segment_stays_in_journal_pool() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let window = elide_core::journal::JournalWindow {
+            ranges: elide_core::journal::JournalRanges::new(vec![(96, 4)]),
+            activation: None,
+        };
+        // Stamp the window so formation partitions the epoch into a pure
+        // journal segment (the [96..100) entry) and a durable one (LBA 0),
+        // exactly as production does.
+        drop(elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap());
+        {
+            let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+            cfg.journal = Some(elide_core::config::JournalConfig {
+                ranges: window.ranges.clone(),
+                activation: None,
+            });
+            cfg.write(fork_dir).unwrap();
+        }
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+        // One 4-block journal entry [96..100), plus a durable block so the
+        // epoch also forms a stable segment (realistic mixed epoch).
+        vol.write(96, &[1u8; 4 * 4096]).unwrap();
+        vol.write(0, &[2u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        // Overwrite a subset of the journal entry's LBAs: 96 dies, 97-99 stay
+        // live, so the [96..100) entry is PartialDeath.
+        vol.write(96, &[3u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
+        let pending_dir = fork_dir.join("pending");
+        let mut ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
+            .collect();
+        ulids.sort();
+        for ulid in &ulids {
+            vol.promote_segment(*ulid).unwrap();
+        }
+
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.lba_referenced_hashes();
+
+        let stats = collect_stats(
+            fork_dir,
+            &vk,
+            &index,
+            &live_hashes,
+            &lbamap,
+            None,
+            &window.ranges,
+        )
+        .unwrap();
+
+        // The segment holding the multi-block journal entry is the one under
+        // test — identify it by that entry surviving as a partial-death run.
+        let partial = stats
+            .iter()
+            .find(|s| {
+                s.live_entries
+                    .iter()
+                    .any(|e| e.start_lba == 96 && e.lba_length == 4)
+            })
+            .expect("multi-block journal segment must still hold its partial-death entry");
+        assert_eq!(
+            partial.pool,
+            SegmentPool::Journal,
+            "a partially-overwritten journal segment must stay in the journal pool, not become stable"
+        );
+
+        // And it must never enter a compaction bucket.
+        let journal_ulid = partial.ulid_str.clone();
+        let buckets = select_buckets(stats, &make_config(0.5), 8);
+        for b in &buckets {
+            for input in &b.bucket {
+                assert_ne!(
+                    input.ulid_str, journal_ulid,
+                    "journal segment must never be packed into a compaction bucket"
+                );
+            }
+        }
+    }
+
     /// Bug H reproduction (DIRECT collect_stats level):
     ///
     /// `collect_stats` keeps a DATA entry at its original `start_lba` when
