@@ -639,7 +639,13 @@ fn pack_stable(
     let mut packed_out: Vec<PackedBucket> = Vec::new();
     for OpenBucket { mut items, .. } in buckets {
         let has_dead = items.iter().any(|s| s.pool == SegmentPool::Tombstone);
-        let has_sparse = items.iter().any(|s| s.density() < density_threshold);
+        // Same predicate as the `is_sparse` admission test. The dead-bytes
+        // term matters: a canonical-only segment has density 0.0 with
+        // nothing dead, and without it a single such input is rewritten
+        // into an identical segment every pass, forever.
+        let has_sparse = items
+            .iter()
+            .any(|s| s.density() < density_threshold && s.dead_lba_bytes() > 0);
         if !has_dead && !has_sparse && items.len() < 2 {
             // Single dense non-sparse non-tombstone input: pointless
             // rewrite. Drop the bucket.
@@ -1936,6 +1942,63 @@ mod tests {
             buckets.is_empty(),
             "lone dense small is a pointless rewrite"
         );
+    }
+
+    #[test]
+    fn select_buckets_drops_lone_canonical_only_input() {
+        // A canonical-only segment: entries make no LBA claim, so density
+        // is 0.0 with zero dead bytes and nothing to reclaim. Rewriting it
+        // reproduces the same segment under a new ULID.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+
+        let canonicals: Vec<SegmentEntry> = (0..3)
+            .map(|i| {
+                SegmentEntry::new_data(
+                    blake3::hash(&[i as u8]),
+                    0,
+                    1,
+                    elide_core::segment::SegmentFlags::empty(),
+                    vec![0u8; BLOCK_BYTES as usize],
+                )
+                .entry
+                .into_canonical()
+            })
+            .collect();
+        let materialised_bytes: u64 = canonicals.iter().map(keep_cost).sum();
+        let n = canonicals.len();
+        let stats = SegmentStats {
+            ulid_str: next().to_string(),
+            live_lba_bytes: 0,
+            materialised_bytes,
+            total_lba_bytes: 0,
+            has_body_entries: true,
+            live_entries: canonicals,
+            live_entry_indices: (0..n as u32).collect(),
+            removed_hashes: Vec::new(),
+            partial_death_runs: vec![None; n],
+            has_partial_death: false,
+            pool: SegmentPool::Stable,
+            journal_blocks: 0,
+        };
+
+        let buckets = select_buckets(vec![stats], &make_config(0.70), 4);
+        assert!(
+            buckets.is_empty(),
+            "lone canonical-only input reclaims nothing and must not churn"
+        );
+    }
+
+    #[test]
+    fn select_buckets_keeps_lone_sparse_input_with_dead_bytes() {
+        // Sparse with real dead bytes: the singleton rewrite reclaims them.
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let sparse = make_stats(next(), 2, BLOCK_BYTES * 32, true);
+        let buckets = select_buckets(vec![sparse], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 1);
     }
 
     #[test]
