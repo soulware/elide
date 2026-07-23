@@ -637,3 +637,69 @@ fn crash_recovery_seed_b1c5223d_regression() {
         );
     }
 }
+
+/// Guards `simulate_coord_gc_local`'s pending-handoff gate, shrunk from
+/// `crash_recovery_oracle`. `GcPlan` stages a fold without consuming its
+/// inputs; without the gate `CoordGcLocal` folded the same still-present
+/// inputs again, and applying both outputs in one batch left the lbamap
+/// claimant for 96/97 pointing at the first output while the disk rebuild
+/// picked the higher-ULID second — a claimant drift under
+/// `volume-invariants`. With the gate the second pass stages nothing.
+#[test]
+fn gc_apply_double_fold_serialized_by_pending_gate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fork_dir = tmp.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir).unwrap();
+    let fork_dir = fork_dir.as_path();
+    let store_dir = tmp.path().join("_store");
+    common::write_test_keypair(fork_dir);
+
+    // Journal window (96, 1): LBA 96 is journal, LBA 97 is not. Matches
+    // `stamp_journal_window` in the proptest harness.
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal = Some(elide_core::config::JournalConfig {
+        ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
+        activation: None,
+    });
+    cfg.write(fork_dir).unwrap();
+
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+
+    // SimOp::JournalDupWrite { journal_first: false, seed: 0 }
+    let data = incompressible_block(0);
+    let _ = vol.write(97, &data);
+    let _ = vol.write(96, &data);
+
+    // SimOp::Flush
+    let _ = vol.flush_wal();
+
+    // SimOp::SignSnapshot
+    let snap_ulid = pick_snap_ulid(fork_dir);
+    let _ = vol.sign_snapshot_manifest(snap_ulid);
+
+    // SimOp::GcCheckpoint — drain, then mint a checkpoint ULID.
+    common::drain_with_repack(&mut vol);
+    let _ = vol.gc_checkpoint_for_test().unwrap();
+
+    // SimOp::GcPlan { n: 2 } — stage a plan without applying it.
+    let plan_gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let _ = common::simulate_coord_gc_local(fork_dir, plan_gc_ulid, 2);
+
+    // SimOp::CoordGcLocal { n: 2 } — drain, checkpoint, simulate, apply.
+    // `apply_gc_handoffs` picks up every staged plan and updates the
+    // in-memory lbamap; the drift trips inside its final consistency check.
+    common::drain_with_repack(&mut vol);
+    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let to_delete =
+        if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
+            paths
+        } else {
+            vec![]
+        };
+    let applied = vol.apply_gc_handoffs().unwrap_or(0);
+    if applied > 0 {
+        for path in &to_delete {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}

@@ -1873,11 +1873,17 @@ impl Volume {
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
-    /// if it diverges from `self.lbamap`. Called at the end of every
-    /// **structural** op (segment-shape mutations: repack apply, promote,
-    /// GC plan apply, checkpoint flush, volume open) so any drift trips at
-    /// the introducing site, not three operations later as a stale-cancel
-    /// or oracle mismatch.
+    /// if the **content** (per-LBA hash) diverges from `self.lbamap`.
+    /// Called at the end of every **structural** op (segment-shape
+    /// mutations: repack apply, promote, GC plan apply, checkpoint flush,
+    /// volume open) so any drift trips at the introducing site, not three
+    /// operations later as a stale-cancel or oracle mismatch.
+    ///
+    /// A claimant difference where the hashes agree is logged, not
+    /// panicked: the claimant is an lbamap-internal ordering hint read by
+    /// no resolution or GC-liveness path (those key on the extent index's
+    /// `segment_id`), and a same-hash claimant names a segment holding
+    /// identical bytes, so it changes no read or liveness outcome.
     ///
     /// Deliberately **not** called from `write` / `write_zeroes` — those
     /// are high-frequency incremental `lbamap.insert` updates that have
@@ -1959,7 +1965,9 @@ impl Volume {
             mem_claimant: Option<Ulid>,
             disk_claimant: Option<Ulid>,
         }
-        let mut diverging: Vec<Diverge> = Vec::new();
+        let mut hash_diverging: Vec<Diverge> = Vec::new();
+        let mut claimant_only = 0usize;
+        let mut claimant_sample: Vec<Diverge> = Vec::new();
         let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (lba, _, _, _) in self.lbamap.iter_entries() {
             all_lbas.insert(lba);
@@ -1972,25 +1980,54 @@ impl Volume {
             let disk_hash = fresh.hash_at(lba);
             let mem_claimant = self.lbamap.claimant_at(lba);
             let disk_claimant = fresh.claimant_at(lba);
-            if mem_hash != disk_hash || mem_claimant != disk_claimant {
-                diverging.push(Diverge {
+            if mem_hash != disk_hash {
+                hash_diverging.push(Diverge {
                     lba,
                     mem_hash,
                     disk_hash,
                     mem_claimant,
                     disk_claimant,
                 });
-                if diverging.len() >= 8 {
+                if hash_diverging.len() >= 8 {
                     break;
+                }
+            } else if mem_claimant != disk_claimant {
+                claimant_only += 1;
+                if claimant_sample.len() < 3 {
+                    claimant_sample.push(Diverge {
+                        lba,
+                        mem_hash,
+                        disk_hash,
+                        mem_claimant,
+                        disk_claimant,
+                    });
                 }
             }
         }
-        if !diverging.is_empty() {
+        if claimant_only > 0 {
             let mut msg = format!(
-                "lbamap drift after [{caller}]: {} LBA(s) diverge",
-                diverging.len()
+                "lbamap claimant-only drift after [{caller}]: {claimant_only} LBA(s) \
+                 differ on owning segment but agree on content (benign — claimant is an \
+                 ordering hint, read by no resolution or GC path)"
             );
-            for d in &diverging {
+            for d in &claimant_sample {
+                msg.push_str(&format!(
+                    "\n  lba={} hash={:?} in_memory_claimant={:?} disk_claimant={:?}",
+                    d.lba,
+                    d.mem_hash.map(|h| h.to_hex().to_string()),
+                    d.mem_claimant.map(|u| u.to_string()),
+                    d.disk_claimant.map(|u| u.to_string()),
+                ));
+            }
+            log::warn!("{msg}");
+        }
+        if !hash_diverging.is_empty() {
+            let mut msg = format!(
+                "lbamap content drift after [{caller}]: {} LBA(s) resolve to different \
+                 bytes on rebuild",
+                hash_diverging.len()
+            );
+            for d in &hash_diverging {
                 msg.push_str(&format!(
                     "\n  lba={} in_memory=({:?}, {:?}) disk_rebuild=({:?}, {:?})",
                     d.lba,

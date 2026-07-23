@@ -453,7 +453,27 @@ fn compact_candidates_inner(
 /// acknowledged the handoff.
 ///
 /// Returns `Some((consumed_ulids, produced_ulid, paths_to_delete))` when
-/// candidates were found, `None` when fewer than two segments exist.
+/// candidates were found, `None` when fewer than two segments exist or a
+/// prior handoff is still pending.
+/// `true` if `gc_dir` holds an in-flight handoff — a `<ulid>.plan` or a
+/// bare `<ulid>`. Mirror of the coordinator's `has_pending_results`.
+fn has_pending_handoff(gc_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(gc_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.ends_with(".plan") {
+            return true;
+        }
+        if !name.contains('.') && Ulid::from_string(name).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn simulate_coord_gc_local(
     fork_dir: &Path,
     new_ulid: Ulid,
@@ -461,6 +481,13 @@ pub fn simulate_coord_gc_local(
 ) -> Option<CompactResult> {
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
+
+    // Mirror the coordinator's `has_pending_results` gate: defer a new pass
+    // while any prior handoff is in flight, so a second pass can't fold the
+    // same still-present inputs into a duplicate output.
+    if has_pending_handoff(&gc_dir) {
+        return None;
+    }
 
     let idx_files = segment::collect_idx_files(&index_dir).ok()?;
     let mut candidates: Vec<(Ulid, PathBuf)> = idx_files
