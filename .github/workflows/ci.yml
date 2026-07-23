@@ -93,25 +93,22 @@ jobs:
               cargo test -p elide-core --features volume-invariants --no-fail-fast --lib
 
           # `elide-coordinator/proptest` propagates `elide-core/volume-invariants`,
-          # so gc_proptest runs with drift detection. gc_segment_cleanup is the
-          # workflow's long pole: 256 disk-heavy cases that dominate CI's slow
-          # disk, and proptest has no intra-fn parallelism. It is case-sharded
-          # across two runners (PROPTEST_CASES=128 each); proptest seeds its RNG
-          # from entropy per process, so the shards explore disjoint cases and
-          # together approximate the original 256-case run. Dropping the
-          # explicit `cases: 256` in gc_proptest.rs is what lets PROPTEST_CASES
-          # take effect.
+          # so gc_proptest runs with drift detection. Its two heavyweight fns,
+          # gc_segment_cleanup and gc_oracle, each run 256 disk-heavy cases that
+          # dominate CI's slow disk, and proptest has no intra-fn parallelism.
+          # Each is case-sharded across two runners (PROPTEST_CASES=128 each);
+          # proptest seeds its RNG from entropy per process, so a fn's two
+          # shards explore disjoint cases and together approximate its original
+          # 256-case run. Dropping the explicit `cases: 256` in gc_proptest.rs
+          # is what lets PROPTEST_CASES take effect.
           #
-          # Complete partition by name: the shard cells run every test matching
-          # `gc_segment_cleanup`; `coord-gc-oracle` runs the complement via
-          # `--skip gc_segment_cleanup` (gc_oracle at the full 256, the other
-          # units) plus segment_head_proptest. A test added later lands in a
-          # shard iff its name contains gc_segment_cleanup, else the oracle cell.
-          - name: coord-gc-oracle
-            cmd: |
-              cargo test -p elide-coordinator --features proptest --no-fail-fast \
-                --test gc_proptest --test segment_head_proptest -- --skip gc_segment_cleanup
-
+          # Complete partition by name: `gc_segment_cleanup`-matching tests run
+          # in the cleanup shards, `gc_oracle`-matching in the oracle shards,
+          # and coord-segment-head runs the remainder — the gc_proptest units
+          # that match neither (via the two --skip filters) plus the whole
+          # segment_head_proptest binary. Any test added later lands in exactly
+          # one group by whether its name contains gc_segment_cleanup, gc_oracle,
+          # or neither.
           - name: coord-gc-cleanup-a
             cmd: |
               PROPTEST_CASES=128 cargo test -p elide-coordinator --features proptest --no-fail-fast \
@@ -121,6 +118,21 @@ jobs:
             cmd: |
               PROPTEST_CASES=128 cargo test -p elide-coordinator --features proptest --no-fail-fast \
                 --test gc_proptest -- gc_segment_cleanup
+
+          - name: coord-gc-oracle-a
+            cmd: |
+              PROPTEST_CASES=128 cargo test -p elide-coordinator --features proptest --no-fail-fast \
+                --test gc_proptest -- gc_oracle
+
+          - name: coord-gc-oracle-b
+            cmd: |
+              PROPTEST_CASES=128 cargo test -p elide-coordinator --features proptest --no-fail-fast \
+                --test gc_proptest -- gc_oracle
+
+          - name: coord-segment-head
+            cmd: |
+              cargo test -p elide-coordinator --features proptest --no-fail-fast \
+                --test gc_proptest --test segment_head_proptest -- --skip gc_segment_cleanup --skip gc_oracle
 
     steps:
       - uses: actions/checkout@v6
