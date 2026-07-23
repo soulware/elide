@@ -353,6 +353,9 @@ fn apply_promoted_partition(
         pre_promote_offsets,
         journal_segment,
     } = part;
+    if entries.is_empty() {
+        return Ok(());
+    }
     let delta_ctx = extentindex::SegmentRegistrationCtx {
         segment_id: segment_ulid,
         body_section_start,
