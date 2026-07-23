@@ -459,8 +459,49 @@ fn compact_candidates_inner(
 /// acknowledged the handoff.
 ///
 /// Returns `Some((consumed_ulids, produced_ulid, paths_to_delete))` when
-/// candidates were found, `None` when fewer than two segments exist.
+/// candidates were found, `None` when fewer than two segments exist or a
+/// prior handoff is still pending.
+///
+/// Mirrors the coordinator's `has_pending_results`: a GC pass defers while
+/// any `<ulid>.plan` or bare `<ulid>` output is in flight, so the harness
+/// never stages a second plan over inputs a still-pending plan already
+/// carries. Use [`simulate_coord_gc_local_ungated`] for tests that
+/// deliberately model the coordinator's mid-apply TOCTOU race.
 pub fn simulate_coord_gc_local(
+    fork_dir: &Path,
+    new_ulid: Ulid,
+    n_candidates: usize,
+) -> Option<CompactResult> {
+    if has_pending_handoff(&fork_dir.join("gc")) {
+        return None;
+    }
+    simulate_coord_gc_local_ungated(fork_dir, new_ulid, n_candidates)
+}
+
+/// `true` if `gc_dir` holds an in-flight handoff — a `<ulid>.plan` or a
+/// bare `<ulid>`. Mirror of the coordinator's `has_pending_results`.
+fn has_pending_handoff(gc_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(gc_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.ends_with(".plan") {
+            return true;
+        }
+        if !name.contains('.') && Ulid::from_string(name).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`simulate_coord_gc_local`] without the pending-handoff gate, for tests
+/// that deliberately emit a plan mid-apply (the coordinator's TOCTOU race,
+/// where the apply's commit removes the `.plan` between the pending check
+/// and emission).
+pub fn simulate_coord_gc_local_ungated(
     fork_dir: &Path,
     new_ulid: Ulid,
     n_candidates: usize,

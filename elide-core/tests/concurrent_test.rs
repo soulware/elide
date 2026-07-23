@@ -355,10 +355,10 @@ fn plan_emitted_during_inflight_apply_is_safe() {
         elide_core::segment::committed_tier_ulids(&fork_dir).unwrap(),
     );
     let p2_emitted = checkpoint2.as_ref().ok().map(|reply| {
-        // Production's planner bails while a .plan is pending; emitting
-        // anyway models the TOCTOU race where the apply's commit removes
-        // the plan file between that check and emission.
-        common::simulate_coord_gc_local(&fork_dir, reply.bucket_ulids[0], 2)
+        // Production's planner bails while a .plan is pending; the ungated
+        // variant emits anyway to model the TOCTOU race where the apply's
+        // commit removes the plan file between that check and emission.
+        common::simulate_coord_gc_local_ungated(&fork_dir, reply.bucket_ulids[0], 2)
     });
     drop(release_tx);
 
