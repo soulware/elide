@@ -1,6 +1,7 @@
 # Design: consolidating journal segments in pending/
 
-**Status:** Proposed. Builds on the disjoint journal tier
+**Status:** Implemented at the single-output default (the split path across
+several journal ULIDs is not built). Builds on the disjoint journal tier
 (`gc-journal-segregation.md`, #774/#776) and claimant-aware journal reap
 (#778), both shipped.
 
@@ -33,6 +34,19 @@ as free compaction), and collapses same-hash entries to one shared body. The
 output keeps the journal flag and stays journal-tier, so it reaps whole exactly
 as its inputs would have.
 
+The merge reuses the existing rewrite materialiser rather than a bespoke journal
+writer: the classifier already routes a superseded journal LBA to `Drop` and a
+partially-reclaimed multi-block journal write to run-sliced `Keep`s, and the
+materialiser already assembles those into an output body. The materialiser's
+guard against journal-tier input entries (a journal entry reaching a durable
+output is a tier leak) is relaxed only for this pass, behind an `allow_journal`
+flag; the pass re-tags every output entry journal before the write, so the guard
+still holds for every other rewriter and the merge stays a journal→journal
+rewrite. Because the output entries carry the journal flag, the apply path
+registers them into the disjoint `(segment, hash)` journal map and re-points each
+LBA's claimant with no journal-specific code — the same bucket apply the data
+rewrites use.
+
 ## How many output segments
 
 One journal output per tick, by default: merge the live journal entries of every
@@ -50,16 +64,18 @@ hold a position twice, which is why it needs no size cap and no wrap handling.
 Across ticks the volume still accrues one journal segment per tick, each a ring
 slice that reaps whole once the log laps past it.
 
-`journal_consolidation_ulids` (config, default 1) reserves that many output ULIDs
-at `gc_checkpoint`. Over-reserving is free — unused reserved ULIDs are discarded,
-the mint having already advanced past them. **Under-reserving is not free**: see
-the ordering invariant below. A pass that repacks data must lift *all* pending
+`JOURNAL_CONSOLIDATION_ULIDS` (a repack const, `1`) fixes how many output ULIDs
+`prepare_repack` reserves for the merge, minted after every data output ULID so
+each sorts above the data (see the invariant below). Over-reserving is free —
+unused reserved ULIDs are discarded, the mint having already advanced past them.
+**Under-reserving is not free**: a pass that repacks data must lift *all* pending
 journal above its data outputs, so the reservation must be enough to hold the
 whole live journal (one output always is, since the live set is at most one ring).
 Raising it above one splits the live ring across that many segments in ULID (ring)
 order, which only buys slightly finer reap granularity; because the surviving set
 is already one ring, there is no wrap to break across, and all of it still lands
-above the data. The split path is not the default and can land later.
+above the data. The split path is not built; the count is a const until it lands,
+at which point it becomes a config knob.
 
 ## Invariant: data stays below its journal through repack
 
@@ -81,10 +97,10 @@ implies journal-pending. So the journal to move up is always right there.
 The pass preserves the order by construction, without needing atomicity across the
 two rewrites:
 
-- `gc_checkpoint` reserves the data bucket ULIDs, then the journal ULID(s) **last**,
-  so every journal output sorts above every data output (and above everything
-  committed and pending).
-- `execute_repack` applies the **journal consolidation first**, then the data
+- `prepare_repack` mints the data output ULIDs, then the journal output ULID(s)
+  **last** (both below `u_flush`), so every journal output sorts above every data
+  output (and above everything committed and pending).
+- `execute_repack` writes the **journal consolidation first**, then the data
   buckets.
 
 At every crash point the data is either at its original low ULID or at a data
@@ -163,11 +179,11 @@ and needs no migration.
   rebuild registers it through the normal journal path and reproduces the
   consolidated state.
 - **Output ULID.** The merged segment consumes one of the journal output ULIDs
-  reserved at `gc_checkpoint` (the volume's monotonic `UlidMint::next`, via
-  `mint_gc_checkpoint_ulids`), exactly as every repack and GC output consumes a
-  reserved bucket ULID. It is above all committed and pending segments by
-  construction, so it neither collides with a live sibling nor reorders against
-  the inputs it replaces. There is no `max(inputs).increment()` step.
+  `prepare_repack` reserves (the volume's monotonic `UlidMint::next`), exactly as
+  every data repack output consumes a reserved bucket ULID. It is above all
+  committed and pending segments by construction, so it neither collides with a
+  live sibling nor reorders against the inputs it replaces. There is no
+  `max(inputs).increment()` step.
 
 ## Non-goals
 

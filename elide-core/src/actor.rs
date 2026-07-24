@@ -2350,8 +2350,6 @@ pub(crate) fn invalidate_promote_siblings(
 struct RepackCandidate {
     seg_path: PathBuf,
     seg_ulid: Ulid,
-    /// Parsed segment index, shared with the segment-index cache.
-    parsed: Arc<crate::segment_cache::ParsedIndex>,
     classifications: Vec<crate::segment_classify::EntryClassification>,
     /// Approximate live `Data + Inline` body bytes after classification.
     live_bytes: u64,
@@ -2367,6 +2365,68 @@ struct RepackCandidate {
     all_live: bool,
 }
 
+/// Translate one input segment's per-entry classifications into the
+/// `PlanOutput` records for a rewrite plan. Shared by the data bin-pack
+/// buckets and the journal-consolidation merge — both keep every live
+/// entry (whole, run-sliced, or canonicalised) and drop the dead ones.
+fn emit_plan_outputs(
+    seg_ulid: Ulid,
+    classifications: &[crate::segment_classify::EntryClassification],
+    outputs: &mut Vec<crate::rewrite_plan::PlanOutput>,
+) {
+    use crate::rewrite_plan::PlanOutput;
+    use crate::segment_classify::EntryClassification;
+
+    for (entry_idx, action) in classifications.iter().enumerate() {
+        let entry_idx = entry_idx as u32;
+        match action {
+            EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
+                input: seg_ulid,
+                entry_idx,
+            }),
+            EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
+                input: seg_ulid,
+                entry_idx,
+            }),
+            EntryClassification::ZeroSubRuns(runs) => {
+                for run in runs {
+                    outputs.push(PlanOutput::ZeroSplit {
+                        input: seg_ulid,
+                        entry_idx,
+                        start_lba: run.range_start,
+                        lba_length: (run.range_end - run.range_start) as u32,
+                    });
+                }
+            }
+            EntryClassification::PartialDeath {
+                live_runs,
+                emit_canonical,
+            } => {
+                if *emit_canonical {
+                    outputs.push(PlanOutput::Canonical {
+                        input: seg_ulid,
+                        entry_idx,
+                    });
+                }
+                for run in live_runs.iter() {
+                    outputs.push(PlanOutput::Run {
+                        input: seg_ulid,
+                        entry_idx,
+                        payload_block_offset: run.payload_block_offset,
+                        start_lba: run.range_start,
+                        lba_length: (run.range_end - run.range_start) as u32,
+                    });
+                }
+            }
+            EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
+                input: seg_ulid,
+                entry_idx,
+            }),
+            EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
+        }
+    }
+}
+
 /// Execute a repack job: classify every non-floor segment in
 /// `pending/`, then bin-pack candidates into output buckets sized to
 /// [`REPACK_TARGET_LIVE`] and [`REPACK_ENTRY_CAP`]. Each bucket
@@ -2378,6 +2438,12 @@ struct RepackCandidate {
 /// Every non-floor pending segment becomes a candidate. Single-input
 /// buckets whose only input is fully live are skipped at materialise —
 /// rewriting would be a byte-identical no-op.
+///
+/// Journal-tier segments never enter the data bin-pack: they are
+/// collected separately and merged into one journal-tagged output at the
+/// reserved (highest) ULID, so the merge stays within the disjoint
+/// journal tier and sorts above every data output. See
+/// `docs/design/journal-pending-consolidation.md`.
 pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     use crate::rewrite_apply::{self, MaterialiseCtx, MaterialiseOutcome, Materialised};
     use crate::rewrite_plan::{PlanOutput, RewritePlan};
@@ -2389,6 +2455,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         floor,
         ceiling,
         output_ulids,
+        journal_output_ulids,
         lbamap_snapshot,
         extent_index_snapshot,
         ancestor_layers,
@@ -2420,6 +2487,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     //     delete the files plus clobber any lbamap claims they made.
     //     See `docs/finding-cargo-build-stale-read.md`.
     let mut candidates: Vec<RepackCandidate> = Vec::new();
+    let mut journal_candidates: Vec<RepackCandidate> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
             .file_name()
@@ -2508,36 +2576,150 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             }
         }
 
-        // Journal segments are pool-isolated exactly as coordinator GC
-        // isolates them (`elide-coordinator::gc::select_buckets`): a journal
-        // segment is never merged into a rewrite — it reaps whole once every
-        // LBA it holds is overwritten. Pending segments are pure (formation
-        // partitions journal content into its own segment), so any
-        // journal-flagged entry means the whole segment is journal-tier. Skip
-        // it while it still holds live content; a fully-dead one (every entry
-        // classified Drop, `live_entry_count == 0`) falls through and reaps as
-        // an all-Drop bucket, carrying no journal entry into a rewrite output.
-        let is_journal_segment = entries.iter().any(|e| e.journal);
-        if is_journal_segment && live_entry_count > 0 {
-            continue;
-        }
-
         let owned_hashes: Vec<blake3::Hash> = entries
             .iter()
             .filter(|e| e.kind.owns_extent_hash())
             .map(|e| e.hash)
             .collect();
 
-        candidates.push(RepackCandidate {
+        // Journal-tier segments are collected apart from the data bin-pack
+        // and merged into one journal-tagged output below. Pending segments
+        // are pure (formation partitions journal content into its own
+        // segment), so any journal-flagged entry means the whole segment is
+        // journal-tier. Every journal segment (live or fully dead) is routed
+        // here so the merge covers all pending journal — the ordering
+        // invariant a data repack relies on (a data repack must lift all
+        // pending journal above its outputs; see the design doc).
+        let is_journal_segment = entries.iter().any(|e| e.journal);
+        let candidate = RepackCandidate {
             seg_path: seg_path.clone(),
             seg_ulid,
-            parsed,
             classifications,
             live_bytes,
             dead_bytes,
             live_entry_count,
             owned_hashes,
             all_live,
+        };
+        if is_journal_segment {
+            journal_candidates.push(candidate);
+        } else {
+            candidates.push(candidate);
+        }
+    }
+
+    let mut result_buckets: Vec<crate::volume::RepackedBucket> = Vec::new();
+
+    // Journal consolidation — merge every pending journal segment's live
+    // entries into one journal-tagged output at the reserved (highest)
+    // ULID. Runs before the data bin-pack so its segment is written first
+    // and, minted above every data output, sorts above them:
+    // data-before-journal on disk and on upload. A lone all-live journal
+    // segment is left alone — a 1→1 rewrite saves no PUT. The whole live
+    // set is at most one jbd2 ring, so it merges into one uncapped output;
+    // there is deliberately no size or entry cap here.
+    let journal_solo_no_op = journal_candidates.len() == 1 && journal_candidates[0].all_live;
+    if !journal_candidates.is_empty() && !journal_solo_no_op {
+        journal_candidates.sort_by_key(|c| c.seg_ulid);
+
+        let mut outputs: Vec<PlanOutput> = Vec::new();
+        let mut journal_inputs: Vec<crate::volume::RepackedInput> =
+            Vec::with_capacity(journal_candidates.len());
+        let mut journal_bytes_freed: u64 = 0;
+        for c in &mut journal_candidates {
+            emit_plan_outputs(c.seg_ulid, &c.classifications, &mut outputs);
+            journal_inputs.push(crate::volume::RepackedInput {
+                input_ulid: c.seg_ulid,
+                input_path: std::mem::take(&mut c.seg_path),
+                owned_hashes: std::mem::take(&mut c.owned_hashes),
+            });
+            journal_bytes_freed += c.dead_bytes;
+            stats.segments_compacted += 1;
+        }
+
+        for input in &journal_inputs {
+            invalidate_promote_siblings(&index_dir, &cache_dir, input.input_ulid)?;
+        }
+
+        let output = if outputs.is_empty() {
+            // Every journal input classified fully dead: no output segment,
+            // the inputs reap as an all-Drop bucket (apply purges their
+            // journal-map entries and queues the files for unlink).
+            None
+        } else {
+            let new_ulid = *journal_output_ulids
+                .first()
+                .ok_or_else(|| io::Error::other("repack: no reserved journal output ulid"))?;
+            let plan = RewritePlan { new_ulid, outputs };
+            let resolver = WorkerBodyResolver {
+                base_dir: &base_dir,
+                ancestor_layers: &ancestor_layers,
+                fetcher: fetcher.as_ref(),
+                extent_index: &extent_index_snapshot,
+            };
+            let plan_inputs = plan.inputs();
+            let ctx = match MaterialiseCtx::new_for_pending(
+                &base_dir,
+                &plan_inputs,
+                &extent_index_snapshot,
+                &resolver,
+            ) {
+                Ok(c) => c.allowing_journal(),
+                Err(MaterialiseOutcome::Io(e)) => return Err(e),
+                Err(MaterialiseOutcome::Cancel(e)) => {
+                    return Err(io::Error::other(format!(
+                        "journal consolidation {new_ulid}: materialise prep cancelled: {e}"
+                    )));
+                }
+            };
+            let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
+                Ok(m) => m,
+                Err(MaterialiseOutcome::Io(e)) => return Err(e),
+                Err(MaterialiseOutcome::Cancel(e)) => {
+                    return Err(io::Error::other(format!(
+                        "journal consolidation {new_ulid}: materialise cancelled: {e}"
+                    )));
+                }
+            };
+            drop(ctx);
+
+            let Materialised {
+                mut entries,
+                delta_body,
+            } = materialised;
+            // Re-tag every merged entry journal so the output registers into
+            // the disjoint `(segment, hash)` journal map, never `inner`, and
+            // reaps whole. The journal tier carries no deltas.
+            for pe in &mut entries {
+                pe.entry.journal = true;
+            }
+            debug_assert!(
+                delta_body.is_empty(),
+                "journal consolidation output must carry no delta body"
+            );
+
+            let new_ulid_str = new_ulid.to_string();
+            let final_path = pending_dir.join(&new_ulid_str);
+            let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
+            let _ = std::fs::remove_file(&tmp_path);
+            let (new_body_section_start, out_entries) =
+                segment::write_segment_full(&tmp_path, entries, &delta_body, &[], signer.as_ref())?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            segment::fsync_dir(&final_path)?;
+            stats.new_segments += 1;
+            stats.bytes_freed += journal_bytes_freed;
+
+            Some(crate::volume::RepackedOutput {
+                new_ulid,
+                new_body_section_start,
+                out_entries,
+            })
+        };
+
+        result_buckets.push(crate::volume::RepackedBucket {
+            inputs: journal_inputs,
+            output,
+            bytes_freed: journal_bytes_freed,
         });
     }
 
@@ -2577,8 +2759,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     }
 
     // Phase 3 — materialise each bucket. A bucket of one fully-live
-    // candidate is a byte-identical no-op; skip it.
-    let mut result_buckets: Vec<crate::volume::RepackedBucket> = Vec::new();
+    // candidate is a byte-identical no-op; skip it. Data buckets append
+    // after the journal bucket already pushed above.
     let mut next_output_idx: usize = 0;
     for bucket in buckets {
         let solo_no_op =
@@ -2598,60 +2780,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let mut bucket_bytes_freed: u64 = 0;
         for &i in &bucket_idxs {
             let c = &candidates[i];
-            for (entry_idx, (_entry, action)) in c
-                .parsed
-                .entries
-                .iter()
-                .zip(c.classifications.iter())
-                .enumerate()
-            {
-                let entry_idx = entry_idx as u32;
-                match action {
-                    EntryClassification::FullyLive => outputs.push(PlanOutput::Keep {
-                        input: c.seg_ulid,
-                        entry_idx,
-                    }),
-                    EntryClassification::DemoteToCanonical => outputs.push(PlanOutput::Canonical {
-                        input: c.seg_ulid,
-                        entry_idx,
-                    }),
-                    EntryClassification::ZeroSubRuns(runs) => {
-                        for run in runs {
-                            outputs.push(PlanOutput::ZeroSplit {
-                                input: c.seg_ulid,
-                                entry_idx,
-                                start_lba: run.range_start,
-                                lba_length: (run.range_end - run.range_start) as u32,
-                            });
-                        }
-                    }
-                    EntryClassification::PartialDeath {
-                        live_runs,
-                        emit_canonical,
-                    } => {
-                        if *emit_canonical {
-                            outputs.push(PlanOutput::Canonical {
-                                input: c.seg_ulid,
-                                entry_idx,
-                            });
-                        }
-                        for run in live_runs.iter() {
-                            outputs.push(PlanOutput::Run {
-                                input: c.seg_ulid,
-                                entry_idx,
-                                payload_block_offset: run.payload_block_offset,
-                                start_lba: run.range_start,
-                                lba_length: (run.range_end - run.range_start) as u32,
-                            });
-                        }
-                    }
-                    EntryClassification::DeferUnresolvableDelta => outputs.push(PlanOutput::Keep {
-                        input: c.seg_ulid,
-                        entry_idx,
-                    }),
-                    EntryClassification::DropAndRemoveHash | EntryClassification::Drop => {}
-                }
-            }
+            emit_plan_outputs(c.seg_ulid, &c.classifications, &mut outputs);
             let c = &mut candidates[i];
             bucket_inputs.push(crate::volume::RepackedInput {
                 input_ulid: c.seg_ulid,

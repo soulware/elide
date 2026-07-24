@@ -116,6 +116,12 @@ pub struct MaterialiseCtx<'a> {
     pub extent_index: &'a ExtentIndex,
     /// Resolver for locating segment bodies across self + ancestors + S3.
     pub resolver: &'a dyn BodyResolver,
+    /// Permit journal-tier input entries. Every other rewriter forbids
+    /// them (a journal entry reaching a durable output is a tier leak —
+    /// see the guard in [`input_entry`]); only the journal-consolidation
+    /// pass sets this, and it re-tags its output journal so the merge
+    /// stays a journal→journal rewrite, never a leak into the data tier.
+    allow_journal: bool,
 }
 
 /// Segment body resolution against the volume's self + ancestor dirs and an
@@ -318,13 +324,14 @@ fn input_entry<'a>(
             state.entries.len()
         )))
     })?;
-    // Journal-tier entries must reap whole, never rewrite: a journal segment
-    // never enters a compaction bucket (GC's pool routing drops the journal
-    // pool before packing), so it only ever reaches a plan as `Drop`, which
-    // does not fetch its entry here. Reaching this point means an entry that
-    // owns a `(segment, hash)` slot in the disjoint journal map is about to be
-    // materialised as durable output — a silent tier leak. Fail loud instead.
-    if entry.journal {
+    // Journal-tier entries must reap whole, never rewrite into a durable
+    // (data-tier) output: a journal entry materialised as durable output is a
+    // silent tier leak. The one sanctioned exception is the journal-
+    // consolidation pass, which sets `allow_journal` and re-tags its output
+    // journal, so the merge stays a journal→journal rewrite. Any other rewriter
+    // reaching a journal entry here is the leak this guard exists to catch —
+    // fail loud.
+    if entry.journal && !ctx.allow_journal {
         return Err(MaterialiseError::Internal(format!(
             "input {input_ulid} entry {entry_idx} is journal-tier; journal segments must reap whole, never rewrite"
         ))
@@ -837,6 +844,7 @@ impl<'a> MaterialiseCtx<'a> {
             input_states,
             extent_index,
             resolver,
+            allow_journal: false,
         })
     }
 
@@ -857,7 +865,16 @@ impl<'a> MaterialiseCtx<'a> {
             input_states,
             extent_index,
             resolver,
+            allow_journal: false,
         })
+    }
+
+    /// Permit journal-tier input entries for this materialisation. Used
+    /// only by the journal-consolidation pass, which re-tags its output
+    /// journal so the merge stays within the journal tier.
+    pub fn allowing_journal(mut self) -> Self {
+        self.allow_journal = true;
+        self
     }
 }
 
@@ -1038,6 +1055,56 @@ mod tests {
             Err(other) => panic!("expected journal-tier Internal error, got {other:?}"),
             Ok(_) => panic!("journal-tier input entry was materialised instead of rejected"),
         }
+    }
+
+    #[test]
+    fn materialise_allows_journal_input_with_flag() {
+        // The one sanctioned exception: the journal-consolidation pass sets
+        // `allow_journal`, so a `Keep` naming a journal entry materialises its
+        // body through instead of failing. The output body is byte-identical;
+        // the pass re-tags the entry journal afterward.
+        let dir = tempfile::TempDir::new().unwrap();
+        let body = vec![9u8; 4096];
+        let hash = blake3::hash(&body);
+
+        let input_ulid = Ulid::new();
+        let input_path = dir.path().join(input_ulid.to_string());
+        let mut pending = SegmentEntry::new_data(hash, 100, 1, SegmentFlags::empty(), body.clone());
+        pending.entry.journal = true;
+        segment::write_segment(&input_path, vec![pending], ephemeral_signer().as_ref()).unwrap();
+
+        let base = dir.path().join("vol");
+        fs::create_dir_all(base.join("index")).unwrap();
+        let idx = base.join("index").join(format!("{input_ulid}.idx"));
+        fs::copy(&input_path, &idx).unwrap();
+
+        let mut resolver = MockResolver {
+            files: HashMap::new(),
+            delta_files: HashMap::new(),
+        };
+        resolver.files.insert(
+            input_ulid,
+            (input_path.clone(), SegmentBodyLayout::FullSegment),
+        );
+
+        let index = ExtentIndex::default();
+        let plan = RewritePlan {
+            new_ulid: Ulid::new(),
+            outputs: vec![PlanOutput::Keep {
+                input: input_ulid,
+                entry_idx: 0,
+            }],
+        };
+
+        let inputs = plan.inputs();
+        let ctx = MaterialiseCtx::new(&base, &inputs, &index, &resolver)
+            .unwrap()
+            .allowing_journal();
+        let out = materialise_plan(&plan, &ctx).unwrap();
+        assert_eq!(out.entries.len(), 1);
+        let e = &out.entries[0];
+        assert_eq!(e.entry.hash, hash);
+        assert_eq!(e.body.as_deref(), Some(body.as_slice()));
     }
 
     #[test]
