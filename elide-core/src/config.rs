@@ -41,20 +41,13 @@ pub struct VolumeConfig {
 
 /// The derived journal window within `volume.toml` (`[journal]`).
 ///
-/// Consulted by the extent index's canonical-ownership rule before the
+/// Applied by the index rebuild to route journal entries before the
 /// filesystem is parseable.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct JournalConfig {
     /// LBA ranges of the journal (for ext4, inode 8's extents). Empty
     /// means the filesystem has no internal journal.
     pub ranges: crate::journal::JournalRanges,
-    /// First segment ULID minted after a mid-session flip of the
-    /// window. While present, journal classification applies the
-    /// window only to segments at or above this ULID, so rebuilds
-    /// during the flip session reproduce the live stamps. The next
-    /// open reclassifies uniformly and clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activation: Option<ulid::Ulid>,
 }
 
 /// ublk server configuration within `volume.toml`.
@@ -96,16 +89,12 @@ impl VolumeConfig {
         crate::segment::write_file_atomic(&dir.join(CONFIG_FILE), s.as_bytes())
     }
 
-    /// The stored journal window as a [`crate::journal::JournalWindow`],
-    /// including any live-flip activation marker. Never-derived reads
-    /// as the empty window.
-    pub fn journal_window(&self) -> crate::journal::JournalWindow {
+    /// The stored journal LBA ranges. Never-derived reads as the empty
+    /// window.
+    pub fn journal_ranges(&self) -> crate::journal::JournalRanges {
         match &self.journal {
-            Some(j) => crate::journal::JournalWindow {
-                ranges: j.ranges.clone(),
-                activation: j.activation,
-            },
-            None => crate::journal::JournalWindow::default(),
+            Some(j) => j.ranges.clone(),
+            None => crate::journal::JournalRanges::default(),
         }
     }
 
@@ -274,7 +263,6 @@ mod tests {
         let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
         cfg.journal = Some(JournalConfig {
             ranges: crate::journal::JournalRanges::new(vec![(100, 16), (300, 4)]),
-            activation: None,
         });
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
@@ -292,20 +280,6 @@ mod tests {
         cfg.write(tmp.path()).unwrap();
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         assert_eq!(cfg.journal, Some(JournalConfig::default()));
-    }
-
-    #[test]
-    fn journal_activation_roundtrips() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = VolumeConfig::read(tmp.path()).unwrap();
-        let activation = ulid::Ulid::from_parts(1234, 42);
-        cfg.journal = Some(JournalConfig {
-            ranges: crate::journal::JournalRanges::new(vec![(100, 16)]),
-            activation: Some(activation),
-        });
-        cfg.write(tmp.path()).unwrap();
-        let cfg = VolumeConfig::read(tmp.path()).unwrap();
-        assert_eq!(cfg.journal.unwrap().activation, Some(activation));
     }
 
     #[test]

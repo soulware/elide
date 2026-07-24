@@ -367,7 +367,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .collect();
     let journal = elide_core::config::VolumeConfig::read(fork_dir)
         .context("reading volume.toml for journal window")?
-        .journal_window();
+        .journal_ranges();
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
 
@@ -389,7 +389,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         &live_hashes,
         &lbamap,
         floor,
-        &journal.ranges,
+        &journal,
     )
     .context("collecting segment stats")?;
     let total_segments = all_stats.len();
@@ -2481,10 +2481,7 @@ mod tests {
             elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
                 .unwrap();
 
-        let window = elide_core::journal::JournalWindow {
-            ranges: elide_core::journal::JournalRanges::new(vec![(96, 8)]),
-            activation: None,
-        };
+        let window = elide_core::journal::JournalRanges::new(vec![(96, 8)]);
 
         let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
         // S1: wholly inside the window.
@@ -2515,16 +2512,8 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &window.ranges,
-        )
-        .unwrap();
+        let stats =
+            collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None, &window).unwrap();
         assert_eq!(stats.len(), 3);
 
         let journal: Vec<&SegmentStats> = stats
@@ -2567,10 +2556,7 @@ mod tests {
             elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
                 .unwrap();
 
-        let window = elide_core::journal::JournalWindow {
-            ranges: elide_core::journal::JournalRanges::new(vec![(96, 4)]),
-            activation: None,
-        };
+        let window = elide_core::journal::JournalRanges::new(vec![(96, 4)]);
         // Stamp the window so formation partitions the epoch into a pure
         // journal segment (the [96..100) entry) and a durable one (LBA 0),
         // exactly as production does.
@@ -2578,8 +2564,7 @@ mod tests {
         {
             let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
             cfg.journal = Some(elide_core::config::JournalConfig {
-                ranges: window.ranges.clone(),
-                activation: None,
+                ranges: window.clone(),
             });
             cfg.write(fork_dir).unwrap();
         }
@@ -2611,16 +2596,8 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &window.ranges,
-        )
-        .unwrap();
+        let stats =
+            collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None, &window).unwrap();
 
         // The segment holding the multi-block journal entry is the one under
         // test — identify it by that entry surviving as a partial-death run.

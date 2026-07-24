@@ -1028,7 +1028,6 @@ fn set_journal_ranges(base: &Path, ranges: Vec<(u64, u64)>) {
     let mut cfg = crate::config::VolumeConfig::read(base).unwrap();
     cfg.journal = Some(crate::config::JournalConfig {
         ranges: crate::journal::JournalRanges::new(ranges),
-        activation: None,
     });
     cfg.write(base).unwrap();
 }
@@ -1083,14 +1082,11 @@ fn format_mid_session_flips_window_at_promote_take() {
         .expect("window derived at take");
     let ranges = jcfg.ranges;
     assert_eq!(ranges.as_slice(), &[(40, 8), (56, 4)]);
-    let activation = jcfg.activation.expect("activation marker persisted");
-    assert_eq!(vol.journal.activation, Some(activation));
-    assert_eq!(vol.journal.ranges, ranges);
+    assert_eq!(vol.journal, ranges);
 
-    let _ = activation;
     // The pre-flip window write happened before the window was derived
     // (ranges were empty), so its persisted flag is clear: it lives in the
-    // durable tier as the pre-activation residue, resolvable through `inner`.
+    // durable tier as pre-derivation residue, resolvable through `inner`.
     let pre_hash = blake3::hash(&pre_flip);
     assert!(
         vol.extent_index.lookup(&pre_hash).is_some(),
@@ -1113,7 +1109,7 @@ fn format_mid_session_flips_window_at_promote_take() {
     assert_eq!(vol.read(40, 1).unwrap(), pre_flip);
 
     // Reopen: the persisted flags drive routing, so the tiers are
-    // reproduced exactly — no reclassification of the pre-activation write.
+    // reproduced exactly — no reclassification of the pre-derivation write.
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
     assert!(
@@ -1163,12 +1159,12 @@ fn reformat_away_from_ext4_clears_stored_window() {
     // The clearing session keeps the set its rebuild used and does not
     // resume polling.
     assert!(vol.journal_derived);
-    assert!(!vol.journal.ranges.is_empty());
+    assert!(!vol.journal.is_empty());
 
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
     assert!(!vol.journal_derived, "next open starts never-derived");
-    assert!(vol.journal.ranges.is_empty());
+    assert!(vol.journal.is_empty());
 
     fs::remove_dir_all(base).unwrap();
 }
@@ -1284,9 +1280,8 @@ fn derived_empty_window_persists_and_stops_polling() {
         .journal
         .expect("authoritative empty answer must persist as derived");
     assert!(jcfg.ranges.is_empty());
-    assert_eq!(jcfg.activation, None);
     assert!(vol.journal_derived);
-    assert!(vol.journal.ranges.is_empty());
+    assert!(vol.journal.is_empty());
 
     fs::remove_dir_all(base).unwrap();
 }

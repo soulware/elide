@@ -28,7 +28,6 @@ fn set_journal_window(fork_dir: &Path, ranges: Vec<(u64, u64)>) {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(ranges),
-        activation: None,
     });
     cfg.write(fork_dir).unwrap();
 }

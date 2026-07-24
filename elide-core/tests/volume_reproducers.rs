@@ -662,7 +662,6 @@ fn gc_apply_double_fold_serialized_by_pending_gate() {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
-        activation: None,
     });
     cfg.write(fork_dir).unwrap();
 
@@ -728,7 +727,6 @@ fn gc_stale_plan_double_fold_blocked_by_pending_gate() {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
-        activation: None,
     });
     cfg.write(fork_dir).unwrap();
 
@@ -798,7 +796,6 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
-        activation: None,
     });
     cfg.write(fork_dir).unwrap();
 
