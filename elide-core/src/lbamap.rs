@@ -1043,6 +1043,7 @@ mod tests {
             inline: None,
             delta_options: Vec::new(),
             journal: false,
+            sketch: None,
         }
     }
 
