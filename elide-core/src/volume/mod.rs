@@ -2381,6 +2381,41 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, _caller: &'static str) {}
 
+    /// Stress-only invariant: the in-memory `own_segments` set equals the
+    /// committed tier a fresh disk scan produces (`index/*.idx` ∪ bare
+    /// `gc/`). A drift here is what trips the coordinator's gc own-segment
+    /// divergence check and wedges plan emission.
+    ///
+    /// Checked at the end of `finalize_gc_handoff` only, not in the
+    /// per-mutation umbrella. Equality holds solely when every committed-tier
+    /// disk mutation has flowed through this volume: the coordinator's own
+    /// divergence check tolerates a transient mismatch across the
+    /// volume/coordinator process boundary, and the reproducer harness plants
+    /// committed-tier files directly (`populate_cache`,
+    /// `simulate_coord_gc_local`), so a fresh scan legitimately diverges
+    /// mid-sequence. Finalize is where the leak the fix closes is born — a
+    /// zero-entry tombstone dropped from disk but left in the set — so the
+    /// check belongs there, matching the per-handoff granularity at which the
+    /// coordinator validates the set in production.
+    #[cfg(feature = "volume-invariants")]
+    pub(in crate::volume) fn assert_own_segments_match_disk(&self, caller: &'static str) {
+        let disk = segment::committed_tier_ulids(&self.base_dir)
+            .expect("committed_tier_ulids scan for own_segments invariant");
+        if self.own_segments != disk {
+            let extra: Vec<Ulid> = self.own_segments.difference(&disk).copied().collect();
+            let missing: Vec<Ulid> = disk.difference(&self.own_segments).copied().collect();
+            panic!(
+                "own_segments invariant violation after [{caller}]: in-memory set diverged \
+                 from the committed tier on disk; in-memory-only={extra:?} disk-only={missing:?}"
+            );
+        }
+    }
+
+    /// No-op stub when `volume-invariants` feature is disabled.
+    #[cfg(not(feature = "volume-invariants"))]
+    #[inline]
+    pub(in crate::volume) fn assert_own_segments_match_disk(&self, _caller: &'static str) {}
+
     /// Umbrella over every `assert_*` runtime invariant. Call this at
     /// the end of each structural state-mutating method instead of the
     /// individual asserts — adding a new invariant only requires
@@ -2692,6 +2727,23 @@ impl Volume {
         // Best-effort cleanup of any stray `.plan` sibling left over from
         // a crash between the bare rename and `.plan` removal.
         let _ = fs::remove_file(gc_dir.join(format!("{ulid}.plan")));
+        // A zero-entry (tombstone) handoff is never promoted to `index/`
+        // (it carries no body to upload), so the bare `gc/<ulid>` deleted
+        // above was its only committed-tier file. Its `promote_segment`
+        // still inserted it into `own_segments`, so drop it now or the set
+        // keeps a member no disk scan can see — the off-by-one that wedges
+        // the gc own-segment divergence check. A live output has an
+        // `index/<ulid>.idx` from its promote and must stay.
+        if !self
+            .base_dir
+            .join("index")
+            .join(format!("{ulid}.idx"))
+            .exists()
+        {
+            self.own_segments.remove(&ulid);
+        }
+        self.assert_volume_invariants("finalize_gc_handoff");
+        self.assert_own_segments_match_disk("finalize_gc_handoff");
         Ok(())
     }
 

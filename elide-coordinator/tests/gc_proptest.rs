@@ -1208,6 +1208,121 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     );
 }
 
+/// Deterministic reproducer for the #767 zero-entry (all-drop) tombstone
+/// handoff at the coordinator layer. A fully-superseded committed segment
+/// folds into a tombstone-only bucket, so `gc_fork` emits a zero-entry
+/// output: `apply_gc_handoffs` writes only the bare `gc/<new>` (no
+/// `index/<new>.idx`), `promote_segment` inserts it into the volume's
+/// in-memory committed set via the tombstone shortcut, and
+/// `finalize_gc_handoff` deletes the bare marker — and must also drop the
+/// output from that set, or it keeps a member no disk scan can see, the
+/// divergence that wedged gc every tick on the pg3 soak. The guard is
+/// `assert_own_segments_match_disk`, which fires inside
+/// `finalize_gc_handoff` under `volume-invariants` (this binary's CI
+/// feature). The randomized `gc_segment_cleanup`/`gc_oracle` passes drive
+/// finalize but never manufacture a pure all-drop tombstone, so this pins
+/// the case.
+#[test]
+fn gc_tombstone_finalize_keeps_own_segments_consistent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    write_keypair_and_provenance(fork_dir);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = GcConfig {
+        density_threshold: 0.0,
+        interval: Duration::ZERO,
+        ..GcConfig::default()
+    };
+    let index_dir = fork_dir.join("index");
+    let gc_dir = fork_dir.join("gc");
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .unwrap();
+
+    // A and B: small single-LBA writes to the same block, each its own
+    // committed segment. B supersedes A.
+    vol.write(0, &[0xA1u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    simulate_upload(&mut vol, fork_dir);
+    vol.write(0, &[0xB2u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+    simulate_upload(&mut vol, fork_dir);
+
+    // C: a large fully-live write covering LBA 0 (superseding B) plus
+    // enough further blocks to clear SWEEP_SMALL_THRESHOLD (16 MiB). Being
+    // large, dense, and free of dead bytes, C is not an eligible rewrite
+    // candidate, so gc opens no stable bucket — the only remaining work is
+    // the two now-dead segments A and B, which pool into a tombstone-only
+    // bucket and produce a pure zero-entry output.
+    let big = vec![0xC3u8; 4097 * 4096];
+    vol.write(0, &big).unwrap();
+    vol.flush_wal().unwrap();
+    simulate_upload(&mut vol, fork_dir);
+
+    let idx_before = list_dir(&index_dir);
+    assert_eq!(
+        idx_before.iter().filter(|n| n.ends_with(".idx")).count(),
+        3,
+        "three committed segments before the sweep: [{}]",
+        idx_before.join(", "),
+    );
+
+    // GcSweep: A and B pool into a single all-drop (zero-entry) tombstone
+    // bucket; C is left for retention.
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    let stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    assert_eq!(
+        stats.candidates, 2,
+        "only the two dead segments pool as candidates; the large live C is retained"
+    );
+    vol.apply_gc_handoffs().unwrap();
+    let gc_contents: Vec<String> = list_dir(&gc_dir);
+
+    // A zero-entry output is the tombstone. Read each bare gc segment and
+    // keep only the ones whose body carries no entries — the carried
+    // (Keep-bearing) output has entries and later promotes to an
+    // `index/<new>.idx`, so filtering on entry count is what distinguishes
+    // the two, not the pre-promote absence of an `.idx`.
+    let tombstones: Vec<ulid::Ulid> = gc_contents
+        .iter()
+        .filter(|n| !n.contains('.'))
+        .filter_map(|n| ulid::Ulid::from_string(n).ok())
+        .filter(|u| {
+            elide_core::segment::read_and_verify_segment_index(&gc_dir.join(u.to_string()), &vk)
+                .map(|(_, entries, _)| entries.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "expected exactly one zero-entry tombstone output, gc/ = [{}]",
+        gc_contents.join(", "),
+    );
+
+    // promote_segment (tombstone shortcut inserts the output into the
+    // volume's in-memory committed set) then finalize_gc_handoff (deletes
+    // the bare marker and must drop the output from that set). The
+    // own_segments invariant inside finalize is the guard under test.
+    promote_gc_outputs(&mut vol, fork_dir);
+    let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
+
+    assert!(
+        list_dir(&gc_dir).iter().all(|n| n.contains('.')),
+        "finalize must delete every bare gc marker, left: [{}]",
+        list_dir(&gc_dir).join(", "),
+    );
+
+    // A fresh open must rebuild the identical committed tier from disk.
+    drop(vol);
+    let _vol = Volume::open(fork_dir, fork_dir).unwrap();
+}
+
 fn list_dir(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .map(|d| {
