@@ -73,8 +73,9 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     print_node(&node, latest_snap_str.as_deref());
     print_ancestor_nodes(&ancestors);
 
+    let journal_window_blocks = cfg.journal_window().ranges.lba_count();
     let t = totals(&node, &ancestors);
-    print_totals(&t, &pending_summary(dir)?);
+    print_totals(&t, &pending_summary(dir)?, journal_window_blocks);
 
     Ok(())
 }
@@ -160,6 +161,10 @@ struct CacheInfo {
     idx_file_bytes: u64,
     /// Actual disk blocks occupied by the .body sparse file.
     body_bytes_cached: u64,
+    /// Sum of `lba_length` over journal-tier entries (`SegmentEntry::journal`).
+    journal_blocks: u64,
+    /// Every entry is journal-tier — a pure journal segment.
+    is_journal: bool,
     error: Option<String>,
 }
 
@@ -183,6 +188,8 @@ struct SegInfo {
     dedup_ref_count: usize,
     delta_count: usize,
     delta_body_bytes: u64,
+    journal_blocks: u64,
+    is_journal: bool,
     error: Option<String>,
 }
 
@@ -281,7 +288,7 @@ fn read_origin(fork_dir: &Path) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-fn print_totals(t: &Totals, p: &PendingSummary) {
+fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
     println!();
     if t.cache_files > 0 {
         let pct = if t.cache_data > 0 {
@@ -319,6 +326,26 @@ fn print_totals(t: &Totals, p: &PendingSummary) {
             "  delta:   {} ({})",
             fmt_commas(t.cache_delta as u64),
             fmt_size(t.cache_delta_body),
+        );
+    }
+    let journal_segs = t.journal_segs_committed + t.journal_segs_pending;
+    let data_segs = t.data_segs_committed + t.data_segs_pending;
+    if journal_window_blocks > 0 && journal_segs + data_segs > 0 {
+        println!(
+            "  journal: {} seg{}, {} blocks / {} window   ({} committed, {} pending)",
+            fmt_commas(journal_segs as u64),
+            if journal_segs == 1 { "" } else { "s" },
+            fmt_commas(t.journal_blocks_committed + t.journal_blocks_pending),
+            fmt_commas(journal_window_blocks),
+            fmt_commas(t.journal_segs_committed as u64),
+            fmt_commas(t.journal_segs_pending as u64),
+        );
+        println!(
+            "  data:    {} seg{}   ({} committed, {} pending)",
+            fmt_commas(data_segs as u64),
+            if data_segs == 1 { "" } else { "s" },
+            fmt_commas(t.data_segs_committed as u64),
+            fmt_commas(t.data_segs_pending as u64),
         );
     }
     if t.wal_files > 0 || t.seg_entries > 0 {
@@ -422,6 +449,13 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         .map(|e| e.stored_length as u64)
                         .sum();
                     let lba_blocks: u64 = entries.iter().map(|e| e.lba_length as u64).sum();
+                    let journal_blocks: u64 = entries
+                        .iter()
+                        .filter(|e| e.journal)
+                        .map(|e| e.lba_length as u64)
+                        .sum();
+                    let journal_entries = entries.iter().filter(|e| e.journal).count();
+                    let is_journal = !entries.is_empty() && journal_entries == entries.len();
                     let delta_body_bytes = segment::read_segment_layout(&path)
                         .map(|l| l.delta_length as u64)
                         .unwrap_or(0);
@@ -434,6 +468,8 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         dedup_ref_count,
                         delta_count,
                         delta_body_bytes,
+                        journal_blocks,
+                        is_journal,
                         error: None,
                     }
                 }
@@ -446,6 +482,8 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                     dedup_ref_count: 0,
                     delta_count: 0,
                     delta_body_bytes: 0,
+                    journal_blocks: 0,
+                    is_journal: false,
                     error: Some(e.to_string()),
                 },
             }
@@ -499,6 +537,8 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 delta_body_bytes: 0,
                 idx_file_bytes: 0,
                 body_bytes_cached: 0,
+                journal_blocks: 0,
+                is_journal: false,
                 error: Some(e.to_string()),
             }),
         }
@@ -535,6 +575,14 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         }
     }
     let _ = canonical_count;
+
+    let journal_blocks: u64 = entries
+        .iter()
+        .filter(|e| e.journal)
+        .map(|e| e.lba_length as u64)
+        .sum();
+    let journal_entries = entries.iter().filter(|e| e.journal).count();
+    let is_journal = !entries.is_empty() && journal_entries == entries.len();
 
     // `promote_to_cache` sets `.present` bits only for Data entries, so the
     // set-bit count is exactly the number of Data entries with bodies cached
@@ -579,6 +627,8 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         delta_body_bytes,
         idx_file_bytes,
         body_bytes_cached,
+        journal_blocks,
+        is_journal,
         error: None,
     })
 }
@@ -602,6 +652,17 @@ struct Totals {
     cache_delta_body: u64,
     cache_idx_file_bytes: u64,
     cache_body_actual: u64,
+    // Journal tier, scoped to this volume's own node (committed index/ +
+    // pending/), not ancestors — mirrors the coordinator's per-fork census.
+    // These are stored counts by the `journal` entry flag, so they include
+    // pending segments (which the gc census cannot see) and any superseded
+    // segments still inside their reap retention window.
+    journal_segs_committed: usize,
+    journal_blocks_committed: u64,
+    data_segs_committed: usize,
+    journal_segs_pending: usize,
+    journal_blocks_pending: u64,
+    data_segs_pending: usize,
 }
 
 fn totals(node: &NodeInfo, ancestors: &[AncestorNode]) -> Totals {
@@ -621,6 +682,20 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
     for s in node.pending.iter() {
         t.seg_entries += s.entry_count;
         t.body_bytes += s.body_bytes;
+        if s.is_journal {
+            t.journal_segs_pending += 1;
+        } else {
+            t.data_segs_pending += 1;
+        }
+        t.journal_blocks_pending += s.journal_blocks;
+    }
+    for f in &node.cache {
+        if f.is_journal {
+            t.journal_segs_committed += 1;
+        } else {
+            t.data_segs_committed += 1;
+        }
+        t.journal_blocks_committed += f.journal_blocks;
     }
     accumulate_cache(&node.cache, t);
 }
@@ -755,6 +830,11 @@ fn print_wal_section(
     }
 }
 
+/// Marker appended after a segment ULID when every entry is journal-tier.
+fn journal_tag(is_journal: bool) -> &'static str {
+    if is_journal { "  [journal]" } else { "" }
+}
+
 fn print_seg_section(
     label: &str,
     segs: &[SegInfo],
@@ -796,8 +876,9 @@ fn print_seg_section(
             String::new()
         };
         println!(
-            "{p}{}  {}  {} entries, {} body, {} LBA blocks{}{}{}",
+            "{p}{}{}  {}  {} entries, {} body, {} LBA blocks{}{}{}",
             s.ulid,
+            journal_tag(s.is_journal),
             fmt_size(s.file_size),
             s.entry_count,
             fmt_size(s.body_bytes),
@@ -837,7 +918,12 @@ fn print_cache_section(
             "0%".to_owned()
         };
         let indent = format!("{p}  ");
-        println!("{p}{}{}", f.ulid, post_snap_tag(&f.ulid, latest_snap),);
+        println!(
+            "{p}{}{}{}",
+            f.ulid,
+            journal_tag(f.is_journal),
+            post_snap_tag(&f.ulid, latest_snap),
+        );
         println!(
             "{indent}index:   {} ({})  (dedup {}, inline {}, zero {})",
             fmt_commas(f.entry_count as u64),
@@ -959,6 +1045,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pending_summary(&tmp).unwrap().total_bytes(), 0);
+
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn journal_segments_flagged_and_blocks_summed() {
+        use elide_core::segment::{self, SegmentEntry, SegmentFlags};
+        use ulid::Ulid;
+
+        let tmp = temp_vol_dir();
+        let pending = tmp.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+        let body = |blocks: usize| vec![0u8; blocks * 4096];
+
+        // Pure journal segment: two journal-tier entries, 2 + 3 = 5 blocks.
+        let ju = Ulid::new();
+        let mut j0 =
+            SegmentEntry::new_data(blake3::hash(b"j0"), 100, 2, SegmentFlags::empty(), body(2));
+        j0.entry.journal = true;
+        let mut j1 =
+            SegmentEntry::new_data(blake3::hash(b"j1"), 102, 3, SegmentFlags::empty(), body(3));
+        j1.entry.journal = true;
+        segment::write_segment(&pending.join(ju.to_string()), vec![j0, j1], signer.as_ref())
+            .unwrap();
+
+        // Pure data segment: no journal entries.
+        let du = Ulid::new();
+        let d0 = SegmentEntry::new_data(blake3::hash(b"d0"), 0, 4, SegmentFlags::empty(), body(4));
+        segment::write_segment(&pending.join(du.to_string()), vec![d0], signer.as_ref()).unwrap();
+
+        // Mixed segment: one journal entry (3 blocks) beside a data entry. Not a
+        // pure journal segment, but its journal blocks still count.
+        let mu = Ulid::new();
+        let mut m0 =
+            SegmentEntry::new_data(blake3::hash(b"m0"), 200, 3, SegmentFlags::empty(), body(3));
+        m0.entry.journal = true;
+        let m1 =
+            SegmentEntry::new_data(blake3::hash(b"m1"), 203, 1, SegmentFlags::empty(), body(1));
+        segment::write_segment(&pending.join(mu.to_string()), vec![m0, m1], signer.as_ref())
+            .unwrap();
+
+        let infos = collect_seg_dir(&pending).unwrap();
+        let get = |u: Ulid| {
+            infos
+                .iter()
+                .find(|s| s.ulid == u.to_string())
+                .expect("segment present")
+        };
+
+        let j = get(ju);
+        assert!(j.is_journal, "all-journal segment is flagged journal");
+        assert_eq!(j.journal_blocks, 5);
+
+        let d = get(du);
+        assert!(!d.is_journal);
+        assert_eq!(d.journal_blocks, 0);
+
+        let m = get(mu);
+        assert!(
+            !m.is_journal,
+            "a segment mixing journal and data entries is not a pure journal segment"
+        );
+        assert_eq!(
+            m.journal_blocks, 3,
+            "journal_blocks counts only journal-tier entries"
+        );
 
         fs::remove_dir_all(tmp).unwrap();
     }
