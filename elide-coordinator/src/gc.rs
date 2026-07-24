@@ -229,7 +229,6 @@ pub fn gc_fork(
 
     let gc_dir = fork_dir.join("gc");
     if has_pending_results(&gc_dir)? {
-        log_journal_census_deferred(fork_dir);
         return Ok(GcStats::none(NoneReason::PendingHandoffs, 0));
     }
 
@@ -247,10 +246,6 @@ pub fn gc_fork(
     let pass = load_pass_state(fork_dir, by_id_dir)?;
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
-
-    // Census the whole eligible population, before residency narrows it to
-    // what this pass can act on.
-    log_journal_census(fork_label(fork_dir), &pass.eligible_stats, &pass.journal);
 
     // Cache-residency filter: drop candidates whose bodies aren't fully
     // resolvable from local cache. Cold candidates wait for organic
@@ -351,7 +346,6 @@ struct PassState {
     live_hashes: HashSet<blake3::Hash>,
     total_segments: usize,
     deferred_count: usize,
-    journal: elide_core::journal::JournalRanges,
 }
 
 fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
@@ -424,7 +418,6 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         live_hashes,
         total_segments,
         deferred_count,
-        journal: journal.ranges,
     })
 }
 
@@ -434,92 +427,6 @@ struct PackedBucket {
     candidates: usize,
     bytes_freed: u64,
     dead_cleaned: usize,
-}
-
-/// Census of the journal pool, emitted once per pass.
-///
-/// GC never rewrites a journal segment, so the only thing that removes one
-/// is the filesystem overwriting every journal LBA it holds. Whether that
-/// settles at a bounded population, and how long the oldest segment
-/// lingers once writing stops, is what decides whether the pool ever needs
-/// a compaction trigger. `mixed` counts stable-pool segments still holding
-/// journal content, so the migration backlog is visible draining to zero,
-/// and `tombstones` is the reap path those segments leave by.
-/// Short identifier for a fork in log lines: the fork directory's basename,
-/// which is the volume ULID. Distinguishes per-volume census output when a
-/// coordinator hosts several volumes (map ULID to name with `elide volume list`).
-fn fork_label(fork_dir: &Path) -> &str {
-    fork_dir.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-}
-
-/// Compact census marker for a pass that defers on pending handoffs. The full
-/// census needs `load_pass_state`, which the defer skips — but a busy volume
-/// defers on nearly every tick, so without a line here it disappears from the
-/// census log exactly when it is most active. Journal volumes only.
-fn log_journal_census_deferred(fork_dir: &Path) {
-    let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) else {
-        return;
-    };
-    if cfg.journal_window().ranges.is_empty() {
-        return;
-    }
-    tracing::info!(
-        "[gc {}] journal census: deferred (pending handoffs)",
-        fork_label(fork_dir)
-    );
-}
-
-fn log_journal_census(
-    fork: &str,
-    stats: &[SegmentStats],
-    journal: &elide_core::journal::JournalRanges,
-) {
-    if journal.is_empty() {
-        return;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let pool: Vec<&SegmentStats> = stats
-        .iter()
-        .filter(|s| s.pool == SegmentPool::Journal)
-        .collect();
-    let stable = stats
-        .iter()
-        .filter(|s| s.pool == SegmentPool::Stable)
-        .count();
-    let tombstones = stats
-        .iter()
-        .filter(|s| s.pool == SegmentPool::Tombstone)
-        .count();
-    let pool_blocks: u64 = pool.iter().map(|s| s.journal_blocks).sum();
-    let mixed: Vec<&SegmentStats> = stats
-        .iter()
-        .filter(|s| s.pool == SegmentPool::Stable && s.journal_blocks > 0)
-        .collect();
-    let mixed_blocks: u64 = mixed.iter().map(|s| s.journal_blocks).sum();
-    let window_blocks = journal.lba_count();
-
-    // Age of the oldest segment the pool is holding. A population that
-    // churns keeps this near the wrap interval; one that has stalled lets
-    // it climb without bound.
-    let oldest_age_s = pool
-        .iter()
-        .filter_map(|s| Ulid::from_string(&s.ulid_str).ok())
-        .map(|u| u.timestamp_ms())
-        .min()
-        .map(|ms| now_ms.saturating_sub(ms) / 1000);
-
-    tracing::info!(
-        "[gc {fork}] journal census: journal={} journal_blocks={pool_blocks}/{window_blocks} \
-         oldest_age_s={} stable={stable} mixed={} mixed_blocks={mixed_blocks} \
-         tombstones={tombstones}",
-        pool.len(),
-        oldest_age_s.map_or_else(|| "-".to_owned(), |s| s.to_string()),
-        mixed.len(),
-    );
 }
 
 /// Which pool a candidate belongs to. Total over every segment
@@ -1019,11 +926,6 @@ struct SegmentStats {
     /// Which pool this segment packs in. Assigned once, here, so no later
     /// stage re-derives it from entry counts.
     pool: SegmentPool,
-    /// Blocks claimed by live entries that fall in the journal window. Zero
-    /// for a pure stable segment; every claimed block for a journal one.
-    /// A stable segment with a non-zero count is a mixed segment awaiting
-    /// migration, so the census tracks the backlog draining.
-    journal_blocks: u64,
 }
 
 impl SegmentStats {
@@ -1414,16 +1316,10 @@ fn collect_stats(
         } else {
             SegmentPool::Stable
         };
-        let journal_blocks: u64 = live_entries
-            .iter()
-            .filter(|e| journal.owns_entry(e))
-            .map(|e| e.lba_length as u64)
-            .sum();
 
         result.push(SegmentStats {
             ulid_str,
             pool,
-            journal_blocks,
             has_body_entries: physical_body_bytes > 0 || has_inline,
             live_lba_bytes,
             materialised_bytes,
@@ -1856,7 +1752,6 @@ mod tests {
             } else {
                 SegmentPool::Stable
             },
-            journal_blocks: 0,
         }
     }
 
@@ -2014,7 +1909,6 @@ mod tests {
             partial_death_runs: vec![None; n],
             has_partial_death: false,
             pool: SegmentPool::Stable,
-            journal_blocks: 0,
         };
 
         let buckets = select_buckets(vec![stats], &make_config(0.70), 4);
@@ -2117,7 +2011,6 @@ mod tests {
             partial_death_runs: vec![None],
             has_partial_death: false,
             pool: SegmentPool::Stable,
-            journal_blocks: 0,
         };
         assert!(is_cache_resident(&cache, &stats));
     }
