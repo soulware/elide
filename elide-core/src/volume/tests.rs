@@ -3459,6 +3459,95 @@ fn gc_staged_handoff_applies_and_commits_bare() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Stage an all-drop (tombstone) GC handoff over `old_ulid` — the shape
+/// the coordinator emits when a bucket's inputs are all dead (`drop=N`,
+/// no carried entries). Mirrors `simulate_coord_gc_staged` but every
+/// output is a `Drop`, so the applied output is a zero-entry segment
+/// whose only job is to record + consume the inputs. Such an output is
+/// never uploaded or promoted to `index/` (#767); the coordinator
+/// finalizes it straight from its bare `gc/<new>` file.
+fn simulate_coord_gc_tombstone(vol: &mut Volume, fork_dir: &Path, old_ulid: &str) -> String {
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+
+    let new_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let new_ulid_str = new_ulid.to_string();
+
+    let gc_dir = fork_dir.join("gc");
+    fs::create_dir_all(&gc_dir).unwrap();
+
+    let old_ulid_parsed = Ulid::from_string(old_ulid).unwrap();
+    let plan = RewritePlan {
+        new_ulid,
+        outputs: vec![PlanOutput::Drop {
+            input: old_ulid_parsed,
+        }],
+    };
+    let plan_path = gc_dir.join(format!("{new_ulid_str}.plan"));
+    plan.write_atomic(&plan_path).unwrap();
+
+    new_ulid_str
+}
+
+#[test]
+fn zero_entry_handoff_finalize_keeps_own_segments_consistent() {
+    // Regression for the #767 zero-entry (tombstone) handoff lifecycle.
+    // An all-drop handoff is never promoted to `index/`, so its only
+    // committed-tier file is the bare `gc/<new>`. `promote_segment` inserts
+    // the output into `own_segments` (tombstone shortcut) and consumes the
+    // inputs; `finalize_gc_handoff` then deletes the bare file. Finalize
+    // must therefore also drop the output from `own_segments` — otherwise
+    // the set keeps a member no disk scan can see, the exact off-by-one
+    // that wedged the gc own-segment divergence check every tick in the
+    // pg3 soak.
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // One committed segment, then overwrite its LBA so it is fully dead —
+    // the shape the coordinator reaps as an all-drop tombstone.
+    let data_a: Vec<u8> = (0..8192).map(|i| (i * 7 + 13) as u8).collect();
+    let data_b: Vec<u8> = (0..8192).map(|i| (i * 11 + 3) as u8).collect();
+    vol.write(0, &data_a).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    let old_ulid = *vol.own_segments.iter().next().unwrap();
+
+    vol.write(0, &data_b).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    assert!(
+        vol.own_segments.contains(&old_ulid),
+        "the superseded input is still committed until the tombstone reaps it"
+    );
+
+    let new_ulid_str = simulate_coord_gc_tombstone(&mut vol, &base, &old_ulid.to_string());
+    let new_ulid = Ulid::from_string(&new_ulid_str).unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    vol.promote_segment(new_ulid).unwrap();
+    assert!(
+        !vol.own_segments.contains(&old_ulid),
+        "the tombstone consumes its dead input"
+    );
+    vol.finalize_gc_handoff(new_ulid).unwrap();
+
+    // own_segments must equal the committed tier a fresh disk scan sees.
+    let disk: std::collections::BTreeSet<Ulid> = segment::committed_tier_ulids(&base).unwrap();
+    assert!(
+        !vol.own_segments.contains(&new_ulid),
+        "the tombstone output has no committed file and must not linger in own_segments"
+    );
+    assert_eq!(
+        vol.own_segments, disk,
+        "own_segments must match the committed tier after a tombstone finalize"
+    );
+
+    // A fresh open rebuilds the identical set from disk.
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.own_segments, disk);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// Write a `gc/<new>.plan` keeping every entry of each input, like
 /// `simulate_coord_gc_staged` but over multiple inputs — the shape the
 /// coordinator emits when a bucket folds several segments.

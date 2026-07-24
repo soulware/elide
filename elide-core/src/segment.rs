@@ -1353,6 +1353,8 @@ pub fn read_and_verify_segment_index(
 pub struct SegmentLayoutInfo {
     /// Absolute file offset of the body section.
     pub body_section_start: u64,
+    /// Byte length of the inline section (may be zero).
+    pub inline_length: u32,
     /// Byte length of the body section (sum of DATA `stored_length`).
     pub body_length: u64,
     /// Byte length of the delta body section (may be zero).
@@ -1375,6 +1377,7 @@ pub fn read_segment_layout(path: &Path) -> io::Result<SegmentLayoutInfo> {
         .map_err(|_| io::Error::other("segment header size mismatch"))?;
     Ok(SegmentLayoutInfo {
         body_section_start,
+        inline_length: h.inline_length.get(),
         body_length: h.body_length.get(),
         delta_length: h.delta_length.get(),
     })
