@@ -319,15 +319,21 @@ pub struct ExtentIndex {
     /// hash of the bytes *after* decompression). Separate from
     /// `inner` so the hot-path DATA lookup stays untouched.
     deltas: Blake3HamtMap<DeltaLocation>,
-    /// Journal-tier bodies, keyed by `(segment, hash)` — a disjoint
-    /// tier from `inner`. Journal content is stored as-is and never
-    /// deduped across segments, so a single hash may have a distinct
-    /// body per journal segment; the segment component keeps them
-    /// separate. A journal-window LBA resolves here via its lbamap
-    /// claimant, never through `inner`, so durable content and journal
-    /// content never reference each other's bodies and a journal
-    /// segment reaps whole. See `docs/design/gc-journal-segregation.md`.
-    journal: imbl::HashMap<(Ulid, blake3::Hash), ExtentLocation>,
+    /// Journal-tier bodies, a disjoint tier from `inner`, grouped by
+    /// segment and then by hash. Journal content is stored as-is and never
+    /// deduped across segments, so a single hash may have a distinct body
+    /// per journal segment; the outer segment key keeps them separate. A
+    /// journal-window LBA resolves here via its lbamap claimant, never
+    /// through `inner`, so durable content and journal content never
+    /// reference each other's bodies and a journal segment reaps whole.
+    ///
+    /// The two-level shape keeps the segment-scoped operations cheap:
+    /// purging a reaped segment is one outer `remove`, promoting a segment
+    /// into cache touches only its own submap, and consolidation drops
+    /// consumed inputs wholesale — none of them scan the whole tier. An
+    /// empty submap is always removed, so [`journal_is_empty`](Self::journal_is_empty)
+    /// stays a single outer check. See `docs/design/gc-journal-segregation.md`.
+    journal: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, ExtentLocation>>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -403,7 +409,7 @@ impl ExtentIndex {
     /// claimant segment. Returns `None` for durable hashes (they live in
     /// [`inner`](Self::lookup)).
     pub fn lookup_journal(&self, segment: Ulid, hash: &blake3::Hash) -> Option<&ExtentLocation> {
-        self.journal.get(&(segment, *hash))
+        self.journal.get(&segment).and_then(|seg| seg.get(hash))
     }
 
     /// Insert a journal-tier body under `(segment, hash)`, keeping the
@@ -417,13 +423,26 @@ impl ExtentIndex {
         location: ExtentLocation,
     ) -> bool {
         use imbl::hashmap::Entry;
-        match self.journal.entry((segment, hash)) {
+        let seg = self.journal.entry(segment).or_default();
+        match seg.entry(hash) {
             Entry::Vacant(v) => {
                 v.insert(location);
                 true
             }
             Entry::Occupied(_) => false,
         }
+    }
+
+    /// Remove `(from, hash)` from the journal tier, dropping `from`'s submap
+    /// if it empties so the outer map holds no empty segments. Returns the
+    /// location that was removed, or `None` when `(from, hash)` is absent.
+    fn take_journal(&mut self, from: Ulid, hash: &blake3::Hash) -> Option<ExtentLocation> {
+        let seg = self.journal.get_mut(&from)?;
+        let removed = seg.remove(hash);
+        if seg.is_empty() {
+            self.journal.remove(&from);
+        }
+        removed
     }
 
     /// Re-key a journal body from `(from, hash)` to `(to, hash)`, applied
@@ -439,8 +458,8 @@ impl ExtentIndex {
         hash: blake3::Hash,
         location: ExtentLocation,
     ) {
-        if self.journal.remove(&(from, hash)).is_some() {
-            self.journal.insert((to, hash), location);
+        if self.take_journal(from, &hash).is_some() {
+            self.journal.entry(to).or_default().insert(hash, location);
         }
     }
 
@@ -451,9 +470,9 @@ impl ExtentIndex {
     ///
     /// [`rekey_owner`]: Self::rekey_owner
     pub fn rekey_journal_owner(&mut self, from: Ulid, to: Ulid, hash: blake3::Hash) {
-        if let Some(mut loc) = self.journal.remove(&(from, hash)) {
+        if let Some(mut loc) = self.take_journal(from, &hash) {
             loc.segment_id = to;
-            self.journal.insert((to, hash), loc);
+            self.journal.entry(to).or_default().insert(hash, loc);
         }
     }
 
@@ -467,15 +486,13 @@ impl ExtentIndex {
         body_section_start: u64,
         idx_of: impl Fn(&blake3::Hash) -> Option<u32>,
     ) {
-        let hashes: Vec<blake3::Hash> = self
-            .journal
-            .keys()
-            .filter(|(seg, _)| *seg == segment)
-            .map(|(_, h)| *h)
-            .collect();
+        let Some(seg) = self.journal.get_mut(&segment) else {
+            return;
+        };
+        let hashes: Vec<blake3::Hash> = seg.keys().copied().collect();
         for hash in hashes {
             let Some(idx) = idx_of(&hash) else { continue };
-            if let Some(loc) = self.journal.get_mut(&(segment, hash)) {
+            if let Some(loc) = seg.get_mut(&hash) {
                 loc.body_source = BodySource::Cached(idx);
                 loc.body_section_start = body_section_start;
             }
@@ -486,7 +503,7 @@ impl ExtentIndex {
     /// segment is reaped whole. Keeps the journal map free of dead
     /// segments so a rebuild reproduces it.
     pub fn purge_journal_segment(&mut self, segment: Ulid) {
-        self.journal.retain(|(seg, _), _| *seg != segment);
+        self.journal.remove(&segment);
     }
 
     /// Compare-and-replace: overwrite the entry for `hash` only if the current
@@ -910,8 +927,11 @@ impl ExtentIndex {
 
     /// Iterate `((segment, hash), location)` pairs for journal-tier
     /// bodies. Ordering is unspecified.
-    pub fn journal_iter(&self) -> impl Iterator<Item = (&(Ulid, blake3::Hash), &ExtentLocation)> {
-        self.journal.iter()
+    pub fn journal_iter(&self) -> impl Iterator<Item = ((Ulid, blake3::Hash), &ExtentLocation)> {
+        self.journal.iter().flat_map(|(seg, entries)| {
+            let seg = *seg;
+            entries.iter().map(move |(hash, loc)| ((seg, *hash), loc))
+        })
     }
 
     /// True when no journal-tier body is registered — used by the

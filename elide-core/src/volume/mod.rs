@@ -2244,12 +2244,12 @@ impl Volume {
             if diverging.len() >= 8 {
                 break;
             }
-            if !disk_journal.contains(&(*seg, *hash)) {
+            if !disk_journal.contains(&(seg, hash)) {
                 diverging.push(format!(
                     "  journal seg={seg} hash={} disk=None (phantom journal)",
                     hash.to_hex(),
                 ));
-            } else if !live_segments.contains(seg) {
+            } else if !live_segments.contains(&seg) {
                 diverging.push(format!(
                     "  journal seg={seg} hash={} (stale journal: points at deleted segment)",
                     hash.to_hex(),
