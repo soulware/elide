@@ -343,9 +343,7 @@ fn crash_recovery_writemulti_dedup_regression() {
     write_multi(&mut vol, &mut oracle, 7, 2, 0);
     write_multi(&mut vol, &mut oracle, 6, 2, 1);
 
-    // Drain before gc_checkpoint to match production sequencing — without
-    // it the un-drained pending segments would violate
-    // pending-above-committed once GC apply commits u_gc.
+    // Drain before gc_checkpoint to match production sequencing.
     common::drain_with_repack(&mut vol);
 
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();

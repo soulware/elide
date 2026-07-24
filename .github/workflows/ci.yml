@@ -129,10 +129,16 @@ jobs:
               PROPTEST_CASES=128 cargo test -p elide-coordinator --features proptest --no-fail-fast \
                 --test gc_proptest -- gc_oracle
 
+          # Also carries the coordinator's own `--lib` unit tests under the
+          # drift checkers (`proptest` propagates `elide-core/volume-invariants`).
+          # The other coord lanes name integration binaries, so this is the only
+          # lane where the gc unit tests exercise the invariants — a violation in
+          # one (e.g. a GC apply leaving pending straddling a promote-tier ULID)
+          # surfaces here.
           - name: coord-segment-head
             cmd: |
               cargo test -p elide-coordinator --features proptest --no-fail-fast \
-                --test gc_proptest --test segment_head_proptest -- --skip gc_segment_cleanup --skip gc_oracle
+                --lib --test gc_proptest --test segment_head_proptest -- --skip gc_segment_cleanup --skip gc_oracle
 
     steps:
       - uses: actions/checkout@v6

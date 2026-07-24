@@ -2039,16 +2039,22 @@ impl Volume {
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
     /// Stress-only invariant: every pending ULID must be greater than every
-    /// committed ULID on disk. This is the structural form of the
+    /// promote-tier (`index/`) ULID on disk. This is the structural form of the
     /// drain-ordering invariant the production drain (`coordinator/upload.rs`)
     /// relies on — `discover_fork_segments` walks committed (sorted by ULID)
     /// then pending (sorted by ULID) with the "pending wins last" semantic;
     /// that semantic is correct *only* when every pending ULID sorts above
-    /// every committed ULID. If a lower-ULID pending peer ever ends up
-    /// alongside a higher-ULID committed segment claiming the same LBA, the
+    /// every promote-tier ULID. If a lower-ULID pending peer ever ends up
+    /// alongside a higher-ULID promote-tier segment claiming the same LBA, the
     /// next promote crosses a tier boundary and flips the walk-order winner
     /// in a way `self.lbamap` doesn't reflect — exactly the drain bug fixed
     /// in #265.
+    ///
+    /// GC outputs are outside this ordering: their ULID is minted at apply
+    /// time and may legitimately exceed a write that was already pending when
+    /// the pass forked, so they are excluded from the comparison. A GC output
+    /// never claims an LBA a pending write owns, so its higher ULID cannot flip
+    /// a walk-order winner.
     ///
     /// `assert_lbamap_consistent` catches that flip after the fact (via
     /// lbamap drift); this assert catches it structurally before any drift
@@ -2070,37 +2076,33 @@ impl Volume {
             return; // No pending — invariant vacuously holds.
         };
 
+        // Only the promote tier (`index/`) is scanned; GC outputs are excluded
+        // for the reason given in the doc comment.
         let mut committed_max: Option<Ulid> = None;
-        let collect = |paths: Vec<PathBuf>, committed_max: &mut Option<Ulid>| {
-            for p in paths {
+        if let Ok(idx_paths) = segment::collect_idx_files(&self.base_dir.join("index")) {
+            for p in idx_paths {
                 let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
                 let Ok(u) = Ulid::from_string(stem) else {
                     continue;
                 };
-                *committed_max = Some(committed_max.map_or(u, |m| m.max(u)));
+                committed_max = Some(committed_max.map_or(u, |m| m.max(u)));
             }
-        };
-        if let Ok(idx_paths) = segment::collect_idx_files(&self.base_dir.join("index")) {
-            collect(idx_paths, &mut committed_max);
-        }
-        if let Ok(gc_paths) = segment::collect_gc_applied_segment_files(&self.base_dir) {
-            collect(gc_paths, &mut committed_max);
         }
 
         // Strict `>`: same-ULID-in-both-tiers (the mid-promote crash recovery
         // state where `pending/<u>` and `index/<u>.idx` coexist briefly) is
         // legitimate and the entries are byte-identical, so the walk-order
         // winner is unambiguous. The bug shape is *different* ULIDs where
-        // pending's min sorts below a committed peer's higher ULID.
+        // pending's min sorts below a promote-tier peer's higher ULID.
         if let Some(c_max) = committed_max
             && c_max > pending_min
         {
             panic!(
                 "pending-above-committed invariant violation after [{caller}]: \
-                 max(committed)={c_max} > min(pending)={pending_min} \
-                 (a lower-ULID pending peer is alongside a higher-ULID committed \
+                 max(promote-tier)={c_max} > min(pending)={pending_min} \
+                 (a lower-ULID pending peer is alongside a higher-ULID promote-tier \
                  segment; the next promote will flip the lbamap walk-order winner)"
             );
         }
