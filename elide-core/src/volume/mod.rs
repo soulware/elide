@@ -2381,11 +2381,22 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, _caller: &'static str) {}
 
-    /// Stress-only invariant: the in-memory `own_segments` set must equal
-    /// the committed tier a fresh disk scan produces (`index/*.idx` ∪ bare
+    /// Stress-only invariant: the in-memory `own_segments` set equals the
+    /// committed tier a fresh disk scan produces (`index/*.idx` ∪ bare
     /// `gc/`). A drift here is what trips the coordinator's gc own-segment
-    /// divergence check and wedges plan emission — catch the mutation that
-    /// leaks the set here instead of downstream.
+    /// divergence check and wedges plan emission.
+    ///
+    /// Checked at the end of `finalize_gc_handoff` only, not in the
+    /// per-mutation umbrella. Equality holds solely when every committed-tier
+    /// disk mutation has flowed through this volume: the coordinator's own
+    /// divergence check tolerates a transient mismatch across the
+    /// volume/coordinator process boundary, and the reproducer harness plants
+    /// committed-tier files directly (`populate_cache`,
+    /// `simulate_coord_gc_local`), so a fresh scan legitimately diverges
+    /// mid-sequence. Finalize is where the leak the fix closes is born — a
+    /// zero-entry tombstone dropped from disk but left in the set — so the
+    /// check belongs there, matching the per-handoff granularity at which the
+    /// coordinator validates the set in production.
     #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_own_segments_match_disk(&self, caller: &'static str) {
         let disk = segment::committed_tier_ulids(&self.base_dir)
@@ -2420,7 +2431,6 @@ impl Volume {
         self.assert_pending_above_committed(caller);
         self.assert_extent_index_consistent(caller);
         self.assert_lbamap_hashes_resolvable(caller);
-        self.assert_own_segments_match_disk(caller);
     }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
@@ -2733,6 +2743,7 @@ impl Volume {
             self.own_segments.remove(&ulid);
         }
         self.assert_volume_invariants("finalize_gc_handoff");
+        self.assert_own_segments_match_disk("finalize_gc_handoff");
         Ok(())
     }
 
