@@ -8,9 +8,9 @@
 //   [Delta body: delta_length bytes]      — starts at byte 100 + index_length + inline_length + body_length
 //
 // Header (100 bytes):
-//   0..8    magic         "ELIDSEG\x05"
+//   0..8    magic         "ELIDSEG\x06"
 //   8..12   entry_count   u32 le
-//   12..16  index_length  u32 le; total bytes of the index section (base + delta table + inputs)
+//   12..16  index_length  u32 le; total bytes of the index section (base + sketch table + delta table + inputs)
 //   16..20  inline_length u32 le; 0 if no inline data
 //   20..28  body_length   u64 le
 //   28..32  delta_length  u32 le; 0 if no delta body
@@ -19,8 +19,15 @@
 //
 // Index section layout:
 //   [entry_count × 64 bytes: base entries]
+//   [sketch table: sketch_length(4) u32 le, then sketch_length bytes of records]
 //   [delta table: variable-length, only present when entries have HAS_DELTAS]
 //   [inputs table: inputs_length bytes, 16 bytes per input ULID] — populated only for GC outputs
+//
+// Sketch table (after base entries, before the delta table):
+//   sketch_length (4 bytes) u32 le — byte length of the records that follow (0 when nothing is sketched)
+//   per sketched entry (4 + NUM_SF × 8 bytes):
+//     entry_index (4 bytes)  u32 le — index of the base entry
+//     super_features (NUM_SF × 8 bytes) u64 le each — the resemblance sketch
 //
 // Base entry format (64 bytes, fixed-size):
 //   hash          (32 bytes) BLAKE3 extent hash
@@ -74,7 +81,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-pub const MAGIC: &[u8; 8] = b"ELIDSEG\x05";
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x06";
 pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
@@ -318,7 +325,21 @@ pub fn would_be_inline(stored_length: usize) -> bool {
     stored_length < INLINE_THRESHOLD
 }
 
-/// Compute the byte length of the base entries + delta table region.
+/// Byte length of the sketch-section length prefix (`u32`).
+const SKETCH_PREFIX_LEN: u32 = 4;
+/// Byte length of one sketch-table record: entry_index(4) + sketch.
+const SKETCH_RECORD_LEN: u32 = 4 + crate::sketch::SKETCH_LEN as u32;
+
+/// Byte length of the v6 sketch section: the length prefix plus one
+/// record per sketched entry. Always at least the prefix, so every v6
+/// segment carries the field even when nothing is sketched.
+fn sketch_section_length(entries: &[SegmentEntry]) -> u32 {
+    let records = entries.iter().filter(|e| e.sketch.is_some()).count() as u32;
+    SKETCH_PREFIX_LEN + records * SKETCH_RECORD_LEN
+}
+
+/// Compute the byte length of the base entries + sketch table + delta
+/// table region.
 ///
 /// Does not include the inputs table. Total index section length is this
 /// value plus `inputs.len() * INPUT_ULID_LEN`.
@@ -329,7 +350,7 @@ fn entries_region_length(entries: &[SegmentEntry]) -> u32 {
         .filter(|e| !e.delta_options.is_empty())
         .map(|e| DELTA_TABLE_ENTRY_HEADER + e.delta_options.len() as u32 * DELTA_OPTION_LEN)
         .sum();
-    base + delta_table
+    base + sketch_section_length(entries) + delta_table
 }
 
 /// Length in bytes of the input ULID table for a given input count.
@@ -556,6 +577,11 @@ pub struct SegmentEntry {
     /// map. Persisted in the entry flag byte, so a disk rebuild reproduces
     /// the routing without recomputing any window predicate.
     pub journal: bool,
+    /// Resemblance sketch for similarity-based delta source selection,
+    /// persisted in the index's sketch table. `Some` only for
+    /// Data/CanonicalData entries the producer sketched; `None` for every
+    /// other kind. Carried unchanged through GC copy-through.
+    pub sketch: Option<crate::sketch::Sketch>,
 }
 
 /// A [`SegmentEntry`] paired with its body bytes while a segment is being
@@ -616,6 +642,7 @@ impl SegmentEntry {
                 inline,
                 delta_options: Vec::new(),
                 journal: false,
+                sketch: None,
             },
             body,
         }
@@ -653,6 +680,7 @@ impl SegmentEntry {
             inline: None,
             delta_options: Vec::new(),
             journal: false,
+            sketch: None,
         }
     }
 
@@ -674,6 +702,7 @@ impl SegmentEntry {
             inline: None,
             delta_options: Vec::new(),
             journal: false,
+            sketch: None,
         }
     }
 
@@ -690,6 +719,7 @@ impl SegmentEntry {
             inline: None,
             delta_options: Vec::new(),
             journal: false,
+            sketch: None,
         }
     }
 
@@ -748,6 +778,7 @@ impl SegmentEntry {
             inline: None,
             delta_options,
             journal: false,
+            sketch: None,
         }
     }
 }
@@ -857,11 +888,12 @@ pub fn write_segment_full(
     let body_section_start = HEADER_LEN + index_length as u64 + inline_length as u64;
 
     // Build index section into a buffer first — needed for signing.
-    // Layout: [N × 64 base entries] [delta table (if any)] [inputs table].
+    // Layout: [N × 64 base entries] [sketch section] [delta table (if any)] [inputs table].
     let mut index_buf = Vec::with_capacity(index_length as usize);
     for entry in entries.iter() {
         write_index_entry(&mut index_buf, entry)?;
     }
+    write_sketch_section(&mut index_buf, &entries)?;
     write_delta_table(&mut index_buf, &entries)?;
     for input in inputs {
         index_buf.extend_from_slice(&input.to_bytes());
@@ -1000,6 +1032,24 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     Ok(())
 }
 
+/// Write the sketch section: a `u32` length prefix followed by one
+/// record (`entry_index` + super-features) per sketched entry. Placed
+/// after the base entries and before the delta table. The prefix lets
+/// the parser find the delta table without walking the records.
+fn write_sketch_section<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Result<()> {
+    let records = entries.iter().filter(|e| e.sketch.is_some()).count() as u32;
+    w.write_all(&(records * SKETCH_RECORD_LEN).to_le_bytes())?; // length prefix: 4
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(sketch) = &entry.sketch {
+            w.write_all(&(i as u32).to_le_bytes())?; // entry_index: 4
+            for sf in sketch {
+                w.write_all(&sf.to_le_bytes())?; // NUM_SF × 8
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write the delta table: entries with delta options, appended after the
 /// fixed-size base entries within the index section.
 fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Result<()> {
@@ -1087,7 +1137,7 @@ pub fn rewrite_with_deltas(
         entries[*idx].delta_options = opts.clone();
     }
 
-    // Build new index section (base entries + delta table + inputs).
+    // Build new index section (base entries + sketch section + delta table + inputs).
     let new_entries_region = entries_region_length(&entries);
     let new_inputs_region = inputs_region_length(&inputs);
     let new_index_length = new_entries_region + new_inputs_region;
@@ -1095,6 +1145,7 @@ pub fn rewrite_with_deltas(
     for entry in &entries {
         write_index_entry(&mut new_index_buf, entry)?;
     }
+    write_sketch_section(&mut new_index_buf, &entries)?;
     write_delta_table(&mut new_index_buf, &entries)?;
     for input in &inputs {
         new_index_buf.extend_from_slice(&input.to_bytes());
@@ -1538,12 +1589,18 @@ fn parse_index_section(
             inline: None,
             delta_options: Vec::new(),
             journal: flags.contains(SegmentFlags::JOURNAL),
+            sketch: None,
         });
     }
 
-    // Pass 2: parse delta table (appended after base entries, before inputs).
+    // Pass 1.5: parse the sketch section (length prefix + records), which
+    // sits between the base entries and the delta table.
+    parse_sketch_section(entries_data, &mut pos, &mut entries)?;
+    let delta_table_start = pos;
+
+    // Pass 2: parse delta table (after the sketch section, before inputs).
     if has_deltas && pos < entries_data.len() {
-        parse_delta_table(entries_data, base_len, &mut entries, delta_length)?;
+        parse_delta_table(entries_data, delta_table_start, &mut entries, delta_length)?;
     }
 
     // Pass 3: parse inputs table (tail of index section).
@@ -1613,6 +1670,46 @@ fn validate_entry_bounds(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Parse the sketch section starting at `*pos`: a `u32` length prefix
+/// then that many bytes of `entry_index(4) + NUM_SF × 8` records. Sets
+/// `entry.sketch` for each named entry and advances `*pos` to the start
+/// of the delta table.
+fn parse_sketch_section(
+    data: &[u8],
+    pos: &mut usize,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
+    let sketch_len = u32::from_le_bytes(read_fixed(data, pos)?) as usize;
+    let record_end = pos
+        .checked_add(sketch_len)
+        .ok_or_else(|| io::Error::other(format!("sketch section length {sketch_len} overflows")))?;
+    if record_end > data.len() {
+        return Err(io::Error::other(format!(
+            "sketch section length {sketch_len} exceeds index region"
+        )));
+    }
+    if !sketch_len.is_multiple_of(SKETCH_RECORD_LEN as usize) {
+        return Err(io::Error::other(format!(
+            "sketch section length {sketch_len} is not a multiple of {SKETCH_RECORD_LEN}"
+        )));
+    }
+    while *pos < record_end {
+        let entry_index = u32::from_le_bytes(read_fixed(data, pos)?) as usize;
+        let mut sf = [0u64; crate::sketch::NUM_SF];
+        for s in sf.iter_mut() {
+            *s = u64::from_le_bytes(read_fixed(data, pos)?);
+        }
+        if entry_index >= entries.len() {
+            return Err(io::Error::other(format!(
+                "sketch table entry_index {entry_index} out of range ({})",
+                entries.len()
+            )));
+        }
+        entries[entry_index].sketch = Some(sf);
     }
     Ok(())
 }
@@ -2959,6 +3056,86 @@ mod tests {
         );
 
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn roundtrip_sketch() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let d0 = vec![0xA0u8; 8192];
+        let d1 = vec![0xA1u8; 8192];
+        let sketch = [1u64, 2, 3, 4, 5, 6, 7, 8];
+
+        let mut e0 = SegmentEntry::new_data(blake3::hash(&d0), 0, 2, SegmentFlags::empty(), d0);
+        e0.entry.sketch = Some(sketch);
+        let entries = vec![
+            e0,
+            // A second Data entry left unsketched, so the table is sparse.
+            SegmentEntry::new_data(blake3::hash(&d1), 2, 2, SegmentFlags::empty(), d1),
+            // A body-less ref is never sketched.
+            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"anc"), 4, 1)),
+        ];
+
+        write_segment(&path, entries, signer.as_ref()).unwrap();
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back[0].sketch, Some(sketch), "sketch must round-trip");
+        assert_eq!(read_back[1].sketch, None, "unsketched entry stays None");
+        assert_eq!(read_back[2].sketch, None, "dedup ref never sketched");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sketch_survives_delta_rewrite() {
+        let seg_path = temp_path(".seg");
+        let delta_path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let d0 = vec![0xB0u8; 8192];
+        let d1 = vec![0xB1u8; 8192];
+        let hash0 = blake3::hash(&d0);
+        let sketch = [9u64, 8, 7, 6, 5, 4, 3, 2];
+
+        let mut e0 = SegmentEntry::new_data(hash0, 0, 2, SegmentFlags::empty(), d0);
+        e0.entry.sketch = Some(sketch);
+        let entries = vec![
+            e0,
+            SegmentEntry::new_data(blake3::hash(&d1), 2, 2, SegmentFlags::empty(), d1),
+        ];
+        write_segment(&seg_path, entries, signer.as_ref()).unwrap();
+
+        // Attach a delta to entry 1. Entry 0's sketch and entry 1's delta land
+        // in separate index sections; the copy-through must preserve both.
+        let blob = b"delta-blob";
+        let deltas = vec![(
+            1usize,
+            vec![DeltaOption {
+                source_hash: hash0,
+                delta_offset: 0,
+                delta_length: blob.len() as u32,
+                delta_hash: blake3::hash(blob),
+            }],
+        )];
+        rewrite_with_deltas(&seg_path, &delta_path, &deltas, blob, signer.as_ref()).unwrap();
+
+        let (_, read_back, _) = read_and_verify_segment_index(&delta_path, &vk).unwrap();
+        assert_eq!(
+            read_back[0].sketch,
+            Some(sketch),
+            "sketch carries through GC copy-through"
+        );
+        assert_eq!(read_back[0].delta_options.len(), 0);
+        assert_eq!(
+            read_back[1].delta_options.len(),
+            1,
+            "delta attached alongside the sketch section"
+        );
+        assert_eq!(read_back[1].sketch, None);
+
+        fs::remove_file(&seg_path).unwrap();
+        fs::remove_file(&delta_path).unwrap();
     }
 
     #[test]
