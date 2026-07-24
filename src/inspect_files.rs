@@ -4,7 +4,8 @@
 //   Prints the header and index entries of a segment file or a cached .idx
 //   file. Works on both: full segments (pending/, segments/) and index-only
 //   files (cache/*.idx). Flags each data entry as OK or OVERFLOW relative
-//   to the body file on disk (if present).
+//   to the body file on disk (if present), and shows each entry's resemblance
+//   sketch with the pairwise super-feature overlap between entries.
 //
 // inspect-wal <path>
 //   Prints every record in a WAL file (wal/<ulid>). Uses scan_readonly so
@@ -156,7 +157,83 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
         println!("WARNING: {overflow_count} entries overflow the body file");
     }
 
+    print_sketches(&sorted);
+
     Ok(())
+}
+
+/// Resemblance-sketch view: which entries carry a sketch, a short fingerprint
+/// of each, and the pairwise super-feature overlap. Two entries sharing
+/// super-features are likely similar content — the signal the similarity
+/// delta producer selects on.
+fn print_sketches(sorted: &[&segment::SegmentEntry]) {
+    use elide_core::sketch::NUM_SF;
+
+    let sketchable = sorted
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::CanonicalData))
+        .count();
+    let sketched: Vec<&&segment::SegmentEntry> =
+        sorted.iter().filter(|e| e.sketch.is_some()).collect();
+
+    println!();
+    println!(
+        "sketches:           {} of {sketchable} data entr{} carry a resemblance sketch",
+        sketched.len(),
+        if sketchable == 1 { "y" } else { "ies" }
+    );
+    if sketched.is_empty() {
+        return;
+    }
+
+    let lba = |e: &segment::SegmentEntry| format!("[{}+{})", e.start_lba, e.lba_length);
+
+    println!();
+    println!(
+        "  {:<14}  {:<12}  super-features (top 16 bits each)",
+        "lba_range", "hash"
+    );
+    for e in &sketched {
+        let sk = e.sketch.expect("filtered to Some");
+        let fp: Vec<String> = sk
+            .iter()
+            .map(|s| format!("{:04x}", (s >> 48) as u16))
+            .collect();
+        println!(
+            "  {:<14}  {:<12}  {}",
+            lba(e),
+            &e.hash.to_hex()[..12],
+            fp.join(" ")
+        );
+    }
+
+    // Pairwise overlap over the full 64-bit super-features (the fingerprint
+    // above is truncated only for display).
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for i in 0..sketched.len() {
+        for j in (i + 1)..sketched.len() {
+            let a = sketched[i].sketch.expect("filtered to Some");
+            let b = sketched[j].sketch.expect("filtered to Some");
+            let shared = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+            if shared > 0 {
+                pairs.push((i, j, shared));
+            }
+        }
+    }
+    println!();
+    if pairs.is_empty() {
+        println!("shared super-features: none (no two entries resemble each other)");
+        return;
+    }
+    pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
+    println!("shared super-features (likely-similar pairs, most first):");
+    for (i, j, shared) in pairs {
+        println!(
+            "  {:<14} <-> {:<14}  {shared}/{NUM_SF} shared",
+            lba(sketched[i]),
+            lba(sketched[j])
+        );
+    }
 }
 
 // --- inspect-wal ---
