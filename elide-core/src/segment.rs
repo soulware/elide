@@ -882,6 +882,33 @@ pub fn write_segment_full(
             )));
         }
     }
+    // Populate resemblance sketches for fresh Data content. Entries that
+    // already carry one (GC copy-through) keep it; Delta / DedupRef / Zero /
+    // Inline and journal-tier content are never sketched. The sketch is over
+    // raw bytes, so a compressed body is decompressed first.
+    for (entry, body) in entries.iter_mut().zip(bodies.iter()) {
+        if entry.sketch.is_some()
+            || entry.journal
+            || !entry.delta_options.is_empty()
+            || !matches!(entry.kind, EntryKind::Data | EntryKind::CanonicalData)
+        {
+            continue;
+        }
+        let Some(body) = body else { continue };
+        let raw = if entry.compressed {
+            match lz4_flex::decompress_size_prepended(body) {
+                Ok(v) => std::borrow::Cow::Owned(v),
+                // Sketching is a best-effort optimisation, not a correctness
+                // property: a body that fails to decompress is left unsketched
+                // rather than failing the segment write.
+                Err(_) => continue,
+            }
+        } else {
+            std::borrow::Cow::Borrowed(body.as_slice())
+        };
+        entry.sketch = crate::sketch::compute(&raw);
+    }
+
     let (entries_region, inline_length, body_length) = assign_offsets(&mut entries);
     let inputs_region = inputs_region_length(inputs);
     let index_length = entries_region + inputs_region;
@@ -1135,6 +1162,9 @@ pub fn rewrite_with_deltas(
             )));
         }
         entries[*idx].delta_options = opts.clone();
+        // A delta-bearing entry is not a valid delta source (no
+        // delta-of-delta), so it advertises no resemblance sketch.
+        entries[*idx].sketch = None;
     }
 
     // Build new index section (base entries + sketch section + delta table + inputs).
@@ -3058,31 +3088,58 @@ mod tests {
         fs::remove_file(&path).unwrap();
     }
 
+    /// High-entropy bytes that reliably sample enough windows to sketch.
+    fn entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut ctr = seed;
+        while out.len() < len {
+            out.extend_from_slice(blake3::hash(&ctr.to_le_bytes()).as_bytes());
+            ctr = ctr.wrapping_add(1);
+        }
+        out.truncate(len);
+        out
+    }
+
     #[test]
     fn roundtrip_sketch() {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let d0 = vec![0xA0u8; 8192];
-        let d1 = vec![0xA1u8; 8192];
+        let d0 = entropy_bytes(0, 8192);
+        let d1 = entropy_bytes(1, 8192);
         let sketch = [1u64, 2, 3, 4, 5, 6, 7, 8];
 
+        // e0 carries an explicit sketch: the writer must preserve it verbatim,
+        // not recompute over the body.
         let mut e0 = SegmentEntry::new_data(blake3::hash(&d0), 0, 2, SegmentFlags::empty(), d0);
         e0.entry.sketch = Some(sketch);
         let entries = vec![
             e0,
-            // A second Data entry left unsketched, so the table is sparse.
+            // A fresh Data entry: the writer populates its sketch.
             SegmentEntry::new_data(blake3::hash(&d1), 2, 2, SegmentFlags::empty(), d1),
-            // A body-less ref is never sketched.
+            // A body-less ref is never sketched — keeps the table sparse.
             PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"anc"), 4, 1)),
         ];
 
-        write_segment(&path, entries, signer.as_ref()).unwrap();
+        let (_, written) = write_segment(&path, entries, signer.as_ref()).unwrap();
+        assert_eq!(written[0].sketch, Some(sketch), "explicit sketch preserved");
+        assert!(
+            written[1].sketch.is_some(),
+            "fresh Data entry gets a sketch"
+        );
+        assert_eq!(written[2].sketch, None, "dedup ref never sketched");
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
-        assert_eq!(read_back[0].sketch, Some(sketch), "sketch must round-trip");
-        assert_eq!(read_back[1].sketch, None, "unsketched entry stays None");
-        assert_eq!(read_back[2].sketch, None, "dedup ref never sketched");
+        assert_eq!(
+            read_back[0].sketch,
+            Some(sketch),
+            "explicit sketch round-trips"
+        );
+        assert_eq!(
+            read_back[1].sketch, written[1].sketch,
+            "populated sketch round-trips"
+        );
+        assert_eq!(read_back[2].sketch, None, "dedup ref stays None");
 
         fs::remove_file(&path).unwrap();
     }
@@ -3196,6 +3253,55 @@ mod tests {
         assert_eq!(read_back.len(), 1);
         assert!(read_back[0].compressed);
         assert_eq!(read_back[0].stored_length, 2048);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sketch_computed_over_decompressed_body() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let raw = entropy_bytes(7, 8192);
+        let compressed = lz4_flex::compress_prepend_size(&raw);
+        let entries = vec![SegmentEntry::new_data(
+            blake3::hash(&raw),
+            0,
+            2,
+            SegmentFlags::COMPRESSED,
+            compressed,
+        )];
+
+        let (_, written) = write_segment(&path, entries, signer.as_ref()).unwrap();
+        assert_eq!(
+            written[0].sketch,
+            crate::sketch::compute(&raw),
+            "sketch is over raw content, not the compressed body"
+        );
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back[0].sketch, written[0].sketch);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn journal_entry_is_not_sketched() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let data = entropy_bytes(8, 8192);
+        let mut e = SegmentEntry::new_data(blake3::hash(&data), 0, 2, SegmentFlags::empty(), data);
+        e.entry.journal = true;
+
+        let (_, written) = write_segment(&path, vec![e], signer.as_ref()).unwrap();
+        assert_eq!(
+            written[0].sketch, None,
+            "journal-tier content is never sketched"
+        );
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back[0].sketch, None);
 
         fs::remove_file(&path).unwrap();
     }
