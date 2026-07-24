@@ -1478,6 +1478,16 @@ fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
     entries.iter().map(|e| e.start_lba).collect()
 }
 
+/// A pending segment is journal-tier when every entry carries the journal
+/// flag — the disjoint-tier invariant that a segment is pure journal or
+/// pure data, never mixed.
+fn seg_all_journal(base: &Path, vol: &Volume, seg: Ulid) -> bool {
+    let seg_path = base.join("pending").join(seg.to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    !entries.is_empty() && entries.iter().all(|e| e.journal)
+}
+
 #[test]
 fn mixed_epoch_forms_data_and_journal_segments() {
     let base = keyed_temp_dir();
@@ -1543,6 +1553,186 @@ fn all_journal_epoch_forms_single_journal_segment() {
     let vol = Volume::open(&base, &base).unwrap();
     assert_eq!(vol.read(100, 1).unwrap(), a);
     assert_eq!(vol.read(101, 1).unwrap(), b);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_consolidation_merges_pending_journal_segments() {
+    // Three all-journal promotes leave three tiny pending journal segments;
+    // repack consolidates their live entries into one journal-tier output.
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    let b: Vec<u8> = (0..4096).map(|i| (i * 5 + 2) as u8).collect();
+    let c: Vec<u8> = (0..4096).map(|i| (i * 7 + 4) as u8).collect();
+
+    vol.write(100, &a).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(101, &b).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(102, &c).unwrap();
+    vol.promote_for_test().unwrap();
+    assert_eq!(pending_ulids(&base).len(), 3);
+
+    let stats = vol.repack().unwrap();
+    assert_eq!(
+        stats.segments_compacted, 3,
+        "all three journal segments are merged"
+    );
+    assert_eq!(stats.new_segments, 1, "into a single journal output");
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 1, "three journal segments consolidate to one");
+    assert!(
+        seg_all_journal(&base, &vol, ulids[0]),
+        "the consolidated output stays journal-tier"
+    );
+    let mut lbas = entry_lbas(&base, &vol, ulids[0]);
+    lbas.sort_unstable();
+    assert_eq!(lbas, vec![100, 101, 102]);
+
+    assert_eq!(vol.read(100, 1).unwrap(), a);
+    assert_eq!(vol.read(101, 1).unwrap(), b);
+    assert_eq!(vol.read(102, 1).unwrap(), c);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(100, 1).unwrap(), a);
+    assert_eq!(vol.read(101, 1).unwrap(), b);
+    assert_eq!(vol.read(102, 1).unwrap(), c);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_consolidation_drops_dead_journal_entries() {
+    // LBA 100 written across two journal promotes: the first copy is
+    // superseded. Consolidation carries only the live copy and reclaims the
+    // dead body.
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let first: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    let second: Vec<u8> = (0..4096).map(|i| (i * 5 + 9) as u8).collect();
+
+    vol.write(100, &first).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(100, &second).unwrap();
+    vol.promote_for_test().unwrap();
+    assert_eq!(pending_ulids(&base).len(), 2);
+
+    let stats = vol.repack().unwrap();
+    assert!(
+        stats.bytes_freed > 0,
+        "the superseded journal body is reclaimed"
+    );
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 1);
+    assert!(seg_all_journal(&base, &vol, ulids[0]));
+    assert_eq!(entry_lbas(&base, &vol, ulids[0]), vec![100]);
+    assert_eq!(vol.read(100, 1).unwrap(), second);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(100, 1).unwrap(), second);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_consolidation_keeps_data_below_journal() {
+    // Two mixed epochs form two data + two journal segments. Repack packs the
+    // data into one output and consolidates the journal into another, minted
+    // above every data output — the data-before-journal ordering the upload
+    // path relies on.
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let d0: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    let j0: Vec<u8> = (0..4096).map(|i| (i * 5 + 2) as u8).collect();
+    let d1: Vec<u8> = (0..4096).map(|i| (i * 7 + 4) as u8).collect();
+    let j1: Vec<u8> = (0..4096).map(|i| (i * 11 + 6) as u8).collect();
+
+    vol.write(0, &d0).unwrap();
+    vol.write(100, &j0).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(1, &d1).unwrap();
+    vol.write(101, &j1).unwrap();
+    vol.promote_for_test().unwrap();
+    assert_eq!(pending_ulids(&base).len(), 4);
+
+    vol.repack().unwrap();
+
+    let ulids = pending_ulids(&base);
+    let journal_ulids: Vec<Ulid> = ulids
+        .iter()
+        .copied()
+        .filter(|u| seg_all_journal(&base, &vol, *u))
+        .collect();
+    let data_ulids: Vec<Ulid> = ulids
+        .iter()
+        .copied()
+        .filter(|u| !seg_all_journal(&base, &vol, *u))
+        .collect();
+    assert_eq!(
+        journal_ulids.len(),
+        1,
+        "journal segments consolidated to one"
+    );
+    assert_eq!(data_ulids.len(), 1, "data segments packed to one");
+    assert!(
+        journal_ulids[0] > data_ulids[0],
+        "the journal output sorts above the data output"
+    );
+
+    assert_eq!(vol.read(0, 1).unwrap(), d0);
+    assert_eq!(vol.read(1, 1).unwrap(), d1);
+    assert_eq!(vol.read(100, 1).unwrap(), j0);
+    assert_eq!(vol.read(101, 1).unwrap(), j1);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap(), d0);
+    assert_eq!(vol.read(1, 1).unwrap(), d1);
+    assert_eq!(vol.read(100, 1).unwrap(), j0);
+    assert_eq!(vol.read(101, 1).unwrap(), j1);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn journal_consolidation_skips_lone_all_live_segment() {
+    // A single all-live journal segment is left in place — a 1→1 rewrite
+    // would save no PUT.
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    vol.write(100, &a).unwrap();
+    vol.promote_for_test().unwrap();
+    let before = pending_ulids(&base);
+    assert_eq!(before.len(), 1);
+
+    let stats = vol.repack().unwrap();
+    assert_eq!(
+        stats.new_segments, 0,
+        "a lone all-live journal segment is not rewritten"
+    );
+    assert_eq!(stats.segments_compacted, 0);
+
+    assert_eq!(
+        pending_ulids(&base),
+        before,
+        "the journal segment is left in place unchanged"
+    );
+    assert_eq!(vol.read(100, 1).unwrap(), a);
 
     fs::remove_dir_all(base).unwrap();
 }

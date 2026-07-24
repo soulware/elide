@@ -16,6 +16,17 @@ use crate::{
 
 use super::{ResolvabilityGate, Volume, latest_snapshot};
 
+/// Number of output ULIDs reserved for journal consolidation per repack
+/// pass. One suffices: consolidation carries only live journal entries,
+/// which are at most one jbd2 ring's worth however deep the pending
+/// backlog, so a single uncapped output always holds them. The reserved
+/// ULIDs are minted after every data output ULID, so every journal output
+/// sorts above every data output — the data-before-journal ordering the
+/// upload path relies on. Raising this above one would split the live ring
+/// across several journal segments in ULID order (finer reap granularity);
+/// that split path is not yet built.
+pub(crate) const JOURNAL_CONSOLIDATION_ULIDS: usize = 1;
+
 /// Results from a single compaction run.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompactionStats {
@@ -55,6 +66,11 @@ pub struct RepackJob {
     pub floor: Option<Ulid>,
     pub ceiling: Ulid,
     pub output_ulids: Vec<Ulid>,
+    /// Output ULIDs reserved for the journal-consolidation merge, minted
+    /// after every entry of `output_ulids` so each sorts above every data
+    /// output (and below `ceiling`). Length is
+    /// [`JOURNAL_CONSOLIDATION_ULIDS`].
+    pub journal_output_ulids: Vec<Ulid>,
     pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
     pub ancestor_layers: Vec<super::AncestorLayer>,
@@ -158,6 +174,15 @@ impl Volume {
         for _ in 0..segs.len() + 1 {
             output_ulids.push(self.mint.next());
         }
+        // Reserve the journal-consolidation output ULID(s) after every data
+        // output ULID: the mint is monotonic, so each journal output sorts
+        // above every data output. That ordering keeps a repacked data
+        // segment below its consolidated journal — the data-before-journal
+        // invariant the upload path relies on (see
+        // docs/design/journal-pending-consolidation.md).
+        let journal_output_ulids: Vec<Ulid> = (0..JOURNAL_CONSOLIDATION_ULIDS)
+            .map(|_| self.mint.next())
+            .collect();
         let u_flush = self.mint.next();
         self.flush_wal_to_pending_as(u_flush)?;
 
@@ -167,6 +192,7 @@ impl Volume {
             floor,
             ceiling: u_flush,
             output_ulids,
+            journal_output_ulids,
             lbamap_snapshot: Arc::clone(&self.lbamap),
             extent_index_snapshot: Arc::clone(&self.extent_index),
             ancestor_layers: self.ancestor_layers.clone(),
