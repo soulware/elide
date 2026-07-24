@@ -143,18 +143,26 @@ struct CacheInfo {
     ulid: String,
     /// Total entries in the index (all kinds).
     entry_count: usize,
-    /// Entries of each kind.
+    /// Body-section entries (`is_data()` = Data + CanonicalData).
     data_count: usize,
     dedup_ref_count: usize,
     zero_count: usize,
+    /// Inline-section entries (`is_inline()` = Inline + CanonicalInline).
     inline_count: usize,
+    /// Delta-section entries (`is_delta()` = Delta + CanonicalDelta).
     delta_count: usize,
-    /// Count of Data entries with their body cached locally (set bit in
-    /// `.present`). Always `<= data_count` — `promote_to_cache` only sets
-    /// bits for Data entries, so this is exactly the data-local count.
+    /// Canonical-only (no LBA claim) subsets of the three storage classes.
+    canonical_data_count: usize,
+    canonical_inline_count: usize,
+    canonical_delta_count: usize,
+    /// Count of body-section entries with their body cached locally (set bit
+    /// in `.present`). Always `<= data_count` — `promote_to_cache` sets bits
+    /// for `is_data()` entries, so this is exactly the body-local count.
     present_count: usize,
-    /// Sum of stored_length for Data entries only (the unique bytes this segment stores).
+    /// Sum of stored_length for body-section entries (Data + CanonicalData).
     data_body_bytes: u64,
+    /// Byte length of the segment's inline body section (from the segment header).
+    inline_body_bytes: u64,
     /// Byte length of the segment's delta body section (from the segment header).
     delta_body_bytes: u64,
     /// Size of the `.idx` file on disk.
@@ -187,6 +195,7 @@ struct SegInfo {
     lba_blocks: u64,
     dedup_ref_count: usize,
     delta_count: usize,
+    canonical_count: usize,
     delta_body_bytes: u64,
     journal_blocks: u64,
     is_journal: bool,
@@ -307,26 +316,40 @@ fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
             if t.cache_files == 1 { "" } else { "s" },
         );
         println!(
-            "  index:   {} ({} idx, {} body on disk)  (dedup {}, inline {}, zero {})",
+            "  index:   {} ({} idx, {} body on disk)  (data {}, dedup {}, inline {}, zero {}, delta {})",
             fmt_commas(total_index as u64),
             fmt_size(t.cache_idx_file_bytes),
             fmt_size(t.cache_body_actual),
+            fmt_commas(t.cache_data as u64),
             fmt_commas(t.cache_dedup_ref as u64),
             fmt_commas(t.cache_inline as u64),
             fmt_commas(t.cache_zero as u64),
+            fmt_commas(t.cache_delta as u64),
         );
         println!(
-            "  cached:  {} / {}  ({} local)  {} present",
+            "  cached:  {} / {}  ({} local)  {} present{}",
             fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_data as u64),
             fmt_size(t.cache_data_body),
             pct,
+            canonical_note(t.cache_canonical_data),
         );
-        println!(
-            "  delta:   {} ({})",
-            fmt_commas(t.cache_delta as u64),
-            fmt_size(t.cache_delta_body),
-        );
+        if t.cache_inline > 0 {
+            println!(
+                "  inline:  {} ({}){}",
+                fmt_commas(t.cache_inline as u64),
+                fmt_size(t.cache_inline_body),
+                canonical_note(t.cache_canonical_inline),
+            );
+        }
+        if t.cache_delta > 0 {
+            println!(
+                "  delta:   {} ({}){}",
+                fmt_commas(t.cache_delta as u64),
+                fmt_size(t.cache_delta_body),
+                canonical_note(t.cache_canonical_delta),
+            );
+        }
     }
     let journal_segs = t.journal_segs_committed + t.journal_segs_pending;
     let data_segs = t.data_segs_committed + t.data_segs_pending;
@@ -439,9 +462,10 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         .iter()
                         .filter(|e| e.kind == EntryKind::DedupRef)
                         .count();
-                    let delta_count = entries
+                    let delta_count = entries.iter().filter(|e| e.kind.is_delta()).count();
+                    let canonical_count = entries
                         .iter()
-                        .filter(|e| e.kind == EntryKind::Delta)
+                        .filter(|e| e.kind.is_canonical_only())
                         .count();
                     let body_bytes: u64 = entries
                         .iter()
@@ -467,6 +491,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         lba_blocks,
                         dedup_ref_count,
                         delta_count,
+                        canonical_count,
                         delta_body_bytes,
                         journal_blocks,
                         is_journal,
@@ -481,6 +506,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                     lba_blocks: 0,
                     dedup_ref_count: 0,
                     delta_count: 0,
+                    canonical_count: 0,
                     delta_body_bytes: 0,
                     journal_blocks: 0,
                     is_journal: false,
@@ -532,8 +558,12 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 zero_count: 0,
                 inline_count: 0,
                 delta_count: 0,
+                canonical_data_count: 0,
+                canonical_inline_count: 0,
+                canonical_delta_count: 0,
                 present_count: 0,
                 data_body_bytes: 0,
+                inline_body_bytes: 0,
                 delta_body_bytes: 0,
                 idx_file_bytes: 0,
                 body_bytes_cached: 0,
@@ -550,12 +580,18 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let (_body_start, entries, _inputs) = segment::read_segment_index(idx_path)
         .map_err(|e| io::Error::other(format!("reading index: {e}")))?;
 
+    // Canonical-only entries are the base kind minus an LBA claim
+    // (`CANONICAL_ONLY` flag), so they fold into their storage class's count
+    // and are reported as a subset: CanonicalData → data, CanonicalInline →
+    // inline, CanonicalDelta → delta.
     let mut data_count = 0usize;
     let mut dedup_ref_count = 0usize;
     let mut zero_count = 0usize;
     let mut inline_count = 0usize;
     let mut delta_count = 0usize;
-    let mut canonical_count = 0usize;
+    let mut canonical_data_count = 0usize;
+    let mut canonical_inline_count = 0usize;
+    let mut canonical_delta_count = 0usize;
     let mut data_body_bytes = 0u64;
     for e in &entries {
         match e.kind {
@@ -564,17 +600,24 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
                 data_body_bytes += e.stored_length as u64;
             }
             EntryKind::CanonicalData => {
-                canonical_count += 1;
+                data_count += 1;
+                canonical_data_count += 1;
                 data_body_bytes += e.stored_length as u64;
             }
             EntryKind::DedupRef => dedup_ref_count += 1,
             EntryKind::Zero => zero_count += 1,
             EntryKind::Inline => inline_count += 1,
-            EntryKind::CanonicalInline => canonical_count += 1,
-            EntryKind::Delta | EntryKind::CanonicalDelta => delta_count += 1,
+            EntryKind::CanonicalInline => {
+                inline_count += 1;
+                canonical_inline_count += 1;
+            }
+            EntryKind::Delta => delta_count += 1,
+            EntryKind::CanonicalDelta => {
+                delta_count += 1;
+                canonical_delta_count += 1;
+            }
         }
     }
-    let _ = canonical_count;
 
     let journal_blocks: u64 = entries
         .iter()
@@ -584,11 +627,11 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let journal_entries = entries.iter().filter(|e| e.journal).count();
     let is_journal = !entries.is_empty() && journal_entries == entries.len();
 
-    // `promote_to_cache` sets `.present` bits only for Data entries, so the
-    // set-bit count is exactly the number of Data entries with bodies cached
-    // locally. Capping at `data_count` both defends against any rogue bits
-    // outside `[0, entry_count)` (padding in the last byte) and makes the
-    // semantic contract explicit.
+    // `promote_to_cache` sets `.present` bits for body-section entries
+    // (`is_data()` = Data + CanonicalData), so the set-bit count is exactly
+    // the number of such entries with bodies cached locally. Capping at
+    // `data_count` (itself the `is_data()` count) defends against rogue bits
+    // outside `[0, entry_count)` (padding in the last byte).
     let present_path = cache_dir.join(format!("{ulid}.present"));
     let present_bytes = fs::read(&present_path).unwrap_or_default();
     let present_count: usize = present_bytes
@@ -606,11 +649,11 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     #[cfg(not(unix))]
     let body_bytes_cached = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
 
-    // Delta body section size is recorded in the segment header; .idx files
-    // carry the same header so read_segment_layout works on them.
-    let delta_body_bytes = segment::read_segment_layout(idx_path)
-        .map(|l| l.delta_length as u64)
-        .unwrap_or(0);
+    // Inline and delta section sizes are recorded in the segment header;
+    // .idx files carry the same header so read_segment_layout works on them.
+    let layout = segment::read_segment_layout(idx_path).ok();
+    let inline_body_bytes = layout.as_ref().map(|l| l.inline_length as u64).unwrap_or(0);
+    let delta_body_bytes = layout.as_ref().map(|l| l.delta_length as u64).unwrap_or(0);
 
     let idx_file_bytes = fs::metadata(idx_path).map(|m| m.len()).unwrap_or(0);
 
@@ -622,8 +665,12 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         zero_count,
         inline_count,
         delta_count,
+        canonical_data_count,
+        canonical_inline_count,
+        canonical_delta_count,
         present_count,
         data_body_bytes,
+        inline_body_bytes,
         delta_body_bytes,
         idx_file_bytes,
         body_bytes_cached,
@@ -647,8 +694,12 @@ struct Totals {
     cache_zero: usize,
     cache_inline: usize,
     cache_delta: usize,
+    cache_canonical_data: usize,
+    cache_canonical_inline: usize,
+    cache_canonical_delta: usize,
     cache_present: usize,
     cache_data_body: u64,
+    cache_inline_body: u64,
     cache_delta_body: u64,
     cache_idx_file_bytes: u64,
     cache_body_actual: u64,
@@ -708,8 +759,12 @@ fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
         t.cache_zero += f.zero_count;
         t.cache_inline += f.inline_count;
         t.cache_delta += f.delta_count;
+        t.cache_canonical_data += f.canonical_data_count;
+        t.cache_canonical_inline += f.canonical_inline_count;
+        t.cache_canonical_delta += f.canonical_delta_count;
         t.cache_present += f.present_count;
         t.cache_data_body += f.data_body_bytes;
+        t.cache_inline_body += f.inline_body_bytes;
         t.cache_delta_body += f.delta_body_bytes;
         t.cache_idx_file_bytes += f.idx_file_bytes;
         t.cache_body_actual += f.body_bytes_cached;
@@ -875,8 +930,13 @@ fn print_seg_section(
         } else {
             String::new()
         };
+        let canon_note = if s.canonical_count > 0 {
+            format!(", {} canonical", s.canonical_count)
+        } else {
+            String::new()
+        };
         println!(
-            "{p}{}{}  {}  {} entries, {} body, {} LBA blocks{}{}{}",
+            "{p}{}{}  {}  {} entries, {} body, {} LBA blocks{}{}{}{}",
             s.ulid,
             journal_tag(s.is_journal),
             fmt_size(s.file_size),
@@ -885,6 +945,7 @@ fn print_seg_section(
             s.lba_blocks,
             ref_note,
             delta_note,
+            canon_note,
             post_snap_tag(&s.ulid, latest_snap),
         );
     }
@@ -925,25 +986,49 @@ fn print_cache_section(
             post_snap_tag(&f.ulid, latest_snap),
         );
         println!(
-            "{indent}index:   {} ({})  (dedup {}, inline {}, zero {})",
+            "{indent}index:   {} ({})  (data {}, dedup {}, inline {}, zero {}, delta {})",
             fmt_commas(f.entry_count as u64),
             fmt_size(f.idx_file_bytes),
+            fmt_commas(f.data_count as u64),
             fmt_commas(f.dedup_ref_count as u64),
             fmt_commas(f.inline_count as u64),
             fmt_commas(f.zero_count as u64),
+            fmt_commas(f.delta_count as u64),
         );
         println!(
-            "{indent}cached:  {} / {}  ({} local)  {} present",
+            "{indent}cached:  {} / {}  ({} local)  {} present{}",
             fmt_commas(f.present_count as u64),
             fmt_commas(f.data_count as u64),
             fmt_size(f.data_body_bytes),
             pct,
+            canonical_note(f.canonical_data_count),
         );
-        println!(
-            "{indent}delta:   {} ({})",
-            fmt_commas(f.delta_count as u64),
-            fmt_size(f.delta_body_bytes),
-        );
+        if f.inline_count > 0 {
+            println!(
+                "{indent}inline:  {} ({}){}",
+                fmt_commas(f.inline_count as u64),
+                fmt_size(f.inline_body_bytes),
+                canonical_note(f.canonical_inline_count),
+            );
+        }
+        if f.delta_count > 0 {
+            println!(
+                "{indent}delta:   {} ({}){}",
+                fmt_commas(f.delta_count as u64),
+                fmt_size(f.delta_body_bytes),
+                canonical_note(f.canonical_delta_count),
+            );
+        }
+    }
+}
+
+/// Trailing `  (N canonical)` note for a storage-class row, empty when the
+/// class has no canonical-only (LBA-less) entries.
+fn canonical_note(n: usize) -> String {
+    if n > 0 {
+        format!("  ({} canonical)", fmt_commas(n as u64))
+    } else {
+        String::new()
     }
 }
 
@@ -1112,6 +1197,87 @@ mod tests {
             m.journal_blocks, 3,
             "journal_blocks counts only journal-tier entries"
         );
+
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn cache_counts_fold_canonical_into_storage_class() {
+        use elide_core::segment::{self, PendingEntry, SegmentEntry, SegmentFlags};
+        use ulid::Ulid;
+
+        let tmp = temp_vol_dir();
+        let index_dir = tmp.join("index");
+        let cache_dir = tmp.join("cache");
+        fs::create_dir_all(&index_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+
+        // One of each storage class, plus its canonical-only demotion for the
+        // three body-carrying classes. `new_data` inlines small bodies, so a
+        // 4 KiB body forces a body-section Data entry and a tiny body an Inline.
+        let big = || vec![7u8; 4096];
+        let small = |b: u8| vec![b; 8];
+        let data =
+            SegmentEntry::new_data(blake3::hash(b"data"), 0, 1, SegmentFlags::empty(), big());
+        let canon_data =
+            SegmentEntry::new_data(blake3::hash(b"cdata"), 1, 1, SegmentFlags::empty(), big())
+                .into_canonical();
+        let inline =
+            SegmentEntry::new_data(blake3::hash(b"inl"), 2, 1, SegmentFlags::empty(), small(1));
+        let canon_inline =
+            SegmentEntry::new_data(blake3::hash(b"cinl"), 3, 1, SegmentFlags::empty(), small(2))
+                .into_canonical();
+        let dref = PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"r"), 4, 1));
+        let zero = PendingEntry::from_entry(SegmentEntry::new_zero(5, 1));
+
+        assert_eq!(inline.entry.kind, EntryKind::Inline);
+        assert_eq!(canon_inline.entry.kind, EntryKind::CanonicalInline);
+        assert_eq!(canon_data.entry.kind, EntryKind::CanonicalData);
+
+        let u = Ulid::new();
+        let seg_path = tmp.join(format!("{u}"));
+        segment::write_segment(
+            &seg_path,
+            vec![data, canon_data, inline, canon_inline, dref, zero],
+            signer.as_ref(),
+        )
+        .unwrap();
+
+        let idx_path = index_dir.join(format!("{u}.idx"));
+        segment::extract_idx(&seg_path, &idx_path).unwrap();
+        segment::promote_to_cache(
+            &seg_path,
+            &cache_dir.join(format!("{u}.body")),
+            &cache_dir.join(format!("{u}.present")),
+        )
+        .unwrap();
+
+        let infos = collect_cache_dir(&tmp).unwrap();
+        let f = infos.iter().find(|f| f.ulid == u.to_string()).unwrap();
+
+        assert_eq!(f.entry_count, 6);
+        // Each canonical folds into its base storage class and is also
+        // reported as the canonical subset of that class.
+        assert_eq!(f.data_count, 2, "Data + CanonicalData");
+        assert_eq!(f.canonical_data_count, 1);
+        assert_eq!(f.inline_count, 2, "Inline + CanonicalInline");
+        assert_eq!(f.canonical_inline_count, 1);
+        assert_eq!(f.dedup_ref_count, 1);
+        assert_eq!(f.zero_count, 1);
+        assert_eq!(f.delta_count, 0);
+        assert_eq!(f.canonical_delta_count, 0);
+
+        // The census partitions every entry exactly once.
+        assert_eq!(
+            f.data_count + f.dedup_ref_count + f.inline_count + f.zero_count + f.delta_count,
+            f.entry_count,
+        );
+
+        // `promote_to_cache` sets present bits for `is_data()` (Data +
+        // CanonicalData), so the canonical body is not masked off the cached
+        // fraction: present reaches the full data_count of 2, not 1.
+        assert_eq!(f.present_count, 2);
 
         fs::remove_dir_all(tmp).unwrap();
     }
