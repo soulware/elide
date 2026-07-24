@@ -847,12 +847,7 @@ proptest! {
                     // docs/design/gc-ulid-ordering.md.
                     pending_gc = None;
                     // Match production sequencing: `tasks.rs` runs drain →
-                    // GC sequentially within each tick. Without an explicit
-                    // drain, a prior `Flush` could leave a u_flush_old
-                    // (< u_gc) in pending and the apply-time commit would
-                    // put u_gc into committed alongside a lower-ULID pending
-                    // peer — violating the structural pending-above-committed
-                    // invariant.
+                    // GC sequentially within each tick.
                     common::drain_with_repack(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     // Core invariant: the volume mint must have advanced past the
@@ -900,9 +895,6 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    // Without this, a u_flush_old in pending below the
-                    // about-to-be-minted u_gc would violate
-                    // pending-above-committed once GcApply commits.
                     common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
@@ -1235,9 +1227,6 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    // Without this, a u_flush_old in pending below the
-                    // about-to-be-minted u_gc would violate
-                    // pending-above-committed once GcApply commits.
                     common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
@@ -1571,9 +1560,6 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    // Without this, a u_flush_old in pending below the
-                    // about-to-be-minted u_gc would violate
-                    // pending-above-committed once GcApply commits.
                     common::drain_with_repack(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
