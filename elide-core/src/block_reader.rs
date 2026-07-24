@@ -114,10 +114,9 @@ impl BlockReader {
         search_dirs.dedup();
 
         let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
-        // Rebuild with the volume's persisted journal window (including
-        // any live-flip activation marker) so the live view resolves
-        // canonicals exactly as the volume does.
-        let journal = crate::config::VolumeConfig::read(&dir)?.journal_window();
+        // Rebuild with the volume's persisted journal ranges so the live
+        // view routes journal entries exactly as the volume does.
+        let journal = crate::config::VolumeConfig::read(&dir)?.journal_ranges();
         let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
@@ -153,7 +152,7 @@ impl BlockReader {
                             body_section_start: 0,
                             inline_data: None,
                         };
-                        if journal.ranges.contains(start_lba) {
+                        if journal.contains(start_lba) {
                             extent_index.insert_journal_if_absent(ulid, hash, location);
                         } else {
                             extent_index.insert_if_absent(hash, location);

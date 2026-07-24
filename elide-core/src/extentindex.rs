@@ -1120,14 +1120,15 @@ pub type RebuiltOwners = (
 ///
 /// Walk order matches [`rebuild`]: committed (gc ∪ index) sorted by
 /// ULID, then pending sorted by ULID, with `insert_if_absent` semantics
-/// (lowest-non-journal-ULID-wins, per the same displacement rule).
+/// (lowest-ULID-wins for the data tier; journal entries route to their
+/// disjoint `(segment, hash)` tier by the persisted flag).
 ///
 /// **Do not use for production rebuild paths** — they need the full
 /// machinery.
 #[cfg(feature = "volume-invariants")]
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
-    journal: &crate::journal::JournalWindow,
+    journal: &crate::journal::JournalRanges,
 ) -> io::Result<RebuiltOwners> {
     let mut inner_owners: HashMap<blake3::Hash, Ulid> = HashMap::new();
     let mut journal_owners: std::collections::HashSet<(Ulid, blake3::Hash)> =
@@ -1220,7 +1221,7 @@ pub fn rebuild_owners_unverified(
                             &mut journal_owners,
                             hash,
                             wal_ulid,
-                            journal.ranges.contains(start_lba),
+                            journal.contains(start_lba),
                         );
                     }
                 }

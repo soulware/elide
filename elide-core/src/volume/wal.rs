@@ -46,7 +46,7 @@ pub(super) fn replay_wal_records(
     path: &Path,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-    journal: &crate::journal::JournalWindow,
+    journal: &crate::journal::JournalRanges,
 ) -> io::Result<WalReplay> {
     let ulid_str = path
         .file_name()
@@ -83,7 +83,7 @@ pub(super) fn replay_wal_records(
                 // goes to the disjoint journal tier keyed by `(ulid, hash)`,
                 // never `inner`; a durable record uses `insert_if_absent`
                 // (first owner wins, loser minted as a DedupRef at formation).
-                let is_journal = journal.ranges.contains(start_lba);
+                let is_journal = journal.contains(start_lba);
                 let location = extentindex::ExtentLocation {
                     segment_id: ulid,
                     body_offset,
@@ -164,7 +164,7 @@ pub(super) fn recover_wal(
     path: PathBuf,
     lbamap: &mut lbamap::LbaMap,
     extent_index: &mut extentindex::ExtentIndex,
-    journal: &crate::journal::JournalWindow,
+    journal: &crate::journal::JournalRanges,
 ) -> io::Result<RecoveredWal> {
     let replay = replay_wal_records(&path, lbamap, extent_index, journal)?;
     let wal = writelog::WriteLog::reopen(&path, replay.valid_size)?;

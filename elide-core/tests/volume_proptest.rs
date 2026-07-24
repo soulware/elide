@@ -487,7 +487,6 @@ fn stamp_journal_window(fork_dir: &std::path::Path) {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
-        activation: None,
     });
     cfg.write(fork_dir).unwrap();
 }

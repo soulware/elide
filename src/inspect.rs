@@ -73,7 +73,7 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     print_node(&node, latest_snap_str.as_deref());
     print_ancestor_nodes(&ancestors);
 
-    let journal_window_blocks = cfg.journal_window().ranges.lba_count();
+    let journal_window_blocks = cfg.journal_ranges().lba_count();
     let t = totals(&node, &ancestors);
     print_totals(&t, &pending_summary(dir)?, journal_window_blocks);
 

@@ -633,13 +633,12 @@ pub struct Volume {
     /// Stats for DedupRef minting at segment formation
     /// (`classify_pending_dedup`).
     pub(in crate::volume) dedup_mint_stats: DedupMintStats,
-    /// The guest filesystem's jbd2 journal window. Loaded from
-    /// `volume.toml` before the extent-index rebuild (which needs it for
-    /// the non-journal ownership preference), re-derived from the
-    /// filesystem after the maps are built, and persisted back when it
-    /// changed. Carries the activation marker while this session has
-    /// flipped the window on live (`poll_derive_and_flip`).
-    pub(in crate::volume) journal: crate::journal::JournalWindow,
+    /// The guest filesystem's jbd2 journal LBA ranges. Loaded from
+    /// `volume.toml` before the extent-index rebuild (which needs them to
+    /// route journal entries to the disjoint tier), re-derived from the
+    /// filesystem after the maps are built, and persisted back when they
+    /// change.
+    pub(in crate::volume) journal: crate::journal::JournalRanges,
     /// Whether `volume.toml` holds an authoritative derivation answer.
     /// While `false`, every promote take re-attempts derivation so a
     /// filesystem formatted mid-session gains journal awareness without
@@ -728,22 +727,13 @@ impl Volume {
             }
         }
 
-        // The journal window persisted by the previous session. The
-        // extent-index rebuild needs it before the filesystem is
+        // The journal ranges persisted by the previous session. The
+        // extent-index rebuild needs them before the filesystem is
         // parseable; a freshly derived window is persisted at the end of
-        // open for the next session (`refresh_journal_ranges`). Any
-        // live-flip activation marker from the previous session is
-        // cleared first: this open reclassifies uniformly under the
-        // stored window, and everything rebuilding from `volume.toml`
-        // during the new session must see the same rule.
-        let mut cfg = crate::config::VolumeConfig::read(base_dir)?;
-        if let Some(j) = cfg.journal.as_mut()
-            && j.activation.take().is_some()
-        {
-            cfg.write(base_dir)?;
-        }
+        // open for the next session (`refresh_journal_ranges`).
+        let cfg = crate::config::VolumeConfig::read(base_dir)?;
         let journal_derived = cfg.journal.is_some();
-        let journal = cfg.journal_window();
+        let journal = cfg.journal_ranges();
 
         // Walk the origin chain and rebuild maps from all committed segments.
         let (ancestor_layers, mut lbamap, mut extent_index) = open_read_state(base_dir, by_id_dir)?;
@@ -861,7 +851,7 @@ impl Volume {
                 pending_entries,
                 pre_promote_offsets,
                 body_offsets,
-                &journal.ranges,
+                &journal,
             );
             // Primary ULID first: the journal segment must sort above the
             // data segment (see `JournalPartition`).
@@ -972,8 +962,8 @@ impl Volume {
     /// it to `volume.toml` when it differs from the stored value.
     ///
     /// Never-derived volumes route through `poll_derive_and_flip`: a
-    /// successful parse takes effect immediately in this session (with
-    /// the activation marker keeping rebuilds consistent). For an
+    /// successful parse takes effect immediately in this session (the
+    /// persisted per-entry `JOURNAL` flag keeps rebuilds consistent). For an
     /// already-derived volume whose window changed (reformat), the
     /// in-memory set stays what this open's rebuild used — the derived
     /// window takes effect at the next open, keeping the live index and
@@ -1011,7 +1001,7 @@ impl Volume {
                 return;
             }
         };
-        if derived == self.journal.ranges {
+        if derived == self.journal {
             return;
         }
         let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
@@ -1023,7 +1013,6 @@ impl Volume {
         };
         cfg.journal = Some(crate::config::JournalConfig {
             ranges: derived.clone(),
-            activation: None,
         });
         if let Err(e) = cfg.write(&self.base_dir) {
             log::warn!("[journal] persisting window failed: {e}");
@@ -1033,8 +1022,8 @@ impl Volume {
             "[journal] window changed: {} range(s), {} LBAs (was {} range(s), {} LBAs); effective next open",
             derived.as_slice().len(),
             derived.lba_count(),
-            self.journal.ranges.as_slice().len(),
-            self.journal.ranges.lba_count(),
+            self.journal.as_slice().len(),
+            self.journal.lba_count(),
         );
     }
 
@@ -1056,8 +1045,8 @@ impl Volume {
         }
         log::info!(
             "[journal] filesystem no longer parses as ext4; cleared stored window ({} range(s), {} LBAs); effective next open",
-            self.journal.ranges.as_slice().len(),
-            self.journal.ranges.lba_count(),
+            self.journal.as_slice().len(),
+            self.journal.lba_count(),
         );
     }
 
@@ -1083,19 +1072,16 @@ impl Volume {
         }
     }
 
-    /// Persist a first-ever derivation answer and activate a non-empty
+    /// Persist a first-ever derivation answer and go live on a non-empty
     /// window in this session.
     ///
-    /// The activation ULID is minted after every existing segment and
-    /// before anything minted later (WALs, segments), so journal
-    /// classification — `window.contains(lba) && segment_ulid >=
-    /// activation` — reproduces this session's stamps in every rebuild:
-    /// pre-flip segments were stamped under the empty window and sort
-    /// below the marker. The config write comes first; if it fails the
-    /// volume stays never-derived so no rebuild can disagree with the
-    /// live index.
+    /// Classification is the persisted per-entry `JOURNAL` flag stamped
+    /// at formation, so pre-derivation writes stay in the data tier and
+    /// this take begins routing window LBAs to the journal tier with no
+    /// reclassification of history. The config write comes first; if it
+    /// fails the volume stays never-derived so no rebuild can disagree
+    /// with the live index.
     fn flip_window(&mut self, ranges: crate::journal::JournalRanges) {
-        let activation = (!ranges.is_empty()).then(|| self.mint.next());
         let mut cfg = match crate::config::VolumeConfig::read(&self.base_dir) {
             Ok(c) => c,
             Err(e) => {
@@ -1105,28 +1091,21 @@ impl Volume {
         };
         cfg.journal = Some(crate::config::JournalConfig {
             ranges: ranges.clone(),
-            activation,
         });
         if let Err(e) = cfg.write(&self.base_dir) {
             log::warn!("[journal] persisting window flip failed: {e}");
             return;
         }
         self.journal_derived = true;
-        match activation {
-            Some(a) => {
-                log::info!(
-                    "[journal] window derived live: {} range(s), {} LBAs; active from segment {a}",
-                    ranges.as_slice().len(),
-                    ranges.lba_count(),
-                );
-                self.journal = crate::journal::JournalWindow {
-                    ranges,
-                    activation: Some(a),
-                };
-            }
-            None => {
-                log::info!("[journal] derived: filesystem has no internal journal");
-            }
+        if ranges.is_empty() {
+            log::info!("[journal] derived: filesystem has no internal journal");
+        } else {
+            log::info!(
+                "[journal] window derived live: {} range(s), {} LBAs",
+                ranges.as_slice().len(),
+                ranges.lba_count(),
+            );
+            self.journal = ranges;
         }
     }
 
@@ -1270,7 +1249,7 @@ impl Volume {
         // that already resolves (a prior canonical, or an earlier write of
         // the same bytes in this epoch) keeps its owner, and the non-owner is
         // minted as a DedupRef at formation (`classify_pending_dedup`).
-        let is_journal = self.journal.ranges.contains(lba);
+        let is_journal = self.journal.contains(lba);
         let location = extentindex::ExtentLocation {
             segment_id: wal_ulid,
             body_offset,
@@ -3351,14 +3330,14 @@ impl Volume {
                 snap_ulid,
                 extent_index: Arc::clone(&self.extent_index),
                 search_dirs,
-                journal_ranges: self.journal.ranges.clone(),
+                journal_ranges: self.journal.clone(),
             }
         });
         let (primary, jpart) = partition_journal_pending(
             std::mem::take(&mut self.pending_entries),
             pre_promote_offsets,
             std::mem::take(&mut self.pending_body_offsets),
-            &self.journal.ranges,
+            &self.journal,
         );
         // The journal segment ULID is minted after the primary's, so it
         // sorts above the data segment (see `JournalPartition`).
@@ -3371,8 +3350,8 @@ impl Volume {
             },
         );
         // Poll for a first-ever window derivation while the taken epoch
-        // is fully staged: any activation ULID minted here sorts above
-        // this epoch's segment ULIDs and below the next WAL's.
+        // is fully staged, so subsequent takes route window LBAs to the
+        // journal tier.
         if !self.journal_derived {
             self.poll_derive_and_flip();
         }
