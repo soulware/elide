@@ -38,6 +38,72 @@ const LBA_BYTES: u64 = 4096;
 /// tradeoff between ratio and import latency.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Byte budget for the per-pass source plaintext cache.
+///
+/// Sources average a few hundred KiB, so an unbounded cache holds every
+/// distinct source a pass touches: measured at 5.4 MiB for a median
+/// formation and 113 MiB for the largest. Bounding trades that tail for
+/// re-reads of evicted sources, which come from cache files written
+/// minutes earlier and are usually already in page cache.
+const SOURCE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Source plaintext held for the duration of one delta pass, bounded by
+/// total bytes rather than entry count because source sizes vary by an
+/// order of magnitude.
+///
+/// A source larger than the whole budget is still cached, as the sole
+/// entry — evicting it would leave the pass unable to use it at all.
+struct SourceCache {
+    entries: lru::LruCache<blake3::Hash, Vec<u8>>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl SourceCache {
+    fn new() -> Self {
+        Self::with_budget(SOURCE_CACHE_BYTES)
+    }
+
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// Take ownership of `plain` as the most recently used entry, evicting
+    /// least-recently-used entries until the budget holds.
+    fn put(&mut self, hash: blake3::Hash, plain: Vec<u8>) {
+        self.bytes += plain.len();
+        if let Some((_, replaced)) = self.entries.push(hash, plain) {
+            self.bytes -= replaced.len();
+        }
+        while self.bytes > self.budget && self.entries.len() > 1 {
+            match self.entries.pop_lru() {
+                Some((_, evicted)) => self.bytes -= evicted.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// Source plaintext for `hash`, reading it if absent, with `true` when
+    /// the cache served it. `None` when the source could not be read.
+    fn get_or_read(
+        &mut self,
+        hash: &blake3::Hash,
+        extent_index: &ExtentIndex,
+        search_dirs: &[PathBuf],
+    ) -> Option<(&[u8], bool)> {
+        let hit = self.entries.contains(hash);
+        if !hit {
+            let plain = read_source_plaintext(extent_index, search_dirs, hash)?;
+            self.put(*hash, plain);
+        }
+        self.entries.get(hash).map(|v| (v.as_slice(), hit))
+    }
+}
+
 /// Compressed length of `plain` with no dictionary, at [`ZSTD_LEVEL`].
 fn dictionaryless_len(plain: &[u8]) -> io::Result<usize> {
     zstd::bulk::compress(plain, ZSTD_LEVEL)
@@ -573,7 +639,7 @@ pub fn delta_pendings_by_resemblance(
     if sketches.is_empty() {
         return Ok(stats);
     }
-    let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
+    let mut source_cache = SourceCache::new();
 
     for pending in pendings.iter_mut() {
         let entry = &pending.entry;
@@ -632,20 +698,16 @@ pub fn delta_pendings_by_resemblance(
                 stats.candidates_unreferenced += 1;
                 continue;
             }
-            let source_plain = match source_plain_cache.get(&cand.hash) {
-                Some(v) => {
-                    stats.dictionary_cache_hits += 1;
-                    v
-                }
-                None => {
-                    let Some(plain) = read_source_plaintext(extent_index, search_dirs, &cand.hash)
-                    else {
-                        continue;
-                    };
-                    stats.dictionary_bytes_read += plain.len() as u64;
-                    source_plain_cache.entry(cand.hash).or_insert(plain)
-                }
+            let Some((source_plain, hit)) =
+                source_cache.get_or_read(&cand.hash, extent_index, search_dirs)
+            else {
+                continue;
             };
+            if hit {
+                stats.dictionary_cache_hits += 1;
+            } else {
+                stats.dictionary_bytes_read += source_plain.len() as u64;
+            }
             stats.candidates_tried += 1;
 
             let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, source_plain)
@@ -723,7 +785,7 @@ pub fn delta_pendings_against_prior(
 ) -> io::Result<(Vec<u8>, SegmentDeltaStats)> {
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
-    let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
+    let mut source_cache = SourceCache::new();
 
     for pending in pendings.iter_mut() {
         let entry = &pending.entry;
@@ -744,15 +806,10 @@ pub fn delta_pendings_against_prior(
 
         // Fetch source plaintext (cached per source hash — a hot file
         // being rewritten at multiple LBAs shares its dictionary).
-        let source_plain = match source_plain_cache.get(&source_hash) {
-            Some(v) => v,
-            None => {
-                let Some(plain) = read_source_plaintext(extent_index, search_dirs, &source_hash)
-                else {
-                    continue;
-                };
-                source_plain_cache.entry(source_hash).or_insert(plain)
-            }
+        let Some((source_plain, _hit)) =
+            source_cache.get_or_read(&source_hash, extent_index, search_dirs)
+        else {
+            continue;
         };
 
         let child_plain_owned: Vec<u8>;
@@ -839,5 +896,61 @@ mod tests {
         assert!(!delta_is_worth_storing(between, stored, &plain).expect("gate"));
 
         assert!(delta_is_worth_storing(plain_zstd - 1, stored, &plain).expect("gate"));
+    }
+}
+
+#[cfg(test)]
+mod source_cache_tests {
+    use super::*;
+
+    fn h(n: u8) -> blake3::Hash {
+        blake3::hash(&[n])
+    }
+
+    #[test]
+    fn evicts_least_recently_used_once_the_budget_is_exceeded() {
+        let mut cache = SourceCache::with_budget(1000);
+        cache.put(h(1), vec![0u8; 400]);
+        cache.put(h(2), vec![0u8; 400]);
+        // Touching 1 makes 2 the least recently used.
+        assert!(cache.entries.get(&h(1)).is_some());
+        cache.put(h(3), vec![0u8; 400]);
+
+        assert!(cache.bytes <= 1000, "budget held: {}", cache.bytes);
+        assert!(cache.entries.contains(&h(1)), "recently used survives");
+        assert!(
+            !cache.entries.contains(&h(2)),
+            "least recently used evicted"
+        );
+        assert!(cache.entries.contains(&h(3)));
+    }
+
+    #[test]
+    fn keeps_a_source_larger_than_the_whole_budget() {
+        let mut cache = SourceCache::with_budget(1000);
+        cache.put(h(1), vec![0u8; 4000]);
+
+        assert!(cache.entries.contains(&h(1)));
+        assert_eq!(cache.bytes, 4000, "an oversized sole entry is not evicted");
+    }
+
+    #[test]
+    fn an_oversized_entry_is_dropped_once_another_arrives() {
+        let mut cache = SourceCache::with_budget(1000);
+        cache.put(h(1), vec![0u8; 4000]);
+        cache.put(h(2), vec![0u8; 100]);
+
+        assert!(!cache.entries.contains(&h(1)));
+        assert_eq!(cache.bytes, 100);
+    }
+
+    #[test]
+    fn re_putting_the_same_hash_does_not_double_count() {
+        let mut cache = SourceCache::with_budget(1000);
+        cache.put(h(1), vec![0u8; 300]);
+        cache.put(h(1), vec![0u8; 300]);
+
+        assert_eq!(cache.bytes, 300);
+        assert_eq!(cache.entries.len(), 1);
     }
 }
