@@ -190,6 +190,19 @@ Not one target that single-source failed was rescued by a combined dictionary, s
 
 On 36% of recovered targets (400 of 1,102) the probe surfaces only one candidate, so there is nothing to combine in the first place.
 
+**Trying past a loss rescues nothing, and a shared-feature floor costs more than it saves.** Across every configuration measured, the bytes recovered by a lower-ranked candidate after the top-ranked one failed the keep rule were **0 MiB in 0 runs**. A floor on shared features, requiring any k of eight rather than one, trades recall for candidate volume:
+
+| min shared | recall | dict saving | candidates past the floor |
+|---|---|---|---|
+| **1** | **94.1%** | **40.4 MiB** | 72.9 per run |
+| 2 | 87.5% | 37.3 MiB | 25.9 |
+| 3 | 74.7% | 32.1 MiB | 10.0 |
+| 4 | 60.2% | 29.2 MiB | 8.2 |
+
+Every step costs recall, for the same reason grouping does: demanding more joint evidence discards the low-resemblance tail, which is where the value is. A floor of 2 on eight features lands at 87.5%, almost exactly where four features with no floor land (87.0%), so the two are the same lever.
+
+The floor also saves less than it appears to. Candidates *surfaced* barely moves (72.9 to 72.5), because the posting runs are walked to count shared features before the floor can apply, and given that a tried-and-lost candidate ends the target, only one dictionary is ever compressed against per target anyway. There is nothing left for the floor to save.
+
 **A trained shared dictionary earns almost nothing here.** `--train-dict` trains one zstd dictionary over 4 KiB windows sampled from the before-image and measures it against the baseline each bucket already has:
 
 | bucket | bytes | baseline | trained 110 KiB | trained 532 KiB |

@@ -90,6 +90,9 @@ enum Command {
         /// Sample window size for dictionary training
         #[arg(long, default_value_t = 4096)]
         train_sample: u64,
+        /// Features a candidate must share with the target to be tried
+        #[arg(long, default_value_t = 1)]
+        min_shared: usize,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -1021,6 +1024,7 @@ fn main() {
             dict_sources,
             train_dict,
             train_sample,
+            min_shared,
         } => {
             let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
             let params = delta_sim::SketchParams::new(kind, features, group, sf_bytes)
@@ -1036,6 +1040,7 @@ fn main() {
                     dict_sources,
                     train_dict,
                     train_sample,
+                    min_shared,
                 },
             )
             .expect("delta-sim failed");

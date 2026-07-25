@@ -514,12 +514,14 @@ fn read_source_plaintext(
     }
 }
 
-/// Dictionaries tried per target, best-ranked first.
+/// How far down the ranked candidates to look for a source whose body is
+/// locally readable.
 ///
-/// Fallback depth rather than search width. Recovery measured identical at
-/// every cap from 1 to 32 because the ranking puts the best source first, so
-/// what the extra depth buys is a second chance when a candidate's body is
-/// not locally readable.
+/// Depth, not search width. Only one candidate is ever compressed against:
+/// a delta that fails the keep rule ends the target, because round 2 found
+/// no case where a lower-ranked source cleared the bar after the top-ranked
+/// one lost. What this bounds is how many candidates can be skipped for
+/// having no readable body, which the map cannot see.
 const MAX_RESEMBLANCE_CANDIDATES: usize = 4;
 
 /// Counters for one resemblance pass.
@@ -620,7 +622,10 @@ pub fn delta_pendings_by_resemblance(
                 .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
 
             if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
-                continue;
+                // Tried and lost, which is a fact about this target rather
+                // than this source. Trying further down the ranking was
+                // measured to rescue nothing.
+                break;
             }
             converted = Some((cand.hash, delta_blob));
             break;

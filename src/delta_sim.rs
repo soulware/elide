@@ -612,6 +612,8 @@ pub struct SimOptions {
     pub train_dict: usize,
     /// Sample window size for that training.
     pub train_sample: u64,
+    /// Features a candidate must share with the target to be tried.
+    pub min_shared: usize,
 }
 
 pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Result<()> {
@@ -623,6 +625,7 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
         dict_sources,
         train_dict,
         train_sample,
+        min_shared,
     } = opts;
     let mut before = File::open(before_path)?;
     let mut after = File::open(after_path)?;
@@ -757,6 +760,9 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
     let mut multi_better_runs = 0u64;
     let mut multi_dict_bytes = 0u64;
     let mut multi_probed = 0u64;
+    let mut candidates_after_floor = 0u64;
+    let mut rescued_bytes = 0u64;
+    let mut rescued_runs = 0u64;
     // Trained-dictionary buckets. `lz4` holds the baseline each is measured
     // against: plain zstd for the first two, the single-source delta for the
     // third.
@@ -826,6 +832,12 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
             }
         }
         candidates_surfaced += tally.len() as u64;
+        // A floor on shared features asks for more joint evidence before a
+        // source is worth trying, the same demand grouping makes at index
+        // time but as a threshold on the estimator rather than a partition
+        // of it: any k of eight, not all of a specific k.
+        tally.retain(|&(_, shared)| shared as usize >= min_shared);
+        candidates_after_floor += tally.len() as u64;
         if tally.len() > max_candidates {
             cap_hits += 1;
         }
@@ -836,13 +848,24 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
             .map(|&(idx, _)| idx)
             .collect();
         let mut best: Option<u64> = None;
-        for &idx in &cands {
+        let mut top_ranked: Option<u64> = None;
+        for (rank, &idx) in cands.iter().enumerate() {
             candidates_tried += 1;
             let dict = dicts.get(&mut before, &before_frags, idx)?.to_vec();
             let d = zstd_dict_len(level, &dict, &body)? as u64;
+            if rank == 0 {
+                top_ranked = Some(d);
+            }
             if best.is_none_or(|b| d < b) {
                 best = Some(d);
             }
+        }
+        // Does trying past a loss ever pay? Every body is present in an
+        // image, so a candidate that does not clear the bar was tried and
+        // lost rather than skipped as unreadable.
+        if matches!((top_ranked, best), (Some(top), Some(b)) if top >= bar && b < bar) {
+            rescued_bytes += target.len;
+            rescued_runs += 1;
         }
 
         // Side measurement: one dictionary built from the top-ranked
@@ -1041,6 +1064,18 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
             mib(multi_only.delta)
         );
     }
+    println!(
+        "    candidates past a floor of {}: {} ({:.1} per probed run)",
+        min_shared,
+        candidates_after_floor,
+        candidates_after_floor as f64
+            / (sim_recovered.runs + sim_nobenefit.runs + sim_nocandidate.runs).max(1) as f64
+    );
+    println!(
+        "    rescued by a lower-ranked candidate: {:.1} MiB in {} runs",
+        mib(rescued_bytes),
+        rescued_runs
+    );
     println!(
         "    candidates surfaced: {} ({:.1} per probed run, cap of {} bound on {} runs)",
         candidates_surfaced,
