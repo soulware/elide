@@ -87,6 +87,10 @@ pub struct Stats {
     pub features_at_cap: usize,
 }
 
+/// `Clone` copies both tables outright, which `Arc::make_mut` needs to
+/// extend a shared map. A promote's own Arc is dropped by the time the
+/// actor applies its result, so that normally mutates in place.
+#[derive(Clone)]
 pub struct SketchIndex {
     slots: Vec<Slot>,
     sources: Vec<SourceRef>,

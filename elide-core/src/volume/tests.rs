@@ -1967,6 +1967,28 @@ fn delta_variant_block(seed: u8, tweak: u8) -> Vec<u8> {
     out
 }
 
+/// `delta_base_block`'s pattern at the sketch size threshold, so the
+/// resemblance tier will both index and probe it.
+fn delta_base_extent(seed: u8) -> Vec<u8> {
+    let mut out = vec![0u8; crate::sketch::MIN_SKETCH_BYTES];
+    let mut hasher = blake3::Hasher::new_keyed(&[seed; 32]);
+    for (i, chunk) in out.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        chunk.copy_from_slice(&hasher.finalize().as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    out
+}
+
+/// A near-duplicate of [`delta_base_extent`]: high-entropy throughout, so
+/// plain zstd gains nothing, with a localised difference a dictionary of the
+/// base covers almost entirely.
+fn delta_variant_extent(seed: u8, tweak: u8) -> Vec<u8> {
+    let mut out = delta_base_extent(seed);
+    out[..64].fill(tweak);
+    out
+}
+
 fn pending_entry_kinds(base: &Path, vol: &Volume, seg: Ulid) -> Vec<segment::EntryKind> {
     let seg_path = base.join("pending").join(seg.to_string());
     let (_, entries, _) =
@@ -2005,6 +2027,74 @@ fn formation_deltas_post_seal_near_duplicate() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// The resemblance tier's reason for existing: a near-duplicate landing at
+/// a fresh LBA, in a volume with no sealed snapshot, which same-LBA
+/// selection cannot reach at all.
+#[test]
+fn formation_deltas_by_resemblance_without_a_snapshot() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // The source has to be promoted before it can be a candidate: the
+    // candidate map is extended when a promote's result is applied.
+    let source = delta_base_extent(3);
+    let blocks = (source.len() / 4096) as u64;
+    vol.write(0, &source).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let variant = delta_variant_extent(3, 0x5A);
+    vol.write(blocks, &variant).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Delta],
+        "a resembling source at another LBA must be found without a snapshot"
+    );
+    assert_eq!(
+        vol.read(blocks, blocks as u32).unwrap(),
+        variant,
+        "delta read-back"
+    );
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(
+        vol.read(blocks, blocks as u32).unwrap(),
+        variant,
+        "delta read-back after reopen"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// An unrelated extent is no source: the probe must not convert on the
+/// strength of a spurious match, and the keep rule is the backstop.
+#[test]
+fn formation_leaves_unrelated_content_as_data() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let first = delta_base_extent(4);
+    let blocks = (first.len() / 4096) as u64;
+    vol.write(0, &first).unwrap();
+    vol.promote_for_test().unwrap();
+
+    // A different key, so the two share no content.
+    vol.write(blocks, &delta_base_extent(5)).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Data],
+        "unrelated content must stay a full body"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn formation_without_sealed_snapshot_stays_data() {
     let base = keyed_temp_dir();
@@ -2017,7 +2107,12 @@ fn formation_without_sealed_snapshot_stays_data() {
 
     for seg in pending_ulids(&base) {
         for kind in pending_entry_kinds(&base, &vol, seg) {
-            assert_eq!(kind, segment::EntryKind::Data, "no snapshot, no delta tier");
+            assert_eq!(
+                kind,
+                segment::EntryKind::Data,
+                "a single block has no same-LBA snapshot source and is below the \
+                 sketch threshold, so neither tier can fire"
+            );
         }
     }
 

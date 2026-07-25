@@ -2106,13 +2106,13 @@ pub(crate) fn execute_promote(
         Err(e) => return Err(fail(e, job)),
     };
 
-    // Delta tier: convert single-block Data entries whose same-LBA prior
-    // extent beats the stored size as a zstd dictionary. Best-effort on
-    // map construction (a promote must not fail because the delta
-    // optimisation's source map broke); conversion errors are real
-    // corruption and fail the promote.
+    // Delta tiers, in cascade order. Same-LBA first where the volume has a
+    // sealed snapshot, then resemblance over what it left alone. Both are
+    // best-effort on source-map construction — a promote must not fail
+    // because a delta optimisation's inputs were unavailable — while
+    // conversion errors are real corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
-    if let Some(prior_spec) = &job.delta_prior {
+    if let Some(prior_spec) = &job.delta.prior {
         match prior_cache.map_for(
             &prior_spec.base_dir,
             prior_spec.snap_ulid,
@@ -2122,8 +2122,8 @@ pub(crate) fn execute_promote(
                 match crate::delta_compute::delta_pendings_against_prior(
                     &mut pendings,
                     prior,
-                    &prior_spec.extent_index,
-                    &prior_spec.search_dirs,
+                    &job.delta.extent_index,
+                    &job.delta.search_dirs,
                 ) {
                     Ok((body, stats)) => {
                         if stats.entries_converted > 0 {
@@ -2143,11 +2143,35 @@ pub(crate) fn execute_promote(
             }
             Err(e) => {
                 warn!(
-                    "formation {}: snapshot {} source map unavailable, skipping delta tier: {e}",
+                    "formation {}: snapshot {} source map unavailable, skipping same-LBA delta tier: {e}",
                     job.segment_ulid, prior_spec.snap_ulid
                 );
             }
         }
+    }
+
+    match crate::delta_compute::delta_pendings_by_resemblance(
+        &mut pendings,
+        &job.delta.sketch_index,
+        &job.delta.extent_index,
+        &job.delta.search_dirs,
+        &mut delta_body,
+    ) {
+        Ok(stats) => {
+            if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
+                log::info!(
+                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes, converted {} entries, {} → {} bytes",
+                    job.segment_ulid,
+                    stats.targets_probed,
+                    stats.candidates_tried,
+                    stats.dictionary_bytes_read,
+                    stats.delta.entries_converted,
+                    stats.delta.original_body_bytes,
+                    stats.delta.delta_body_bytes,
+                );
+            }
+        }
+        Err(e) => return Err(fail(e, job)),
     }
 
     // An all-journal epoch leaves the primary partition empty; no

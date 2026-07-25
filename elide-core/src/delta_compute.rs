@@ -27,7 +27,11 @@ use crate::segment::{
     read_and_verify_segment_index, read_body_section_bodies, write_segment_with_delta_body,
 };
 use crate::signing::{self, VerifyingKey};
+use crate::sketch_index::SketchIndex;
 use crate::volume;
+
+/// Bytes an extent covers per LBA.
+const LBA_BYTES: u64 = 4096;
 
 /// zstd compression level for delta blobs. Deltas are computed once at
 /// import time and fetched infrequently; a middling level is a good
@@ -508,6 +512,155 @@ fn read_source_plaintext(
     } else {
         Some(buf)
     }
+}
+
+/// Dictionaries tried per target, best-ranked first.
+///
+/// Fallback depth rather than search width. Recovery measured identical at
+/// every cap from 1 to 32 because the ranking puts the best source first, so
+/// what the extra depth buys is a second chance when a candidate's body is
+/// not locally readable.
+const MAX_RESEMBLANCE_CANDIDATES: usize = 4;
+
+/// Counters for one resemblance pass.
+#[derive(Debug, Default)]
+pub struct ResemblanceStats {
+    pub delta: SegmentDeltaStats,
+    /// Targets whose sketch was probed against the map.
+    pub targets_probed: u64,
+    /// Candidate dictionaries read and compressed against.
+    pub candidates_tried: u64,
+    /// Source plaintext read to seed dictionaries, before caching.
+    pub dictionary_bytes_read: u64,
+}
+
+/// Convert `Data` pendings to thin `Delta` entries against sources the
+/// candidate map says resemble them.
+///
+/// Runs after the same-LBA tier, over the entries it left alone, and needs
+/// no snapshot: `sketches` spans whatever the lineage held at open plus what
+/// later promotes appended. Delta blobs append to `delta_body`, which the
+/// same-LBA tier may already have filled.
+///
+/// Best-effort like every delta tier. A target too small to sketch, a
+/// sketch with no candidate, a candidate whose body is not locally readable,
+/// and a delta that fails the keep rule all leave the entry as the `Data`
+/// entry it was.
+///
+/// A candidate can never come from this same batch, since the map is fed
+/// after a promote commits, so no conversion here can leave another
+/// conversion's source pointing at a `Delta`.
+pub fn delta_pendings_by_resemblance(
+    pendings: &mut [segment::PendingEntry],
+    sketches: &SketchIndex,
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
+    delta_body: &mut Vec<u8>,
+) -> io::Result<ResemblanceStats> {
+    let mut stats = ResemblanceStats::default();
+    if sketches.is_empty() {
+        return Ok(stats);
+    }
+    let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
+
+    for pending in pendings.iter_mut() {
+        let entry = &pending.entry;
+        // The same-LBA tier converts before this one, and a delta-bearing
+        // entry cannot take a second source.
+        if entry.kind != EntryKind::Data || !entry.delta_options.is_empty() {
+            continue;
+        }
+        if entry.journal {
+            continue;
+        }
+        let raw_len = entry.lba_length as u64 * LBA_BYTES;
+        if raw_len < crate::sketch::MIN_SKETCH_BYTES as u64 {
+            continue;
+        }
+        let Some(stored) = pending.body.as_deref() else {
+            continue;
+        };
+
+        let child_plain_owned: Vec<u8>;
+        let child_plain: &[u8] = if entry.compressed {
+            child_plain_owned = decompress_lz4(stored)?;
+            &child_plain_owned
+        } else {
+            stored
+        };
+        let Some(target_sketch) = crate::sketch::compute(child_plain) else {
+            continue;
+        };
+        stats.targets_probed += 1;
+
+        let mut converted = None;
+        for cand in sketches.candidates(&target_sketch, MAX_RESEMBLANCE_CANDIDATES) {
+            // A source that is its own target would be a delta naming its
+            // own hash, which nothing can resolve. Exact-hash dedup runs
+            // before this tier and takes that case.
+            if cand.hash == entry.hash {
+                continue;
+            }
+            let source_plain = match source_plain_cache.get(&cand.hash) {
+                Some(v) => v,
+                None => {
+                    let Some(plain) = read_source_plaintext(extent_index, search_dirs, &cand.hash)
+                    else {
+                        continue;
+                    };
+                    stats.dictionary_bytes_read += plain.len() as u64;
+                    source_plain_cache.entry(cand.hash).or_insert(plain)
+                }
+            };
+            stats.candidates_tried += 1;
+
+            let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, source_plain)
+                .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
+                .compress(child_plain)
+                .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
+
+            if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
+                continue;
+            }
+            converted = Some((cand.hash, delta_blob));
+            break;
+        }
+
+        let entry = &mut pending.entry;
+        let Some((source_hash, delta_blob)) = converted else {
+            // Formation computes a sketch for every fresh Data entry; hand
+            // over the one already computed so the segment write does not
+            // repeat it.
+            entry.sketch = Some(target_sketch);
+            continue;
+        };
+
+        let delta_offset = delta_body.len() as u64;
+        let delta_length = delta_blob.len() as u32;
+        let delta_hash = blake3::hash(&delta_blob);
+        delta_body.extend_from_slice(&delta_blob);
+
+        stats.delta.original_body_bytes += entry.stored_length as u64;
+        stats.delta.delta_body_bytes += delta_length as u64;
+        stats.delta.entries_converted += 1;
+
+        entry.kind = EntryKind::Delta;
+        entry.stored_offset = 0;
+        entry.stored_length = 0;
+        entry.compressed = false;
+        // A delta-bearing entry is not a valid source, so it advertises no
+        // sketch.
+        entry.sketch = None;
+        entry.delta_options.push(DeltaOption {
+            source_hash,
+            delta_offset,
+            delta_length,
+            delta_hash,
+        });
+        pending.body = None;
+    }
+
+    Ok(stats)
 }
 
 /// Convert single-block `Data` pendings to thin `Delta` entries wherever

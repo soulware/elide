@@ -38,10 +38,9 @@ pub struct PromoteJob {
     pub body_offsets: Vec<Option<u64>>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
-    /// Present when the volume has a sealed snapshot: the worker deltas
-    /// single-block Data entries against same-LBA extents from it before
-    /// writing the segment. `None` reproduces a plain promote.
-    pub delta_prior: Option<PromoteDeltaPrior>,
+    /// What the worker's delta tiers select sources from before writing
+    /// the segment.
+    pub delta: PromoteDeltaSpec,
     /// The epoch's journal-window share, written as its own segment.
     /// `None` when the volume has no journal window or the epoch touched
     /// no journal LBAs.
@@ -66,17 +65,28 @@ pub struct JournalPartition {
     pub body_offsets: Vec<Option<u64>>,
 }
 
-/// The sealed snapshot a promote's delta tier sources dictionaries from.
+/// What a promote's delta tiers need to find dictionaries.
+///
+/// Always present: the resemblance tier needs no snapshot, only the
+/// candidate map. `prior` carries the sealed snapshot the same-LBA tier
+/// sources from, for the volumes that have one.
+pub struct PromoteDeltaSpec {
+    /// Live extent-index snapshot for resolving source bodies by hash.
+    /// Any canonical serving a hash yields identical bytes, so the worker
+    /// needs no snapshot-pinned locations.
+    pub extent_index: Arc<extentindex::ExtentIndex>,
+    /// Candidate map over the lineage's persisted sketches, for selecting
+    /// sources by content resemblance.
+    pub sketch_index: Arc<crate::sketch_index::SketchIndex>,
+    /// Body-lookup roots: the fork directory first, then ancestor dirs.
+    pub search_dirs: Vec<PathBuf>,
+    pub prior: Option<PromoteDeltaPrior>,
+}
+
+/// The sealed snapshot the same-LBA delta tier sources dictionaries from.
 pub struct PromoteDeltaPrior {
     pub base_dir: PathBuf,
     pub snap_ulid: Ulid,
-    /// Live extent-index snapshot for resolving source bodies by hash.
-    /// Any canonical serving a hash yields identical bytes, so the
-    /// worker needs no snapshot-pinned locations — only the snapshot's
-    /// `LBA → hash` map (built worker-side, cached per `snap_ulid`).
-    pub extent_index: Arc<extentindex::ExtentIndex>,
-    /// Body-lookup roots: the fork directory first, then ancestor dirs.
-    pub search_dirs: Vec<PathBuf>,
     /// The volume's journal window: journal LBAs are excluded from the
     /// source map, so journal content never seeds a dictionary.
     pub journal_ranges: crate::journal::JournalRanges,
