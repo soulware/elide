@@ -1731,7 +1731,6 @@ impl Volume {
             return Ok(StagedApply::Diverged);
         }
 
-        let live = self.lbamap.lba_referenced_hashes();
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
@@ -1753,7 +1752,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if live.contains(hash) {
+            if self.lbamap.is_referenced(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
