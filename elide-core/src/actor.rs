@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, tick};
-use log::{error, warn};
+use log::{debug, error, warn};
 
 use ulid::Ulid;
 
@@ -282,8 +282,12 @@ struct PromotePipeline {
 struct ParkedOps {
     /// In-progress GC plan handoff batch. At most one batch at a time.
     handoffs: Option<ParkedGcHandoffs>,
-    /// Whether a GC plan handoff job is currently on the worker thread.
+    /// Whether a GC plan handoff job is on the worker thread, or has
+    /// returned a result held in `deferred_handoff`.
     handoff_in_flight: bool,
+    /// A finished plan-apply result held back until in-flight promotes
+    /// have applied. See [`VolumeActor::apply_or_defer_gc_plan`].
+    deferred_handoff: Option<Box<crate::volume::GcPlanApplyResult>>,
     /// Reply channel for an in-flight `Repack` request, parked while
     /// the worker thread executes the repack.
     repack: Option<Sender<io::Result<CompactionStats>>>,
@@ -923,50 +927,7 @@ impl VolumeActor {
                 self.pipeline.failed_promotes.push_back(failure.job);
             }
             WorkerResult::GcPlan(Ok(result)) => {
-                self.parked.handoff_in_flight = false;
-                let applied = self.lock_volume().apply_plan_apply_result(result);
-                match applied {
-                    Ok(crate::volume::StagedApply::Applied) => {
-                        self.publish_snapshot();
-                        if let Some(ref mut parked) = self.parked.handoffs {
-                            parked.applied_count += 1;
-                        }
-                    }
-                    Ok(crate::volume::StagedApply::Cancelled) => {
-                        // Cancelled in worker or stale-liveness in
-                        // apply; plan/tmp already cleaned up inside.
-                    }
-                    Ok(crate::volume::StagedApply::Diverged) => {
-                        self.on_divergence();
-                        // No hook (tests): drop the rest of the
-                        // batch — every remaining plan is suspect
-                        // against the same read state.
-                        if let Some(parked) = self.parked.handoffs.as_mut() {
-                            parked.remaining.clear();
-                        }
-                    }
-                    Err(e) => {
-                        warn!("gc plan apply failed: {e}");
-                        if let Some(parked) = self.parked.handoffs.take()
-                            && let Some(reply) = parked.reply
-                        {
-                            let _ = reply.send(Err(e));
-                        }
-                    }
-                }
-                // Dispatch next plan in this batch, or complete.
-                if let Some(mut parked) = self.parked.handoffs.take() {
-                    if parked.remaining.is_empty() {
-                        if let Some(reply) = parked.reply {
-                            let _ = reply.send(Ok(parked.applied_count));
-                        }
-                    } else if matches!(
-                        self.dispatch_next_handoff(&mut parked),
-                        HandoffDispatch::Dispatched
-                    ) {
-                        self.parked.handoffs = Some(parked);
-                    }
-                }
+                self.apply_or_defer_gc_plan(Box::new(result));
             }
             WorkerResult::GcPlan(Err(e)) => {
                 self.parked.handoff_in_flight = false;
@@ -1043,6 +1004,86 @@ impl VolumeActor {
             }
             #[cfg(test)]
             WorkerResult::Barrier => {}
+        }
+        // A promote applying above may have been the last one the deferred
+        // plan was waiting for.
+        if self.pipeline.promotes_in_flight == 0
+            && let Some(result) = self.parked.deferred_handoff.take()
+        {
+            self.apply_or_defer_gc_plan(result);
+        }
+    }
+
+    /// Apply a completed plan-apply result, or hold it until every
+    /// in-flight promote has applied.
+    ///
+    /// A promote captures index snapshots at prep and decides against them
+    /// on the worker, off-lock. A plan apply drops the extents GC found
+    /// dead, so landing one inside a promote's prep→apply window lets the
+    /// promote commit a reference to an extent that no longer exists — a
+    /// delta source is the reference that can name a dead extent, since
+    /// every other reference a promote makes is to live content, which a
+    /// rewrite must carry forward. Ordering the applies removes the
+    /// window. Detecting it at apply cannot work: by then the segment is
+    /// committed and the old WAL consumed, so there is nothing to roll
+    /// back to.
+    ///
+    /// Only promotes already in flight matter, because one dispatched
+    /// after this preps against post-apply state. Nothing starves: the
+    /// worker has already finished the plan, and the wait is bounded by
+    /// promotes that are running.
+    fn apply_or_defer_gc_plan(&mut self, result: Box<crate::volume::GcPlanApplyResult>) {
+        if self.pipeline.promotes_in_flight > 0 {
+            debug!(
+                "holding gc plan apply behind {} in-flight promote(s)",
+                self.pipeline.promotes_in_flight
+            );
+            self.parked.deferred_handoff = Some(result);
+            return;
+        }
+        self.parked.handoff_in_flight = false;
+        let applied = self.lock_volume().apply_plan_apply_result(*result);
+        match applied {
+            Ok(crate::volume::StagedApply::Applied) => {
+                self.publish_snapshot();
+                if let Some(ref mut parked) = self.parked.handoffs {
+                    parked.applied_count += 1;
+                }
+            }
+            Ok(crate::volume::StagedApply::Cancelled) => {
+                // Cancelled in worker or stale-liveness in
+                // apply; plan/tmp already cleaned up inside.
+            }
+            Ok(crate::volume::StagedApply::Diverged) => {
+                self.on_divergence();
+                // No hook (tests): drop the rest of the
+                // batch — every remaining plan is suspect
+                // against the same read state.
+                if let Some(parked) = self.parked.handoffs.as_mut() {
+                    parked.remaining.clear();
+                }
+            }
+            Err(e) => {
+                warn!("gc plan apply failed: {e}");
+                if let Some(parked) = self.parked.handoffs.take()
+                    && let Some(reply) = parked.reply
+                {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+        // Dispatch next plan in this batch, or complete.
+        if let Some(mut parked) = self.parked.handoffs.take() {
+            if parked.remaining.is_empty() {
+                if let Some(reply) = parked.reply {
+                    let _ = reply.send(Ok(parked.applied_count));
+                }
+            } else if matches!(
+                self.dispatch_next_handoff(&mut parked),
+                HandoffDispatch::Dispatched
+            ) {
+                self.parked.handoffs = Some(parked);
+            }
         }
     }
 
@@ -2154,17 +2195,19 @@ pub(crate) fn execute_promote(
         &mut pendings,
         &job.delta.sketch_index,
         &job.delta.extent_index,
+        &job.delta.referenced,
         &job.delta.search_dirs,
         &mut delta_body,
     ) {
         Ok(stats) => {
             if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
                 log::info!(
-                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes, converted {} entries, {} → {} bytes",
+                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes, skipped {} unreferenced, converted {} entries, {} → {} bytes",
                     job.segment_ulid,
                     stats.targets_probed,
                     stats.candidates_tried,
                     stats.dictionary_bytes_read,
+                    stats.candidates_unreferenced,
                     stats.delta.entries_converted,
                     stats.delta.original_body_bytes,
                     stats.delta.delta_body_bytes,

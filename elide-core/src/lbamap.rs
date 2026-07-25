@@ -100,6 +100,24 @@ enum Admission<'a> {
 /// split, or overwritten, the refcounts are updated in lockstep. A hash
 /// with refcount zero is removed from the map, so `lba_referenced_hashes`
 /// never reports stale sources.
+/// Snapshot of which hashes are referenced, taken from a [`LbaMap`] via
+/// [`LbaMap::referenced_hashes`].
+///
+/// Exists so a worker can ask the liveness question against state captured
+/// on the actor, which is where the delta producer decides whether a
+/// candidate source is worth pinning.
+#[derive(Clone, Default)]
+pub struct ReferencedHashes {
+    claims: ImHashMap<blake3::Hash, u32>,
+    delta_sources: ImHashMap<blake3::Hash, u32>,
+}
+
+impl ReferencedHashes {
+    pub fn contains(&self, hash: &blake3::Hash) -> bool {
+        self.claims.contains_key(hash) || self.delta_sources.contains_key(hash)
+    }
+}
+
 #[derive(Clone)]
 pub struct LbaMap {
     inner: OrdMap<u64, MapEntry>,
@@ -112,6 +130,17 @@ pub struct LbaMap {
     /// equals the number of keys in `delta_sources_by_lba` whose value
     /// contains `h`. Zero-count entries are removed eagerly.
     delta_source_counts: ImHashMap<blake3::Hash, u32>,
+    /// Refcounts for hashes claimed by an LBA. Invariant:
+    /// `claim_counts[h]` equals the number of keys in `inner` whose entry
+    /// has `hash == h`, and zero-count entries are removed eagerly, so a
+    /// key is present exactly when some LBA claims that hash.
+    /// [`Self::recount_claims`] recomputes it as the oracle.
+    ///
+    /// Maintaining it makes "is this hash claimed" an O(1) question. The
+    /// walk it replaces is the primary liveness oracle for GC, staged
+    /// apply and full-warm enumeration, all of which asked it by
+    /// collecting a fresh set over every entry.
+    claim_counts: ImHashMap<blake3::Hash, u32>,
 }
 
 impl LbaMap {
@@ -120,6 +149,7 @@ impl LbaMap {
             inner: OrdMap::new(),
             delta_sources_by_lba: OrdMap::new(),
             delta_source_counts: ImHashMap::new(),
+            claim_counts: ImHashMap::new(),
         }
     }
 
@@ -137,10 +167,26 @@ impl LbaMap {
         }
     }
 
-    /// Remove the entry at `key` from `inner` and decref any attached
-    /// Delta sources. Returns the removed entry if one existed.
+    fn claim_incref(&mut self, h: blake3::Hash) {
+        *self.claim_counts.entry(h).or_insert(0) += 1;
+    }
+
+    fn claim_decref(&mut self, h: &blake3::Hash) {
+        match self.claim_counts.get_mut(h) {
+            Some(c) if *c == 1 => {
+                self.claim_counts.remove(h);
+            }
+            Some(c) => *c -= 1,
+            None => debug_assert!(false, "decref of unclaimed hash"),
+        }
+    }
+
+    /// Remove the entry at `key` from `inner` and decref its claimed hash
+    /// plus any attached Delta sources. Returns the removed entry if one
+    /// existed.
     fn remove_entry(&mut self, key: u64) -> Option<MapEntry> {
         let entry = self.inner.remove(&key)?;
+        self.claim_decref(&entry.hash);
         if let Some(srcs) = self.delta_sources_by_lba.remove(&key) {
             for h in srcs.iter() {
                 self.decref(h);
@@ -150,8 +196,17 @@ impl LbaMap {
     }
 
     /// Insert `(key, entry)` into `inner`, optionally attaching Delta
-    /// sources. Increments refcounts for each source in the list.
+    /// sources. Increments refcounts for the claimed hash and for each
+    /// source in the list.
     fn add_entry(&mut self, key: u64, entry: MapEntry, sources: Option<Arc<[blake3::Hash]>>) {
+        // Displacing an occupied key would drop its claim and delta-source
+        // refs without decrefing them. Every caller trims or removes first,
+        // and both refcounts depend on that holding.
+        debug_assert!(
+            !self.inner.contains_key(&key),
+            "add_entry would displace the entry at {key}"
+        );
+        self.claim_incref(entry.hash);
         self.inner.insert(key, entry);
         if let Some(srcs) = sources {
             for h in srcs.iter() {
@@ -788,9 +843,54 @@ impl LbaMap {
     /// or a Delta source, violating canonical-presence and corrupting
     /// reads.
     pub fn lba_referenced_hashes(&self) -> HashSet<blake3::Hash> {
-        let mut out: HashSet<blake3::Hash> = self.inner.values().map(|e| e.hash).collect();
+        let mut out: HashSet<blake3::Hash> = self.claim_counts.keys().copied().collect();
         out.extend(self.delta_source_counts.keys().copied());
         out
+    }
+
+    /// Whether `hash` is referenced, by the same definition
+    /// [`Self::lba_referenced_hashes`] uses. Two hash lookups against the
+    /// maintained refcounts, for callers that only ask membership and have
+    /// no use for an owned set.
+    pub fn is_referenced(&self, hash: &blake3::Hash) -> bool {
+        self.claim_counts.contains_key(hash) || self.delta_source_counts.contains_key(hash)
+    }
+
+    /// A detached view answering [`Self::is_referenced`], for a worker that
+    /// needs the question off-lock.
+    ///
+    /// Both maps are persistent, so this shares structure rather than
+    /// copying, and the view is a snapshot: it answers as of the moment it
+    /// was taken.
+    pub fn referenced_hashes(&self) -> ReferencedHashes {
+        ReferencedHashes {
+            claims: self.claim_counts.clone(),
+            delta_sources: self.delta_source_counts.clone(),
+        }
+    }
+
+    /// Recompute `claim_counts` from `inner`, the definition the maintained
+    /// map has to match.
+    ///
+    /// This is the walk `lba_referenced_hashes` used to do on every call.
+    /// It survives as the oracle for [`Self::debug_assert_claim_counts`].
+    fn recount_claims(&self) -> ImHashMap<blake3::Hash, u32> {
+        let mut out: ImHashMap<blake3::Hash, u32> = ImHashMap::new();
+        for e in self.inner.values() {
+            *out.entry(e.hash).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// Assert the incrementally maintained `claim_counts` equals a fresh
+    /// recount. Compiled out of release builds; call it after mutations in
+    /// tests and at apply boundaries.
+    pub fn debug_assert_claim_counts(&self) {
+        debug_assert_eq!(
+            self.claim_counts,
+            self.recount_claims(),
+            "claim_counts diverged from a recount over inner"
+        );
     }
 
     /// Iterate every entry in the map as
@@ -857,6 +957,14 @@ impl LbaMap {
     /// [`lba_referenced_hashes`].
     pub fn delta_source_refcount(&self, target: &blake3::Hash) -> u32 {
         self.delta_source_counts.get(target).copied().unwrap_or(0)
+    }
+
+    /// How many LBA entries claim `target`. Returns 0 when no LBA does,
+    /// which for a hash with no delta references means it is dead. The
+    /// count exceeds 1 when a claim was split, or when separate LBA ranges
+    /// dedup to the same content.
+    pub fn claim_refcount(&self, target: &blake3::Hash) -> u32 {
+        self.claim_counts.get(target).copied().unwrap_or(0)
     }
 
     /// Return the content hash mapped to `lba`, if any entry covers it.
@@ -1861,5 +1969,106 @@ mod tests {
         assert_eq!(result[0].range_start, 5);
         assert_eq!(result[0].range_end, 8);
         assert_eq!(result[0].payload_block_offset, 5); // 4 (tail offset) + 1 (5-4)
+    }
+
+    // --- claim refcount tests ---
+
+    #[test]
+    fn a_claim_is_counted_and_an_overwrite_moves_the_count() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(1));
+        assert_eq!(map.claim_refcount(&h(1)), 1);
+        assert!(map.is_referenced(&h(1)));
+
+        map.insert(0, 4, h(2), u(2));
+        assert_eq!(
+            map.claim_refcount(&h(1)),
+            0,
+            "the displaced hash is no longer claimed"
+        );
+        assert!(!map.is_referenced(&h(1)));
+        assert_eq!(map.claim_refcount(&h(2)), 1);
+        map.debug_assert_claim_counts();
+    }
+
+    #[test]
+    fn a_hole_punch_leaves_both_fragments_counted() {
+        let mut map = LbaMap::new();
+        map.insert(0, 10, h(1), u(1));
+        // Splits [0,10) into [0,3) and [4,10), both still claiming h(1).
+        map.insert(3, 1, h(2), u(2));
+
+        assert_eq!(map.claim_refcount(&h(1)), 2);
+        assert!(
+            map.is_referenced(&h(1)),
+            "a hash claimed only by fragments is still live"
+        );
+        map.debug_assert_claim_counts();
+    }
+
+    #[test]
+    fn a_trim_keeps_the_surviving_fragment_counted() {
+        let mut map = LbaMap::new();
+        map.insert(0, 10, h(1), u(1));
+        // Overwrites the tail, leaving [0,6) → h(1).
+        map.insert(6, 4, h(2), u(2));
+
+        assert_eq!(map.claim_refcount(&h(1)), 1);
+        assert_eq!(map.claim_refcount(&h(2)), 1);
+        map.debug_assert_claim_counts();
+    }
+
+    #[test]
+    fn separate_ranges_deduping_to_one_hash_count_separately() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(1));
+        map.insert(100, 4, h(1), u(2));
+        assert_eq!(map.claim_refcount(&h(1)), 2);
+
+        map.insert(0, 4, h(9), u(3));
+        assert_eq!(
+            map.claim_refcount(&h(1)),
+            1,
+            "the far range still claims it after the near one is overwritten"
+        );
+        assert!(map.is_referenced(&h(1)));
+        map.debug_assert_claim_counts();
+    }
+
+    #[test]
+    fn claim_counts_survive_a_churn_sequence() {
+        // The oracle is the recount over `inner`; the point of the churn is
+        // to drive every trim, split and displacement path into it.
+        let mut map = LbaMap::new();
+        let mut claimant = 0u8;
+        for step in 0..40u64 {
+            claimant += 1;
+            let start = (step * 7) % 23;
+            let len = 1 + (step % 5) as u32;
+            map.insert(start, len, h((step % 6) as u8), u(claimant));
+            map.debug_assert_claim_counts();
+        }
+
+        // The maintained map is exactly the set the old walk produced.
+        let walked: HashSet<blake3::Hash> =
+            map.iter_entries().map(|(_, _, hash, _)| hash).collect();
+        let mut referenced = map.lba_referenced_hashes();
+        referenced.retain(|hash| map.claim_refcount(hash) > 0);
+        assert_eq!(referenced, walked);
+    }
+
+    #[test]
+    fn a_delta_source_is_referenced_without_being_claimed() {
+        let mut map = LbaMap::new();
+        map.insert_delta(0, 4, h(1), u(1), vec![h(7)].into());
+
+        assert_eq!(map.claim_refcount(&h(7)), 0, "no LBA claims the source");
+        assert_eq!(map.delta_source_refcount(&h(7)), 1);
+        assert!(
+            map.is_referenced(&h(7)),
+            "is_referenced spans both refcounts, as lba_referenced_hashes does"
+        );
+        assert!(map.lba_referenced_hashes().contains(&h(7)));
+        map.debug_assert_claim_counts();
     }
 }

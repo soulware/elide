@@ -238,6 +238,7 @@ Two TLA+ models checked with TLC:
 
 - `specs/HandoffProtocol.tla` — GC handoff protocol.
 - `specs/GCCheckpointOrdering.tla` — `u_gc < u_flush < next_write_wal_ulid` ordering invariant enforced by the two-ULID pre-mint in `gc_checkpoint`. The post-checkpoint WAL is opened lazily on the next write; its ULID comes from the monotonic mint so it automatically exceeds `u_flush`.
+- `specs/DeltaSourceLiveness.tla` — the three mechanisms keeping a Delta entry's source extent present: the liveness filter on candidate selection, the ordering of a GC plan apply behind in-flight promotes, and stale-liveness cancellation. Separate from `WorkerOffload` because the hazard is a cross-op interleaving that `OneInFlight` excludes there.
 - `specs/WorkerOffload.tla` — actor ↔ worker offload protocol. Models the prep/middle/apply three-phase shape every offloaded maintenance op shares (sweep, repack, delta_repack, promote, gc_handoff, sign_snapshot_manifest) using one canonical op. Checks the CAS-loser survival invariant that proptest cannot cover (a single-threaded test cannot interleave a write between prep and apply on the same actor), and the post-crash no-permanent-park invariant that is structurally invisible to proptest (the actor is dropped along with its parked slots).
 
 ### HandoffProtocol
@@ -258,6 +259,18 @@ tlc specs/HandoffProtocol.tla -config specs/HandoffProtocol.cfg
 ```
 
 Or via VS Code (`tlaplus.tlaplus`). Requires a JRE. The `.cfg` uses two carried hashes and one removed hash — enough to exercise all branches while keeping the state space small.
+
+### DeltaSourceLiveness
+
+```
+tlc specs/DeltaSourceLiveness.tla -config specs/DeltaSourceLiveness.cfg
+```
+
+`MAX_EXTENTS = 3`, 3266 distinct states, depth 14. Invariants: `NoDanglingDeltaSource`, `DeltaSourceReferenced`. Properties: `NoApplyInsidePromote`, `DeferredEventuallyApplies`.
+
+The module header records a measured ablation per mechanism. Two of the three are necessary for `NoDanglingDeltaSource` — the apply ordering and stale-liveness cancellation. The liveness filter on candidate selection is not: with it removed the invariant still holds, because a delta increfs its source at apply and cancellation then refuses any plan that would drop it. The filter earns its place on cost rather than safety, by not pinning bytes GC was about to free and not provoking cancellations. That is a frequency argument, so it is not checkable here.
+
+A dangling delta source is an unreadable extent, so this is the one modelled property whose violation is corruption rather than cost. The interleaving is invisible to proptest for the reason `WorkerOffload`'s header gives — a single test thread cannot land a plan apply between another op's prep and apply.
 
 ### WorkerOffload
 

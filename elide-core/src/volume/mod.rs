@@ -894,6 +894,7 @@ impl Volume {
                         extent_index: Arc::new(extentindex::ExtentIndex::new()),
                         sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
                         search_dirs: Vec::new(),
+                        referenced: Default::default(),
                         prior: None,
                     },
                     journal: jpart,
@@ -1730,7 +1731,6 @@ impl Volume {
             return Ok(StagedApply::Diverged);
         }
 
-        let live = self.lbamap.lba_referenced_hashes();
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
@@ -1752,7 +1752,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if live.contains(hash) {
+            if self.lbamap.is_referenced(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
@@ -3347,6 +3347,7 @@ impl Volume {
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
+            referenced: self.lbamap.referenced_hashes(),
             prior: latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 snap_ulid,

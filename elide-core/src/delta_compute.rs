@@ -534,6 +534,10 @@ pub struct ResemblanceStats {
     pub candidates_tried: u64,
     /// Source plaintext read to seed dictionaries, before caching.
     pub dictionary_bytes_read: u64,
+    /// Candidates declined for being unreferenced when the job was
+    /// prepared. A persistently high count means the map is holding dead
+    /// sources, which is expected on a churning volume.
+    pub candidates_unreferenced: u64,
 }
 
 /// Convert `Data` pendings to thin `Delta` entries against sources the
@@ -556,6 +560,7 @@ pub fn delta_pendings_by_resemblance(
     pendings: &mut [segment::PendingEntry],
     sketches: &SketchIndex,
     extent_index: &ExtentIndex,
+    referenced: &crate::lbamap::ReferencedHashes,
     search_dirs: &[PathBuf],
     delta_body: &mut Vec<u8>,
 ) -> io::Result<ResemblanceStats> {
@@ -601,6 +606,25 @@ pub fn delta_pendings_by_resemblance(
             // own hash, which nothing can resolve. Exact-hash dedup runs
             // before this tier and takes that case.
             if cand.hash == entry.hash {
+                continue;
+            }
+            // Deltaing against an unreferenced source costs twice over. It
+            // pins bytes GC was about to free, to save a delta a fraction
+            // of their size. And it makes the hash referenced again, so the
+            // GC plan that omitted it is refused on apply and a whole pass
+            // of rewrites and uploads is discarded.
+            //
+            // The map is a never-pruned cache built from historical `.idx`
+            // walks, so it offers dead sources for as long as the process
+            // lives, and a dead extent resembles whatever superseded it —
+            // the likeliest-dead candidates rank first.
+            //
+            // This is a cost measure. Correctness rests on the plan apply
+            // being ordered behind in-flight promotes and on stale-liveness
+            // cancellation, both of which hold without it
+            // (`specs/DeltaSourceLiveness.tla`).
+            if !referenced.contains(&cand.hash) {
+                stats.candidates_unreferenced += 1;
                 continue;
             }
             let source_plain = match source_plain_cache.get(&cand.hash) {

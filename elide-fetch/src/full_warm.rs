@@ -5,8 +5,8 @@
 //! outside the hint set is presumed peer-cold, so probing the peer for
 //! it just buys a 404 round-trip.
 //!
-//! Enumeration walks `LbaMap.lba_referenced_hashes() ∩ ExtentIndex` —
-//! the post-overlap live view — skips `BodySource::Local` (already on
+//! Enumeration walks the `ExtentIndex`, keeping what `LbaMap` still
+//! references — the post-overlap live view — skips `BodySource::Local` (already on
 //! disk), and filters each segment's populated entries against the
 //! per-segment `SegmentPresence` bitset the `ExtentIndex` holds (loaded
 //! from `cache/<id>.present` during rebuild). Segments whose live
@@ -182,10 +182,9 @@ fn plan_segments(
         }
     }
 
-    let live_hashes = lba_map.lba_referenced_hashes();
     let mut by_segment: BTreeMap<Ulid, SegmentWork> = BTreeMap::new();
     for (hash, loc) in extent_index.iter() {
-        if !live_hashes.contains(hash) {
+        if !lba_map.is_referenced(hash) {
             continue;
         }
         let entry_idx = match loc.body_source {

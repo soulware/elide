@@ -80,6 +80,11 @@ pub struct PromoteDeltaSpec {
     pub sketch_index: Arc<crate::sketch_index::SketchIndex>,
     /// Body-lookup roots: the fork directory first, then ancestor dirs.
     pub search_dirs: Vec<PathBuf>,
+    /// Which hashes were referenced when the job was prepared. The
+    /// resemblance tier declines an unreferenced source: deltaing against
+    /// one pins bytes GC was about to free and gets the GC plan that
+    /// omitted them refused on apply.
+    pub referenced: crate::lbamap::ReferencedHashes,
     pub prior: Option<PromoteDeltaPrior>,
 }
 

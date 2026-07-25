@@ -85,6 +85,11 @@ fn assert_manifest_filter_correct(
 
     let (lbamap, extent_index) = vol.snapshot_maps();
 
+    // The maintained claim refcounts back `lba_referenced_hashes`, which the
+    // liveness pass below depends on. Checked here because this point is
+    // reached after arbitrary write, drain, GC and recovery sequences.
+    lbamap.debug_assert_claim_counts();
+
     let index_dir = fork_dir.join("index");
     let entries = match fs::read_dir(&index_dir) {
         Ok(e) => e,
