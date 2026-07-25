@@ -14,6 +14,8 @@ The WAL is never uploaded. It absorbs guest writes and is consumed at formation.
 
 `cache/<ULID>.dmat` is a local-only read cache. Its compression is paid on write-back and its decompression on every subsequent cold delta read, so its cost is read latency.
 
+Local reads are held to a standard rather than a budget: the aim is to serve them as close to raw-disk performance as the format allows. Decompression cost on the read path is therefore a constraint on the design, not one term to trade off against uploaded bytes, and it is what the local cache in § Open questions exists to serve.
+
 ## Where compression happens today
 
 There is one compression, and it is on the write path. `Volume::write` calls `maybe_compress` before handing bytes to the WAL. Formation then carries the result through unchanged: `volume/wal.rs:72-79` translates `WalFlags::COMPRESSED` into `SegmentFlags::COMPRESSED` and reuses the same buffer and length.
@@ -83,7 +85,7 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 
 ## Rejected
 
-**Separate codecs for the local cache and the uploaded object.** `cache/<ULID>.body` is a byte-identical slice of the uploaded segment, which is what lets demand-fetch range-GET directly into it. Different codecs give different sizes, so the segment index would have to carry two offset tables. That is a permanent format cost for a read-latency win that has not been shown to be needed.
+**Re-encoding `cache/<ULID>.body` itself to a codec the uploaded object does not use.** The `.body` file is a byte-identical slice of the uploaded segment, which is what lets demand-fetch range-GET straight into it at the offsets the signed index already carries. A second codec gives different sizes, so the index would have to carry a second offset table. A local sidecar that leaves `.body` alone is a different shape and stays open (§ Open questions).
 
 **A precomputed entropy gate.** `volume/compress.rs` already records the reasoning: running the codec decides faster than estimating first. Today's measurement removes the remaining motive, since codec choice does not depend on content — lz4 never produces smaller output above the framing crossover, so there is nothing for an entropy signal to select between.
 
@@ -99,6 +101,14 @@ The measured corpus is dominated by an initial bulk load. A churned corpus — m
 
 A trained dictionary reopens on that corpus too. Its mean entry ran to 8.8 KiB against 592 KiB here, and 8 KiB is the size at which the dictionary earns 17.4%. A volume that churns into small extents is the shape the per-size table says a dictionary is for, so the question is which distribution real volumes settle into rather than whether dictionaries work.
 
-Guest read latency under zstd is unmeasured. Decompression is roughly three to four times slower than lz4 and is absorbed by the materialised-extent cache across an extent, but the cost per cold extent read has not been measured on the ublk path.
+Guest read latency under zstd is unmeasured, and under the aim above it gates the change rather than costing against it. Decompression is roughly three to four times slower than lz4. What decides whether that is visible is extent-level read locality under the guest, which nothing measures today.
+
+Two ways to hold reads near raw-disk speed, cheapest first.
+
+`BlockReader.materialised` caches one extent, so a guest alternating between two hot extents re-materialises both on every read. A bounded LRU keyed by content hash with a byte budget — the shape `delta_compute::SourceCache` already uses — costs no format change, no disk and no recovery story, and targets that thrash directly.
+
+Beyond that, a local lz4 sidecar per segment, built from the zstd `.body` on first read, in the shape `.dmat` already has. It leaves `.body` byte-identical to the object, so demand-fetch is untouched. Three things it has to answer that `.dmat` does not. `.dmat` is append-only with no eviction, which is affordable only because delta entries are a fraction of a percent of a volume; across all entries the sidecar is a second complete copy and needs reclamation, and eviction is what makes its truncate-at-first-bad-record recovery argument stop holding. Local footprint rises to about 21% of plaintext against 14.8% today, since both copies are kept. And lz4 is roughly 2.4 times the size of zstd for the same content, so the sidecar reads more bytes to spend less CPU — a win while those bytes are in page cache and a loss when they are not.
+
+Whole-extent materialisation pulls against the same aim from the other side. A 4 KiB read of a 1 MiB extent reads and BLAKE3-hashes the whole extent, which the content check requires because the hash covers the extent. Per-block hashes in the index would let a read verify only what it serves, at the cost of index bytes on every entry.
 
 Delta compression and a stronger body codec are substitutes at the margin. The first keep bar is "beat the stored body", which becomes a smaller number under zstd, so conversions drop. Delta's measured value needs re-baselining against zstd bodies rather than lz4 ones.
