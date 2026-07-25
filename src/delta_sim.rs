@@ -495,6 +495,53 @@ fn zstd_dict_len(level: i32, dict: &[u8], target: &[u8]) -> io::Result<usize> {
     Ok(blob.len())
 }
 
+/// Train a zstd dictionary over windows sampled from `frags`.
+///
+/// `zdict` is built for many small samples, so whole extents dilute it;
+/// this takes `sample_bytes` windows, breadth-first across fragments and
+/// then at increasing offsets, until the corpus reaches the 100x the
+/// dictionary size that zstd's guidance asks for.
+fn train_dictionary(
+    f: &mut File,
+    frags: &[Frag],
+    dict_bytes: usize,
+    sample_bytes: u64,
+) -> io::Result<(Vec<u8>, usize, u64)> {
+    let corpus_target = dict_bytes as u64 * 100;
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    let mut held = 0u64;
+    let mut round = 0u64;
+    while held < corpus_target {
+        let mut added = 0usize;
+        for fr in frags {
+            let off = round * sample_bytes;
+            if off + sample_bytes > fr.byte_count {
+                continue;
+            }
+            samples.push(read_span(
+                f,
+                Span {
+                    start: fr.start_byte + off,
+                    len: sample_bytes,
+                },
+            )?);
+            held += sample_bytes;
+            added += 1;
+            if held >= corpus_target {
+                break;
+            }
+        }
+        if added == 0 {
+            break;
+        }
+        round += 1;
+    }
+    let count = samples.len();
+    let dict = zstd::dict::from_samples(&samples, dict_bytes)
+        .map_err(|e| io::Error::other(format!("zstd dictionary training failed: {e}")))?;
+    Ok((dict, count, held))
+}
+
 /// Index of the fragment covering byte `pos`, if any.
 fn covering_frag(frags: &[Frag], pos: u64) -> Option<u32> {
     let i = frags.partition_point(|fr| fr.start_byte <= pos);
@@ -550,15 +597,33 @@ fn print_top_paths(label: &str, map: &HashMap<String, u64>) {
     }
 }
 
-pub fn run(
-    before_path: &Path,
-    after_path: &Path,
-    level: i32,
-    threshold: u64,
-    params: SketchParams,
-    max_candidates: usize,
-    dict_sources: usize,
-) -> io::Result<()> {
+/// Knobs for one measurement run.
+pub struct SimOptions {
+    pub level: i32,
+    /// Smallest run sketched, indexed and probed.
+    pub threshold: u64,
+    pub params: SketchParams,
+    /// Dictionaries tried per target, best-ranked first.
+    pub max_candidates: usize,
+    /// Ranked candidates concatenated into one dictionary; 1 measures
+    /// single-source only.
+    pub dict_sources: usize,
+    /// Size of a dictionary trained over the before-image; 0 skips it.
+    pub train_dict: usize,
+    /// Sample window size for that training.
+    pub train_sample: u64,
+}
+
+pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Result<()> {
+    let SimOptions {
+        level,
+        threshold,
+        params,
+        max_candidates,
+        dict_sources,
+        train_dict,
+        train_sample,
+    } = opts;
     let mut before = File::open(before_path)?;
     let mut after = File::open(after_path)?;
     let image_size = before.metadata()?.len();
@@ -647,6 +712,25 @@ pub fn run(
     }
     let index_elapsed = index_start.elapsed();
 
+    // Trained shared dictionary: one artefact for every target, against
+    // the per-target sources similarity picks.
+    let trained = if train_dict > 0 {
+        let t = Instant::now();
+        let (dict, samples, corpus) =
+            train_dictionary(&mut before, &before_frags, train_dict, train_sample)?;
+        println!(
+            "Trained a {:.1} KiB dictionary from {} samples of {} B ({:.1} MiB corpus) in {:.2}s",
+            dict.len() as f64 / 1024.0,
+            samples,
+            train_sample,
+            mib(corpus),
+            t.elapsed().as_secs_f64()
+        );
+        Some(dict)
+    } else {
+        None
+    };
+
     // Similarity matching over Tier-1 misses.
     println!("Matching {} Tier-1 misses ...", misses.len());
     let mut sim_recovered = Bucket::default();
@@ -673,6 +757,12 @@ pub fn run(
     let mut multi_better_runs = 0u64;
     let mut multi_dict_bytes = 0u64;
     let mut multi_probed = 0u64;
+    // Trained-dictionary buckets. `lz4` holds the baseline each is measured
+    // against: plain zstd for the first two, the single-source delta for the
+    // third.
+    let mut trained_sub = Bucket::default();
+    let mut trained_nosource = Bucket::default();
+    let mut trained_vs_single = Bucket::default();
     let mut recovered_paths: HashMap<String, u64> = HashMap::new();
     let mut nocandidate_paths: HashMap<String, u64> = HashMap::new();
 
@@ -691,6 +781,14 @@ pub fn run(
     for &(target, lz4_len) in &misses {
         if target.len < threshold {
             subthreshold.add(target.len, lz4_len, 0);
+            // The population similarity abandons: too small to carry a
+            // sketch, too small to resemble a single source.
+            if let Some(dict) = &trained {
+                let body = read_span(&mut after, target)?;
+                let nodict = zstd_len(level, &body)? as u64;
+                let t = zstd_dict_len(level, dict, &body)? as u64;
+                trained_sub.add(target.len, nodict, t);
+            }
             continue;
         }
         let body = read_span(&mut after, target)?;
@@ -774,6 +872,16 @@ pub fn run(
             } else if m < bar {
                 // Only the combined dictionary cleared the bar.
                 multi_only.add(target.len, nodict, m);
+            }
+        }
+
+        if let Some(dict) = &trained {
+            let t = zstd_dict_len(level, dict, &body)? as u64;
+            match best {
+                // Where similarity found a source, that source is the
+                // baseline the trained dictionary has to beat.
+                Some(single) if single < bar => trained_vs_single.add(target.len, single, t),
+                _ => trained_nosource.add(target.len, nodict, t),
             }
         }
 
@@ -879,6 +987,34 @@ pub fn run(
         mib(codec_only.lz4),
         mib(codec_only.delta)
     );
+    if let Some(dict) = &trained {
+        println!();
+        println!(
+            "  trained dictionary ({:.1} KiB), measured against the baseline each bucket already has:",
+            dict.len() as f64 / 1024.0
+        );
+        println!(
+            "    sub-threshold runs:    {:.1} MiB in {} runs, plain zstd {:.1} -> trained {:.1} MiB",
+            mib(trained_sub.bytes),
+            trained_sub.runs,
+            mib(trained_sub.lz4),
+            mib(trained_sub.delta)
+        );
+        println!(
+            "    no similarity source:  {:.1} MiB in {} runs, plain zstd {:.1} -> trained {:.1} MiB",
+            mib(trained_nosource.bytes),
+            trained_nosource.runs,
+            mib(trained_nosource.lz4),
+            mib(trained_nosource.delta)
+        );
+        println!(
+            "    similarity recovered:  {:.1} MiB in {} runs, single-source {:.1} -> trained {:.1} MiB",
+            mib(trained_vs_single.bytes),
+            trained_vs_single.runs,
+            mib(trained_vs_single.lz4),
+            mib(trained_vs_single.delta)
+        );
+    }
     if dict_sources > 1 {
         println!();
         println!(

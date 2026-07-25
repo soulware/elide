@@ -84,6 +84,12 @@ enum Command {
         /// Top-ranked candidates concatenated into one dictionary; 1 measures single-source only
         #[arg(long, default_value_t = 1)]
         dict_sources: usize,
+        /// Also measure a zstd dictionary trained over the before-image, at this size in bytes; 0 skips
+        #[arg(long, default_value_t = 0)]
+        train_dict: usize,
+        /// Sample window size for dictionary training
+        #[arg(long, default_value_t = 4096)]
+        train_sample: u64,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -1009,6 +1015,8 @@ fn main() {
             sf_bytes,
             max_candidates,
             dict_sources,
+            train_dict,
+            train_sample,
         } => {
             let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
             let params = delta_sim::SketchParams::new(kind, features, group, sf_bytes)
@@ -1016,11 +1024,15 @@ fn main() {
             delta_sim::run(
                 Path::new(&before),
                 Path::new(&after),
-                level,
-                threshold,
-                params,
-                max_candidates,
-                dict_sources,
+                delta_sim::SimOptions {
+                    level,
+                    threshold,
+                    params,
+                    max_candidates,
+                    dict_sources,
+                    train_dict,
+                    train_sample,
+                },
             )
             .expect("delta-sim failed");
         }

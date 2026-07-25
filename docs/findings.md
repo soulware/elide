@@ -190,6 +190,20 @@ Not one target that single-source failed was rescued by a combined dictionary, s
 
 On 36% of recovered targets (400 of 1,102) the probe surfaces only one candidate, so there is nothing to combine in the first place.
 
+**A trained shared dictionary earns almost nothing here.** `--train-dict` trains one zstd dictionary over 4 KiB windows sampled from the before-image and measures it against the baseline each bucket already has:
+
+| bucket | bytes | baseline | trained 110 KiB | trained 532 KiB |
+|---|---|---|---|---|
+| Sub-threshold runs | 29.6 MiB in 4,252 runs | plain zstd 8.7 MiB | 8.2 MiB | 7.9 MiB |
+| No similarity source | 344.5 MiB in 175 runs | plain zstd 137.9 MiB | 137.9 MiB | 137.9 MiB |
+| Similarity recovered | 170.3 MiB in 1,102 runs | single-source 25.2 MiB | 65.7 MiB | 64.4 MiB |
+
+On the sub-threshold population it was meant to serve, the population too small to carry a sketch, the dictionary earns 0.5 to 0.8 MiB against similarity's 40.4 MiB. On content with no similarity source it earns exactly nothing, that bucket being `/var/cache/apt` archives which are already compressed. Where a near-copy source exists the trained dictionary is 2.6× worse than that source, which is expected: the near-copy is the ideal dictionary and 110 KiB of trained structure cannot approach it.
+
+Dictionary size is not the limit. Asking for 1 MiB produced 532 KiB, `zdict` having found no more shared structure in a 100 MiB corpus, and the 5× size increase moved the sub-threshold figure by 0.3 MiB. Training cost 0.6s for 110 KiB from a 10.7 MiB corpus and 4.2s for 532 KiB from 100 MiB.
+
+The value scales with the sub-threshold population, which is small on this workload. A churn profile dominated by small uncompressed files would be a different measurement.
+
 **Costs:** sketching runs at 383 to 431 MiB/s single-threaded across all geometries, so the gear hash dominates and the permutation count is nearly free. A full run over the 4 GiB pair takes 12 seconds.
 
 ## OCI container images vs cloud images
