@@ -48,7 +48,21 @@ Two knobs to settle with the churned-corpus rerun: the ratio itself, and whether
 
 zstd with no dictionary compresses against an empty window. There is no built-in content dictionary; the window fills with the input's own earlier bytes as the frame proceeds. The format does define default FSE distributions for literal lengths, match lengths and offset codes, used when a block selects predefined mode rather than transmitting its own table, and blocks may reuse a previous block's Huffman and FSE tables within a frame. That prior is entropy tables, not content.
 
-Dictionary benefit therefore scales inversely with input size: a dictionary substitutes for history and for table budget, and a large frame has both. Entries here are large — 962 of 1,677 in the measured corpus sit near a megabyte — which is why a trained dictionary lands within 0.3% of dictionaryless zstd at every size from 16 KiB to 1 MiB, with 0.0 to 0.2 points of drift against a dictionary trained on the test set. The dictionary has nothing to add rather than being stale.
+Dictionary benefit therefore scales inversely with input size: a dictionary substitutes for history and for table budget, and a large frame supplies both itself. Measured against dictionaryless zstd on the held-out segments, per power-of-two entry size:
+
+| entry size | entries | gain |
+|---|---|---|
+| 4 KiB | 30 | 22.5% |
+| 8 KiB | 53 | 17.4% |
+| 16 KiB | 9 | 15.0% |
+| 128 KiB | 17 | 7.9% |
+| 256 KiB | 45 | 3.6% |
+| 512 KiB | 23 | 2.0% |
+| 1 MiB | 370 | 0.0% |
+
+The aggregate over the same set is 0.3%, because 370 entries near a megabyte carry 378 MB of the 382.6 MB and set the total on their own. So the dictionary works, on the inputs small enough to need it, and this volume holds almost none of them. Drift against a dictionary trained on the test set is 0.0 to 0.2 points, so what limits it is input size rather than staleness.
+
+The economics follow the same shape. The gain totals ~109 KiB across 382.6 MiB of plaintext, and most rows are served best by a 1 MiB dictionary — which has to be stored. A dictionary sized to what these rows want costs more than it saves; a 112 KiB one breaks even at roughly this much data and is worth ~0.03% of plaintext after. Whether a trained dictionary pays is therefore a property of a volume's entry-size distribution, not of the workload's content.
 
 ## Measurement
 
@@ -78,6 +92,8 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 ## Open questions
 
 The measured corpus is dominated by an initial bulk load. A churned corpus — many small overwrites, a large canonical-only population from GC output — gave a very different picture on the same workload, with stored bytes within 1% of plaintext because almost every entry failed the 1.5× bar. The codec gap, the funnel, and the threshold all need re-measuring there before the change is taken.
+
+A trained dictionary reopens on that corpus too. Its mean entry ran to 8.8 KiB against 592 KiB here, and 8 KiB is the size at which the dictionary earns 17.4%. A volume that churns into small extents is the shape the per-size table says a dictionary is for, so the question is which distribution real volumes settle into rather than whether dictionaries work.
 
 Guest read latency under zstd is unmeasured. Decompression is roughly three to four times slower than lz4 and is absorbed by the materialised-extent cache across an extent, but the cost per cold extent read has not been measured on the ublk path.
 
