@@ -4,12 +4,14 @@
 pub mod body_prefetch;
 pub mod control;
 pub mod coordinator_client;
+pub mod corpus_sim;
 pub mod creds_fetcher;
 pub mod delta_sim;
 pub mod extents;
 pub mod inspect;
 pub mod inspect_files;
 pub mod serve;
+pub mod sim_util;
 pub mod ublk;
 pub mod verify;
 pub mod volume_open;

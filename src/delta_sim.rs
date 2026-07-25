@@ -15,6 +15,7 @@ use std::time::Instant;
 use crate::extents::{
     INODE_FLAG_EXTENTS, SUPERBLOCK_OFFSET, Superblock, collect_extents, inode_table_block, u32le,
 };
+use crate::sim_util::{mib, pct, zstd_len};
 
 const LBA_SIZE: u64 = 4096;
 const DIFF_CHUNK: usize = 4 << 20;
@@ -481,12 +482,6 @@ impl DictCache {
 /// [`zstd_dict_len`]: beating LZ4 says only that zstd is the better
 /// codec, which it usually is, so the dictionary has earned nothing
 /// until it beats this.
-fn zstd_len(level: i32, target: &[u8]) -> io::Result<usize> {
-    zstd::bulk::compress(target, level)
-        .map(|blob| blob.len())
-        .map_err(|e| io::Error::other(format!("zstd compression failed: {e}")))
-}
-
 fn zstd_dict_len(level: i32, dict: &[u8], target: &[u8]) -> io::Result<usize> {
     let blob = zstd::bulk::Compressor::with_dictionary(level, dict)
         .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
@@ -568,10 +563,6 @@ impl Bucket {
         self.lz4 += lz4;
         self.delta += delta;
     }
-}
-
-fn mib(v: u64) -> f64 {
-    v as f64 / (1 << 20) as f64
 }
 
 /// First three path components, for directory-level attribution.
@@ -1120,13 +1111,6 @@ pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Resul
     print_top_paths("recovered", &recovered_paths);
     print_top_paths("no candidate", &nocandidate_paths);
     Ok(())
-}
-
-fn pct(part: u64, whole: u64) -> f64 {
-    if whole == 0 {
-        return 0.0;
-    }
-    part as f64 * 100.0 / whole as f64
 }
 
 #[cfg(test)]
