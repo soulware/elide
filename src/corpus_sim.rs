@@ -229,6 +229,56 @@ fn training_samples(entries: &[&Version], dict_bytes: usize) -> Vec<Vec<u8>> {
     samples
 }
 
+/// Per-entry lz4 against zstd, both recomputed from plaintext so the
+/// comparison is between codecs rather than against whatever the write path
+/// happened to store.
+fn codec_study(versions: &[Version]) -> io::Result<()> {
+    let mut plain = 0u64;
+    let mut lz4_total = 0u64;
+    let mut zstd_total = 0u64;
+    let mut lz4_wins = 0u64;
+    let mut lz4_win_margin = 0u64;
+    let mut win_sizes: BTreeMap<u32, u64> = BTreeMap::new();
+
+    for v in versions {
+        let lz4 = lz4_flex::compress_prepend_size(&v.plain).len() as u64;
+        let zst = zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
+        plain += v.plain.len() as u64;
+        lz4_total += lz4;
+        zstd_total += zst;
+        if lz4 < zst {
+            lz4_wins += 1;
+            lz4_win_margin += zst - lz4;
+            let bucket = (v.plain.len() as u64).next_power_of_two().trailing_zeros();
+            *win_sizes.entry(bucket).or_default() += 1;
+        }
+    }
+
+    println!("\n== codec");
+    println!(
+        "plain              {:.1} MiB\nlz4                {:.1} MiB ({:.1}% of plain)\nzstd-{}             {:.1} MiB ({:.1}% of plain)\nzstd over lz4      {:.1} MiB fewer ({:.1}%)",
+        mib(plain),
+        mib(lz4_total),
+        pct(lz4_total, plain),
+        ZSTD_LEVEL,
+        mib(zstd_total),
+        pct(zstd_total, plain),
+        mib(lz4_total.saturating_sub(zstd_total)),
+        pct(lz4_total.saturating_sub(zstd_total), lz4_total),
+    );
+    println!(
+        "entries lz4 smaller {} of {} ({:.1}%), {} bytes total margin",
+        lz4_wins,
+        versions.len(),
+        pct(lz4_wins, versions.len() as u64),
+        lz4_win_margin,
+    );
+    for (log2, count) in &win_sizes {
+        println!("  <= {:>7}  {:>6} entries", fmt_pow2(*log2), count);
+    }
+    Ok(())
+}
+
 fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
     let segs: Vec<ulid::Ulid> = {
         let mut s: Vec<ulid::Ulid> = versions.iter().map(|v| v.seg).collect();
@@ -438,6 +488,7 @@ pub fn run(dir: &Path, opts: Options) -> io::Result<()> {
         return Err(io::Error::other("no data entries found in corpus"));
     }
     funnel(&versions);
+    codec_study(&versions)?;
     dict_study(&versions, &opts.dict_sizes)?;
     chain_study(&versions)?;
     Ok(())
