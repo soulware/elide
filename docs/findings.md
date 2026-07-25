@@ -178,6 +178,18 @@ Two ungrouped features in 8 bytes match the shipping 64-byte geometry's 33.6 MiB
 
 **Codec versus dictionary.** Under the LZ4 baseline, 61.7 MiB of recovered target bytes in 11 runs came from zstd beating LZ4 with no dictionary contribution (delta 30.9 MiB against plain zstd's 30.8 MiB). The content is ordinary: shared libraries, apt archives, udev rules. Declining those costs 6.2 MiB of stored bytes and avoids 11 arbitrary source dependencies.
 
+**Multi-source dictionaries buy nothing.** Building one dictionary from the top-ranked candidates concatenated (`--dict-sources`, best-ranked last so it sits closest to the input) was measured against the single-source result on the same targets:
+
+| | top 2 | top 3 |
+|---|---|---|
+| Recall gain over single-source | 0 MiB, 0 runs | 0 MiB, 0 runs |
+| Delta size where both cleared the bar | 5.7 → 5.7 MiB | 5.7 → 5.7 MiB |
+| Targets where combined won | 9.5 MiB, 84 runs | 10.0 MiB, 85 runs |
+
+Not one target that single-source failed was rescued by a combined dictionary, so the residual recall gap is content with no source at all rather than content spread across two. Aggregate delta size is unchanged to a tenth of a MiB, the combined dictionary winning marginally on some targets and losing on others. Mean combined dictionary was 0.2 to 0.3 MiB, well short of the size where long offsets would penalise it, so this is not a ceiling effect.
+
+On 36% of recovered targets (400 of 1,102) the probe surfaces only one candidate, so there is nothing to combine in the first place.
+
 **Costs:** sketching runs at 383 to 431 MiB/s single-threaded across all geometries, so the gear hash dominates and the permutation count is nearly free. A full run over the 4 GiB pair takes 12 seconds.
 
 ## OCI container images vs cloud images

@@ -557,6 +557,7 @@ pub fn run(
     threshold: u64,
     params: SketchParams,
     max_candidates: usize,
+    dict_sources: usize,
 ) -> io::Result<()> {
     let mut before = File::open(before_path)?;
     let mut after = File::open(after_path)?;
@@ -663,6 +664,15 @@ pub fn run(
     // than plain zstd.
     let mut codec_only = Bucket::default();
     let mut codec_only_paths: HashMap<String, u64> = HashMap::new();
+    // Concatenated-dictionary side measurement. `multi_vs_single` holds the
+    // single-source delta in `lz4` and the combined one in `delta`, over the
+    // targets both cleared.
+    let mut multi_vs_single = Bucket::default();
+    let mut multi_only = Bucket::default();
+    let mut multi_better_bytes = 0u64;
+    let mut multi_better_runs = 0u64;
+    let mut multi_dict_bytes = 0u64;
+    let mut multi_probed = 0u64;
     let mut recovered_paths: HashMap<String, u64> = HashMap::new();
     let mut nocandidate_paths: HashMap<String, u64> = HashMap::new();
 
@@ -736,6 +746,37 @@ pub fn run(
                 best = Some(d);
             }
         }
+
+        // Side measurement: one dictionary built from the top-ranked
+        // candidates concatenated, against the single-source result on the
+        // same target. Best-ranked goes last, since the dictionary sits
+        // immediately before the input and its tail is the cheapest region
+        // to reference.
+        let multi: Option<u64> = if dict_sources > 1 && cands.len() > 1 {
+            let mut dict: Vec<u8> = Vec::new();
+            for &idx in cands.iter().take(dict_sources).rev() {
+                dict.extend_from_slice(dicts.get(&mut before, &before_frags, idx)?);
+            }
+            multi_dict_bytes += dict.len() as u64;
+            multi_probed += 1;
+            Some(zstd_dict_len(level, &dict, &body)? as u64)
+        } else {
+            None
+        };
+        if let (Some(m), Some(single)) = (multi, best) {
+            if single < bar {
+                // Both cleared: compare ratio on the same bytes.
+                multi_vs_single.add(target.len, single, m);
+                if m < single {
+                    multi_better_bytes += target.len;
+                    multi_better_runs += 1;
+                }
+            } else if m < bar {
+                // Only the combined dictionary cleared the bar.
+                multi_only.add(target.len, nodict, m);
+            }
+        }
+
         let sim_ok = matches!(best, Some(d) if d < bar);
         matrix[usize::from(sim_ok)][usize::from(oracle_ok)] += target.len;
 
@@ -838,6 +879,32 @@ pub fn run(
         mib(codec_only.lz4),
         mib(codec_only.delta)
     );
+    if dict_sources > 1 {
+        println!();
+        println!(
+            "  dictionary from top {dict_sources} candidates concatenated, on {} probed runs (mean dict {:.1} MiB):",
+            multi_probed,
+            mib(multi_dict_bytes) / (multi_probed.max(1) as f64)
+        );
+        println!(
+            "    where single-source already cleared the bar: {:.1} MiB, delta {:.1} -> {:.1} MiB",
+            mib(multi_vs_single.bytes),
+            mib(multi_vs_single.lz4),
+            mib(multi_vs_single.delta)
+        );
+        println!(
+            "      combined won on {:.1} MiB in {} runs",
+            mib(multi_better_bytes),
+            multi_better_runs
+        );
+        println!(
+            "    recall gain, combined cleared where single did not: {:.1} MiB in {} runs ({:.1} -> {:.1} MiB vs plain zstd)",
+            mib(multi_only.bytes),
+            multi_only.runs,
+            mib(multi_only.lz4),
+            mib(multi_only.delta)
+        );
+    }
     println!(
         "    candidates surfaced: {} ({:.1} per probed run, cap of {} bound on {} runs)",
         candidates_surfaced,

@@ -81,6 +81,9 @@ enum Command {
         /// Dictionaries tried per miss, best-ranked first
         #[arg(long, default_value_t = 8)]
         max_candidates: usize,
+        /// Top-ranked candidates concatenated into one dictionary; 1 measures single-source only
+        #[arg(long, default_value_t = 1)]
+        dict_sources: usize,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -1005,6 +1008,7 @@ fn main() {
             group,
             sf_bytes,
             max_candidates,
+            dict_sources,
         } => {
             let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
             let params = delta_sim::SketchParams::new(kind, features, group, sf_bytes)
@@ -1016,6 +1020,7 @@ fn main() {
                 threshold,
                 params,
                 max_candidates,
+                dict_sources,
             )
             .expect("delta-sim failed");
         }
