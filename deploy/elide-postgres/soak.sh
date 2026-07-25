@@ -25,9 +25,10 @@ cd "$(dirname "$0")"
 cycles="${1:-6}"
 read -ra modes <<<"${MODES:-pg vol host}"
 RUN_SECS="${RUN_SECS:-120}"
+VOL="${VOL:-pg0}"
 
 run() { echo "+ $*" >&2; "$@"; }
-ssh_cmd() { run fly ssh console -C "env RUN_SECS=$RUN_SECS $1"; }
+ssh_cmd() { run fly ssh console -C "env RUN_SECS=$RUN_SECS VOL=$VOL $1"; }
 
 machine_id() {
     if [ -n "${MACHINE:-}" ]; then echo "$MACHINE"; return; fi
