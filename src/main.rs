@@ -69,6 +69,18 @@ enum Command {
         /// Sketch construction: broder (position-independent) or finesse
         #[arg(long, default_value = "broder")]
         sketch: String,
+        /// Independent features sampled per sketch
+        #[arg(long, default_value_t = 16)]
+        features: usize,
+        /// Features hashed into each super-feature
+        #[arg(long, default_value_t = 2)]
+        group: usize,
+        /// Bytes retained per super-feature
+        #[arg(long, default_value_t = 8)]
+        sf_bytes: usize,
+        /// Dictionaries tried per miss, best-ranked first
+        #[arg(long, default_value_t = 8)]
+        max_candidates: usize,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -989,14 +1001,21 @@ fn main() {
             level,
             threshold,
             sketch,
+            features,
+            group,
+            sf_bytes,
+            max_candidates,
         } => {
             let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
+            let params = delta_sim::SketchParams::new(kind, features, group, sf_bytes)
+                .expect("bad sketch geometry");
             delta_sim::run(
                 Path::new(&before),
                 Path::new(&after),
                 level,
                 threshold,
-                kind,
+                params,
+                max_candidates,
             )
             .expect("delta-sim failed");
         }

@@ -118,6 +118,8 @@ The journal region cycled completely during the upgrade. Journal plus metadata i
 
 **Same-LBA selection barely fires on this workload:** 31.9 MiB of the 555.8 file-data MiB (5.7%) found a beneficial same-LBA source. Package upgrades re-materialise nearly everything at fresh LBAs. (In-place writers such as postgres are the opposite regime and are already covered.)
 
+Round 1's keep criterion was zstd-with-dictionary against LZ4. That comparison varies the codec and the dictionary at once, so the recovery figures below include bytes the dictionary did not earn (round 2 measures the split at 27%). They stand as measured under that criterion.
+
 **Similarity matching on the 523.9 MiB of misses** (16 features, grouped in pairs into eight 8-byte super-features, 32 KiB threshold):
 
 | Outcome | Bytes | Note |
@@ -144,6 +146,39 @@ The "neither" bucket is almost entirely `/var/cache/apt` and `/var/lib/apt` — 
 
 - Super-feature grouping width dominated recall. Four-feature groups recovered 101.4 MiB; two-feature pairs recovered 158.1 MiB. Rebuilt binaries have diffuse byte-level diffs, so requiring four features to survive jointly is what broke matching. With pair grouping, the cheap positional construction (max per fixed subchunk) matched the position-independent one within 1%.
 - A plain `mv` rename moves no data blocks, so rotated-in-place files never enter the changed-block set at all. Rename-only churn costs nothing at the block layer; the case that matters is a rewrite landing at fresh LBAs.
+
+### Sketch geometry, round 2
+
+Measured 2026-07-25 on a freshly generated image pair from the same workload script (694.1 MiB changed, 576.3 MiB of file data, and an identical 31.9 MiB same-LBA hit to round 1). Every figure below is **dictionary-attributable**: the delta had to beat plain zstd on the same plaintext, not just the stored LZ4 body, so the codec's contribution is excluded. Recall is measured over the miss bytes a same-path oracle proves a source exists for, which isolates the sketch from content that has no source at all.
+
+**Grouping is the dominant knob, and less is better.** These three geometries all store eight values per sketch, so sketch bytes, posting count and map size are identical and grouping is the only variable:
+
+| features | grouping | recall | dict saving |
+|---|---|---|---|
+| 32 | fours | 57.5% | 27.8 MiB |
+| 16 | pairs | 81.0% | 33.6 MiB |
+| **8** | **none** | **94.1%** | **40.4 MiB** |
+
+Ungrouped also computes the fewest features of the three. Grouping buys precision the size check already provides exactly, and it destroys the shared-feature count that candidate ranking uses.
+
+**Feature count is the weaker knob, and its slope depends on grouping.** At pair grouping, doubling to 32 features moved recall 81.0% to 85.0% for 2.3 MiB more saving, where a uniform-resemblance fit to round 1 predicted 93%. The fit overstates it because the pairs a sketch misses are the low-resemblance tail the aggregate does not represent. Ungrouped, the count matters more, with a knee around eight:
+
+| features (ungrouped) | sketch | map | recall | dict saving |
+|---|---|---|---|---|
+| 2 | 8 B | 29 KiB | 78.0% | 33.7 MiB |
+| 4 | 16 B | 59 KiB | 87.0% | 37.7 MiB |
+| **8** | **32 B** | **119 KiB** | **94.1%** | **40.4 MiB** |
+| 16 | 64 B | 238 KiB | 98.7% | 41.9 MiB |
+
+Two ungrouped features in 8 bytes match the shipping 64-byte geometry's 33.6 MiB. Eight in 32 bytes beat it by 20% at half the size. Sixteen buys 1.5 MiB more for another 32 bytes.
+
+**Width is inert.** Four-byte and eight-byte super-features produced bit-identical results on every recovery number at both grouping widths. Two-byte values inflate apparent recovery by 69% through collisions while saving exactly the same 40.4 MiB, which is how the LZ4-baseline flaw surfaced.
+
+**The candidate cap is inert once candidates are ranked** by shared-feature count. Recovery is identical at caps of 1, 2, 4, 8, 16 and 32, so the best dictionary ranks first almost always. Ungrouped features raise candidates surfaced per probe from 13 to 72 without raising dictionaries tried, because the cap holds.
+
+**Codec versus dictionary.** Under the LZ4 baseline, 61.7 MiB of recovered target bytes in 11 runs came from zstd beating LZ4 with no dictionary contribution (delta 30.9 MiB against plain zstd's 30.8 MiB). The content is ordinary: shared libraries, apt archives, udev rules. Declining those costs 6.2 MiB of stored bytes and avoids 11 arbitrary source dependencies.
+
+**Costs:** sketching runs at 383 to 431 MiB/s single-threaded across all geometries, so the gear hash dominates and the permutation count is nearly free. A full run over the 4 GiB pair takes 12 seconds.
 
 ## OCI container images vs cloud images
 
