@@ -100,6 +100,25 @@ enum Admission<'a> {
 /// split, or overwritten, the refcounts are updated in lockstep. A hash
 /// with refcount zero is removed from the map, so `lba_referenced_hashes`
 /// never reports stale sources.
+/// Snapshot of which hashes are referenced, taken from a [`LbaMap`] via
+/// [`LbaMap::referenced_hashes`].
+///
+/// Exists so a worker can ask the liveness question against state captured
+/// on the actor. A reference to an unreferenced extent is what lets a
+/// rewrite drop the bytes out from under it, so the delta producer consults
+/// this before offering a source.
+#[derive(Clone, Default)]
+pub struct ReferencedHashes {
+    claims: ImHashMap<blake3::Hash, u32>,
+    delta_sources: ImHashMap<blake3::Hash, u32>,
+}
+
+impl ReferencedHashes {
+    pub fn contains(&self, hash: &blake3::Hash) -> bool {
+        self.claims.contains_key(hash) || self.delta_sources.contains_key(hash)
+    }
+}
+
 #[derive(Clone)]
 pub struct LbaMap {
     inner: OrdMap<u64, MapEntry>,
@@ -836,6 +855,19 @@ impl LbaMap {
     /// no use for an owned set.
     pub fn is_referenced(&self, hash: &blake3::Hash) -> bool {
         self.claim_counts.contains_key(hash) || self.delta_source_counts.contains_key(hash)
+    }
+
+    /// A detached view answering [`Self::is_referenced`], for a worker that
+    /// needs the question off-lock.
+    ///
+    /// Both maps are persistent, so this shares structure rather than
+    /// copying, and the view is a snapshot: it answers as of the moment it
+    /// was taken.
+    pub fn referenced_hashes(&self) -> ReferencedHashes {
+        ReferencedHashes {
+            claims: self.claim_counts.clone(),
+            delta_sources: self.delta_source_counts.clone(),
+        }
     }
 
     /// Recompute `claim_counts` from `inner`, the definition the maintained

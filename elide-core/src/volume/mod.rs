@@ -894,6 +894,7 @@ impl Volume {
                         extent_index: Arc::new(extentindex::ExtentIndex::new()),
                         sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
                         search_dirs: Vec::new(),
+                        referenced: Default::default(),
                         prior: None,
                     },
                     journal: jpart,
@@ -3347,6 +3348,7 @@ impl Volume {
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
+            referenced: self.lbamap.referenced_hashes(),
             prior: latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 snap_ulid,

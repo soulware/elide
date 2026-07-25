@@ -2069,6 +2069,58 @@ fn formation_deltas_by_resemblance_without_a_snapshot() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// A source nothing references is a source a rewrite may drop, which
+/// would leave the delta unreadable. The candidate map is never pruned,
+/// so it keeps offering one long after its last claim is gone.
+#[test]
+fn formation_declines_an_unreferenced_source() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let source = delta_base_extent(7);
+    let blocks = (source.len() / 4096) as u64;
+    vol.write(0, &source).unwrap();
+    vol.promote_for_test().unwrap();
+
+    // Overwrite the only claim on `source`. It stays resolvable and stays
+    // in the candidate map, but nothing references it any more.
+    let unrelated = delta_base_extent(8);
+    vol.write(0, &unrelated).unwrap();
+    vol.promote_for_test().unwrap();
+    {
+        let (lbamap, index) = vol.snapshot_maps();
+        let source_hash = blake3::hash(&source);
+        assert!(
+            index.lookup(&source_hash).is_some(),
+            "the source must still resolve, or the test proves nothing"
+        );
+        assert!(
+            !lbamap.is_referenced(&source_hash),
+            "the overwrite must have dropped its last claim"
+        );
+    }
+
+    // A near-copy of the now-unreferenced source. Without the filter this
+    // converts to a Delta against it.
+    let variant = delta_variant_extent(7, 0x5A);
+    vol.write(blocks * 2, &variant).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg = *pending_ulids(&base).last().unwrap();
+    assert_eq!(
+        pending_entry_kinds(&base, &vol, seg),
+        vec![segment::EntryKind::Data],
+        "an unreferenced candidate must not become a delta source"
+    );
+    assert_eq!(
+        vol.read(blocks * 2, blocks as u32).unwrap(),
+        variant,
+        "read-back of the entry left as Data"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// An unrelated extent is no source: the probe must not convert on the
 /// strength of a spurious match, and the keep rule is the backstop.
 #[test]

@@ -534,6 +534,10 @@ pub struct ResemblanceStats {
     pub candidates_tried: u64,
     /// Source plaintext read to seed dictionaries, before caching.
     pub dictionary_bytes_read: u64,
+    /// Candidates declined for being unreferenced when the job was
+    /// prepared. A persistently high count means the map is holding dead
+    /// sources, which is expected on a churning volume.
+    pub candidates_unreferenced: u64,
 }
 
 /// Convert `Data` pendings to thin `Delta` entries against sources the
@@ -556,6 +560,7 @@ pub fn delta_pendings_by_resemblance(
     pendings: &mut [segment::PendingEntry],
     sketches: &SketchIndex,
     extent_index: &ExtentIndex,
+    referenced: &crate::lbamap::ReferencedHashes,
     search_dirs: &[PathBuf],
     delta_body: &mut Vec<u8>,
 ) -> io::Result<ResemblanceStats> {
@@ -601,6 +606,17 @@ pub fn delta_pendings_by_resemblance(
             // own hash, which nothing can resolve. Exact-hash dedup runs
             // before this tier and takes that case.
             if cand.hash == entry.hash {
+                continue;
+            }
+            // An unreferenced source is one a concurrent rewrite is free to
+            // drop, which would leave this delta unreadable. Deltaing only
+            // against referenced content puts this tier in the same class as
+            // dedup, whose refs are safe because a rewrite must carry live
+            // content forward. The map is a cache built from historical
+            // `.idx` walks and never pruned, so it offers dead sources for
+            // as long as the process lives.
+            if !referenced.contains(&cand.hash) {
+                stats.candidates_unreferenced += 1;
                 continue;
             }
             let source_plain = match source_plain_cache.get(&cand.hash) {
