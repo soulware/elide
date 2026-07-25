@@ -534,6 +534,11 @@ pub struct ResemblanceStats {
     pub candidates_tried: u64,
     /// Source plaintext read to seed dictionaries, before caching.
     pub dictionary_bytes_read: u64,
+    /// Attempts served by the per-formation source cache rather than a
+    /// read. `candidates_tried - dictionary_cache_hits` is the number of
+    /// distinct sources read, so the two together give the mean source
+    /// size and say how much a prepared dictionary would be reused.
+    pub dictionary_cache_hits: u64,
     /// Candidates declined for being unreferenced when the job was
     /// prepared. A persistently high count means the map is holding dead
     /// sources, which is expected on a churning volume.
@@ -628,7 +633,10 @@ pub fn delta_pendings_by_resemblance(
                 continue;
             }
             let source_plain = match source_plain_cache.get(&cand.hash) {
-                Some(v) => v,
+                Some(v) => {
+                    stats.dictionary_cache_hits += 1;
+                    v
+                }
                 None => {
                     let Some(plain) = read_source_plaintext(extent_index, search_dirs, &cand.hash)
                     else {

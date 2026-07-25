@@ -2202,11 +2202,12 @@ pub(crate) fn execute_promote(
         Ok(stats) => {
             if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
                 log::info!(
-                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes, skipped {} unreferenced, converted {} entries, {} → {} bytes",
+                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes ({} cached), skipped {} unreferenced, converted {} entries, {} → {} bytes",
                     job.segment_ulid,
                     stats.targets_probed,
                     stats.candidates_tried,
                     stats.dictionary_bytes_read,
+                    stats.dictionary_cache_hits,
                     stats.candidates_unreferenced,
                     stats.delta.entries_converted,
                     stats.delta.original_body_bytes,
