@@ -289,12 +289,27 @@ impl BlockReader {
 
     /// Cache `body` as the materialised extent for `hash` and return the
     /// 4 KiB block at `block_offset`.
+    ///
+    /// Every path that materialises extent plaintext for the guest funnels
+    /// through here, so the content check is the one place deciding whether
+    /// bytes reach the block device. A location that resolves to the wrong
+    /// bytes is otherwise indistinguishable from a correct read: lz4 rejects
+    /// some of them, raw-stored extents produce no error at all.
     fn remember_and_slice(
         &self,
         hash: blake3::Hash,
         body: Vec<u8>,
         block_offset: u32,
     ) -> io::Result<[u8; 4096]> {
+        let got = blake3::hash(&body);
+        if got != hash {
+            return Err(io::Error::other(format!(
+                "extent body hashed {} instead of {} ({} bytes)",
+                got.to_hex(),
+                hash.to_hex(),
+                body.len()
+            )));
+        }
         let src = block_offset as usize * 4096;
         let slice = body.get(src..src + 4096).ok_or_else(|| {
             io::Error::other(format!(
@@ -330,16 +345,18 @@ impl BlockReader {
         let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let seek = layout.body_seek(loc);
         let f = fs::File::open(path)?;
+        // The whole stored payload, not just the requested 4 KiB: the content
+        // hash covers the extent, so it can only be checked against all of it.
+        // `materialised_block` serves every later block in this extent from
+        // the cache below, which is what keeps the extra read amortised.
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact_at(&mut buf, seek)?;
         if loc.compressed {
-            let mut buf = vec![0u8; loc.body_length as usize];
-            f.read_exact_at(&mut buf, seek)?;
             let decompressed =
                 lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?;
             return self.remember_and_slice(*hash, decompressed, block_offset);
         }
-        let mut block = [0u8; 4096];
-        f.read_exact_at(&mut block, seek + block_offset as u64 * 4096)?;
-        Ok(block)
+        self.remember_and_slice(*hash, buf, block_offset)
     }
 
     /// Read a 4 KiB block from a Delta extent.
@@ -380,7 +397,7 @@ impl BlockReader {
             ))
         })?;
 
-        let source_bytes = self.read_extent_body_at(&source_loc)?;
+        let source_bytes = self.read_extent_body_at(&source_loc, &opt.source_hash)?;
         let delta_blob = self.read_delta_blob(
             delta_loc.segment_id,
             delta_loc.body_source,
@@ -517,9 +534,33 @@ impl BlockReader {
         }
     }
 
-    /// Read the full plaintext body of an extent at `loc`. Used by the delta
-    /// path to materialise a source extent for zstd-dict decompression.
-    fn read_extent_body_at(&self, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
+    /// Full plaintext body of the extent at `loc`, checked against the content
+    /// hash it is claimed to hold. The delta path uses it to materialise a
+    /// source extent for zstd-dict decompression.
+    fn read_extent_body_at(
+        &self,
+        loc: &ExtentLocation,
+        expected: &blake3::Hash,
+    ) -> io::Result<Vec<u8>> {
+        let bytes = self.read_extent_body_unverified(loc)?;
+        let got = blake3::hash(&bytes);
+        if got != *expected {
+            return Err(io::Error::other(format!(
+                "extent body hashed {} instead of {} ({} bytes)",
+                got.to_hex(),
+                expected.to_hex(),
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Full extent plaintext with no content check.
+    ///
+    /// [`Self::verify_content`] is the only caller: it compares the hash
+    /// itself so a mismatch becomes a reported finding rather than an error
+    /// that ends the scan.
+    fn read_extent_body_unverified(&self, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
         if let Some(ref idata) = loc.inline_data {
             return if loc.compressed {
                 lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
@@ -553,7 +594,7 @@ impl BlockReader {
             .lookup(hash)
             .ok_or_else(|| io::Error::other(format!("extent {hash} not in index")))?
             .clone();
-        self.read_extent_body_at(&loc)
+        self.read_extent_body_at(&loc, hash)
     }
 
     /// Dump every LBA-map entry as `(start_lba, lba_length, hash,
@@ -591,7 +632,7 @@ impl BlockReader {
         for (hash, runs) in items {
             let kind = if let Some(loc) = self.extent_index.lookup(&hash) {
                 let loc = loc.clone();
-                match self.read_extent_body_at(&loc) {
+                match self.read_extent_body_unverified(&loc) {
                     Ok(bytes) => {
                         let got = blake3::hash(&bytes);
                         if got == hash {
