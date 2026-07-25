@@ -608,13 +608,21 @@ pub fn delta_pendings_by_resemblance(
             if cand.hash == entry.hash {
                 continue;
             }
-            // An unreferenced source is one a concurrent rewrite is free to
-            // drop, which would leave this delta unreadable. Deltaing only
-            // against referenced content puts this tier in the same class as
-            // dedup, whose refs are safe because a rewrite must carry live
-            // content forward. The map is a cache built from historical
-            // `.idx` walks and never pruned, so it offers dead sources for
-            // as long as the process lives.
+            // Deltaing against an unreferenced source costs twice over. It
+            // pins bytes GC was about to free, to save a delta a fraction
+            // of their size. And it makes the hash referenced again, so the
+            // GC plan that omitted it is refused on apply and a whole pass
+            // of rewrites and uploads is discarded.
+            //
+            // The map is a never-pruned cache built from historical `.idx`
+            // walks, so it offers dead sources for as long as the process
+            // lives, and a dead extent resembles whatever superseded it —
+            // the likeliest-dead candidates rank first.
+            //
+            // This is a cost measure. Correctness rests on the plan apply
+            // being ordered behind in-flight promotes and on stale-liveness
+            // cancellation, both of which hold without it
+            // (`specs/DeltaSourceLiveness.tla`).
             if !referenced.contains(&cand.hash) {
                 stats.candidates_unreferenced += 1;
                 continue;

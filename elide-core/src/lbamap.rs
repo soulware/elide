@@ -104,9 +104,8 @@ enum Admission<'a> {
 /// [`LbaMap::referenced_hashes`].
 ///
 /// Exists so a worker can ask the liveness question against state captured
-/// on the actor. A reference to an unreferenced extent is what lets a
-/// rewrite drop the bytes out from under it, so the delta producer consults
-/// this before offering a source.
+/// on the actor, which is where the delta producer decides whether a
+/// candidate source is worth pinning.
 #[derive(Clone, Default)]
 pub struct ReferencedHashes {
     claims: ImHashMap<blake3::Hash, u32>,
