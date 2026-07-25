@@ -574,6 +574,15 @@ pub struct Volume {
     lock_file: nix::fcntl::Flock<fs::File>,
     pub(in crate::volume) lbamap: Arc<lbamap::LbaMap>,
     pub(in crate::volume) extent_index: Arc<extentindex::ExtentIndex>,
+    /// Candidate map for the formation resemblance delta tier, harvested
+    /// from the same walk that rebuilt `extent_index` and extended with
+    /// each promote's own sketched entries.
+    ///
+    /// A cache, not index state: every candidate is resolved through
+    /// `extent_index` before use, so a posting for a hash that no longer
+    /// resolves costs one failed lookup. Nothing rebuilds against it and
+    /// nothing persists it.
+    pub(in crate::volume) sketch_index: Arc<crate::sketch_index::SketchIndex>,
     /// Lazy WAL state. `None` means no WAL file exists on disk — the next
     /// write opens a fresh one at `mint.next()`. Keeps idle volumes from
     /// churning the WAL on every GC tick.
@@ -736,7 +745,8 @@ impl Volume {
         let journal = cfg.journal_ranges();
 
         // Walk the origin chain and rebuild maps from all committed segments.
-        let (ancestor_layers, mut lbamap, mut extent_index) = open_read_state(base_dir, by_id_dir)?;
+        let (ancestor_layers, mut lbamap, mut extent_index, sketch_index) =
+            open_read_state(base_dir, by_id_dir)?;
 
         // Find the in-progress WAL file (there should be at most one).
         let mut wal_files: Vec<PathBuf> = Vec::new();
@@ -876,10 +886,16 @@ impl Volume {
                     signer: Arc::clone(&signer),
                     pending_dir: pending_dir.clone(),
                     // Recovery promotes of stale WALs write plain Data
-                    // entries: the delta tier resolves source bodies
-                    // through an Arc'd extent-index snapshot, and the
-                    // open path holds the index by value at this point.
-                    delta_prior: None,
+                    // entries. Both delta tiers resolve sources through
+                    // Arc'd snapshots, and the open path holds the index
+                    // and the candidate map by value at this point, so an
+                    // empty spec leaves every entry alone.
+                    delta: crate::volume::jobs::PromoteDeltaSpec {
+                        extent_index: Arc::new(extentindex::ExtentIndex::new()),
+                        sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
+                        search_dirs: Vec::new(),
+                        prior: None,
+                    },
                     journal: jpart,
                 },
                 &mut crate::actor::PriorSourceCache::default(),
@@ -932,6 +948,7 @@ impl Volume {
             lock_file,
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
+            sketch_index: Arc::new(sketch_index),
             wal,
             pending_entries,
             pending_body_offsets,
@@ -3320,21 +3337,22 @@ impl Volume {
         self.classify_pending_dedup(open.ulid);
         let pre_promote_offsets =
             snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
-        let delta_prior = latest_snapshot(&self.base_dir)?.map(|snap_ulid| {
-            let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
-            for layer in &self.ancestor_layers {
-                if !search_dirs.contains(&layer.dir) {
-                    search_dirs.push(layer.dir.clone());
-                }
+        let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
+        for layer in &self.ancestor_layers {
+            if !search_dirs.contains(&layer.dir) {
+                search_dirs.push(layer.dir.clone());
             }
-            PromoteDeltaPrior {
+        }
+        let delta = jobs::PromoteDeltaSpec {
+            extent_index: Arc::clone(&self.extent_index),
+            sketch_index: Arc::clone(&self.sketch_index),
+            search_dirs,
+            prior: latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 snap_ulid,
-                extent_index: Arc::clone(&self.extent_index),
-                search_dirs,
                 journal_ranges: self.journal.clone(),
-            }
-        });
+            }),
+        };
         let (primary, jpart) = partition_journal_pending(
             std::mem::take(&mut self.pending_entries),
             pre_promote_offsets,
@@ -3366,7 +3384,7 @@ impl Volume {
             body_offsets: primary.2,
             signer: Arc::clone(&self.signer),
             pending_dir: self.base_dir.join("pending"),
-            delta_prior,
+            delta,
             journal: jpart,
         })
     }
@@ -3395,6 +3413,14 @@ impl Volume {
             Arc::make_mut(&mut self.lbamap),
             result,
         )?;
+
+        // Extend the candidate map with what this promote sketched, so the
+        // next formation can source against it. The journal partition
+        // carries no sketches, so only the primary share is offered.
+        let sketches = Arc::make_mut(&mut self.sketch_index);
+        for entry in &result.entries {
+            sketches.insert_entry(entry);
+        }
 
         // Delete old WAL — only after the extent index is updated.
         if let Err(e) = fs::remove_file(&result.old_wal_path) {

@@ -94,6 +94,22 @@ fn write_snapshot_and_filemap(
     filemap::write(&vol_dir.join("snapshots"), &snap_str, &rows).unwrap();
 }
 
+/// High-entropy bytes, so that a delta has to earn its keep against what
+/// plain zstd achieves rather than riding on the content's own
+/// compressibility.
+fn incompressible(seed: u8, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut x = 0x2545_F491_4F6C_DD1Du64 ^ ((seed as u64) << 32 | seed as u64);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 #[test]
 fn rewrite_pending_with_deltas_converts_matching_entry() {
     let tmp = TempDir::new().unwrap();
@@ -101,7 +117,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
     fs::create_dir_all(&by_id_dir).unwrap();
 
     // ── Source volume: one 4 KiB DATA entry at LBA 0 for "/shared.bin".
-    let parent_bytes = vec![0x55u8; 4096];
+    let parent_bytes = incompressible(1, 4096);
     let parent_hash = blake3::hash(&parent_bytes);
     let (source_ulid, source_dir, source_signer) =
         make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
@@ -122,9 +138,10 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
         parent_bytes.len() as u64,
     );
 
-    // ── Child volume: same path, different bytes (but delta-compressible).
+    // ── Child volume: same path, a near-copy of the source with a
+    // localised difference, which is the shape a dictionary wins on.
     // Provenance names the source as an extent-index lineage entry.
-    let mut child_bytes = vec![0x55u8; 4096];
+    let mut child_bytes = parent_bytes.clone();
     for (i, byte) in child_bytes.iter_mut().enumerate().take(128) {
         *byte = i as u8;
     }
@@ -387,12 +404,16 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
 
 #[test]
 fn rewrite_pending_with_deltas_handles_inline_source() {
-    // Regression: a highly-compressible 4 KiB source block lands as an
-    // Inline entry (compressed bytes < 256). The delta stage must read
-    // the source bytes from `loc.inline_data`, not from `cache/.body`
-    // where an Inline entry has no presence. Prior to the fix this
-    // failed with an lz4 decompression error on the first jammy->jammy
-    // import.
+    // A highly-compressible 4 KiB source block lands as an Inline entry
+    // (compressed bytes < 256), whose bytes the delta stage reads from
+    // `loc.inline_data` rather than from `cache/.body`, where an Inline
+    // entry has no presence. That read happens while matching, before
+    // any size gate, so a source it cannot decompress surfaces here as
+    // an error.
+    //
+    // The conversion itself is declined: an Inline source holds under
+    // 256 stored bytes, so its dictionary cannot beat what plain zstd
+    // already achieves on content that compressible.
     let tmp = TempDir::new().unwrap();
     let by_id_dir = tmp.path().join("by_id");
     fs::create_dir_all(&by_id_dir).unwrap();
@@ -461,12 +482,12 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     let stats =
         delta_compute::rewrite_pending_with_deltas(&child_dir, &by_id_dir, child_signer.as_ref())
             .expect("rewrite_pending_with_deltas must not fail on inline source");
-    assert_eq!(stats.entries_converted, 1);
+    assert_eq!(stats.entries_converted, 0);
 
     let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
-    assert_eq!(entries[0].kind, EntryKind::Delta);
-    assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
+    assert_eq!(entries[0].kind, EntryKind::Data);
+    assert!(entries[0].delta_options.is_empty());
 }
 
 #[test]

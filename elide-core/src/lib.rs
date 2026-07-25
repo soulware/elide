@@ -26,6 +26,7 @@ pub mod segment_cache;
 pub mod segment_classify;
 pub mod signing;
 pub mod sketch;
+pub mod sketch_index;
 pub mod store_keys;
 pub mod ulid_mint;
 pub mod volume;

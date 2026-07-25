@@ -27,12 +27,37 @@ use crate::segment::{
     read_and_verify_segment_index, read_body_section_bodies, write_segment_with_delta_body,
 };
 use crate::signing::{self, VerifyingKey};
+use crate::sketch_index::SketchIndex;
 use crate::volume;
+
+/// Bytes an extent covers per LBA.
+const LBA_BYTES: u64 = 4096;
 
 /// zstd compression level for delta blobs. Deltas are computed once at
 /// import time and fetched infrequently; a middling level is a good
 /// tradeoff between ratio and import latency.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Compressed length of `plain` with no dictionary, at [`ZSTD_LEVEL`].
+fn dictionaryless_len(plain: &[u8]) -> io::Result<usize> {
+    zstd::bulk::compress(plain, ZSTD_LEVEL)
+        .map(|blob| blob.len())
+        .map_err(|e| io::Error::other(format!("zstd control compression failed: {e}")))
+}
+
+/// Whether a delta of `delta_len` bytes earns its place for an entry whose
+/// body occupies `stored_length` bytes and decompresses to `plain`.
+///
+/// Two bars. The delta must not grow the stored bytes, and it must beat
+/// what plain zstd achieves on the same plaintext. Beating only the stored
+/// lz4 body shows that zstd is the stronger codec, not that the dictionary
+/// contributed anything.
+fn delta_is_worth_storing(delta_len: usize, stored_length: u32, plain: &[u8]) -> io::Result<bool> {
+    if delta_len >= stored_length as usize {
+        return Ok(false);
+    }
+    Ok(delta_len < dictionaryless_len(plain)?)
+}
 
 /// Upper bound on the uncompressed size of a delta-dict decompression.
 /// Matches the 16 MiB segment-size cap — a single extent cannot be
@@ -333,12 +358,7 @@ fn maybe_rewrite_segment(
             .compress(child_plain)
             .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
 
-        // Skip conversion if the delta isn't actually smaller than the
-        // stored (possibly lz4-compressed) body — storing a larger
-        // delta just to drop the DATA body would be a net loss on hosts
-        // that already have the source cached but a net loss too on
-        // cold hosts that would otherwise fetch the raw body.
-        if delta_blob.len() >= entry.stored_length as usize {
+        if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
             continue;
         }
 
@@ -494,6 +514,160 @@ fn read_source_plaintext(
     }
 }
 
+/// How far down the ranked candidates to look for a source whose body is
+/// locally readable.
+///
+/// Depth, not search width. Only one candidate is ever compressed against:
+/// a delta that fails the keep rule ends the target, because round 2 found
+/// no case where a lower-ranked source cleared the bar after the top-ranked
+/// one lost. What this bounds is how many candidates can be skipped for
+/// having no readable body, which the map cannot see.
+const MAX_RESEMBLANCE_CANDIDATES: usize = 4;
+
+/// Counters for one resemblance pass.
+#[derive(Debug, Default)]
+pub struct ResemblanceStats {
+    pub delta: SegmentDeltaStats,
+    /// Targets whose sketch was probed against the map.
+    pub targets_probed: u64,
+    /// Candidate dictionaries read and compressed against.
+    pub candidates_tried: u64,
+    /// Source plaintext read to seed dictionaries, before caching.
+    pub dictionary_bytes_read: u64,
+}
+
+/// Convert `Data` pendings to thin `Delta` entries against sources the
+/// candidate map says resemble them.
+///
+/// Runs after the same-LBA tier, over the entries it left alone, and needs
+/// no snapshot: `sketches` spans whatever the lineage held at open plus what
+/// later promotes appended. Delta blobs append to `delta_body`, which the
+/// same-LBA tier may already have filled.
+///
+/// Best-effort like every delta tier. A target too small to sketch, a
+/// sketch with no candidate, a candidate whose body is not locally readable,
+/// and a delta that fails the keep rule all leave the entry as the `Data`
+/// entry it was.
+///
+/// A candidate can never come from this same batch, since the map is fed
+/// after a promote commits, so no conversion here can leave another
+/// conversion's source pointing at a `Delta`.
+pub fn delta_pendings_by_resemblance(
+    pendings: &mut [segment::PendingEntry],
+    sketches: &SketchIndex,
+    extent_index: &ExtentIndex,
+    search_dirs: &[PathBuf],
+    delta_body: &mut Vec<u8>,
+) -> io::Result<ResemblanceStats> {
+    let mut stats = ResemblanceStats::default();
+    if sketches.is_empty() {
+        return Ok(stats);
+    }
+    let mut source_plain_cache: HashMap<blake3::Hash, Vec<u8>> = HashMap::new();
+
+    for pending in pendings.iter_mut() {
+        let entry = &pending.entry;
+        // The same-LBA tier converts before this one, and a delta-bearing
+        // entry cannot take a second source.
+        if entry.kind != EntryKind::Data || !entry.delta_options.is_empty() {
+            continue;
+        }
+        if entry.journal {
+            continue;
+        }
+        let raw_len = entry.lba_length as u64 * LBA_BYTES;
+        if raw_len < crate::sketch::MIN_SKETCH_BYTES as u64 {
+            continue;
+        }
+        let Some(stored) = pending.body.as_deref() else {
+            continue;
+        };
+
+        let child_plain_owned: Vec<u8>;
+        let child_plain: &[u8] = if entry.compressed {
+            child_plain_owned = decompress_lz4(stored)?;
+            &child_plain_owned
+        } else {
+            stored
+        };
+        let Some(target_sketch) = crate::sketch::compute(child_plain) else {
+            continue;
+        };
+        stats.targets_probed += 1;
+
+        let mut converted = None;
+        for cand in sketches.candidates(&target_sketch, MAX_RESEMBLANCE_CANDIDATES) {
+            // A source that is its own target would be a delta naming its
+            // own hash, which nothing can resolve. Exact-hash dedup runs
+            // before this tier and takes that case.
+            if cand.hash == entry.hash {
+                continue;
+            }
+            let source_plain = match source_plain_cache.get(&cand.hash) {
+                Some(v) => v,
+                None => {
+                    let Some(plain) = read_source_plaintext(extent_index, search_dirs, &cand.hash)
+                    else {
+                        continue;
+                    };
+                    stats.dictionary_bytes_read += plain.len() as u64;
+                    source_plain_cache.entry(cand.hash).or_insert(plain)
+                }
+            };
+            stats.candidates_tried += 1;
+
+            let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, source_plain)
+                .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
+                .compress(child_plain)
+                .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
+
+            if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
+                // Tried and lost, which is a fact about this target rather
+                // than this source. Trying further down the ranking was
+                // measured to rescue nothing.
+                break;
+            }
+            converted = Some((cand.hash, delta_blob));
+            break;
+        }
+
+        let entry = &mut pending.entry;
+        let Some((source_hash, delta_blob)) = converted else {
+            // Formation computes a sketch for every fresh Data entry; hand
+            // over the one already computed so the segment write does not
+            // repeat it.
+            entry.sketch = Some(target_sketch);
+            continue;
+        };
+
+        let delta_offset = delta_body.len() as u64;
+        let delta_length = delta_blob.len() as u32;
+        let delta_hash = blake3::hash(&delta_blob);
+        delta_body.extend_from_slice(&delta_blob);
+
+        stats.delta.original_body_bytes += entry.stored_length as u64;
+        stats.delta.delta_body_bytes += delta_length as u64;
+        stats.delta.entries_converted += 1;
+
+        entry.kind = EntryKind::Delta;
+        entry.stored_offset = 0;
+        entry.stored_length = 0;
+        entry.compressed = false;
+        // A delta-bearing entry is not a valid source, so it advertises no
+        // sketch.
+        entry.sketch = None;
+        entry.delta_options.push(DeltaOption {
+            source_hash,
+            delta_offset,
+            delta_length,
+            delta_hash,
+        });
+        pending.body = None;
+    }
+
+    Ok(stats)
+}
+
 /// Convert single-block `Data` pendings to thin `Delta` entries wherever
 /// `prior` holds a different same-LBA extent whose body is locally
 /// present and the zstd-dict delta beats the stored size. Runs at segment
@@ -562,7 +736,7 @@ pub fn delta_pendings_against_prior(
             .compress(child_plain)
             .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
 
-        if delta_blob.len() >= entry.stored_length as usize {
+        if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
             continue;
         }
 
@@ -590,4 +764,48 @@ pub fn delta_pendings_against_prior(
     }
 
     Ok((delta_body, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text-like content that zstd compresses substantially better than
+    /// lz4, which is what makes the two bars distinguishable.
+    fn compressible(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut i = 0u32;
+        while out.len() < len {
+            out.extend_from_slice(format!("record {i} field=value status=ok\n").as_bytes());
+            i += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn delta_larger_than_the_stored_body_is_rejected() {
+        let plain = compressible(8192);
+        let stored = lz4_flex::compress_prepend_size(&plain).len() as u32;
+        assert!(!delta_is_worth_storing(stored as usize, stored, &plain).expect("gate"));
+        assert!(!delta_is_worth_storing(stored as usize + 1, stored, &plain).expect("gate"));
+    }
+
+    #[test]
+    fn delta_must_beat_plain_zstd_not_just_the_stored_body() {
+        let plain = compressible(8192);
+        let stored = lz4_flex::compress_prepend_size(&plain).len() as u32;
+        let plain_zstd = dictionaryless_len(&plain).expect("control");
+        assert!(
+            plain_zstd < stored as usize,
+            "fixture needs zstd to beat lz4 ({plain_zstd} vs {stored})"
+        );
+
+        // Between the two bars: smaller than the stored body, but the
+        // dictionary added nothing a plain zstd encode would not have.
+        let between = (plain_zstd + stored as usize) / 2;
+        assert!(!delta_is_worth_storing(between, stored, &plain).expect("gate"));
+
+        assert!(delta_is_worth_storing(plain_zstd - 1, stored, &plain).expect("gate"));
+    }
 }

@@ -69,6 +69,30 @@ enum Command {
         /// Sketch construction: broder (position-independent) or finesse
         #[arg(long, default_value = "broder")]
         sketch: String,
+        /// Independent features sampled per sketch
+        #[arg(long, default_value_t = 16)]
+        features: usize,
+        /// Features hashed into each super-feature
+        #[arg(long, default_value_t = 2)]
+        group: usize,
+        /// Bytes retained per super-feature
+        #[arg(long, default_value_t = 8)]
+        sf_bytes: usize,
+        /// Dictionaries tried per miss, best-ranked first
+        #[arg(long, default_value_t = 8)]
+        max_candidates: usize,
+        /// Top-ranked candidates concatenated into one dictionary; 1 measures single-source only
+        #[arg(long, default_value_t = 1)]
+        dict_sources: usize,
+        /// Also measure a zstd dictionary trained over the before-image, at this size in bytes; 0 skips
+        #[arg(long, default_value_t = 0)]
+        train_dict: usize,
+        /// Sample window size for dictionary training
+        #[arg(long, default_value_t = 4096)]
+        train_sample: u64,
+        /// Features a candidate must share with the target to be tried
+        #[arg(long, default_value_t = 1)]
+        min_shared: usize,
     },
 
     /// Combine a boot trace with cross-image analysis to estimate cold-boot fetch cost
@@ -110,6 +134,10 @@ enum Command {
     /// check it hashes to the claimed hash (diagnostic)
     #[command(hide = true)]
     VerifyContent { fork_dir: PathBuf },
+
+    /// Build the delta candidate map for a volume's lineage and report its shape
+    #[command(hide = true)]
+    SketchIndex { fork_dir: PathBuf },
 
     /// Print the rebuilt LBA map: lba, length, hash, payload_block_offset
     #[command(hide = true)]
@@ -989,14 +1017,31 @@ fn main() {
             level,
             threshold,
             sketch,
+            features,
+            group,
+            sf_bytes,
+            max_candidates,
+            dict_sources,
+            train_dict,
+            train_sample,
+            min_shared,
         } => {
             let kind = delta_sim::SketchKind::parse(&sketch).expect("bad --sketch");
+            let params = delta_sim::SketchParams::new(kind, features, group, sf_bytes)
+                .expect("bad sketch geometry");
             delta_sim::run(
                 Path::new(&before),
                 Path::new(&after),
-                level,
-                threshold,
-                kind,
+                delta_sim::SimOptions {
+                    level,
+                    threshold,
+                    params,
+                    max_candidates,
+                    dict_sources,
+                    train_dict,
+                    train_sample,
+                    min_shared,
+                },
             )
             .expect("delta-sim failed");
         }
@@ -1056,6 +1101,10 @@ fn main() {
 
         Command::BlockHash { path, block_bytes } => {
             block_hash(&path, block_bytes).expect("block-hash failed");
+        }
+
+        Command::SketchIndex { fork_dir } => {
+            inspect_files::inspect_sketch_index(&fork_dir).expect("sketch-index failed");
         }
 
         Command::VerifyContent { fork_dir } => {

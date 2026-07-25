@@ -41,7 +41,12 @@ use super::ancestry::{verify_ancestor_manifests, walk_ancestors, walk_extent_anc
 pub(super) fn open_read_state(
     fork_dir: &Path,
     by_id_dir: &Path,
-) -> std::io::Result<(Vec<AncestorLayer>, lbamap::LbaMap, extentindex::ExtentIndex)> {
+) -> std::io::Result<(
+    Vec<AncestorLayer>,
+    lbamap::LbaMap,
+    extentindex::ExtentIndex,
+    crate::sketch_index::SketchIndex,
+)> {
     let total_started = std::time::Instant::now();
 
     // Fail-fast verification: every ancestor in the fork chain must have a
@@ -84,7 +89,10 @@ pub(super) fn open_read_state(
     }
     let hash_chain_len = hash_chain.len();
     let extent_rebuild_started = std::time::Instant::now();
-    let extent_index = extentindex::rebuild(&hash_chain)?;
+    // The candidate map rides this walk rather than paying for a second
+    // one: signature verification dominates reading an `.idx` and this
+    // walk already does it for every segment in the lineage.
+    let (extent_index, sketch_index) = extentindex::rebuild_with_sketches(&hash_chain)?;
     let extent_rebuild_elapsed = extent_rebuild_started.elapsed();
 
     // The returned `ancestor_layers` unifies fork parents and extent
@@ -109,5 +117,5 @@ pub(super) fn open_read_state(
         fork_layers_n,
         hash_chain_len,
     );
-    Ok((ancestor_layers, lbamap, extent_index))
+    Ok((ancestor_layers, lbamap, extent_index, sketch_index))
 }

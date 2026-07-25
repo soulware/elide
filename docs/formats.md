@@ -207,7 +207,7 @@ Each segment is a **single file** both locally and in S3. The same format is use
 
 ```
 [Header: 100 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x05"
+  magic          (8 bytes)  — "ELIDSEG\x07"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
@@ -255,7 +255,7 @@ Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression
 
 **Compression granularity:** `FLAG_COMPRESSED` applies to the full stored payload of an entry — the entire extent is compressed as a unit. There is no sub-extent compression granularity. A read of any portion of a compressed extent must decompress the full payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
 
-The index section has two parts: fixed-size base entries, followed by a delta table.
+The index section has four parts in order: fixed-size base entries, a sketch table, a delta table, and an inputs table.
 
 **Base entries** (`entry_count × 64 bytes`):
 
@@ -272,7 +272,18 @@ For each extent (64 bytes, fixed-size):
 
 All entry kinds (DATA, DEDUP_REF, ZERO, INLINE, and DELTA) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for DEDUP_REF, ZERO, and DELTA.
 
-**Delta table** (appended after base entries, variable-length):
+**Sketch table** (appended after base entries):
+
+```
+sketch_length     (4 bytes)  — byte length of the records that follow (u32 le); 0 when nothing is sketched
+per sketched entry (36 bytes):
+  entry_index     (4 bytes)  — index of the base entry (u32 le)
+  features        (32 bytes) — 8 × u32 le, the resemblance sketch
+```
+
+The length prefix is always present, so every segment carries the field even when no entry is sketched. Records appear in base-entry order and only for entries that carry a sketch, which is Data and CanonicalData entries at or above 32 KiB that are not journal-tier and carry no delta. Each feature is a minhash over content-defined sampled windows of the entry's decompressed bytes; the number of features two entries share estimates their resemblance, which is how the delta producer finds a dictionary source by content rather than by LBA or path. See [delta-compression.md](design/delta-compression.md).
+
+**Delta table** (appended after the sketch table, variable-length):
 
 ```
 Per entry with deltas:
@@ -292,7 +303,7 @@ Per entry with deltas:
                                demand-fetch before the blob is cached)
 ```
 
-The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - inputs_length`.
+The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - (4 + sketch_length) - inputs_length`.
 
 **Inputs table** (appended after the delta table, at the tail of the index section):
 

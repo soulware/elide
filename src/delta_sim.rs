@@ -1,9 +1,9 @@
 // Measures delta source-selection strategies between two states of the
 // same live-written ext4 image (before/after a workload such as a package
 // upgrade). Replays the production Tier-1 rule (same-LBA prior fragment as
-// zstd dictionary, keep iff smaller than the LZ4-stored size) over the
-// changed blocks, then attempts super-feature similarity matching on the
-// misses. Journal-range and non-file (metadata) bytes are bucketed
+// zstd dictionary, keep iff smaller than both the LZ4-stored size and what
+// plain zstd achieves) over the changed blocks, then attempts super-feature
+// similarity matching on the misses. Journal-range and non-file (metadata) bytes are bucketed
 // separately. See docs/design/delta-compression.md § Measurement.
 
 use std::collections::HashMap;
@@ -18,16 +18,14 @@ use crate::extents::{
 
 const LBA_SIZE: u64 = 4096;
 const DIFF_CHUNK: usize = 4 << 20;
-/// Candidates tried per miss (union of the three super-feature buckets).
-const MAX_CANDIDATES: usize = 8;
 /// Dictionary bytes held in the read cache before it is cleared.
 const DICT_CACHE_CAP: u64 = 512 << 20;
 
 // --- sketch ---
 
-const SUBCHUNKS: usize = 16;
-const FEATURES_PER_SF: usize = 2;
-const NUM_SF: usize = SUBCHUNKS / FEATURES_PER_SF;
+/// Upper bound on features per sketch. Sized so every geometry in a
+/// sweep computes on the stack.
+const MAX_FEATURES: usize = 32;
 
 /// Content-defined sampling rate for the Broder sketch: positions where
 /// the low bits of the rolling hash are all-ones (~1/32 of positions).
@@ -54,25 +52,26 @@ const fn gear_table() -> [u64; 256] {
 
 static GEAR: [u64; 256] = gear_table();
 
-const fn perm_table() -> [u64; SUBCHUNKS] {
-    let mut t = [0u64; SUBCHUNKS];
+const fn perm_table() -> [u64; MAX_FEATURES] {
+    let mut t = [0u64; MAX_FEATURES];
     let mut i = 0usize;
-    while i < SUBCHUNKS {
+    while i < MAX_FEATURES {
         t[i] = splitmix(0x1000 + i as u64) | 1;
         i += 1;
     }
     t
 }
 
-static PERMS: [u64; SUBCHUNKS] = perm_table();
+static PERMS: [u64; MAX_FEATURES] = perm_table();
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SketchKind {
     /// Positional: max Gear hash per fixed subchunk (Finesse-style).
     /// Cheap, but brittle when content shifts across subchunk boundaries.
     Finesse,
-    /// Position-independent: max of SUBCHUNKS independent permutations
-    /// over content-defined sampled window hashes (Broder resemblance).
+    /// Position-independent: max of one independent permutation per
+    /// feature over content-defined sampled window hashes (Broder
+    /// resemblance).
     Broder,
 }
 
@@ -93,30 +92,130 @@ impl SketchKind {
     }
 }
 
-fn sfs_from_features(features: &[u64; SUBCHUNKS]) -> [u64; NUM_SF] {
-    let mut sfs = [0u64; NUM_SF];
-    for (j, sf) in sfs.iter_mut().enumerate() {
-        let mut bytes = [0u8; FEATURES_PER_SF * 8];
-        for k in 0..FEATURES_PER_SF {
-            bytes[k * 8..(k + 1) * 8]
-                .copy_from_slice(&features[j * FEATURES_PER_SF + k].to_le_bytes());
-        }
-        let h = blake3::hash(&bytes);
-        let b = h.as_bytes();
-        *sf = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-    }
-    sfs
+/// The sketch geometry under measurement: `features` independent
+/// features, grouped `group` at a time into `features / group`
+/// super-features, each truncated to `sf_bytes`.
+///
+/// `group` sets how much resemblance a pair needs before a super-feature
+/// registers it (all features in the group must agree, so the per-group
+/// probability is `r^group`), and the count sets how many independent
+/// chances there are to register it. `sf_bytes` affects neither: it
+/// controls only how often two *different* groups land on the same
+/// super-feature value.
+#[derive(Clone, Copy)]
+pub struct SketchParams {
+    kind: SketchKind,
+    features: usize,
+    group: usize,
+    sf_bytes: usize,
 }
 
-/// Super-feature sketch: SUBCHUNKS features grouped into NUM_SF 8-byte
-/// super-features. Two inputs sharing any super-feature are likely
-/// similar. Returns None when the input is too small to sketch reliably.
-fn sketch(kind: SketchKind, data: &[u8]) -> Option<[u64; NUM_SF]> {
-    let mut features = [0u64; SUBCHUNKS];
-    match kind {
+impl SketchParams {
+    pub fn new(
+        kind: SketchKind,
+        features: usize,
+        group: usize,
+        sf_bytes: usize,
+    ) -> io::Result<Self> {
+        if features == 0 || features > MAX_FEATURES {
+            return Err(io::Error::other(format!(
+                "features must be in 1..={MAX_FEATURES}, got {features}"
+            )));
+        }
+        if group == 0 || !features.is_multiple_of(group) {
+            return Err(io::Error::other(format!(
+                "features {features} must be a positive multiple of group {group}"
+            )));
+        }
+        if !(1..=8).contains(&sf_bytes) {
+            return Err(io::Error::other(format!(
+                "sf-bytes must be in 1..=8, got {sf_bytes}"
+            )));
+        }
+        Ok(Self {
+            kind,
+            features,
+            group,
+            sf_bytes,
+        })
+    }
+
+    fn sf_count(self) -> usize {
+        self.features / self.group
+    }
+
+    /// Bytes one sketch occupies in a segment index.
+    fn sketch_bytes(self) -> usize {
+        self.sf_count() * self.sf_bytes
+    }
+
+    /// Bytes one posting occupies in the producer's inverted map: the
+    /// super-feature plus a `u32` source id, padded to alignment.
+    fn posting_bytes(self) -> usize {
+        if self.sf_bytes <= 4 { 8 } else { 16 }
+    }
+
+    fn label(self) -> String {
+        format!(
+            "{} {}f/{}g = {} SF x {}B",
+            self.kind.name(),
+            self.features,
+            self.group,
+            self.sf_count(),
+            self.sf_bytes
+        )
+    }
+}
+
+/// A computed sketch: `len` super-features, the rest of the array unused.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Sketch {
+    sfs: [u64; MAX_FEATURES],
+    len: usize,
+}
+
+impl Sketch {
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.sfs[..self.len].iter().copied()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, sf: u64) -> bool {
+        self.sfs[..self.len].contains(&sf)
+    }
+}
+
+fn sfs_from_features(p: SketchParams, features: &[u64]) -> Sketch {
+    let mut out = Sketch {
+        sfs: [0u64; MAX_FEATURES],
+        len: p.sf_count(),
+    };
+    let mask = if p.sf_bytes >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (p.sf_bytes * 8)) - 1
+    };
+    let mut bytes = [0u8; MAX_FEATURES * 8];
+    for (j, sf) in out.sfs[..p.sf_count()].iter_mut().enumerate() {
+        for k in 0..p.group {
+            bytes[k * 8..(k + 1) * 8].copy_from_slice(&features[j * p.group + k].to_le_bytes());
+        }
+        let h = blake3::hash(&bytes[..p.group * 8]);
+        let b = h.as_bytes();
+        *sf = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) & mask;
+    }
+    out
+}
+
+/// Super-feature sketch under the geometry `p`. Two inputs sharing any
+/// super-feature are likely similar. Returns None when the input is too
+/// small to sketch reliably.
+fn sketch(p: SketchParams, data: &[u8]) -> Option<Sketch> {
+    let mut features = [0u64; MAX_FEATURES];
+    match p.kind {
         SketchKind::Finesse => {
-            let sub = data.len().div_ceil(SUBCHUNKS).max(1);
-            for (i, chunk) in data.chunks(sub).enumerate().take(SUBCHUNKS) {
+            let sub = data.len().div_ceil(p.features).max(1);
+            for (i, chunk) in data.chunks(sub).enumerate().take(p.features) {
                 let mut h = 0u64;
                 let mut m = 0u64;
                 for &b in chunk {
@@ -135,7 +234,7 @@ fn sketch(kind: SketchKind, data: &[u8]) -> Option<[u64; NUM_SF]> {
                 h = (h << 1).wrapping_add(GEAR[b as usize]);
                 if h & SAMPLE_MASK == SAMPLE_MASK {
                     samples += 1;
-                    for (f, perm) in features.iter_mut().zip(PERMS) {
+                    for (f, perm) in features[..p.features].iter_mut().zip(PERMS) {
                         let v = h.wrapping_mul(perm);
                         if v > *f {
                             *f = v;
@@ -148,7 +247,7 @@ fn sketch(kind: SketchKind, data: &[u8]) -> Option<[u64; NUM_SF]> {
             }
         }
     }
-    Some(sfs_from_features(&features))
+    Some(sfs_from_features(p, &features[..p.features]))
 }
 
 // --- intervals ---
@@ -378,12 +477,69 @@ impl DictCache {
     }
 }
 
+/// Compressed length with no dictionary. The control for
+/// [`zstd_dict_len`]: beating LZ4 says only that zstd is the better
+/// codec, which it usually is, so the dictionary has earned nothing
+/// until it beats this.
+fn zstd_len(level: i32, target: &[u8]) -> io::Result<usize> {
+    zstd::bulk::compress(target, level)
+        .map(|blob| blob.len())
+        .map_err(|e| io::Error::other(format!("zstd compression failed: {e}")))
+}
+
 fn zstd_dict_len(level: i32, dict: &[u8], target: &[u8]) -> io::Result<usize> {
     let blob = zstd::bulk::Compressor::with_dictionary(level, dict)
         .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
         .compress(target)
         .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
     Ok(blob.len())
+}
+
+/// Train a zstd dictionary over windows sampled from `frags`.
+///
+/// `zdict` is built for many small samples, so whole extents dilute it;
+/// this takes `sample_bytes` windows, breadth-first across fragments and
+/// then at increasing offsets, until the corpus reaches the 100x the
+/// dictionary size that zstd's guidance asks for.
+fn train_dictionary(
+    f: &mut File,
+    frags: &[Frag],
+    dict_bytes: usize,
+    sample_bytes: u64,
+) -> io::Result<(Vec<u8>, usize, u64)> {
+    let corpus_target = dict_bytes as u64 * 100;
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    let mut held = 0u64;
+    let mut round = 0u64;
+    while held < corpus_target {
+        let mut added = 0usize;
+        for fr in frags {
+            let off = round * sample_bytes;
+            if off + sample_bytes > fr.byte_count {
+                continue;
+            }
+            samples.push(read_span(
+                f,
+                Span {
+                    start: fr.start_byte + off,
+                    len: sample_bytes,
+                },
+            )?);
+            held += sample_bytes;
+            added += 1;
+            if held >= corpus_target {
+                break;
+            }
+        }
+        if added == 0 {
+            break;
+        }
+        round += 1;
+    }
+    let count = samples.len();
+    let dict = zstd::dict::from_samples(&samples, dict_bytes)
+        .map_err(|e| io::Error::other(format!("zstd dictionary training failed: {e}")))?;
+    Ok((dict, count, held))
 }
 
 /// Index of the fragment covering byte `pos`, if any.
@@ -441,13 +597,36 @@ fn print_top_paths(label: &str, map: &HashMap<String, u64>) {
     }
 }
 
-pub fn run(
-    before_path: &Path,
-    after_path: &Path,
-    level: i32,
-    threshold: u64,
-    kind: SketchKind,
-) -> io::Result<()> {
+/// Knobs for one measurement run.
+pub struct SimOptions {
+    pub level: i32,
+    /// Smallest run sketched, indexed and probed.
+    pub threshold: u64,
+    pub params: SketchParams,
+    /// Dictionaries tried per target, best-ranked first.
+    pub max_candidates: usize,
+    /// Ranked candidates concatenated into one dictionary; 1 measures
+    /// single-source only.
+    pub dict_sources: usize,
+    /// Size of a dictionary trained over the before-image; 0 skips it.
+    pub train_dict: usize,
+    /// Sample window size for that training.
+    pub train_sample: u64,
+    /// Features a candidate must share with the target to be tried.
+    pub min_shared: usize,
+}
+
+pub fn run(before_path: &Path, after_path: &Path, opts: SimOptions) -> io::Result<()> {
+    let SimOptions {
+        level,
+        threshold,
+        params,
+        max_candidates,
+        dict_sources,
+        train_dict,
+        train_sample,
+        min_shared,
+    } = opts;
     let mut before = File::open(before_path)?;
     let mut after = File::open(after_path)?;
     let image_size = before.metadata()?.len();
@@ -525,16 +704,35 @@ pub fn run(
                 len: fr.byte_count,
             },
         )?;
-        let Some(sfs) = sketch(kind, &body) else {
+        let Some(sfs) = sketch(params, &body) else {
             continue;
         };
-        for sf in sfs {
+        for sf in sfs.iter() {
             sf_index.entry(sf).or_default().push(i as u32);
         }
         indexed_frags += 1;
         indexed_bytes += fr.byte_count;
     }
     let index_elapsed = index_start.elapsed();
+
+    // Trained shared dictionary: one artefact for every target, against
+    // the per-target sources similarity picks.
+    let trained = if train_dict > 0 {
+        let t = Instant::now();
+        let (dict, samples, corpus) =
+            train_dictionary(&mut before, &before_frags, train_dict, train_sample)?;
+        println!(
+            "Trained a {:.1} KiB dictionary from {} samples of {} B ({:.1} MiB corpus) in {:.2}s",
+            dict.len() as f64 / 1024.0,
+            samples,
+            train_sample,
+            mib(corpus),
+            t.elapsed().as_secs_f64()
+        );
+        Some(dict)
+    } else {
+        None
+    };
 
     // Similarity matching over Tier-1 misses.
     println!("Matching {} Tier-1 misses ...", misses.len());
@@ -543,6 +741,34 @@ pub fn run(
     let mut sim_nobenefit = Bucket::default();
     let mut subthreshold = Bucket::default();
     let mut candidates_tried = 0u64;
+    let mut candidates_surfaced = 0u64;
+    let mut cap_hits = 0u64;
+    // Recovered bytes measured against the no-dictionary control rather
+    // than lz4, so `lz4` here holds the plain-zstd length and the
+    // difference is what the dictionary itself bought.
+    let mut dict_saving = Bucket::default();
+    // Deltas the bar declines: smaller than the stored body, no better
+    // than plain zstd.
+    let mut codec_only = Bucket::default();
+    let mut codec_only_paths: HashMap<String, u64> = HashMap::new();
+    // Concatenated-dictionary side measurement. `multi_vs_single` holds the
+    // single-source delta in `lz4` and the combined one in `delta`, over the
+    // targets both cleared.
+    let mut multi_vs_single = Bucket::default();
+    let mut multi_only = Bucket::default();
+    let mut multi_better_bytes = 0u64;
+    let mut multi_better_runs = 0u64;
+    let mut multi_dict_bytes = 0u64;
+    let mut multi_probed = 0u64;
+    let mut candidates_after_floor = 0u64;
+    let mut rescued_bytes = 0u64;
+    let mut rescued_runs = 0u64;
+    // Trained-dictionary buckets. `lz4` holds the baseline each is measured
+    // against: plain zstd for the first two, the single-source delta for the
+    // third.
+    let mut trained_sub = Bucket::default();
+    let mut trained_nosource = Bucket::default();
+    let mut trained_vs_single = Bucket::default();
     let mut recovered_paths: HashMap<String, u64> = HashMap::new();
     let mut nocandidate_paths: HashMap<String, u64> = HashMap::new();
 
@@ -561,41 +787,128 @@ pub fn run(
     for &(target, lz4_len) in &misses {
         if target.len < threshold {
             subthreshold.add(target.len, lz4_len, 0);
+            // The population similarity abandons: too small to carry a
+            // sketch, too small to resemble a single source.
+            if let Some(dict) = &trained {
+                let body = read_span(&mut after, target)?;
+                let nodict = zstd_len(level, &body)? as u64;
+                let t = zstd_dict_len(level, dict, &body)? as u64;
+                trained_sub.add(target.len, nodict, t);
+            }
             continue;
         }
         let body = read_span(&mut after, target)?;
+
+        // The production bar (`delta_compute::delta_is_worth_storing`): a
+        // delta must not grow the stored bytes and must beat what plain
+        // zstd achieves on the same plaintext, so that the dictionary is
+        // what earned it rather than the codec.
+        let nodict = zstd_len(level, &body)? as u64;
+        let bar = lz4_len.min(nodict);
 
         let oracle_ok = match covering_frag(&after_frags, target.start)
             .and_then(|i| before_by_path.get(after_frags[i as usize].path.as_str()))
         {
             Some(&idx) => {
                 let dict = dicts.get(&mut before, &before_frags, idx)?.to_vec();
-                (zstd_dict_len(level, &dict, &body)? as u64) < lz4_len
+                (zstd_dict_len(level, &dict, &body)? as u64) < bar
             }
             None => false,
         };
 
-        let mut cands: Vec<u32> = Vec::new();
-        for sf in sketch(kind, &body).unwrap_or_default() {
-            if let Some(v) = sf_index.get(&sf) {
-                for &idx in v {
-                    if !cands.contains(&idx) {
-                        cands.push(idx);
-                    }
+        // Rank by how many super-features a source shares with the
+        // target before the cap applies. Sharing several is stronger
+        // evidence than sharing one, so the cap spends itself on the
+        // closest sources rather than on whichever the super-feature
+        // order reached first.
+        let mut tally: Vec<(u32, u32)> = Vec::new();
+        for sf in sketch(params, &body).unwrap_or_default().iter() {
+            let Some(v) = sf_index.get(&sf) else { continue };
+            for &idx in v {
+                match tally.iter_mut().find(|(i, _)| *i == idx) {
+                    Some((_, shared)) => *shared += 1,
+                    None => tally.push((idx, 1)),
                 }
             }
         }
-        cands.truncate(MAX_CANDIDATES);
+        candidates_surfaced += tally.len() as u64;
+        // A floor on shared features asks for more joint evidence before a
+        // source is worth trying, the same demand grouping makes at index
+        // time but as a threshold on the estimator rather than a partition
+        // of it: any k of eight, not all of a specific k.
+        tally.retain(|&(_, shared)| shared as usize >= min_shared);
+        candidates_after_floor += tally.len() as u64;
+        if tally.len() > max_candidates {
+            cap_hits += 1;
+        }
+        tally.sort_by_key(|&(_, shared)| std::cmp::Reverse(shared));
+        let cands: Vec<u32> = tally
+            .iter()
+            .take(max_candidates)
+            .map(|&(idx, _)| idx)
+            .collect();
         let mut best: Option<u64> = None;
-        for &idx in &cands {
+        let mut top_ranked: Option<u64> = None;
+        for (rank, &idx) in cands.iter().enumerate() {
             candidates_tried += 1;
             let dict = dicts.get(&mut before, &before_frags, idx)?.to_vec();
             let d = zstd_dict_len(level, &dict, &body)? as u64;
+            if rank == 0 {
+                top_ranked = Some(d);
+            }
             if best.is_none_or(|b| d < b) {
                 best = Some(d);
             }
         }
-        let sim_ok = matches!(best, Some(d) if d < lz4_len);
+        // Does trying past a loss ever pay? Every body is present in an
+        // image, so a candidate that does not clear the bar was tried and
+        // lost rather than skipped as unreadable.
+        if matches!((top_ranked, best), (Some(top), Some(b)) if top >= bar && b < bar) {
+            rescued_bytes += target.len;
+            rescued_runs += 1;
+        }
+
+        // Side measurement: one dictionary built from the top-ranked
+        // candidates concatenated, against the single-source result on the
+        // same target. Best-ranked goes last, since the dictionary sits
+        // immediately before the input and its tail is the cheapest region
+        // to reference.
+        let multi: Option<u64> = if dict_sources > 1 && cands.len() > 1 {
+            let mut dict: Vec<u8> = Vec::new();
+            for &idx in cands.iter().take(dict_sources).rev() {
+                dict.extend_from_slice(dicts.get(&mut before, &before_frags, idx)?);
+            }
+            multi_dict_bytes += dict.len() as u64;
+            multi_probed += 1;
+            Some(zstd_dict_len(level, &dict, &body)? as u64)
+        } else {
+            None
+        };
+        if let (Some(m), Some(single)) = (multi, best) {
+            if single < bar {
+                // Both cleared: compare ratio on the same bytes.
+                multi_vs_single.add(target.len, single, m);
+                if m < single {
+                    multi_better_bytes += target.len;
+                    multi_better_runs += 1;
+                }
+            } else if m < bar {
+                // Only the combined dictionary cleared the bar.
+                multi_only.add(target.len, nodict, m);
+            }
+        }
+
+        if let Some(dict) = &trained {
+            let t = zstd_dict_len(level, dict, &body)? as u64;
+            match best {
+                // Where similarity found a source, that source is the
+                // baseline the trained dictionary has to beat.
+                Some(single) if single < bar => trained_vs_single.add(target.len, single, t),
+                _ => trained_nosource.add(target.len, nodict, t),
+            }
+        }
+
+        let sim_ok = matches!(best, Some(d) if d < bar);
         matrix[usize::from(sim_ok)][usize::from(oracle_ok)] += target.len;
 
         if cands.is_empty() {
@@ -604,9 +917,16 @@ pub fn run(
             continue;
         }
         match best {
-            Some(d) if d < lz4_len => {
+            Some(d) if d < bar => {
                 sim_recovered.add(target.len, lz4_len, d);
                 attribute(&mut recovered_paths, &after_frags, target);
+                dict_saving.add(target.len, nodict, d);
+            }
+            // Smaller than the stored body but no better than plain zstd.
+            // The bar declines these, so report what declining them costs.
+            Some(d) if d < lz4_len => {
+                codec_only.add(target.len, lz4_len, d);
+                attribute(&mut codec_only_paths, &after_frags, target);
             }
             _ => sim_nobenefit.add(target.len, lz4_len, 0),
         }
@@ -677,16 +997,105 @@ pub fn run(
         candidates_tried,
         candidates_tried as f64 / (sim_recovered.runs + sim_nobenefit.runs).max(1) as f64
     );
-    println!();
     println!(
-        "  sketch index ({}): {} fragments, {:.1} MiB scanned in {:.2}s ({:.0} MiB/s), {} SF entries (~{} KiB)",
-        kind.name(),
+        "    dictionary saving:  {:.1} -> {:.1} MiB vs plain zstd ({:.1} MiB saved)",
+        mib(dict_saving.lz4),
+        mib(dict_saving.delta),
+        mib(dict_saving.lz4.saturating_sub(dict_saving.delta))
+    );
+    println!(
+        "    declined, codec-only: {:.1} MiB in {} runs (lz4 {:.1} MiB, delta {:.1} MiB)",
+        mib(codec_only.bytes),
+        codec_only.runs,
+        mib(codec_only.lz4),
+        mib(codec_only.delta)
+    );
+    if let Some(dict) = &trained {
+        println!();
+        println!(
+            "  trained dictionary ({:.1} KiB), measured against the baseline each bucket already has:",
+            dict.len() as f64 / 1024.0
+        );
+        println!(
+            "    sub-threshold runs:    {:.1} MiB in {} runs, plain zstd {:.1} -> trained {:.1} MiB",
+            mib(trained_sub.bytes),
+            trained_sub.runs,
+            mib(trained_sub.lz4),
+            mib(trained_sub.delta)
+        );
+        println!(
+            "    no similarity source:  {:.1} MiB in {} runs, plain zstd {:.1} -> trained {:.1} MiB",
+            mib(trained_nosource.bytes),
+            trained_nosource.runs,
+            mib(trained_nosource.lz4),
+            mib(trained_nosource.delta)
+        );
+        println!(
+            "    similarity recovered:  {:.1} MiB in {} runs, single-source {:.1} -> trained {:.1} MiB",
+            mib(trained_vs_single.bytes),
+            trained_vs_single.runs,
+            mib(trained_vs_single.lz4),
+            mib(trained_vs_single.delta)
+        );
+    }
+    if dict_sources > 1 {
+        println!();
+        println!(
+            "  dictionary from top {dict_sources} candidates concatenated, on {} probed runs (mean dict {:.1} MiB):",
+            multi_probed,
+            mib(multi_dict_bytes) / (multi_probed.max(1) as f64)
+        );
+        println!(
+            "    where single-source already cleared the bar: {:.1} MiB, delta {:.1} -> {:.1} MiB",
+            mib(multi_vs_single.bytes),
+            mib(multi_vs_single.lz4),
+            mib(multi_vs_single.delta)
+        );
+        println!(
+            "      combined won on {:.1} MiB in {} runs",
+            mib(multi_better_bytes),
+            multi_better_runs
+        );
+        println!(
+            "    recall gain, combined cleared where single did not: {:.1} MiB in {} runs ({:.1} -> {:.1} MiB vs plain zstd)",
+            mib(multi_only.bytes),
+            multi_only.runs,
+            mib(multi_only.lz4),
+            mib(multi_only.delta)
+        );
+    }
+    println!(
+        "    candidates past a floor of {}: {} ({:.1} per probed run)",
+        min_shared,
+        candidates_after_floor,
+        candidates_after_floor as f64
+            / (sim_recovered.runs + sim_nobenefit.runs + sim_nocandidate.runs).max(1) as f64
+    );
+    println!(
+        "    rescued by a lower-ranked candidate: {:.1} MiB in {} runs",
+        mib(rescued_bytes),
+        rescued_runs
+    );
+    println!(
+        "    candidates surfaced: {} ({:.1} per probed run, cap of {} bound on {} runs)",
+        candidates_surfaced,
+        candidates_surfaced as f64
+            / (sim_recovered.runs + sim_nobenefit.runs + sim_nocandidate.runs).max(1) as f64,
+        max_candidates,
+        cap_hits
+    );
+    println!();
+    let postings: usize = sf_index.values().map(Vec::len).sum();
+    println!(
+        "  sketch index ({}): {} fragments, {:.1} MiB scanned in {:.2}s ({:.0} MiB/s), {} postings (~{} KiB map, ~{} KiB persisted)",
+        params.label(),
         indexed_frags,
         mib(indexed_bytes),
         index_elapsed.as_secs_f64(),
         mib(indexed_bytes) / index_elapsed.as_secs_f64().max(1e-9),
-        sf_index.values().map(Vec::len).sum::<usize>(),
-        sf_index.values().map(Vec::len).sum::<usize>() * 12 / 1024
+        postings,
+        postings * params.posting_bytes() / 1024,
+        indexed_frags as usize * params.sketch_bytes() / 1024,
     );
     let recovered_share = pct(sim_recovered.bytes, miss_bytes.max(1));
     println!(
@@ -699,7 +1108,15 @@ pub fn run(
     println!("    similarity only:     {:.1} MiB", mib(matrix[1][0]));
     println!("    oracle only:         {:.1} MiB", mib(matrix[0][1]));
     println!("    neither:             {:.1} MiB", mib(matrix[0][0]));
+    // Recall over the bytes the oracle proves a related source exists
+    // for. The geometry sweep moves this number; the buckets above also
+    // move with how much content has any source at all.
+    println!(
+        "    sketch recall on oracle-provable sources: {:.1}%",
+        pct(matrix[1][1], matrix[1][1] + matrix[0][1])
+    );
     println!();
+    print_top_paths("declined, codec-only", &codec_only_paths);
     print_top_paths("recovered", &recovered_paths);
     print_top_paths("no candidate", &nocandidate_paths);
     Ok(())
@@ -748,26 +1165,32 @@ mod tests {
         (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect()
     }
 
+    /// The round-1 geometry: 16 features in pairs, eight 8-byte SFs.
+    fn params(kind: SketchKind) -> SketchParams {
+        SketchParams::new(kind, 16, 2, 8).expect("valid geometry")
+    }
+
     #[test]
     fn sketch_is_deterministic_and_detects_similarity() {
         for kind in [SketchKind::Finesse, SketchKind::Broder] {
+            let p = params(kind);
             let base = base_data();
-            assert_eq!(sketch(kind, &base), sketch(kind, &base));
+            assert_eq!(sketch(p, &base), sketch(p, &base));
 
             // A lightly patched copy shares at least one super-feature.
             let mut patched = base.clone();
             for b in patched[1000..1200].iter_mut() {
                 *b ^= 0xff;
             }
-            let a = sketch(kind, &base).expect("sketchable");
-            let b = sketch(kind, &patched).expect("sketchable");
+            let a = sketch(p, &base).expect("sketchable");
+            let b = sketch(p, &patched).expect("sketchable");
             assert!(a.iter().any(|sf| b.contains(sf)), "{a:?} vs {b:?}");
 
             // Unrelated content shares none.
             let other: Vec<u8> = (0..200_000u32)
                 .flat_map(|i| (i.wrapping_mul(2_654_435_761)).to_le_bytes())
                 .collect();
-            let c = sketch(kind, &other).expect("sketchable");
+            let c = sketch(p, &other).expect("sketchable");
             assert!(!a.iter().any(|sf| c.contains(sf)), "{a:?} vs {c:?}");
         }
     }
@@ -779,14 +1202,66 @@ mod tests {
         // (and in different fixed subchunks).
         let mut shifted = vec![0xa5u8; 4321];
         shifted.extend_from_slice(&base);
-        let a = sketch(SketchKind::Broder, &base).expect("sketchable");
-        let b = sketch(SketchKind::Broder, &shifted).expect("sketchable");
+        let p = params(SketchKind::Broder);
+        let a = sketch(p, &base).expect("sketchable");
+        let b = sketch(p, &shifted).expect("sketchable");
         assert!(a.iter().any(|sf| b.contains(sf)), "{a:?} vs {b:?}");
     }
 
     #[test]
     fn broder_sketch_rejects_tiny_input() {
-        assert_eq!(sketch(SketchKind::Broder, &[0u8; 64]), None);
+        assert_eq!(sketch(params(SketchKind::Broder), &[0u8; 64]), None);
+    }
+
+    /// Raising the feature count extends a sketch rather than changing
+    /// it: feature `i` uses permutation `i` over the same sampled
+    /// positions either way, so the wider geometry's leading
+    /// super-features are the narrower one's. A recall sweep over the
+    /// count is therefore monotone by construction, and any difference
+    /// it measures comes from the added super-features alone.
+    #[test]
+    fn feature_count_extends_the_sketch() {
+        let base = base_data();
+        let narrow = sketch(
+            SketchParams::new(SketchKind::Broder, 16, 2, 8).expect("geometry"),
+            &base,
+        )
+        .expect("sketchable");
+        let wide = sketch(
+            SketchParams::new(SketchKind::Broder, 32, 2, 8).expect("geometry"),
+            &base,
+        )
+        .expect("sketchable");
+        assert_eq!(narrow.len, 8);
+        assert_eq!(wide.len, 16);
+        assert_eq!(narrow.sfs[..8], wide.sfs[..8]);
+    }
+
+    #[test]
+    fn sf_bytes_truncates_the_super_feature() {
+        let base = base_data();
+        let wide = sketch(
+            SketchParams::new(SketchKind::Broder, 16, 2, 8).expect("geometry"),
+            &base,
+        )
+        .expect("sketchable");
+        let narrow = sketch(
+            SketchParams::new(SketchKind::Broder, 16, 2, 4).expect("geometry"),
+            &base,
+        )
+        .expect("sketchable");
+        for (w, n) in wide.iter().zip(narrow.iter()) {
+            assert_eq!(w & 0xffff_ffff, n);
+        }
+    }
+
+    #[test]
+    fn geometry_validation() {
+        assert!(SketchParams::new(SketchKind::Broder, 16, 3, 8).is_err());
+        assert!(SketchParams::new(SketchKind::Broder, 64, 2, 8).is_err());
+        assert!(SketchParams::new(SketchKind::Broder, 16, 0, 8).is_err());
+        assert!(SketchParams::new(SketchKind::Broder, 16, 2, 0).is_err());
+        assert!(SketchParams::new(SketchKind::Broder, 16, 2, 9).is_err());
     }
 
     #[test]

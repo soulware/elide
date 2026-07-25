@@ -34,6 +34,7 @@ use ulid::Ulid;
 use crate::blake3_id_hasher::Blake3HamtMap;
 use crate::segment::{self, EntryKind};
 use crate::signing;
+use crate::sketch_index::SketchIndex;
 
 /// How the extent's body is stored locally.
 ///
@@ -980,6 +981,27 @@ impl Default for ExtentIndex {
 /// map by their persisted `JOURNAL` flag, so no window argument is
 /// needed — the routing is self-describing in each entry.
 pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
+    rebuild_inner(forks, None)
+}
+
+/// [`rebuild`], also harvesting a [`SketchIndex`] from the same walk.
+///
+/// Signature verification dominates the cost of reading an `.idx`, and this
+/// walk already pays it for every segment in the lineage, so the candidate
+/// map comes free here where a separate pass would double that bill. Only
+/// a writable open wants one; every other caller uses [`rebuild`].
+pub fn rebuild_with_sketches(
+    forks: &[(PathBuf, Option<String>)],
+) -> io::Result<(ExtentIndex, SketchIndex)> {
+    let mut sketches = SketchIndex::new();
+    let index = rebuild_inner(forks, Some(&mut sketches))?;
+    Ok((index, sketches))
+}
+
+fn rebuild_inner(
+    forks: &[(PathBuf, Option<String>)],
+    mut sketches: Option<&mut SketchIndex>,
+) -> io::Result<ExtentIndex> {
     let mut index = ExtentIndex::new();
 
     for (fork_dir, branch_ulid) in forks {
@@ -1078,6 +1100,9 @@ pub fn rebuild(forks: &[(PathBuf, Option<String>)]) -> io::Result<ExtentIndex> {
             };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
+                if let Some(sketches) = sketches.as_mut() {
+                    sketches.insert_entry(entry);
+                }
             }
         }
     }
