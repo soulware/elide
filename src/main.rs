@@ -132,6 +132,10 @@ enum Command {
     #[command(hide = true)]
     VerifyContent { fork_dir: PathBuf },
 
+    /// Build the delta candidate map for a volume's lineage and report its shape
+    #[command(hide = true)]
+    SketchIndex { fork_dir: PathBuf },
+
     /// Print the rebuilt LBA map: lba, length, hash, payload_block_offset
     #[command(hide = true)]
     DumpLbamap { fork_dir: PathBuf },
@@ -1092,6 +1096,10 @@ fn main() {
 
         Command::BlockHash { path, block_bytes } => {
             block_hash(&path, block_bytes).expect("block-hash failed");
+        }
+
+        Command::SketchIndex { fork_dir } => {
+            inspect_files::inspect_sketch_index(&fork_dir).expect("sketch-index failed");
         }
 
         Command::VerifyContent { fork_dir } => {

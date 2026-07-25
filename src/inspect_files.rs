@@ -20,6 +20,7 @@ use std::path::Path;
 
 use elide_core::dmat::{self, DmatFlags};
 use elide_core::segment::{self, EntryKind};
+use elide_core::sketch;
 use elide_core::writelog;
 
 // --- inspect-segment ---
@@ -237,6 +238,81 @@ fn print_sketches(sorted: &[&segment::SegmentEntry]) {
 }
 
 // --- inspect-wal ---
+
+/// Build the candidate map for a volume's lineage from `.idx` files alone
+/// and report its shape. Offline: reads no bodies and needs no running
+/// volume, so it answers what the map costs on real content.
+pub fn inspect_sketch_index(fork_dir: &Path) -> std::io::Result<()> {
+    // Canonicalize so a by_name symlink resolves and the parent is the
+    // by_id directory ancestor lookup needs.
+    let dir = std::fs::canonicalize(fork_dir).unwrap_or_else(|_| fork_dir.to_owned());
+    let by_id_dir = dir.parent().unwrap_or(&dir).to_owned();
+    let ancestors = elide_core::volume::walk_ancestors(&dir, &by_id_dir)?;
+    let chain: Vec<(std::path::PathBuf, Option<String>)> = ancestors
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .chain(std::iter::once((dir.clone(), None)))
+        .collect();
+
+    let started = std::time::Instant::now();
+    let (extents, sketches) = elide_core::extentindex::rebuild_with_sketches(&chain)?;
+    let elapsed = started.elapsed();
+    let st = sketches.stats();
+
+    println!("=== sketch index ===");
+    println!("  volume:            {}", dir.display());
+    println!("  lineage:           {} layer(s)", chain.len());
+    println!("  built in:          {elapsed:.2?}");
+    println!();
+    println!("  extent index:      {} hash(es)", extents.len());
+    println!(
+        "  sketched sources:  {} ({:.1}% of extent-index hashes)",
+        st.sources,
+        pct(st.sources as u64, extents.len() as u64)
+    );
+    println!("  postings:          {}", st.postings);
+    println!(
+        "  slots:             {} ({:.0}% occupied)",
+        st.slots,
+        pct(st.postings as u64, st.slots as u64)
+    );
+    if st.sources == 0 {
+        println!(
+            "  memory:            {:.1} KiB",
+            st.memory_bytes as f64 / 1024.0
+        );
+        println!();
+        println!(
+            "  nothing sketched: no extent in this lineage is at or above {} bytes",
+            sketch::MIN_SKETCH_BYTES
+        );
+        return Ok(());
+    }
+    println!(
+        "  memory:            {:.1} KiB ({:.0} bytes per source)",
+        st.memory_bytes as f64 / 1024.0,
+        st.memory_bytes as f64 / st.sources as f64
+    );
+    println!();
+    println!(
+        "  distinct features: {} ({:.2} postings each on average)",
+        st.distinct_features,
+        st.postings as f64 / (st.distinct_features.max(1) as f64)
+    );
+    println!("  busiest feature:   {} sources", st.max_per_feature);
+    println!(
+        "  features at cap:   {} (further sources declined)",
+        st.features_at_cap
+    );
+    Ok(())
+}
+
+fn pct(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 * 100.0 / whole as f64
+}
 
 pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
     let (records, truncated) = writelog::scan_readonly(path)?;

@@ -17,6 +17,8 @@
 //! duplicate features occupy neighbouring slots, and a probe is one slot
 //! index plus a scan to the end of the cluster.
 
+use std::collections::HashMap;
+
 use crate::segment::{EntryKind, SegmentEntry};
 use crate::sketch::Sketch;
 
@@ -67,6 +69,22 @@ pub struct Candidate {
     /// How many of the target's features this source carries. An estimate
     /// of resemblance, since each feature is a minhash.
     pub shared: u32,
+}
+
+/// Shape of a [`SketchIndex`], from [`SketchIndex::stats`].
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    pub sources: usize,
+    pub postings: usize,
+    pub slots: usize,
+    pub memory_bytes: usize,
+    /// Feature values with at least one posting. Well below `postings`
+    /// means features recur across extents, which is what a probe walks.
+    pub distinct_features: usize,
+    pub max_per_feature: usize,
+    /// Feature values holding the retention cap, whose further sources
+    /// were declined.
+    pub features_at_cap: usize,
 }
 
 pub struct SketchIndex {
@@ -279,6 +297,30 @@ impl SketchIndex {
     pub fn memory_bytes(&self) -> usize {
         self.slots.len() * std::mem::size_of::<Slot>()
             + self.sources.capacity() * std::mem::size_of::<SourceRef>()
+    }
+
+    /// Shape of the map, for the offline `sketch-index` report. Walks the
+    /// whole slot table, so this is a diagnostic rather than something to
+    /// call per promote.
+    pub fn stats(&self) -> Stats {
+        let mut per_feature: HashMap<u32, usize> = HashMap::new();
+        for slot in &self.slots {
+            if slot.source != EMPTY {
+                *per_feature.entry(slot.feature).or_default() += 1;
+            }
+        }
+        Stats {
+            sources: self.sources.len(),
+            postings: self.postings,
+            slots: self.slots.len(),
+            memory_bytes: self.memory_bytes(),
+            distinct_features: per_feature.len(),
+            max_per_feature: per_feature.values().copied().max().unwrap_or(0),
+            features_at_cap: per_feature
+                .values()
+                .filter(|&&n| n >= CAP_PER_FEATURE)
+                .count(),
+        }
     }
 }
 
