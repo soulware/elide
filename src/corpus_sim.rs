@@ -139,8 +139,7 @@ fn funnel(versions: &[Version]) {
             eligible_bytes += n;
             eligible_count += 1;
         }
-        let bucket = (v.plain.len() as u64).next_power_of_two().trailing_zeros();
-        let e = buckets.entry(bucket).or_default();
+        let e = buckets.entry(size_bucket(v.plain.len())).or_default();
         e.0 += 1;
         e.1 += n;
     }
@@ -249,8 +248,7 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         if lz4 < zst {
             lz4_wins += 1;
             lz4_win_margin += zst - lz4;
-            let bucket = (v.plain.len() as u64).next_power_of_two().trailing_zeros();
-            *win_sizes.entry(bucket).or_default() += 1;
+            *win_sizes.entry(size_bucket(v.plain.len())).or_default() += 1;
         }
     }
 
@@ -279,6 +277,22 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     Ok(())
 }
 
+/// Per-entry-size totals for the dictionary comparison.
+#[derive(Default)]
+struct SizeBucket {
+    entries: u64,
+    plain: u64,
+    zstd: u64,
+    /// Dictionary output keyed by dictionary size, so each row can report the
+    /// size that served it best rather than one chosen for the whole corpus.
+    by_dict: BTreeMap<usize, u64>,
+}
+
+/// Power-of-two bucket an entry of `len` bytes falls in.
+fn size_bucket(len: usize) -> u32 {
+    (len as u64).next_power_of_two().trailing_zeros()
+}
+
 fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
     let segs: Vec<ulid::Ulid> = {
         let mut s: Vec<ulid::Ulid> = versions.iter().map(|v| v.seg).collect();
@@ -300,10 +314,19 @@ fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
     let mut stored = 0u64;
     let mut plain = 0u64;
     let mut zstd_plain = 0u64;
+    // Per-size totals as well as the aggregate: a dictionary earns most on
+    // small inputs, and a total dominated by megabyte entries hides whatever
+    // it does to the small ones.
+    let mut buckets: BTreeMap<u32, SizeBucket> = BTreeMap::new();
     for v in &late {
+        let z = zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
         stored += v.stored_length as u64;
         plain += v.plain.len() as u64;
-        zstd_plain += zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
+        zstd_plain += z;
+        let b = buckets.entry(size_bucket(v.plain.len())).or_default();
+        b.entries += 1;
+        b.plain += v.plain.len() as u64;
+        b.zstd += z;
     }
 
     println!("\n== dict");
@@ -342,7 +365,10 @@ fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
         let prepared = zstd::dict::EncoderDictionary::copy(&held_out, ZSTD_LEVEL);
         let mut comp = zstd::bulk::Compressor::with_prepared_dictionary(&prepared)?;
         for v in &late {
-            held_total += dict_len(&mut comp, &v.plain)? as u64;
+            let d = dict_len(&mut comp, &v.plain)? as u64;
+            held_total += d;
+            let b = buckets.entry(size_bucket(v.plain.len())).or_default();
+            *b.by_dict.entry(size).or_default() += d;
         }
 
         let oracle_total = match &oracle {
@@ -375,6 +401,27 @@ fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
             ),
             None => println!(),
         }
+    }
+
+    println!("\nheld-out dictionary by entry size (best dictionary size per row):");
+    println!(
+        "  {:>9}  {:>7}  {:>10}  {:>10}  {:>10}  {:>7}  {:>8}",
+        "size", "entries", "plain", "zstd", "best dict", "gain", "dict"
+    );
+    for (log2, b) in &buckets {
+        let Some((&best_size, &best)) = b.by_dict.iter().min_by_key(|entry| *entry.1) else {
+            continue;
+        };
+        println!(
+            "  {:>9}  {:>7}  {:>10}  {:>10}  {:>10}  {:>6.1}%  {:>5} KiB",
+            fmt_pow2(*log2),
+            b.entries,
+            b.plain,
+            b.zstd,
+            best,
+            100.0 * (b.zstd as f64 - best as f64) / b.zstd.max(1) as f64,
+            best_size >> 10,
+        );
     }
     Ok(())
 }
