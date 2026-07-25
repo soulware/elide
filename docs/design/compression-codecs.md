@@ -26,13 +26,17 @@ Formation is the seam. It is asynchronous, off the ack path, and already visits 
 
 **WAL — lz4.** On the ack path, where the codec's cost is guest write latency and its benefit is a smaller WAL file that is deleted at formation.
 
-**Segment body — zstd.** Re-encoded at formation: lz4-decompress the WAL body, zstd-compress the plaintext, store that. This is the artefact whose bytes are uploaded, and the only one whose size is charged to S3.
+**Segment body — zstd.** Every `Data` and `CanonicalData` entry, re-encoded at formation: lz4-decompress the WAL body, zstd-compress the plaintext, store that. This is the artefact whose bytes are uploaded, and the only one whose size is charged to S3. The delta body section alongside it already holds zstd blobs, produced against a source extent as dictionary, so this extends a codec the segment format already carries rather than introducing one.
+
+**Inline section — lz4.** An `Inline` entry holds under 256 stored bytes, and below roughly 1 KiB zstd's frame header costs more than its coding saves — one to four bytes, on every content pattern measured. The crossover is framing overhead, so it sits at a fixed size rather than moving with content.
 
 **`.dmat` — lz4.** A local read cache whose whole purpose is to be faster to read than re-materialising a delta.
 
 Level 3. Level 19 measured 11% smaller on a 64 KiB entry (1,640 bytes against 1,835) for roughly twenty times the compression CPU. zstd decompression speed is close to independent of compression level, so the level can be raised later against formation CPU headroom without touching the read path.
 
-Formation gains an lz4-decompress plus a zstd-compress per entry, asynchronous, roughly seven seconds of CPU per GiB of plaintext at level 3.
+Formation gains an lz4-decompress plus a zstd-compress per entry, asynchronous, roughly eight seconds of CPU per GiB of plaintext at level 3.
+
+Codec contexts are pooled per formation worker and per queue thread. At body scope every entry compresses once and every cold extent read decompresses, so a context constructed per call runs at the rate of the whole workload rather than the 0.2% of entries that carry deltas. Per-call construction is the allocation shape that ratcheted RSS into the OOMs behind `malloc_policy.rs`, which makes pooling a constraint on the design rather than a tuning step. `delta_compute::apply_delta` builds a decompression context per call today and is the pattern not to extend.
 
 ## The ratio threshold
 
