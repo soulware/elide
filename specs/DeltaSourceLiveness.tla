@@ -39,6 +39,13 @@
        likeliest-dead sources rank first.
        Modelled by: PromoteChoose requiring src \in job_referenced.
 
+       This one is NOT required for NoDanglingDeltaSource; see the
+       ablation results below. What it buys is cost: not pinning bytes GC
+       was about to free, and not provoking the plan cancellations that
+       mechanism 3 would otherwise have to make. Its justification is the
+       frequency argument — dead sources accumulate and rank first — which
+       is not a safety property and is not checkable here.
+
     2. APPLY ORDERING (actor::apply_or_defer_gc_plan)
        A finished plan-apply result is held until no promote is in
        flight. Closes the case where a source is referenced at Prep and
@@ -54,8 +61,8 @@
        Modelled by: PlanApply cancelling when drop_set intersects
        referenced'.
 
-  Mechanisms 1 and 3 are each necessary on their own. 2 is necessary
-  given 1, because 1 only establishes liveness as of Prep.
+  Mechanisms 2 and 3 are each necessary for NoDanglingDeltaSource; 1 is
+  not. See the measured ablation results below.
 
   WHAT THIS SPEC CHECKS
   ---------------------
@@ -72,25 +79,34 @@
     DeferredEventuallyApplies
                             a deferred plan is not held forever.
 
-  TO SEE EACH MECHANISM EARN ITS PLACE
-  ------------------------------------
-    Drop mechanism 1: remove `src \in job_referenced` from
-      PromoteChoose. TLC violates NoDanglingDeltaSource via
-        Write(e) → Unreference(e) → StartPlan → StartPromote →
-        PromoteChoose(e) → PlanApply → PromoteApply
-      (the plan's drop set was computed while e was dead, so
-      cancellation does not save it).
+  ABLATION RESULTS (measured, MAX_EXTENTS = 3)
+  --------------------------------------------
+  Baseline: 3266 distinct states, depth 14, everything holds.
 
-    Drop mechanism 2: let PlanApply fire regardless of `promote`. TLC
-      violates NoDanglingDeltaSource via
-        Write(e) → StartPromote → PromoteChoose(e) → Unreference(e) →
-        StartPlan → PlanApply → PromoteApply
+    Drop mechanism 1 — remove `src \in job_referenced` from
+      PromoteChoose. NoDanglingDeltaSource STILL HOLDS (3566 distinct
+      states). Choosing a dead source is safe here because PromoteApply
+      adds it to `referenced`, after which mechanism 3 refuses any plan
+      that would drop it. The filter is a cost measure, not a safety one.
 
-    Drop mechanism 3: remove the cancellation conjunct. TLC violates
-      NoDanglingDeltaSource via
-        Write(e) → Unreference(e) → StartPlan → StartPromote →
-        PromoteChoose(e) → PromoteApply → PlanApply
-      where the delta's own reference is what should have saved e.
+    Drop mechanism 2 — let PlanApply fire regardless of `promote`.
+      Violates NoApplyInsidePromote immediately, and with that property
+      unchecked, violates NoDanglingDeltaSource at depth 8:
+        Write(1) → StartPromote(2) → Unreference(1) → PromoteChoose(1)
+        → StartPlan → PlanApply → PromoteApply
+      The claim on 1 goes away *after* Prep, so the filter admits it;
+      the plan drops it before the delta commits. Mechanism 1 cannot
+      reach this case and mechanism 3 does not see it, because the
+      delta's reference does not exist yet when the plan applies.
+
+    Drop mechanism 3 — replace the cancellation branch with an
+      unconditional `present' = present \ plan_drop`. Violates
+      NoDanglingDeltaSource. This is the mechanism doing most of the work,
+      including covering the case mechanism 1 was assumed to own.
+
+  Controls: with 1 and 2 both dropped, and with all three dropped, the
+  invariant is still violated — so mechanism 1's pass above is a real
+  result rather than the invariant being unreachable.
 
   SHAPE
   -----

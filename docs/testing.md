@@ -266,7 +266,9 @@ Or via VS Code (`tlaplus.tlaplus`). Requires a JRE. The `.cfg` uses two carried 
 tlc specs/DeltaSourceLiveness.tla -config specs/DeltaSourceLiveness.cfg
 ```
 
-`MAX_EXTENTS = 3`. Invariants: `NoDanglingDeltaSource`, `DeltaSourceReferenced`. Properties: `NoApplyInsidePromote`, `DeferredEventuallyApplies`. Each of the three mechanisms can be disabled individually in the module to produce a counterexample to `NoDanglingDeltaSource`; the header gives the edit and the expected trace for each, which is how the model shows all three are load-bearing rather than one subsuming the others.
+`MAX_EXTENTS = 3`, 3266 distinct states, depth 14. Invariants: `NoDanglingDeltaSource`, `DeltaSourceReferenced`. Properties: `NoApplyInsidePromote`, `DeferredEventuallyApplies`.
+
+The module header records a measured ablation per mechanism. Two of the three are necessary for `NoDanglingDeltaSource` — the apply ordering and stale-liveness cancellation. The liveness filter on candidate selection is not: with it removed the invariant still holds, because a delta increfs its source at apply and cancellation then refuses any plan that would drop it. The filter earns its place on cost rather than safety, by not pinning bytes GC was about to free and not provoking cancellations. That is a frequency argument, so it is not checkable here.
 
 A dangling delta source is an unreadable extent, so this is the one modelled property whose violation is corruption rather than cost. The interleaving is invisible to proptest for the reason `WorkerOffload`'s header gives — a single test thread cannot land a plan apply between another op's prep and apply.
 
