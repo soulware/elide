@@ -147,6 +147,15 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             status,
             e.hash.to_hex(),
         );
+        for opt in &e.delta_options {
+            println!(
+                "          source={} delta_off={} delta_len={} delta_hash={}",
+                opt.source_hash.to_hex(),
+                opt.delta_offset,
+                opt.delta_length,
+                opt.delta_hash.to_hex(),
+            );
+        }
     }
 
     println!();
