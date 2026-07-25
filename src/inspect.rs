@@ -165,6 +165,8 @@ struct CacheInfo {
     inline_body_bytes: u64,
     /// Byte length of the segment's delta body section (from the segment header).
     delta_body_bytes: u64,
+    /// Size of the `cache/<ulid>.dmat` materialisation sidecar on disk.
+    dmat_bytes: u64,
     /// Size of the `.idx` file on disk.
     idx_file_bytes: u64,
     /// Actual disk blocks occupied by the .body sparse file.
@@ -344,9 +346,10 @@ fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
         }
         if t.cache_delta > 0 {
             println!(
-                "  delta:   {} ({}){}",
+                "  delta:   {} ({}{}){}",
                 fmt_commas(t.cache_delta as u64),
                 fmt_size(t.cache_delta_body),
+                dmat_note(t.cache_dmat),
                 canonical_note(t.cache_canonical_delta),
             );
         }
@@ -565,6 +568,7 @@ fn collect_cache_dir(dir: &Path) -> io::Result<Vec<CacheInfo>> {
                 data_body_bytes: 0,
                 inline_body_bytes: 0,
                 delta_body_bytes: 0,
+                dmat_bytes: 0,
                 idx_file_bytes: 0,
                 body_bytes_cached: 0,
                 journal_blocks: 0,
@@ -655,6 +659,12 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
     let inline_body_bytes = layout.as_ref().map(|l| l.inline_length as u64).unwrap_or(0);
     let delta_body_bytes = layout.as_ref().map(|l| l.delta_length as u64).unwrap_or(0);
 
+    // Local-only sidecar, so its size comes from the filesystem rather than
+    // the signed header.
+    let dmat_bytes = fs::metadata(cache_dir.join(format!("{ulid}.dmat")))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     let idx_file_bytes = fs::metadata(idx_path).map(|m| m.len()).unwrap_or(0);
 
     Ok(CacheInfo {
@@ -672,6 +682,7 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
         data_body_bytes,
         inline_body_bytes,
         delta_body_bytes,
+        dmat_bytes,
         idx_file_bytes,
         body_bytes_cached,
         journal_blocks,
@@ -701,6 +712,7 @@ struct Totals {
     cache_data_body: u64,
     cache_inline_body: u64,
     cache_delta_body: u64,
+    cache_dmat: u64,
     cache_idx_file_bytes: u64,
     cache_body_actual: u64,
     // Journal tier, scoped to this volume's own node (committed index/ +
@@ -766,6 +778,7 @@ fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
         t.cache_data_body += f.data_body_bytes;
         t.cache_inline_body += f.inline_body_bytes;
         t.cache_delta_body += f.delta_body_bytes;
+        t.cache_dmat += f.dmat_bytes;
         t.cache_idx_file_bytes += f.idx_file_bytes;
         t.cache_body_actual += f.body_bytes_cached;
     }
@@ -1013,12 +1026,24 @@ fn print_cache_section(
         }
         if f.delta_count > 0 {
             println!(
-                "{indent}delta:   {} ({}){}",
+                "{indent}delta:   {} ({}{}){}",
                 fmt_commas(f.delta_count as u64),
                 fmt_size(f.delta_body_bytes),
+                dmat_note(f.dmat_bytes),
                 canonical_note(f.canonical_delta_count),
             );
         }
+    }
+}
+
+/// Trailing `, N dmat` note for the delta row, empty when no materialisation
+/// sidecar exists. The `.dmat` bytes are local-only, so they sit beside the
+/// delta-section size rather than summed into it.
+fn dmat_note(bytes: u64) -> String {
+    if bytes > 0 {
+        format!(", {} dmat", fmt_size(bytes))
+    } else {
+        String::new()
     }
 }
 
@@ -1199,6 +1224,50 @@ mod tests {
         );
 
         fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn dmat_bytes_are_read_from_the_sidecar_and_absent_when_it_is() {
+        use elide_core::segment::{self, SegmentEntry, SegmentFlags};
+        use ulid::Ulid;
+
+        let tmp = temp_vol_dir();
+        let index_dir = tmp.join("index");
+        let cache_dir = tmp.join("cache");
+        fs::create_dir_all(&index_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
+
+        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let with_dmat = mint.next();
+        let without = mint.next();
+        for u in [with_dmat, without] {
+            let entry = SegmentEntry::new_data(
+                blake3::hash(u.to_string().as_bytes()),
+                0,
+                1,
+                SegmentFlags::empty(),
+                vec![7u8; 4096],
+            );
+            let seg_path = tmp.join(format!("{u}"));
+            segment::write_segment(&seg_path, vec![entry], signer.as_ref()).unwrap();
+            segment::extract_idx(&seg_path, &index_dir.join(format!("{u}.idx"))).unwrap();
+        }
+        fs::write(cache_dir.join(format!("{with_dmat}.dmat")), [0u8; 321]).unwrap();
+
+        let infos = collect_cache_dir(&tmp).unwrap();
+        let find = |u: Ulid| {
+            infos
+                .iter()
+                .find(|f| f.ulid == u.to_string())
+                .unwrap()
+                .dmat_bytes
+        };
+        assert_eq!(find(with_dmat), 321);
+        assert_eq!(find(without), 0, "no sidecar means no bytes, not an error");
+
+        assert_eq!(dmat_note(321), ", 321 B dmat");
+        assert_eq!(dmat_note(0), "");
     }
 
     #[test]
