@@ -8,7 +8,7 @@
 //   [Delta body: delta_length bytes]      — starts at byte 100 + index_length + inline_length + body_length
 //
 // Header (100 bytes):
-//   0..8    magic         "ELIDSEG\x06"
+//   0..8    magic         "ELIDSEG\x07"
 //   8..12   entry_count   u32 le
 //   12..16  index_length  u32 le; total bytes of the index section (base + sketch table + delta table + inputs)
 //   16..20  inline_length u32 le; 0 if no inline data
@@ -25,9 +25,9 @@
 //
 // Sketch table (after base entries, before the delta table):
 //   sketch_length (4 bytes) u32 le — byte length of the records that follow (0 when nothing is sketched)
-//   per sketched entry (4 + NUM_SF × 8 bytes):
+//   per sketched entry (4 + NUM_FEATURES × 4 bytes):
 //     entry_index (4 bytes)  u32 le — index of the base entry
-//     super_features (NUM_SF × 8 bytes) u64 le each — the resemblance sketch
+//     features (NUM_FEATURES × 4 bytes) u32 le each — the resemblance sketch
 //
 // Base entry format (64 bytes, fixed-size):
 //   hash          (32 bytes) BLAKE3 extent hash
@@ -81,7 +81,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-pub const MAGIC: &[u8; 8] = b"ELIDSEG\x06";
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x07";
 pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
@@ -1070,7 +1070,7 @@ fn write_sketch_section<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Re
         if let Some(sketch) = &entry.sketch {
             w.write_all(&(i as u32).to_le_bytes())?; // entry_index: 4
             for sf in sketch {
-                w.write_all(&sf.to_le_bytes())?; // NUM_SF × 8
+                w.write_all(&sf.to_le_bytes())?; // NUM_FEATURES × 4
             }
         }
     }
@@ -1705,7 +1705,7 @@ fn validate_entry_bounds(
 }
 
 /// Parse the sketch section starting at `*pos`: a `u32` length prefix
-/// then that many bytes of `entry_index(4) + NUM_SF × 8` records. Sets
+/// then that many bytes of `entry_index(4) + NUM_FEATURES × 4` records. Sets
 /// `entry.sketch` for each named entry and advances `*pos` to the start
 /// of the delta table.
 fn parse_sketch_section(
@@ -1729,9 +1729,9 @@ fn parse_sketch_section(
     }
     while *pos < record_end {
         let entry_index = u32::from_le_bytes(read_fixed(data, pos)?) as usize;
-        let mut sf = [0u64; crate::sketch::NUM_SF];
+        let mut sf = [0u32; crate::sketch::NUM_FEATURES];
         for s in sf.iter_mut() {
-            *s = u64::from_le_bytes(read_fixed(data, pos)?);
+            *s = u32::from_le_bytes(read_fixed(data, pos)?);
         }
         if entry_index >= entries.len() {
             return Err(io::Error::other(format!(
@@ -3105,20 +3105,34 @@ mod tests {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let d0 = entropy_bytes(0, 8192);
-        let d1 = entropy_bytes(1, 8192);
-        let sketch = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        // At the sketch size threshold, so the writer populates a fresh
+        // entry's sketch rather than declining it on size.
+        let blocks = (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32;
+        let d0 = entropy_bytes(0, crate::sketch::MIN_SKETCH_BYTES);
+        let d1 = entropy_bytes(1, crate::sketch::MIN_SKETCH_BYTES);
+        let sketch = [1u32, 2, 3, 4, 5, 6, 7, 8];
 
         // e0 carries an explicit sketch: the writer must preserve it verbatim,
         // not recompute over the body.
-        let mut e0 = SegmentEntry::new_data(blake3::hash(&d0), 0, 2, SegmentFlags::empty(), d0);
+        let mut e0 =
+            SegmentEntry::new_data(blake3::hash(&d0), 0, blocks, SegmentFlags::empty(), d0);
         e0.entry.sketch = Some(sketch);
         let entries = vec![
             e0,
             // A fresh Data entry: the writer populates its sketch.
-            SegmentEntry::new_data(blake3::hash(&d1), 2, 2, SegmentFlags::empty(), d1),
+            SegmentEntry::new_data(
+                blake3::hash(&d1),
+                blocks as u64,
+                blocks,
+                SegmentFlags::empty(),
+                d1,
+            ),
             // A body-less ref is never sketched — keeps the table sparse.
-            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"anc"), 4, 1)),
+            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
+                blake3::hash(b"anc"),
+                (blocks * 2) as u64,
+                1,
+            )),
         ];
 
         let (_, written) = write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -3153,7 +3167,7 @@ mod tests {
         let d0 = vec![0xB0u8; 8192];
         let d1 = vec![0xB1u8; 8192];
         let hash0 = blake3::hash(&d0);
-        let sketch = [9u64, 8, 7, 6, 5, 4, 3, 2];
+        let sketch = [9u32, 8, 7, 6, 5, 4, 3, 2];
 
         let mut e0 = SegmentEntry::new_data(hash0, 0, 2, SegmentFlags::empty(), d0);
         e0.entry.sketch = Some(sketch);
@@ -3262,17 +3276,21 @@ mod tests {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let raw = entropy_bytes(7, 8192);
+        let raw = entropy_bytes(7, crate::sketch::MIN_SKETCH_BYTES);
         let compressed = lz4_flex::compress_prepend_size(&raw);
         let entries = vec![SegmentEntry::new_data(
             blake3::hash(&raw),
             0,
-            2,
+            (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32,
             SegmentFlags::COMPRESSED,
             compressed,
         )];
 
         let (_, written) = write_segment(&path, entries, signer.as_ref()).unwrap();
+        assert!(
+            written[0].sketch.is_some(),
+            "an entry at the size threshold is sketched, so the comparison below has content"
+        );
         assert_eq!(
             written[0].sketch,
             crate::sketch::compute(&raw),
@@ -3290,8 +3308,17 @@ mod tests {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
 
-        let data = entropy_bytes(8, 8192);
-        let mut e = SegmentEntry::new_data(blake3::hash(&data), 0, 2, SegmentFlags::empty(), data);
+        // Above the size threshold and high-entropy, so only the journal
+        // flag can be what leaves it unsketched.
+        let data = entropy_bytes(8, crate::sketch::MIN_SKETCH_BYTES);
+        assert!(crate::sketch::compute(&data).is_some());
+        let mut e = SegmentEntry::new_data(
+            blake3::hash(&data),
+            0,
+            (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32,
+            SegmentFlags::empty(),
+            data,
+        );
         e.entry.journal = true;
 
         let (_, written) = write_segment(&path, vec![e], signer.as_ref()).unwrap();

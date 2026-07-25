@@ -163,11 +163,11 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
 }
 
 /// Resemblance-sketch view: which entries carry a sketch, a short fingerprint
-/// of each, and the pairwise super-feature overlap. Two entries sharing
-/// super-features are likely similar content — the signal the similarity
-/// delta producer selects on.
+/// of each, and the pairwise feature overlap. The count two entries share
+/// estimates their resemblance, which is the signal the similarity delta
+/// producer ranks candidates on.
 fn print_sketches(sorted: &[&segment::SegmentEntry]) {
-    use elide_core::sketch::NUM_SF;
+    use elide_core::sketch::NUM_FEATURES;
 
     let sketchable = sorted
         .iter()
@@ -190,14 +190,14 @@ fn print_sketches(sorted: &[&segment::SegmentEntry]) {
 
     println!();
     println!(
-        "  {:<14}  {:<12}  super-features (top 16 bits each)",
+        "  {:<14}  {:<12}  features (top 16 bits each)",
         "lba_range", "hash"
     );
     for e in &sketched {
         let sk = e.sketch.expect("filtered to Some");
         let fp: Vec<String> = sk
             .iter()
-            .map(|s| format!("{:04x}", (s >> 48) as u16))
+            .map(|s| format!("{:04x}", (s >> 16) as u16))
             .collect();
         println!(
             "  {:<14}  {:<12}  {}",
@@ -207,8 +207,8 @@ fn print_sketches(sorted: &[&segment::SegmentEntry]) {
         );
     }
 
-    // Pairwise overlap over the full 64-bit super-features (the fingerprint
-    // above is truncated only for display).
+    // Pairwise overlap over the full-width features (the fingerprint above
+    // is truncated only for display).
     let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
     for i in 0..sketched.len() {
         for j in (i + 1)..sketched.len() {
@@ -222,14 +222,14 @@ fn print_sketches(sorted: &[&segment::SegmentEntry]) {
     }
     println!();
     if pairs.is_empty() {
-        println!("shared super-features: none (no two entries resemble each other)");
+        println!("shared features: none (no two entries resemble each other)");
         return;
     }
     pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
-    println!("shared super-features (likely-similar pairs, most first):");
+    println!("shared features (likely-similar pairs, most first):");
     for (i, j, shared) in pairs {
         println!(
-            "  {:<14} <-> {:<14}  {shared}/{NUM_SF} shared",
+            "  {:<14} <-> {:<14}  {shared}/{NUM_FEATURES} shared",
             lba(sketched[i]),
             lba(sketched[j])
         );
