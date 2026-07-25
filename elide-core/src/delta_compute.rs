@@ -34,6 +34,27 @@ use crate::volume;
 /// tradeoff between ratio and import latency.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Compressed length of `plain` with no dictionary, at [`ZSTD_LEVEL`].
+fn dictionaryless_len(plain: &[u8]) -> io::Result<usize> {
+    zstd::bulk::compress(plain, ZSTD_LEVEL)
+        .map(|blob| blob.len())
+        .map_err(|e| io::Error::other(format!("zstd control compression failed: {e}")))
+}
+
+/// Whether a delta of `delta_len` bytes earns its place for an entry whose
+/// body occupies `stored_length` bytes and decompresses to `plain`.
+///
+/// Two bars. The delta must not grow the stored bytes, and it must beat
+/// what plain zstd achieves on the same plaintext. Beating only the stored
+/// lz4 body shows that zstd is the stronger codec, not that the dictionary
+/// contributed anything.
+fn delta_is_worth_storing(delta_len: usize, stored_length: u32, plain: &[u8]) -> io::Result<bool> {
+    if delta_len >= stored_length as usize {
+        return Ok(false);
+    }
+    Ok(delta_len < dictionaryless_len(plain)?)
+}
+
 /// Upper bound on the uncompressed size of a delta-dict decompression.
 /// Matches the 16 MiB segment-size cap — a single extent cannot be
 /// larger, and the decoder needs a capacity bound to protect against
@@ -333,12 +354,7 @@ fn maybe_rewrite_segment(
             .compress(child_plain)
             .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
 
-        // Skip conversion if the delta isn't actually smaller than the
-        // stored (possibly lz4-compressed) body — storing a larger
-        // delta just to drop the DATA body would be a net loss on hosts
-        // that already have the source cached but a net loss too on
-        // cold hosts that would otherwise fetch the raw body.
-        if delta_blob.len() >= entry.stored_length as usize {
+        if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
             continue;
         }
 
@@ -562,7 +578,7 @@ pub fn delta_pendings_against_prior(
             .compress(child_plain)
             .map_err(|e| io::Error::other(format!("zstd delta compression failed: {e}")))?;
 
-        if delta_blob.len() >= entry.stored_length as usize {
+        if !delta_is_worth_storing(delta_blob.len(), entry.stored_length, child_plain)? {
             continue;
         }
 
@@ -590,4 +606,48 @@ pub fn delta_pendings_against_prior(
     }
 
     Ok((delta_body, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text-like content that zstd compresses substantially better than
+    /// lz4, which is what makes the two bars distinguishable.
+    fn compressible(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut i = 0u32;
+        while out.len() < len {
+            out.extend_from_slice(format!("record {i} field=value status=ok\n").as_bytes());
+            i += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn delta_larger_than_the_stored_body_is_rejected() {
+        let plain = compressible(8192);
+        let stored = lz4_flex::compress_prepend_size(&plain).len() as u32;
+        assert!(!delta_is_worth_storing(stored as usize, stored, &plain).expect("gate"));
+        assert!(!delta_is_worth_storing(stored as usize + 1, stored, &plain).expect("gate"));
+    }
+
+    #[test]
+    fn delta_must_beat_plain_zstd_not_just_the_stored_body() {
+        let plain = compressible(8192);
+        let stored = lz4_flex::compress_prepend_size(&plain).len() as u32;
+        let plain_zstd = dictionaryless_len(&plain).expect("control");
+        assert!(
+            plain_zstd < stored as usize,
+            "fixture needs zstd to beat lz4 ({plain_zstd} vs {stored})"
+        );
+
+        // Between the two bars: smaller than the stored body, but the
+        // dictionary added nothing a plain zstd encode would not have.
+        let between = (plain_zstd + stored as usize) / 2;
+        assert!(!delta_is_worth_storing(between, stored, &plain).expect("gate"));
+
+        assert!(delta_is_worth_storing(plain_zstd - 1, stored, &plain).expect("gate"));
+    }
 }
