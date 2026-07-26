@@ -581,16 +581,17 @@ fn try_read_delta_extent(
     // dmat hit path: materialised bytes are already on disk for this
     // (segment, entry_idx). Read + lz4-decompress, verify against the
     // entry's content hash (the dmat open-scan does not authenticate
-    // records), copy out, return. A mismatch is treated as a miss —
-    // re-materialisation writes a fresh record that supersedes the
-    // corrupt one in the in-memory map.
+    // records), copy out, return. Every failure — open, read, decode,
+    // hash mismatch — is treated as a miss: the dmat is a rebuildable
+    // cache, so re-materialisation writes a fresh record that
+    // supersedes the bad one, and a cache failure never fails the read.
     if let Some(materialised) = dmat_lookup(
         dmat_cache,
         dmat_stats,
         cache_dir,
         delta_segment_id,
         delta_entry_idx,
-    )? {
+    ) {
         if blake3::hash(&materialised) == er.hash {
             dmat_stats.record_hit();
             return copy_materialised_into(er, lba, &materialised, out).map(|()| true);
@@ -766,9 +767,11 @@ fn copy_materialised_into(
 
 /// Look up an entry in `cache/<segment_id>.dmat`.
 ///
-/// Returns `Ok(None)` if either the file doesn't exist or the entry hasn't
-/// been materialised yet. Returns `Ok(Some(bytes))` with the lz4-decompressed
-/// canonical extent bytes on a hit. Errors propagate (I/O failure).
+/// Returns the lz4-decompressed canonical extent bytes on a hit, `None`
+/// on any miss or cache failure: absent file, unmaterialised entry, or
+/// an open, read, or decode error. The dmat is a rebuildable cache, so
+/// a failure is logged, the record forgotten, and the caller
+/// re-materialises from the delta — it never fails the read.
 ///
 /// Lazily opens the `Dmat` instance and inserts it into the in-memory cache
 /// on first access for a segment.
@@ -778,7 +781,7 @@ fn dmat_lookup(
     cache_dir: &Path,
     segment_id: Ulid,
     entry_idx: u32,
-) -> io::Result<Option<Vec<u8>>> {
+) -> Option<Vec<u8>> {
     use std::collections::hash_map::Entry;
     let mut cache = dmat_cache.borrow_mut();
     let dmat_inst = match cache.entry(segment_id) {
@@ -786,17 +789,34 @@ fn dmat_lookup(
         Entry::Vacant(v) => {
             let path = cache_dir.join(format!("{segment_id}.dmat"));
             if !path.exists() {
-                return Ok(None);
+                return None;
             }
-            let (d, scan) = dmat::Dmat::open_or_create(&path, |_, _| true)?;
-            dmat_stats.record_open_scan(scan);
-            v.insert(d)
+            match dmat::Dmat::open_or_create(&path, |_, _| true) {
+                Ok((d, scan)) => {
+                    dmat_stats.record_open_scan(scan);
+                    v.insert(d)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "dmat for segment {segment_id} failed to open ({e}); re-materialising"
+                    );
+                    return None;
+                }
+            }
         }
     };
-    let Some(loc) = dmat_inst.lookup(entry_idx) else {
-        return Ok(None);
-    };
-    Ok(Some(dmat_inst.read_materialised(loc)?))
+    let loc = dmat_inst.lookup(entry_idx)?;
+    match dmat_inst.read_materialised(loc) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::warn!(
+                "dmat record for segment {segment_id}[{entry_idx}] failed to read ({e}); \
+                 re-materialising"
+            );
+            dmat_inst.forget(entry_idx);
+            None
+        }
+    }
 }
 
 /// Append a materialised entry to `cache/<segment_id>.dmat`.

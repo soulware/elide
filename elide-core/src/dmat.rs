@@ -217,6 +217,11 @@ impl Dmat {
         self.entries.get(&entry_idx).copied()
     }
 
+    /// Drop an entry from the in-memory map so subsequent lookups miss.
+    pub fn forget(&mut self, entry_idx: u32) {
+        self.entries.remove(&entry_idx);
+    }
+
     /// Number of materialised records currently indexed.
     pub fn len(&self) -> usize {
         self.entries.len()
