@@ -218,11 +218,11 @@ impl Volume {
     ///     claimant ULIDs and are preserved on overlapping LBAs.
     ///
     /// A refused bucket is rolled back whole: the worker classified
-    /// against a prep-time lbamap snapshot, so a dedup ref minted
-    /// while it ran can reference an input-owned hash the output
-    /// doesn't carry. The output file is deleted, the inputs stay,
-    /// and the next repack pass — whose prep snapshot includes the
-    /// new claim — carries the hash.
+    /// against a prep-time lbamap snapshot, so a dedup ref or a
+    /// delta-source reference minted while it ran can reference an
+    /// input-owned hash the output doesn't carry. The output file is
+    /// deleted, the inputs stay, and the next repack pass — whose
+    /// prep snapshot includes the new reference — carries the hash.
     ///
     /// Applied buckets queue `pending/<input_ulid>` into the returned
     /// unlink list (for all-dead buckets too — `output: None`). The
@@ -252,6 +252,56 @@ impl Volume {
 
             let bucket_input_ulids: std::collections::HashSet<Ulid> =
                 bucket.inputs.iter().map(|i| i.input_ulid).collect();
+
+            let inputs_fmt = bucket
+                .inputs
+                .iter()
+                .map(|i| i.input_ulid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            // Stale-liveness refusal, mirroring the GC plan apply: the
+            // worker classified against a prep-time lbamap snapshot, so a
+            // reference minted since — a dedup claim, or a promoted delta
+            // naming an input-owned hash as its source — can make a hash
+            // this bucket drops live again. A delta source makes no LBA
+            // claim, so the resolvability gate cannot see it; the refcount
+            // check here is what refuses the bucket.
+            let stale: Vec<blake3::Hash> = bucket
+                .inputs
+                .iter()
+                .flat_map(|input| {
+                    input.owned_hashes.iter().filter(|hash| {
+                        if carried_hashes.contains(*hash) {
+                            return false;
+                        }
+                        let still_at_input = self
+                            .extent_index
+                            .lookup(hash)
+                            .is_some_and(|loc| loc.segment_id == input.input_ulid)
+                            || self
+                                .extent_index
+                                .lookup_delta(hash)
+                                .is_some_and(|loc| loc.segment_id == input.input_ulid);
+                        still_at_input && self.lbamap.is_referenced(hash)
+                    })
+                })
+                .copied()
+                .collect();
+            if !stale.is_empty() {
+                log::warn!(
+                    "repack [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
+                     hash(es) became referenced after classification, first {}; \
+                     dropping output and keeping inputs",
+                    stale.len(),
+                    stale[0].to_hex(),
+                );
+                stats.buckets_refused += 1;
+                if let Some(out) = &bucket.output {
+                    let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
+                }
+                continue;
+            }
 
             let delta_body_source = match &bucket.output {
                 Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
@@ -315,13 +365,6 @@ impl Volume {
                 }
                 Ok(())
             })?;
-
-            let inputs_fmt = bucket
-                .inputs
-                .iter()
-                .map(|i| i.input_ulid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
 
             if let ResolvabilityGate::Refused(orphaned) = gate {
                 let detail = orphaned
