@@ -621,3 +621,98 @@ fn delta_read_populates_dmat_and_second_read_matches() {
     let bytes = fs::read(&dmat_path).unwrap();
     assert_eq!(&bytes[..8], elide_core::dmat::MAGIC);
 }
+
+/// A dmat record that fails to decode is a miss, not a read error: the
+/// read re-materialises from the delta and serves the correct bytes.
+#[test]
+fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
+    use std::os::unix::fs::FileExt;
+
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    fs::create_dir_all(vol_dir.join("cache")).unwrap();
+
+    let parent_bytes = vec![0x55u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+    let mut child_bytes = vec![0x55u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
+    write_segment(
+        &vol_dir.join(format!("pending/{parent_seg_ulid}")),
+        vec![SegmentEntry::new_data(
+            parent_hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            parent_bytes,
+        )],
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    let delta_seg_ulid = mint.next();
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
+    };
+    write_segment_with_delta_body(
+        &vol_dir.join(format!("pending/{delta_seg_ulid}")),
+        vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            10,
+            1,
+            vec![delta_option],
+        ))],
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+    )
+    .unwrap();
+
+    let vol = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+
+    // First read materialises and writes the dmat record; the second
+    // must be served by it.
+    assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
+    assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
+    assert!(
+        vol.dmat_stats().hit_total >= 1,
+        "second read must hit the dmat"
+    );
+
+    // Overwrite the record's stored payload in place. The open Dmat
+    // instance still maps the entry at the old offset, so the next
+    // lookup decodes garbage.
+    let dmat_path = vol_dir.join("cache").join(format!("{delta_seg_ulid}.dmat"));
+    let len = fs::metadata(&dmat_path).unwrap().len() as usize;
+    let payload_from = 8 + 9; // magic + record header
+    assert!(len > payload_from, "dmat must hold a record");
+    assert!(
+        len < payload_from + 4096,
+        "record must be stored compressed so the corruption hits the decode, \
+         not the hash check"
+    );
+    let f = fs::OpenOptions::new().write(true).open(&dmat_path).unwrap();
+    f.write_all_at(&vec![0xFFu8; len - payload_from], payload_from as u64)
+        .unwrap();
+
+    // The decode failure must be a miss: re-materialised, correct bytes,
+    // and the fresh record serves the read after it.
+    assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
+    assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
+}
