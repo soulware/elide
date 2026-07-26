@@ -10,21 +10,90 @@ use ulid::Ulid;
 use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
-    AncestorLayer, BoxFetcher, ReclaimJob, ReclaimResult, RepackJob, RepackResult, StagedApply,
+    AncestorLayer, BoxFetcher, PendingWrite, ReclaimJob, ReclaimResult, RepackJob, RepackResult,
+    StagedApply,
 };
+
+/// One destination segment's share of a promote: the pending writes, and the
+/// CAS precondition tokens taken for them while the extent index was held.
+///
+/// The vectors are private and [`Self::push`] grows them together, so every
+/// write keeps the token taken for it.
+#[derive(Default)]
+pub struct PendingPartition {
+    writes: Vec<PendingWrite>,
+    /// The `body_offset` each Data/Inline write's hash had in the extent index
+    /// at prep time, positionally parallel to `writes`.
+    pre_promote_offsets: Vec<Option<u64>>,
+}
+
+impl PendingPartition {
+    pub(super) fn new(writes: Vec<PendingWrite>, pre_promote_offsets: Vec<Option<u64>>) -> Self {
+        Self {
+            writes,
+            pre_promote_offsets,
+        }
+    }
+
+    pub(super) fn push(&mut self, write: PendingWrite, pre_promote_offset: Option<u64>) {
+        self.writes.push(write);
+        self.pre_promote_offsets.push(pre_promote_offset);
+    }
+
+    pub fn writes(&self) -> &[PendingWrite] {
+        &self.writes
+    }
+
+    pub fn pre_promote_offsets(&self) -> &[Option<u64>] {
+        &self.pre_promote_offsets
+    }
+
+    /// Each write alongside the CAS token taken for it.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&PendingWrite, Option<u64>)> {
+        self.writes
+            .iter()
+            .zip(self.pre_promote_offsets.iter().copied())
+    }
+
+    pub(super) fn into_writes(self) -> Vec<PendingWrite> {
+        self.writes
+    }
+
+    /// Split off the journal-window share, each write keeping its token and
+    /// gaining `entry.journal`. Stays whole as the primary when the window is
+    /// empty or no write falls inside it.
+    pub(super) fn split_journal(
+        self,
+        journal_ranges: &crate::journal::JournalRanges,
+    ) -> (Self, Option<Self>) {
+        let inside = |w: &PendingWrite| journal_ranges.contains(w.entry.start_lba);
+        if journal_ranges.is_empty() || !self.writes.iter().any(inside) {
+            return (self, None);
+        }
+        let mut primary = Self::default();
+        let mut journal = Self::default();
+        for (mut write, pre) in self.writes.into_iter().zip(self.pre_promote_offsets) {
+            write.entry.journal = inside(&write);
+            if write.entry.journal {
+                journal.push(write, pre);
+            } else {
+                primary.push(write, pre);
+            }
+        }
+        (primary, Some(journal))
+    }
+
+    pub fn into_pre_promote_offsets(self) -> Vec<Option<u64>> {
+        self.pre_promote_offsets
+    }
+}
 
 /// Data needed by the worker thread to write a pending segment.
 pub struct PromoteJob {
     pub segment_ulid: Ulid,
     pub old_wal_ulid: Ulid,
     pub old_wal_path: PathBuf,
-    pub entries: Vec<segment::SegmentEntry>,
-    /// CAS precondition tokens: the `body_offset` each Data/Inline entry had
-    /// in the extent index at prep time.
-    pub pre_promote_offsets: Vec<Option<u64>>,
-    /// Where each Data/Inline entry's bytes live in the WAL. Bodies stay in
-    /// the WAL until the segment is written.
-    pub body_offsets: Vec<Option<u64>>,
+    pub primary: PendingPartition,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
     pub delta: PromoteDeltaSpec,
@@ -43,9 +112,7 @@ pub struct PromoteJob {
 /// minted as a DedupRef then points at a lower ULID as required.
 pub struct JournalPartition {
     pub segment_ulid: Ulid,
-    pub entries: Vec<segment::SegmentEntry>,
-    pub pre_promote_offsets: Vec<Option<u64>>,
-    pub body_offsets: Vec<Option<u64>>,
+    pub partition: PendingPartition,
 }
 
 /// Where a promote's delta tiers find dictionaries.

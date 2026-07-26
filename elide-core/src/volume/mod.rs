@@ -22,7 +22,7 @@
 // Recovery:
 //   Volume::open() calls lbamap::rebuild_segments() (segments only), then
 //   scans the WAL once: that single pass truncates any partial-tail record,
-//   replays entries into the LBA map, extent index, and pending_entries.
+//   replays entries into the LBA map, extent index, and pending writes.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::cell::RefCell;
@@ -66,9 +66,9 @@ pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
     GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult, JournalPartition, JournalSegmentResult,
-    PromoteDeltaPrior, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
-    PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob, SignSnapshotManifestResult,
-    WorkerJob, WorkerResult,
+    PendingPartition, PromoteDeltaPrior, PromoteFailure, PromoteJob, PromoteResult,
+    PromoteSegmentJob, PromoteSegmentPrep, PromoteSegmentResult, SignSnapshotManifestJob,
+    SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
 use open_state::open_read_state;
 pub use read::DmatCache;
@@ -131,34 +131,37 @@ pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 /// memory growth on large volumes.
 const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 
-/// Pair each pending entry with its stored bytes pread from `wal_path`,
+/// A segment entry whose stored bytes are still in the WAL, travelling with the
+/// location of those bytes until [`materialise_pending_bodies`] reunites them.
+pub struct PendingWrite {
+    pub entry: segment::SegmentEntry,
+    /// Where the entry's stored bytes live in the WAL, spanning
+    /// `off..off + entry.stored_length`. `Some` for the body-bearing kinds
+    /// (Data, Inline).
+    pub wal_body_offset: Option<u64>,
+}
+
+/// Pair each pending write with its stored bytes pread from `wal_path`,
 /// producing the build-form [`segment::PendingEntry`]s a segment write
 /// consumes. Inline-kind bytes land on `entry.inline`; Data bytes ride
 /// as the pending body.
-///
-/// `body_offsets` is parallel to `entries`: `Some(off)` means the entry's
-/// bytes live at `off..off + entry.stored_length` in the WAL file; `None`
-/// means the entry has none (DedupRef, Zero, Delta). Used both at promote
-/// time (write_and_commit needs the body in memory to write the segment)
-/// and at recovery-time startup promote.
 pub(crate) fn materialise_pending_bodies(
     wal_path: &Path,
-    entries: &[segment::SegmentEntry],
-    body_offsets: &[Option<u64>],
+    writes: &[PendingWrite],
 ) -> io::Result<Vec<segment::PendingEntry>> {
     use std::os::unix::fs::FileExt;
-    debug_assert_eq!(entries.len(), body_offsets.len());
-    let f = if body_offsets.iter().any(Option::is_some) {
+    let f = if writes.iter().any(|w| w.wal_body_offset.is_some()) {
         Some(fs::File::open(wal_path)?)
     } else {
         None
     };
-    let mut out = Vec::with_capacity(entries.len());
-    for (mut entry, off) in entries.iter().cloned().zip(body_offsets.iter()) {
+    let mut out = Vec::with_capacity(writes.len());
+    for write in writes {
+        let mut entry = write.entry.clone();
         let mut body = None;
-        if let (Some(off), Some(f)) = (off, &f) {
+        if let (Some(off), Some(f)) = (write.wal_body_offset, &f) {
             let mut buf = vec![0u8; entry.stored_length as usize];
-            f.read_exact_at(&mut buf, *off)?;
+            f.read_exact_at(&mut buf, off)?;
             if entry.kind.is_inline() {
                 entry.inline = Some(buf.into_boxed_slice());
             } else {
@@ -174,21 +177,19 @@ pub(crate) fn materialise_pending_bodies(
 /// each body-bearing entry currently has in the extent index. These gate
 /// the apply loop in [`apply_promoted_entries`] — an entry is only
 /// rewritten if it still points at `(wal_ulid, snapshotted_offset)`.
-/// `None` for kinds with no extent-index body (DedupRef, Zero, Delta).
-///
-/// Must run before `segment::write_and_commit` rewrites `stored_offset`
-/// from WAL-relative to segment-relative.
 fn snapshot_pre_promote_offsets(
-    entries: &[segment::SegmentEntry],
+    writes: &[PendingWrite],
     extent_index: &extentindex::ExtentIndex,
 ) -> Vec<Option<u64>> {
-    entries
+    writes
         .iter()
-        .map(|e| match e.kind {
+        .map(|w| match w.entry.kind {
             EntryKind::Data
             | EntryKind::Inline
             | EntryKind::CanonicalData
-            | EntryKind::CanonicalInline => extent_index.lookup(&e.hash).map(|loc| loc.body_offset),
+            | EntryKind::CanonicalInline => extent_index
+                .lookup(&w.entry.hash)
+                .map(|loc| loc.body_offset),
             EntryKind::DedupRef
             | EntryKind::Zero
             | EntryKind::Delta
@@ -205,92 +206,69 @@ fn snapshot_pre_promote_offsets(
 /// Inline-sized duplicates dedup like any other: a DedupRef costs zero
 /// bytes where an Inline entry would put its body in the `.idx`.
 ///
-/// Must run before `snapshot_pre_promote_offsets`: the offsets snapshot
-/// keys off `entry.kind`, so a converted entry must already read as
-/// DedupRef when the CAS tokens are taken. Returns the counters for this
-/// formation.
+/// Returns the counters for this formation.
 fn classify_pending_dedup_entries(
-    entries: &mut [segment::SegmentEntry],
-    body_offsets: &mut [Option<u64>],
+    writes: &mut [PendingWrite],
     extent_index: &extentindex::ExtentIndex,
     wal_ulid: Ulid,
 ) -> DedupMintStats {
     let mut stats = DedupMintStats::default();
-    for (entry, body_offset) in entries.iter_mut().zip(body_offsets.iter_mut()) {
-        if !matches!(entry.kind, EntryKind::Data | EntryKind::Inline) {
+    for write in writes.iter_mut() {
+        if !matches!(write.entry.kind, EntryKind::Data | EntryKind::Inline) {
             continue;
         }
-        // Journal-tier entries are stored as-is: never a dedup target, so
-        // durable content and journal content never share a body and a
-        // journal segment reaps whole. They also never appear in `inner`,
-        // so a durable write below can never dedup against journal content.
-        if entry.journal {
+        // Journal-tier entries are stored as-is: they stay out of the deduped
+        // map, so durable and journal content keep separate bodies and a
+        // journal segment reaps whole.
+        if write.entry.journal {
             continue;
         }
-        let Some(loc) = extent_index.lookup(&entry.hash) else {
+        let Some(loc) = extent_index.lookup(&write.entry.hash) else {
             continue;
         };
-        if loc.segment_id == wal_ulid && Some(loc.body_offset) == *body_offset {
+        if loc.segment_id == wal_ulid && Some(loc.body_offset) == write.wal_body_offset {
             continue;
         }
         stats.minted_entries += 1;
-        stats.wal_body_bytes += entry.stored_length as u64;
-        *entry =
-            segment::SegmentEntry::new_dedup_ref(entry.hash, entry.start_lba, entry.lba_length);
-        *body_offset = None;
+        stats.wal_body_bytes += write.entry.stored_length as u64;
+        write.entry = segment::SegmentEntry::new_dedup_ref(
+            write.entry.hash,
+            write.entry.start_lba,
+            write.entry.lba_length,
+        );
+        write.wal_body_offset = None;
     }
     stats
 }
 
-/// Split the positional (entries, pre_promote_offsets, body_offsets)
-/// triple into the stable share and the journal-window share, in
-/// lockstep so the CAS-token pairing survives the split. Returns
-/// `(primary_triple, None)` untouched when the window is empty or the
-/// epoch wrote no journal LBAs.
+/// Stage one WAL epoch's pending writes for promotion: mint dedup refs against
+/// the extent index, take the CAS precondition tokens, then split the
+/// journal-window share off into its own segment.
 ///
-/// Must run after `classify_pending_dedup_entries` and
-/// `snapshot_pre_promote_offsets` — the split permutes positions, so
-/// the tokens must already be paired.
-#[allow(clippy::type_complexity)]
-fn partition_journal_pending(
-    entries: Vec<segment::SegmentEntry>,
-    pre_promote_offsets: Vec<Option<u64>>,
-    body_offsets: Vec<Option<u64>>,
+/// The three steps are ordered. The token snapshot keys off entry kinds, so
+/// classification runs first and a converted entry reads as a DedupRef by the
+/// time its token is taken; the split then permutes positions, with every token
+/// already paired to its write. Taking the tokens here also puts them ahead of
+/// `segment::write_and_commit` rewriting `stored_offset` to segment-relative.
+///
+/// `mint` yields the journal segment's ULID, so callers mint the primary
+/// segment's ULID first.
+fn stage_pending_for_promote(
+    mut writes: Vec<PendingWrite>,
+    extent_index: &extentindex::ExtentIndex,
+    wal_ulid: Ulid,
     journal_ranges: &crate::journal::JournalRanges,
-) -> (
-    (
-        Vec<segment::SegmentEntry>,
-        Vec<Option<u64>>,
-        Vec<Option<u64>>,
-    ),
-    Option<(
-        Vec<segment::SegmentEntry>,
-        Vec<Option<u64>>,
-        Vec<Option<u64>>,
-    )>,
-) {
-    if journal_ranges.is_empty() || !entries.iter().any(|e| journal_ranges.contains(e.start_lba)) {
-        return ((entries, pre_promote_offsets, body_offsets), None);
-    }
-    let mut primary = (Vec::new(), Vec::new(), Vec::new());
-    let mut journal = (Vec::new(), Vec::new(), Vec::new());
-    for ((mut entry, pre), body) in entries
-        .into_iter()
-        .zip(pre_promote_offsets)
-        .zip(body_offsets)
-    {
-        let is_journal = journal_ranges.contains(entry.start_lba);
-        entry.journal = is_journal;
-        let dst = if is_journal {
-            &mut journal
-        } else {
-            &mut primary
-        };
-        dst.0.push(entry);
-        dst.1.push(pre);
-        dst.2.push(body);
-    }
-    (primary, Some(journal))
+    mint: &mut UlidMint,
+) -> (PendingPartition, Option<JournalPartition>, DedupMintStats) {
+    let dedup = classify_pending_dedup_entries(&mut writes, extent_index, wal_ulid);
+    let pre_promote_offsets = snapshot_pre_promote_offsets(&writes, extent_index);
+    let (primary, journal) =
+        PendingPartition::new(writes, pre_promote_offsets).split_journal(journal_ranges);
+    let journal = journal.map(|partition| JournalPartition {
+        segment_ulid: mint.next(),
+        partition,
+    });
+    (primary, journal, dedup)
 }
 
 /// Apply a committed promote to the in-memory maps: CAS each body-bearing
@@ -587,17 +565,11 @@ pub struct Volume {
     /// write opens a fresh one at `mint.next()`. Keeps idle volumes from
     /// churning the WAL on every GC tick.
     pub(in crate::volume) wal: Option<OpenWal>,
-    /// DATA and REF extents written since the last promotion; used to write
-    /// the clean segment file on the next promote().
-    pub(in crate::volume) pending_entries: Vec<segment::SegmentEntry>,
-    /// Parallel to `pending_entries`: where to read body bytes from at
-    /// promote time. `Some(offset)` means the body lives in the WAL at
-    /// that offset (length == `entry.stored_length`); `None` means the
-    /// entry has no body (DedupRef, Zero, Delta) or its body is
-    /// already in `entry.data`. Populated by `write_commit` and by
-    /// `recover_wal` so that body bytes never live twice (in
-    /// `pending_entries.data` *and* in the WAL/page cache).
-    pub(in crate::volume) pending_body_offsets: Vec<Option<u64>>,
+    /// DATA and REF extents written since the last promotion, each carrying
+    /// where its body bytes sit in the WAL; used to write the clean segment
+    /// file on the next promote(). Populated by `write_commit` and by
+    /// `recover_wal`, so body bytes live once — in the WAL and its page cache.
+    pub(in crate::volume) pending: Vec<PendingWrite>,
     /// True if at least one segment has been committed since the last snapshot
     /// (or since open, if no snapshot has been taken this session). Used by
     /// `snapshot()` to decide whether a new marker is needed or the latest
@@ -841,48 +813,30 @@ impl Volume {
             let wal::WalReplay {
                 ulid: old_wal_ulid,
                 valid_size: _,
-                mut pending_entries,
-                mut body_offsets,
+                pending,
             } = replay_wal_records(&wal_path, &mut lbamap, &mut extent_index, &journal)?;
-            if pending_entries.is_empty() {
+            if pending.is_empty() {
                 fs::remove_file(&wal_path)?;
                 continue;
             }
-            let minted = classify_pending_dedup_entries(
-                &mut pending_entries,
-                &mut body_offsets,
-                &extent_index,
-                old_wal_ulid,
-            );
-            recovery_dedup_stats.minted_entries += minted.minted_entries;
-            recovery_dedup_stats.wal_body_bytes += minted.wal_body_bytes;
-            let pre_promote_offsets = snapshot_pre_promote_offsets(&pending_entries, &extent_index);
-            let (primary, jpart) = partition_journal_pending(
-                pending_entries,
-                pre_promote_offsets,
-                body_offsets,
-                &journal,
-            );
             // Primary ULID first: the journal segment must sort above the
             // data segment (see `JournalPartition`).
             let segment_ulid = mint.next();
-            let jpart =
-                jpart.map(
-                    |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
-                        segment_ulid: mint.next(),
-                        entries,
-                        pre_promote_offsets,
-                        body_offsets,
-                    },
-                );
+            let (primary, jpart, dedup) = stage_pending_for_promote(
+                pending,
+                &extent_index,
+                old_wal_ulid,
+                &journal,
+                &mut mint,
+            );
+            recovery_dedup_stats.minted_entries += dedup.minted_entries;
+            recovery_dedup_stats.wal_body_bytes += dedup.wal_body_bytes;
             let result = crate::actor::execute_promote(
                 PromoteJob {
                     segment_ulid,
                     old_wal_ulid,
                     old_wal_path: wal_path.clone(),
-                    entries: primary.0,
-                    pre_promote_offsets: primary.1,
-                    body_offsets: primary.2,
+                    primary,
                     signer: Arc::clone(&signer),
                     pending_dir: pending_dir.clone(),
                     // Recovery promotes of stale WALs write plain Data
@@ -918,29 +872,23 @@ impl Volume {
         }
 
         // recover_wal does the single WAL scan: truncates any partial tail,
-        // replays records into the LBA map, and rebuilds pending_entries.
+        // replays records into the LBA map, and rebuilds the pending writes.
         // When no WAL file is present on disk, leave `wal` as None; the next
         // write lazily opens a fresh WAL. This avoids creating an empty WAL
         // for read-only volumes and idle sessions that never write.
-        let (wal, pending_entries, pending_body_offsets) =
-            if let Some(path) = wal_files.into_iter().last() {
-                let wal::RecoveredWal {
-                    wal,
-                    ulid,
-                    path,
-                    pending_entries,
-                    body_offsets,
-                } = recover_wal(path, &mut lbamap, &mut extent_index, &journal)?;
-                (
-                    Some(OpenWal { wal, ulid, path }),
-                    pending_entries,
-                    body_offsets,
-                )
-            } else {
-                (None, Vec::new(), Vec::new())
-            };
+        let (wal, pending) = if let Some(path) = wal_files.into_iter().last() {
+            let wal::RecoveredWal {
+                wal,
+                ulid,
+                path,
+                pending,
+            } = recover_wal(path, &mut lbamap, &mut extent_index, &journal)?;
+            (Some(OpenWal { wal, ulid, path }), pending)
+        } else {
+            (None, Vec::new())
+        };
 
-        let has_new_segments = !pending_entries.is_empty()
+        let has_new_segments = !pending.is_empty()
             || matches!((&latest_snap, &last_segment_ulid), (Some(snap), Some(last)) if last > snap);
 
         let mut ret = Self {
@@ -951,8 +899,7 @@ impl Volume {
             extent_index: Arc::new(extent_index),
             sketch_index: Arc::new(sketch_index),
             wal,
-            pending_entries,
-            pending_body_offsets,
+            pending,
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
@@ -1291,8 +1238,10 @@ impl Volume {
             stored_length,
         );
         entry.journal = is_journal;
-        self.pending_entries.push(entry);
-        self.pending_body_offsets.push(Some(body_offset));
+        self.pending.push(PendingWrite {
+            entry,
+            wal_body_offset: Some(body_offset),
+        });
 
         Ok(())
     }
@@ -1328,9 +1277,10 @@ impl Volume {
             open.ulid
         };
         Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
-        self.pending_entries
-            .push(segment::SegmentEntry::new_zero(start_lba, lba_count));
-        self.pending_body_offsets.push(None);
+        self.pending.push(PendingWrite {
+            entry: segment::SegmentEntry::new_zero(start_lba, lba_count),
+            wal_body_offset: None,
+        });
         Ok(())
     }
 
@@ -2746,9 +2696,9 @@ impl Volume {
     }
 
     /// Flush the current WAL to a segment in this node's `pending/`, update
-    /// the extent index, and clear `pending_entries`. The WAL file is deleted.
+    /// the extent index, and clear `pending`. The WAL file is deleted.
     ///
-    /// If `pending_entries` is empty (nothing written since last flush), the
+    /// If `pending` is empty (nothing written since last flush), the
     /// WAL file is deleted directly without writing a segment.
     ///
     /// Evict `segment_id` from the file handle cache.
@@ -2813,7 +2763,7 @@ impl Volume {
         if self.wal.is_none() {
             return Ok(());
         }
-        if self.pending_entries.is_empty() {
+        if self.pending.is_empty() {
             if let Some(open) = self.wal.take() {
                 fs::remove_file(&open.path)?;
             }
@@ -2854,19 +2804,13 @@ impl Volume {
         // CAS/hash-match guards leave anything a concurrent writer has
         // superseded untouched.
         {
-            let journal_part = job
-                .journal
-                .as_ref()
-                .map(|j| (j.entries.as_slice(), j.pre_promote_offsets.as_slice()));
-            let partitions =
-                std::iter::once((job.entries.as_slice(), job.pre_promote_offsets.as_slice()))
-                    .chain(journal_part);
+            let journal_part = job.journal.as_ref().map(|j| &j.partition);
+            let partitions = std::iter::once(&job.primary).chain(journal_part);
             let index = Arc::make_mut(&mut self.extent_index);
             let lbamap = Arc::make_mut(&mut self.lbamap);
-            for (entries, pre_promote_offsets) in partitions {
-                for (entry, old_wal_offset) in
-                    entries.iter().zip(pre_promote_offsets.iter().copied())
-                {
+            for part in partitions {
+                for (write, old_wal_offset) in part.iter() {
+                    let entry = &write.entry;
                     match entry.kind {
                         EntryKind::Data
                         | EntryKind::Inline
@@ -2886,7 +2830,8 @@ impl Volume {
                         index.rekey_owner(entry.hash, job.old_wal_ulid, old_wal_offset, new_ulid);
                     }
                 }
-                for entry in entries {
+                for write in part.writes() {
+                    let entry = &write.entry;
                     if entry.kind.is_canonical_only() {
                         continue;
                     }
@@ -2911,11 +2856,9 @@ impl Volume {
             ulid: new_ulid,
             path: new_path,
         });
-        self.pending_entries = job.entries;
-        self.pending_body_offsets = job.body_offsets;
+        self.pending = job.primary.into_writes();
         if let Some(j) = job.journal {
-            self.pending_entries.extend(j.entries);
-            self.pending_body_offsets.extend(j.body_offsets);
+            self.pending.extend(j.partition.into_writes());
         }
         Ok(())
     }
@@ -3231,7 +3174,7 @@ impl Volume {
     /// Flush the current WAL to a pending segment if it contains any entries.
     /// No-op if the WAL is empty. Called by the idle-flush path in the daemon.
     pub fn flush_wal(&mut self) -> io::Result<()> {
-        if self.pending_entries.is_empty() {
+        if self.pending.is_empty() {
             return Ok(());
         }
         self.promote()
@@ -3249,7 +3192,7 @@ impl Volume {
     /// (WAL append only) and the promotion cost is never borne by the write caller.
     pub fn needs_promote(&self) -> bool {
         self.wal.as_ref().is_some_and(|o| {
-            o.wal.size() >= FLUSH_THRESHOLD || self.pending_entries.len() >= FLUSH_ENTRY_THRESHOLD
+            o.wal.size() >= FLUSH_THRESHOLD || self.pending.len() >= FLUSH_ENTRY_THRESHOLD
         })
     }
 
@@ -3275,7 +3218,7 @@ impl Volume {
     /// Prep phase of the off-actor promote.  Runs on the actor thread.
     ///
     /// Takes the current WAL, snapshots CAS precondition tokens, takes
-    /// ownership of `pending_entries`, and mints a fresh segment ULID.
+    /// ownership of `pending`, and mints a fresh segment ULID.
     /// Returns `None` if the WAL is empty or absent (nothing to promote).
     ///
     /// After this call the volume's `wal` is `None`. The next write will
@@ -3283,7 +3226,7 @@ impl Volume {
     /// immediately. The returned [`PromoteJob`] is sent to the worker
     /// thread for the heavy segment-write work.
     pub fn prepare_promote(&mut self) -> io::Result<Option<PromoteJob>> {
-        if self.pending_entries.is_empty() {
+        if self.pending.is_empty() {
             return Ok(None);
         }
 
@@ -3299,16 +3242,9 @@ impl Volume {
         Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
     }
 
-    /// Run [`classify_pending_dedup_entries`] over the pending entries
-    /// under the volume lock, folding the counters into
-    /// `self.dedup_mint_stats`.
-    fn classify_pending_dedup(&mut self, wal_ulid: Ulid) {
-        let stats = classify_pending_dedup_entries(
-            &mut self.pending_entries,
-            &mut self.pending_body_offsets,
-            &self.extent_index,
-            wal_ulid,
-        );
+    /// Fold one formation's dedup counters into `self.dedup_mint_stats` and log
+    /// the running totals.
+    fn record_dedup_mint_stats(&mut self, wal_ulid: Ulid, stats: DedupMintStats) {
         if stats.minted_entries > 0 {
             self.dedup_mint_stats.minted_entries += stats.minted_entries;
             self.dedup_mint_stats.wal_body_bytes += stats.wal_body_bytes;
@@ -3323,20 +3259,24 @@ impl Volume {
         }
     }
 
-    /// Take the open WAL and pending entries into a [`PromoteJob`] targeting
-    /// `segment_ulid`. Snapshots the CAS precondition tokens before
-    /// `write_and_commit` rewrites `stored_offset` to segment-relative.
+    /// Take the open WAL and pending writes into a [`PromoteJob`] targeting
+    /// `segment_ulid`.
     ///
-    /// Errors if no WAL is open — callers check `pending_entries` is
-    /// non-empty first, and the write path only ever appends entries after
-    /// opening the WAL.
+    /// Errors if no WAL is open — callers check `pending` is non-empty first,
+    /// and the write path only ever appends entries after opening the WAL.
     fn take_wal_into_promote_job(&mut self, segment_ulid: Ulid) -> io::Result<PromoteJob> {
-        let open = self.wal.take().ok_or_else(|| {
-            io::Error::other("internal: pending_entries non-empty but wal absent")
-        })?;
-        self.classify_pending_dedup(open.ulid);
-        let pre_promote_offsets =
-            snapshot_pre_promote_offsets(&self.pending_entries, &self.extent_index);
+        let open = self
+            .wal
+            .take()
+            .ok_or_else(|| io::Error::other("internal: pending writes non-empty but wal absent"))?;
+        let (primary, jpart, dedup) = stage_pending_for_promote(
+            std::mem::take(&mut self.pending),
+            &self.extent_index,
+            open.ulid,
+            &self.journal,
+            &mut self.mint,
+        );
+        self.record_dedup_mint_stats(open.ulid, dedup);
         let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
         for layer in &self.ancestor_layers {
             if !search_dirs.contains(&layer.dir) {
@@ -3354,22 +3294,6 @@ impl Volume {
                 journal_ranges: self.journal.clone(),
             }),
         };
-        let (primary, jpart) = partition_journal_pending(
-            std::mem::take(&mut self.pending_entries),
-            pre_promote_offsets,
-            std::mem::take(&mut self.pending_body_offsets),
-            &self.journal,
-        );
-        // The journal segment ULID is minted after the primary's, so it
-        // sorts above the data segment (see `JournalPartition`).
-        let jpart = jpart.map(
-            |(entries, pre_promote_offsets, body_offsets)| JournalPartition {
-                segment_ulid: self.mint.next(),
-                entries,
-                pre_promote_offsets,
-                body_offsets,
-            },
-        );
         // Poll for a first-ever window derivation while the taken epoch
         // is fully staged, so subsequent takes route window LBAs to the
         // journal tier.
@@ -3380,9 +3304,7 @@ impl Volume {
             segment_ulid,
             old_wal_ulid: open.ulid,
             old_wal_path: open.path,
-            entries: primary.0,
-            pre_promote_offsets: primary.1,
-            body_offsets: primary.2,
+            primary,
             signer: Arc::clone(&self.signer),
             pending_dir: self.base_dir.join("pending"),
             delta,
@@ -3458,14 +3380,14 @@ impl Volume {
     ///
     /// Always mints ULIDs. An earlier Idle short-circuit (cfcb132) was
     /// reverted because the coordinator's per-tick `promote_wal` IPC
-    /// empties `pending_entries` before this call, which would make the
+    /// empties `pending` before this call, which would make the
     /// Idle check fire on every tick under active writes and silently
     /// disable GC. We still run GC on every tick; we only stop creating
     /// a new WAL file when there is nothing to promote.
     pub fn prepare_gc_checkpoint(&mut self, max_buckets: usize) -> io::Result<GcCheckpointPrep> {
         let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(max_buckets);
 
-        if self.pending_entries.is_empty() {
+        if self.pending.is_empty() {
             // Empty or absent WAL — delete any lingering file, leave wal None.
             if let Some(open) = self.wal.take() {
                 fs::remove_file(&open.path)?;

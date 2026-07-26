@@ -15,24 +15,18 @@ use crate::{
 
 use super::ZERO_HASH;
 
-/// Output of [`replay_wal_records`]: the parsed records turned into
-/// pending segment entries, plus parallel `body_offsets` recording where
-/// each entry's body bytes live in the WAL file.
-///
-/// `body_offsets[i]` is `Some(off)` when `pending_entries[i]` is a
-/// body-bearing kind (Data / Inline) — the body lives at `off..off+stored_length`
-/// in the WAL — and `None` for kinds with no body (DedupRef, Zero). The
-/// bytes are read from the WAL on promote, not held in memory.
+/// Output of [`replay_wal_records`]: the parsed records turned back into the
+/// pending writes the next promote consumes, each carrying where its body
+/// bytes sit in the WAL. The bytes themselves are read at promote time.
 pub(super) struct WalReplay {
     pub ulid: Ulid,
     pub valid_size: u64,
-    pub pending_entries: Vec<segment::SegmentEntry>,
-    pub body_offsets: Vec<Option<u64>>,
+    pub pending: Vec<super::PendingWrite>,
 }
 
 /// Scan a WAL file and replay its records into `lbamap` + `extent_index`,
 /// returning the WAL ULID, the valid (non-partial) tail size, and the
-/// reconstructed pending_entries list (with parallel WAL body offsets).
+/// reconstructed pending writes.
 ///
 /// Shared between:
 /// - [`recover_wal`], which also reopens the file for continued appending
@@ -56,8 +50,7 @@ pub(super) fn replay_wal_records(
 
     let (records, valid_size) = writelog::scan(path)?;
 
-    let mut pending_entries = Vec::new();
-    let mut body_offsets = Vec::new();
+    let mut pending: Vec<super::PendingWrite> = Vec::new();
     for record in records {
         match record {
             writelog::LogRecord::Data {
@@ -110,8 +103,10 @@ pub(super) fn replay_wal_records(
                     body_length,
                 );
                 entry.journal = is_journal;
-                pending_entries.push(entry);
-                body_offsets.push(Some(body_offset));
+                pending.push(super::PendingWrite {
+                    entry,
+                    wal_body_offset: Some(body_offset),
+                });
             }
             writelog::LogRecord::Ref {
                 hash,
@@ -122,18 +117,20 @@ pub(super) fn replay_wal_records(
                 // REF: no body bytes, no body reservation, no extent_index
                 // update. The canonical entry is populated from whichever
                 // segment holds the DATA for this hash.
-                pending_entries.push(segment::SegmentEntry::new_dedup_ref(
-                    hash, start_lba, lba_length,
-                ));
-                body_offsets.push(None);
+                pending.push(super::PendingWrite {
+                    entry: segment::SegmentEntry::new_dedup_ref(hash, start_lba, lba_length),
+                    wal_body_offset: None,
+                });
             }
             writelog::LogRecord::Zero {
                 start_lba,
                 lba_length,
             } => {
                 lbamap.insert(start_lba, lba_length, ZERO_HASH, ulid);
-                pending_entries.push(segment::SegmentEntry::new_zero(start_lba, lba_length));
-                body_offsets.push(None);
+                pending.push(super::PendingWrite {
+                    entry: segment::SegmentEntry::new_zero(start_lba, lba_length),
+                    wal_body_offset: None,
+                });
             }
         }
     }
@@ -141,23 +138,21 @@ pub(super) fn replay_wal_records(
     Ok(WalReplay {
         ulid,
         valid_size,
-        pending_entries,
-        body_offsets,
+        pending,
     })
 }
 
-/// Scan an existing WAL, replay its records into `lbamap`, rebuild
-/// `pending_entries`, and reopen the WAL for continued appending.
+/// Scan an existing WAL, replay its records into `lbamap`, rebuild the
+/// pending writes, and reopen the WAL for continued appending.
 ///
 /// This is the single WAL scan on startup — it both updates the LBA map
-/// (WAL is more recent than any segment) and recovers the pending_entries
-/// list needed for the next promotion.
+/// (WAL is more recent than any segment) and recovers the pending writes
+/// needed for the next promotion.
 pub(super) struct RecoveredWal {
     pub wal: writelog::WriteLog,
     pub ulid: Ulid,
     pub path: PathBuf,
-    pub pending_entries: Vec<segment::SegmentEntry>,
-    pub body_offsets: Vec<Option<u64>>,
+    pub pending: Vec<super::PendingWrite>,
 }
 
 pub(super) fn recover_wal(
@@ -172,8 +167,7 @@ pub(super) fn recover_wal(
         wal,
         ulid: replay.ulid,
         path,
-        pending_entries: replay.pending_entries,
-        body_offsets: replay.body_offsets,
+        pending: replay.pending,
     })
 }
 

@@ -301,7 +301,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // Overwrite LBA 1 with seed 101 — same data → write-path dedup creates
     // a thin DedupRef (H101 already in extent_index from S3).
     vol.write(1, &[101u8; 4096]).unwrap();
-    // Not flushed yet — still in WAL / pending_entries.
+    // Not flushed yet — still in WAL / pending writes.
 
     // GC pass 2: gc_checkpoint flushes WAL (creates S4 with DedupRef for
     // LBA 1→H101), then GC finds nothing in index/ (no candidates).

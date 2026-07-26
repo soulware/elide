@@ -535,7 +535,7 @@ fn recovery_after_promotion() {
 #[test]
 fn promotion_after_wal_recovery() {
     // Write to the WAL, drop (simulating a crash), reopen (WAL recovery),
-    // promote, then reopen again — verifies that pending_entries is correctly
+    // promote, then reopen again — verifies that the pending writes are correctly
     // rebuilt from the recovered WAL so the segment contains the pre-crash writes.
     let base = keyed_temp_dir();
 
@@ -701,7 +701,7 @@ fn recovery_replays_all_wals_promoting_non_latest() {
     );
 
     // Both LBAs read back correctly. LBA 0 comes from the promoted
-    // segment; LBA 1 from the active WAL's pending_entries.
+    // segment; LBA 1 from the active WAL's pending writes.
     assert_eq!(vol.read(0, 1).unwrap(), payload_low);
     assert_eq!(vol.read(1, 1).unwrap(), payload_high);
     assert_eq!(vol.lbamap_len(), 2);
@@ -947,9 +947,9 @@ fn same_epoch_duplicate_minted_as_dedup_ref_at_formation() {
 
     // The write path performs no dedup: both pending entries carry bodies.
     assert!(
-        vol.pending_entries
+        vol.pending
             .iter()
-            .all(|e| e.kind == segment::EntryKind::Data),
+            .all(|w| w.entry.kind == segment::EntryKind::Data),
         "write path must append full Data entries for duplicate content"
     );
     assert_eq!(vol.dedup_mint_stats().minted_entries, 0);
@@ -3261,14 +3261,14 @@ fn snapshot_not_idempotent_after_new_write() {
 
 #[test]
 fn snapshot_idempotent_after_auto_promoted_data_already_snapshotted() {
-    // Data promoted via FLUSH_THRESHOLD (pending_entries empty at snapshot
+    // Data promoted via FLUSH_THRESHOLD (pending writes empty at snapshot
     // time) but that segment was already covered by a prior snapshot.
     let fork_dir = keyed_temp_dir();
     let mut vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     vol.write(0, &vec![0xAAu8; 4096]).unwrap();
     vol.promote_for_test().unwrap(); // lands in pending/ with wal_ulid_1
     let ulid1 = vol.snapshot().unwrap(); // snapshot covers pending/wal_ulid_1
-    // pending_entries is now empty; pending/ has one file but it's <= ulid1.
+    // pending is now empty; pending/ has one file but it's <= ulid1.
     let ulid2 = vol.snapshot().unwrap();
     assert_eq!(ulid1, ulid2);
 
