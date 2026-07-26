@@ -38,9 +38,10 @@ pub struct CompactionStats {
     pub bytes_freed: u64,
     /// Number of dead extent entries removed from the extent index.
     pub extents_removed: usize,
-    /// Buckets rolled back by the apply-time resolvability gate: a
-    /// claim minted while the worker ran references an input-owned
-    /// hash the output doesn't carry. Inputs kept, output dropped.
+    /// Buckets refused at apply time — by the stale-liveness check or
+    /// the resolvability gate: a claim or delta-source reference minted
+    /// while the worker ran references an input-owned hash the output
+    /// doesn't carry. Inputs kept, output dropped.
     #[serde(default)]
     pub buckets_refused: usize,
 }
