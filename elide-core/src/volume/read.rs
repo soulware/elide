@@ -35,8 +35,9 @@ pub type DmatCache = RefCell<HashMap<Ulid, dmat::Dmat>>;
 /// Per-thread scratch buffers for compressed-extent reads.
 ///
 /// `compressed` holds the raw compressed bytes pread'd from the segment file;
-/// `decompressed` holds the lz4 output when the caller wants a sub-range of
-/// the extent (the fast path decompresses straight into the caller buffer
+/// `decompressed` holds the full extent plaintext when the caller wants a
+/// sub-range of the extent (lz4 output for compressed extents, the pread
+/// payload for raw ones — the whole-extent path targets the caller buffer
 /// and never touches `decompressed`). Both Vecs grow to the high-water-mark
 /// of any read served by this thread and stay there — extent sizes are
 /// bounded by the 16 MiB segment cap, so total per-thread overhead is small.
@@ -52,6 +53,37 @@ thread_local! {
             decompressed: Vec::new(),
         })
     };
+}
+
+/// Refuse extent plaintext that fails its content hash.
+///
+/// `payload` must be the extent's whole plaintext: the hash covers all of
+/// it, so it can only be checked against all of it. A location that
+/// resolves to the wrong bytes is otherwise indistinguishable from a
+/// correct read — lz4 rejects some of them, raw-stored extents produce
+/// no error at all.
+fn verify_extent_content(
+    expected: &blake3::Hash,
+    payload: &[u8],
+    lba: u64,
+    segment_id: Ulid,
+) -> io::Result<()> {
+    let got = blake3::hash(payload);
+    if got == *expected {
+        return Ok(());
+    }
+    log::error!(
+        "content hash mismatch: lba={lba} segment={segment_id} expected={} got={} ({} bytes)",
+        expected.to_hex(),
+        got.to_hex(),
+        payload.len(),
+    );
+    Err(io::Error::other(format!(
+        "extent body hashed {} instead of {} ({} bytes)",
+        got.to_hex(),
+        expected.to_hex(),
+        payload.len()
+    )))
 }
 
 /// Default capacity for the segment file handle LRU cache.
@@ -312,6 +344,7 @@ pub(crate) fn read_extents(
         if let Some(idata) = &loc.inline_data {
             if loc.compressed {
                 let raw = lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?;
+                verify_extent_content(&er.hash, &raw, lba, loc.segment_id)?;
                 let src_slice = raw
                     .get(src_start..src_end)
                     .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
@@ -319,6 +352,7 @@ pub(crate) fn read_extents(
             } else {
                 // Slice straight out of the inline buffer — no allocation,
                 // no intermediate to_vec.
+                verify_extent_content(&er.hash, idata, lba, loc.segment_id)?;
                 let src_slice = idata
                     .get(src_start..src_end)
                     .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
@@ -418,7 +452,7 @@ pub(crate) fn read_extents(
                         );
                         io::Error::other(e)
                     })?;
-                    return Ok(());
+                    return verify_extent_content(&er.hash, out_slice, lba, loc.segment_id);
                 }
 
                 // Slow path: caller wants a sub-range — decompress into the
@@ -439,6 +473,7 @@ pub(crate) fn read_extents(
                     );
                     io::Error::other(e)
                 })?;
+                verify_extent_content(&er.hash, &s.decompressed, lba, loc.segment_id)?;
                 let src_slice = s.decompressed.get(src_start..src_end).ok_or_else(|| {
                     io::Error::other("corrupt segment: decompressed payload too short")
                 })?;
@@ -446,8 +481,10 @@ pub(crate) fn read_extents(
                 Ok(())
             })?;
         } else {
-            let read_at = file_body_offset + er.payload_block_offset as u64 * 4096;
-            if let Err(e) = f.read_exact_at(out_slice, read_at) {
+            // The whole stored payload, not just the requested blocks: the
+            // content hash covers the extent, so it can only be checked
+            // against all of it.
+            let log_read_err = |target_len: usize, e: &io::Error| {
                 let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
                 log::error!(
                     "read_extents failed: lba={} segment={} layout={:?} \
@@ -461,11 +498,33 @@ pub(crate) fn read_extents(
                     loc.body_length,
                     er.payload_block_offset,
                     file_body_offset,
-                    out_slice.len(),
+                    target_len,
                     file_size,
                     e,
                 );
-                return Err(e);
+            };
+            let body_len = loc.body_length as usize;
+            if src_start == 0 && out_slice.len() == body_len {
+                if let Err(e) = f.read_exact_at(out_slice, file_body_offset) {
+                    log_read_err(out_slice.len(), &e);
+                    return Err(e);
+                }
+                verify_extent_content(&er.hash, out_slice, lba, loc.segment_id)?;
+            } else {
+                READ_SCRATCH.with(|s| -> io::Result<()> {
+                    let mut s = s.borrow_mut();
+                    s.decompressed.resize(body_len, 0);
+                    if let Err(e) = f.read_exact_at(&mut s.decompressed, file_body_offset) {
+                        log_read_err(body_len, &e);
+                        return Err(e);
+                    }
+                    verify_extent_content(&er.hash, &s.decompressed, lba, loc.segment_id)?;
+                    let src_slice = s.decompressed.get(src_start..src_end).ok_or_else(|| {
+                        io::Error::other("corrupt segment: stored payload too short")
+                    })?;
+                    out_slice.copy_from_slice(src_slice);
+                    Ok(())
+                })?;
             }
         }
     }
