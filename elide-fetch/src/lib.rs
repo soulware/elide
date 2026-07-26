@@ -657,7 +657,33 @@ fn fetch_one_extent(
         // Fast exit: target entry was filled in by a prior leader's
         // batch while we were waiting (or even before we entered).
         if is_present(start) {
-            return Ok(());
+            let body_path = body_dir.join(format!("{segment_id}.body"));
+            if body_path.exists() {
+                return Ok(());
+            }
+            // A set bit with no .body file is the remnant of an eviction
+            // that died between unlinks. No bit in the file can be
+            // trusted against a body that is gone — drop the bitset so
+            // every entry demand-fetches afresh.
+            let present_lock = coalescer.present_lock_for(segment_ulid);
+            let _present_guard = present_lock
+                .lock()
+                .map_err(|_| io::Error::other("per-segment .present lock poisoned"))?;
+            if !body_path.exists() {
+                match std::fs::remove_file(&present_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                if let Some(p) = presence {
+                    p.replace_from_bytes(&[]);
+                }
+                tracing::warn!(
+                    segment_id,
+                    "dropped .present with no .body (interrupted eviction); re-fetching"
+                );
+            }
+            continue;
         }
 
         // Scan forward from `start` to find the longest contiguous run of
@@ -1491,6 +1517,102 @@ mod tests {
         assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
         assert!(check_present_bit(&present_path, 1).unwrap(), "bit 1 set");
         assert!(check_present_bit(&present_path, 2).unwrap(), "bit 2 set");
+    }
+
+    /// A set present bit with no `.body` file is the remnant of an
+    /// eviction that died between unlinks. The fetcher must drop the
+    /// orphaned bitset and fetch, not fast-exit into a permanently
+    /// missing file.
+    #[test]
+    fn fetch_extent_recovers_from_present_bits_without_a_body() {
+        use elide_core::segment::{
+            SegmentEntry, SegmentFlags, check_present_bit, set_present_bit, write_segment,
+        };
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let cache_dir = tmp.path().join("cache");
+
+        let seg_ulid = ulid::Ulid::new();
+        let seg_id = seg_ulid.to_string();
+        let vol_id = "01JQAAAAAAAAAAAAAAAAAAAAAA";
+        let owner_vol_id = ulid::Ulid::from_string(vol_id).unwrap();
+
+        let data0 = vec![0x11u8; 4096];
+        let data1 = vec![0x22u8; 4096];
+        let h0 = blake3::hash(&data0);
+        let h1 = blake3::hash(&data1);
+        let entries = vec![
+            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
+        ];
+        let seg_path = tmp.path().join(&seg_id);
+        let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
+        let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
+        let full_bytes = std::fs::read(&seg_path).unwrap();
+
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            index_dir.join(format!("{seg_id}.idx")),
+            &full_bytes[..bss as usize],
+        )
+        .unwrap();
+
+        // The remnant: every bit set, no .body file.
+        let present_path = cache_dir.join(format!("{seg_id}.present"));
+        set_present_bit(&present_path, 0, 2).unwrap();
+        set_present_bit(&present_path, 1, 2).unwrap();
+
+        let key = segment_key(vol_id, &seg_id).unwrap();
+        put_local(store_dir.path(), &key, &full_bytes);
+
+        let vol_dir = tmp.path().join(vol_id);
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let pub_hex = vk
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n";
+        std::fs::write(vol_dir.join("volume.pub"), pub_hex.as_bytes()).unwrap();
+
+        let cfg = FetchConfig {
+            bucket: None,
+            endpoint: None,
+            region: None,
+            local_path: Some(store_dir.path().to_string_lossy().into_owned()),
+            fetch_batch_bytes: None,
+        };
+        let fetcher = RemoteFetcher::new(&cfg, None).unwrap();
+
+        fetcher
+            .fetch_extent(
+                seg_ulid,
+                owner_vol_id,
+                &index_dir,
+                &cache_dir,
+                &segment::ExtentFetch {
+                    body_section_start: bss,
+                    body_offset: entries[0].stored_offset,
+                    body_length: entries[0].stored_length,
+                    entry_idx: 0,
+                },
+                None,
+            )
+            .unwrap();
+
+        // The orphaned bitset was dropped, so the fetch coalesced both
+        // entries and the body bytes are real.
+        let body_bytes = std::fs::read(cache_dir.join(format!("{seg_id}.body"))).unwrap();
+        let off0 = entries[0].stored_offset as usize;
+        let off1 = entries[1].stored_offset as usize;
+        assert_eq!(&body_bytes[off0..off0 + 4096], data0.as_slice());
+        assert_eq!(&body_bytes[off1..off1 + 4096], data1.as_slice());
+        assert!(check_present_bit(&present_path, 0).unwrap(), "bit 0 set");
+        assert!(check_present_bit(&present_path, 1).unwrap(), "bit 1 set");
     }
 
     /// A gap in body layout stops coalescing: only the requested entry is fetched,
