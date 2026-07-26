@@ -4,14 +4,14 @@
 
 ## Problem
 
-Two processes mutate a mounted volume's `cache/` artefacts. The volume
-process writes them (demand-fetch), and the coordinator deletes them
+Two processes mutate a volume's `cache/` artefacts. The volume process
+writes them (demand-fetch), and the coordinator deletes them
 (`evict_bodies` / `evict_one_body` in the per-fork task). The fetcher's
 serialisation — per-segment coalescer leases and the `.present` lock
 around its read-modify-write — is in-process state the coordinator
 cannot see.
 
-Consequences while a volume is mounted:
+Consequences while a volume process is running:
 
 - **A presence race.** The `.present`-first unlink order (#803)
   excludes the single-fetch corruption interleaving, but a multi-leader
@@ -32,8 +32,10 @@ Consequences while a volume is mounted:
 
 ## Proposed design
 
-Route eviction through the volume when it is running; the coordinator
-touches `cache/` directly only when it is not.
+Eviction is performed only by a process that holds the volume's
+exclusive lock and serves `control.sock`: the running daemon when
+there is one, a short-lived limited volume process otherwise. The
+coordinator never unlinks a live segment's cache artefacts itself.
 
 - New `VolumeRequest::Evict { segment_ulid: Option<Ulid> }` on
   `control.sock` (`None` = every S3-confirmed segment, mirroring the
@@ -44,9 +46,13 @@ touches `cache/` directly only when it is not.
   unlink `.present`, `.dmat`, `.body`, `.delta` in that order, and
   clear the in-memory `SegmentPresence` inside the same critical
   section. One mutator, no window.
-- Coordinator fork task: attempt the IPC first; if the volume is not
-  running, evict directly as today — with no volume process there is
-  nothing to race.
+- No running daemon: the coordinator brings up a limited volume
+  process for the operation, on the precedent of `elide-import`'s
+  `serve_promote` — a process that takes the volume's exclusive lock,
+  binds `control.sock`, serves the request, and exits. The lock is
+  what a check-then-act coordinator arm cannot have: it excludes a
+  daemon starting mid-eviction, where "not running" is a stale answer
+  by the time the unlinks run.
 - Open fds in reader `FileCache`s may pin an unlinked inode's space
   until they cycle out; unchanged from today and safe, since segment
   files are immutable and reads through a stale fd return complete,
@@ -60,6 +66,8 @@ index.
 ## What this closes
 
 The multi-leader presence race becomes structurally impossible instead
-of unlikely; evict-while-mounted stops leaving a stale in-memory
-bitset; and cache mutation returns to the single-owner model the
-promote path already follows.
+of unlikely; evicting under a running volume stops leaving a stale
+in-memory bitset; cache mutation returns to the single-owner model the
+promote path already follows; and eviction has one code path — there
+is no running/not-running behavioural fork, and no window in which
+that distinction can go stale.
