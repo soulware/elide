@@ -81,9 +81,11 @@ When you do comment, it may describe only what the adjacent code **does, right n
 
 These words are a stop signal *while writing*, not a review filter — the moment one forms in a comment, it has already failed; delete it rather than reword it: *unchanged, untouched, stays, remains, still, not done here, not a change to, left as-is, for now, unlike*.
 
+State it **positively**. A comment says what the code does, never what it avoids or omits. Negatives date badly, because the absence stops being true the moment someone adds the case, and they leave the reader to derive the real behaviour. The positive form is usually shorter as well as more informative: prefer *the live index suffices* to *no snapshot-pinned locations are needed*, and *bodies stay in the WAL until the segment is written* to *never carries body bytes between commit and promote*. Treat *no, not, never, without, rather than, instead of* as the same kind of stop signal as the words above.
+
 Never grow a comment across edits — trim or delete, never accrete.
 
-The same test governs prose in design docs and PR descriptions: state what the change **is**, not what it isn't, was, or might have been.
+Both tests govern prose in design docs and PR descriptions: state what the change **is**, not what it isn't, was, or might have been.
 
 ## Documentation
 
