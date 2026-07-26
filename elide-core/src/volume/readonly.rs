@@ -7,7 +7,6 @@
 //! `volume/open_state.rs`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,7 +54,7 @@ impl ReadonlyVolume {
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
             file_cache: RefCell::new(FileCache::default()),
-            dmat_cache: RefCell::new(HashMap::new()),
+            dmat_cache: DmatCache::default(),
             dmat_stats: Arc::new(DmatStats::default()),
             fetcher: None,
         })

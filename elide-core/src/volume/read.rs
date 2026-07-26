@@ -25,12 +25,24 @@ use crate::{
 
 use super::{AncestorLayer, BoxFetcher, ZERO_HASH};
 
-/// Per-volume in-memory cache of opened `.dmat` sidecars, keyed by segment
+/// Shared per-volume cache of opened `.dmat` sidecars, keyed by segment
 /// ULID. Populated lazily when a Delta entry is first read for a segment.
 ///
-/// `RefCell` mirrors the FileCache pattern: the read path is `&self` but we
-/// internally need `&mut Dmat` to append records.
-pub type DmatCache = RefCell<HashMap<Ulid, dmat::Dmat>>;
+/// One instance per volume per process, shared by every reader thread
+/// and snapshot: `Dmat::open_or_create` truncates torn records on disk,
+/// and a private instance per reader would run that truncation — and
+/// its own appends — concurrently against offsets another instance's
+/// map already holds.
+pub type DmatCache = Arc<std::sync::Mutex<HashMap<Ulid, dmat::Dmat>>>;
+
+/// Lock a [`DmatCache`], recovering from poisoning: the map only holds
+/// rebuildable cache state, and every record served through it is
+/// hash-verified by the caller.
+fn lock_dmat_cache(cache: &DmatCache) -> std::sync::MutexGuard<'_, HashMap<Ulid, dmat::Dmat>> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Per-thread scratch buffers for compressed-extent reads.
 ///
@@ -783,7 +795,7 @@ fn dmat_lookup(
     entry_idx: u32,
 ) -> Option<Vec<u8>> {
     use std::collections::hash_map::Entry;
-    let mut cache = dmat_cache.borrow_mut();
+    let mut cache = lock_dmat_cache(dmat_cache);
     let dmat_inst = match cache.entry(segment_id) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {
@@ -833,7 +845,7 @@ fn dmat_writeback(
     materialised: &[u8],
 ) -> io::Result<()> {
     use std::collections::hash_map::Entry;
-    let mut cache = dmat_cache.borrow_mut();
+    let mut cache = lock_dmat_cache(dmat_cache);
     let dmat_inst = match cache.entry(segment_id) {
         Entry::Occupied(o) => o.into_mut(),
         Entry::Vacant(v) => {

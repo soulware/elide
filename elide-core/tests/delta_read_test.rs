@@ -716,3 +716,92 @@ fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
     assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
     assert_eq!(vol.read(10, 1).unwrap(), child_bytes);
 }
+
+/// Every reader of a volume shares one dmat instance: a record
+/// materialised through one reader serves the other without a second
+/// materialisation.
+#[test]
+fn readers_share_one_dmat_instance() {
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    fs::create_dir_all(vol_dir.join("cache")).unwrap();
+
+    let parent_bytes = vec![0x66u8; 4096];
+    let parent_hash = blake3::hash(&parent_bytes);
+    let mut child_bytes = vec![0x66u8; 4096];
+    for (i, byte) in child_bytes.iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    let child_hash = blake3::hash(&child_bytes);
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+
+    let mut mint = UlidMint::new(Ulid::nil());
+    let parent_seg_ulid = mint.next();
+    write_segment(
+        &vol_dir.join(format!("pending/{parent_seg_ulid}")),
+        vec![SegmentEntry::new_data(
+            parent_hash,
+            0,
+            1,
+            SegmentFlags::empty(),
+            parent_bytes,
+        )],
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    let delta_seg_ulid = mint.next();
+    let delta_option = DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
+    };
+    write_segment_with_delta_body(
+        &vol_dir.join(format!("pending/{delta_seg_ulid}")),
+        vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            10,
+            1,
+            vec![delta_option],
+        ))],
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+    elide_core::signing::write_snapshot_manifest(
+        &vol_dir,
+        signer.as_ref(),
+        &delta_seg_ulid,
+        &[delta_seg_ulid],
+    )
+    .unwrap();
+
+    let vol = elide_core::volume::Volume::open(&vol_dir, &vol_dir).unwrap();
+    let (actor, handle) = elide_core::actor::spawn(vol);
+    let actor_thread = std::thread::spawn(move || actor.run());
+
+    let r1 = handle.reader();
+    let r2 = handle.reader();
+
+    let mut buf = vec![0u8; 4096];
+    r1.read_into(10, &mut buf).unwrap();
+    assert_eq!(buf, child_bytes, "r1 materialises the delta");
+    assert_eq!(r1.dmat_stats().write_total, 1, "r1 wrote the record");
+
+    let mut buf2 = vec![0u8; 4096];
+    r2.read_into(10, &mut buf2).unwrap();
+    assert_eq!(buf2, child_bytes);
+    assert_eq!(
+        r2.dmat_stats().hit_total,
+        1,
+        "r2's first read must hit the record r1 materialised"
+    );
+    assert_eq!(r2.dmat_stats().write_total, 0, "r2 must not re-materialise");
+
+    drop(handle);
+    drop(r1);
+    drop(r2);
+    actor_thread.join().unwrap();
+}

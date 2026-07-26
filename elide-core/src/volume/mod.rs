@@ -956,7 +956,7 @@ impl Volume {
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
-            dmat_cache: RefCell::new(std::collections::HashMap::new()),
+            dmat_cache: read::DmatCache::default(),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             signer,
             verifying_key,
@@ -3216,6 +3216,12 @@ impl Volume {
     /// mutation triggers a copy-on-write clone.
     pub fn snapshot_maps(&self) -> (Arc<lbamap::LbaMap>, Arc<extentindex::ExtentIndex>) {
         (Arc::clone(&self.lbamap), Arc::clone(&self.extent_index))
+    }
+
+    /// Shared handle on the volume's dmat cache — the single per-process
+    /// instance every reader must use (see [`read::DmatCache`]).
+    pub fn dmat_cache_handle(&self) -> read::DmatCache {
+        Arc::clone(&self.dmat_cache)
     }
 
     /// Ancestor layers for this fork, oldest-first.

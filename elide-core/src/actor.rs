@@ -1378,6 +1378,9 @@ pub struct VolumeClient {
     /// which already pins the actor's strong ref while the actor thread
     /// is alive.
     flush_gen: Arc<AtomicU64>,
+    /// The volume's single per-process dmat cache, handed to every
+    /// reader (see `volume::read::DmatCache`).
+    dmat_cache: crate::volume::DmatCache,
 }
 
 /// Per-thread reader for a volume session.
@@ -1396,10 +1399,11 @@ pub struct VolumeReader {
     /// each transport thread holds its own reader. `RefCell` is sufficient;
     /// `Mutex` is not needed.
     file_cache: RefCell<FileCache>,
-    /// Per-reader cache of opened `cache/<ULID>.dmat` sidecars. Cleared
-    /// alongside `file_cache` whenever the snapshot's `flush_gen` changes,
-    /// so an eviction that drops `.dmat` from disk can't leave a stale FD
-    /// pointing at a removed inode.
+    /// The volume's shared cache of opened `cache/<ULID>.dmat` sidecars —
+    /// one instance per volume per process (see `volume::read::DmatCache`).
+    /// Cleared alongside `file_cache` whenever the snapshot's `flush_gen`
+    /// changes, so an eviction that drops `.dmat` from disk can't leave a
+    /// stale FD pointing at a removed inode.
     dmat_cache: crate::volume::DmatCache,
     /// Telemetry counters for the dmat cache. Per-reader; aggregate by
     /// summing snapshots across readers if needed.
@@ -1427,9 +1431,9 @@ impl VolumeClient {
     pub fn reader(&self) -> VolumeReader {
         let current_gen = self.snapshot.load().flush_gen;
         VolumeReader {
+            dmat_cache: self.dmat_cache.clone(),
             client: self.clone(),
             file_cache: RefCell::new(FileCache::default()),
-            dmat_cache: RefCell::new(std::collections::HashMap::new()),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             last_flush_gen: Cell::new(current_gen),
         }
@@ -1809,7 +1813,10 @@ impl VolumeReader {
     ) -> io::Result<()> {
         if snap.flush_gen != self.last_flush_gen.get() {
             self.file_cache.borrow_mut().clear();
-            self.dmat_cache.borrow_mut().clear();
+            self.dmat_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             self.last_flush_gen.set(snap.flush_gen);
         }
         let config = &self.client.config;
@@ -3248,6 +3255,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         tx,
         snapshot,
         config,
+        dmat_cache: lock_volume(&volume).dmat_cache_handle(),
         volume: Arc::downgrade(&volume),
         flush_gen,
     };
