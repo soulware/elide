@@ -1,14 +1,15 @@
 // Integration tests for ReadonlyVolume.
 //
-// ReadonlyVolume differs from Volume in three ways:
-//   - Does not create wal/, does not acquire an exclusive lock.
+// ReadonlyVolume differs from Volume in two ways:
+//   - Does not create wal/.
 //   - Does not replay the WAL — writes that have not been flushed to pending/
 //     are invisible.
-//   - Intended for the --readonly serve path where a separate writer may
-//     be active on the same fork concurrently.
 //
-// Each test opens a writable Volume, performs some operations, then opens a
-// ReadonlyVolume on the same directory and verifies reads.
+// Like Volume it holds the fork's exclusive volume lock: serving reads
+// warms cache/ (dmat writeback), so a fork admits one serving process.
+//
+// Each test opens a writable Volume, performs some operations, drops it,
+// then opens a ReadonlyVolume on the same directory and verifies reads.
 
 use std::path::PathBuf;
 
@@ -41,6 +42,7 @@ fn readonly_sees_flushed_pending_not_wal() {
     // LBA 1: in WAL only, not flushed — should be invisible (returns zeros).
     vol.write(1, &[0xBB; 4096]).unwrap();
 
+    drop(vol);
     let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
 
     let lba0 = rv.read(0, 1).unwrap();
@@ -64,6 +66,7 @@ fn readonly_sees_drained_segments() {
     vol.flush_wal().unwrap();
     common::drain_with_repack(&mut vol);
 
+    drop(vol);
     let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     for lba in 0u64..4 {
         let actual = rv.read(lba, 1).unwrap();
@@ -99,6 +102,7 @@ fn readonly_sees_data_after_gc() {
         let _ = std::fs::remove_file(path);
     }
 
+    drop(vol);
     let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     for lba in 0u64..4 {
         let actual = rv.read(lba, 1).unwrap();
@@ -125,6 +129,7 @@ fn readonly_returns_latest_flushed_value() {
     vol.write(0, &[0x22; 4096]).unwrap();
     vol.flush_wal().unwrap();
 
+    drop(vol);
     let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
     let actual = rv.read(0, 1).unwrap();
     assert_eq!(
