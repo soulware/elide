@@ -4822,3 +4822,73 @@ fn own_segments_commitment_matches_disk_scan_through_lifecycle() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// A delta-source reference minted between repack classification and
+/// apply must refuse the bucket that would drop the source. The source
+/// makes no LBA claim, so the resolvability gate cannot see it — only
+/// the stale-liveness refusal keeps the delta reconstructable.
+#[test]
+fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Pending segment P owns the source's body; the overwrite left in
+    // the WAL takes its claim away, so repack classifies it dead.
+    let source_data = vec![7u8; 4096];
+    let source_hash = blake3::hash(&source_data);
+    vol.write(0, &source_data).unwrap();
+    vol.flush_wal().unwrap();
+    let input_ulids: std::collections::HashSet<ulid::Ulid> =
+        pending_ulids(&base).into_iter().collect();
+    vol.write(0, &vec![8u8; 4096]).unwrap();
+
+    let job = vol.prepare_repack().unwrap().expect("repack job");
+    let result = crate::actor::execute_repack(job).unwrap();
+
+    // Between execute and apply, a promote lands a delta whose only
+    // source option is the input-owned hash.
+    let target_hash = blake3::hash(b"delta target content");
+    let claimant = vol.mint.next();
+    Arc::make_mut(&mut vol.extent_index).insert_delta(
+        target_hash,
+        extentindex::DeltaLocation {
+            segment_id: claimant,
+            entry_idx: 0,
+            body_source: extentindex::DeltaBodySource::Cached,
+            options: vec![segment::DeltaOption {
+                source_hash,
+                delta_offset: 0,
+                delta_length: 8,
+                delta_hash: blake3::hash(b"blob"),
+            }],
+        },
+    );
+    Arc::make_mut(&mut vol.lbamap).insert_delta(
+        50,
+        1,
+        target_hash,
+        claimant,
+        std::iter::once(source_hash).collect(),
+    );
+
+    let (stats, consumed_inputs) = vol.apply_repack_result(result).unwrap();
+
+    assert!(
+        stats.buckets_refused >= 1,
+        "the bucket dropping the delta source must be refused, stats: {stats:?}"
+    );
+    assert!(
+        vol.extent_index.lookup(&source_hash).is_some(),
+        "the delta's source must still resolve through the data index"
+    );
+    for path in &consumed_inputs {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let ulid = ulid::Ulid::from_string(name).unwrap();
+        assert!(
+            !input_ulids.contains(&ulid),
+            "the refused bucket's input {ulid} must not be consumed"
+        );
+    }
+
+    fs::remove_dir_all(base).unwrap();
+}

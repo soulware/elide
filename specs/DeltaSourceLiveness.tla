@@ -19,10 +19,13 @@
   else references: a DedupRef or a carried entry names live content, and
   a rewrite must carry live content forward, so those cannot dangle.
 
-  A GC plan removes the extents GC found dead. If one lands between a
-  promote's Prep and its Apply, the promote can commit a delta naming an
-  extent that is already gone — an unreadable extent, which for a block
-  device is corruption, not a cost.
+  A GC plan removes the extents GC found dead; a repack drops the
+  input-owned hashes it classified dead. Both are the same transition
+  here: a drop set computed against an observed snapshot, applied
+  later. If one lands between a promote's Prep and its Apply, the
+  promote can commit a delta naming an extent that is already gone —
+  an unreadable extent, which for a block device is corruption, not a
+  cost.
 
   Detecting this at Apply is not an option in the implementation: by then
   the pending segment is committed and the old WAL consumed, so there is
@@ -46,14 +49,16 @@
        frequency argument — dead sources accumulate and rank first — which
        is not a safety property and is not checkable here.
 
-    2. APPLY ORDERING (actor::apply_or_defer_gc_plan)
+    2. APPLY ORDERING (actor::apply_or_defer_gc_plan,
+       actor::apply_or_defer_repack)
        A finished plan-apply result is held until no promote is in
        flight. Closes the case where a source is referenced at Prep and
        its last claim disappears mid-promote.
        Modelled by: PlanApply requiring promote = "idle", PlanDefer
        otherwise.
 
-    3. STALE-LIVENESS CANCELLATION (volume::apply_plan_apply_result)
+    3. STALE-LIVENESS CANCELLATION (volume::apply_plan_apply_result,
+       the per-bucket refusal in volume::apply_repack_result)
        A plan is cancelled if it would drop a hash the volume now
        considers referenced. Closes the reverse order: the promote
        applies first, so the delta's source refcount makes the extent

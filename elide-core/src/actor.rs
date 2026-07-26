@@ -289,8 +289,13 @@ struct ParkedOps {
     /// have applied. See [`VolumeActor::apply_or_defer_gc_plan`].
     deferred_handoff: Option<Box<crate::volume::GcPlanApplyResult>>,
     /// Reply channel for an in-flight `Repack` request, parked while
-    /// the worker thread executes the repack.
+    /// the worker thread executes the repack. Stays occupied while a
+    /// finished result waits in `deferred_repack`, so concurrent
+    /// repack requests are still rejected.
     repack: Option<Sender<io::Result<CompactionStats>>>,
+    /// A finished repack result held back until in-flight promotes
+    /// have applied. See [`VolumeActor::apply_or_defer_repack`].
+    deferred_repack: Option<Box<RepackResult>>,
     /// Reply channel for an in-flight `SignSnapshotManifest` request,
     /// parked while the worker thread enumerates `index/`, signs, and
     /// writes the manifest + marker.  Concurrent requests are rejected
@@ -954,19 +959,15 @@ impl VolumeActor {
                     }
                 }
             }
-            WorkerResult::Repack(result) => {
-                let reply = self.parked.repack.take();
-                let outcome = match result {
-                    Ok(r) => self.apply_repack_and_publish(r),
-                    Err(e) => {
-                        warn!("worker repack failed: {e}");
-                        Err(e)
+            WorkerResult::Repack(result) => match result {
+                Ok(r) => self.apply_or_defer_repack(Box::new(r)),
+                Err(e) => {
+                    warn!("worker repack failed: {e}");
+                    if let Some(reply) = self.parked.repack.take() {
+                        let _ = reply.send(Err(e));
                     }
-                };
-                if let Some(reply) = reply {
-                    let _ = reply.send(outcome);
                 }
-            }
+            },
             WorkerResult::SignSnapshotManifest(result) => {
                 let reply = self.parked.sign_snapshot_manifest.take();
                 let outcome = match result {
@@ -1005,12 +1006,15 @@ impl VolumeActor {
             #[cfg(test)]
             WorkerResult::Barrier => {}
         }
-        // A promote applying above may have been the last one the deferred
-        // plan was waiting for.
-        if self.pipeline.promotes_in_flight == 0
-            && let Some(result) = self.parked.deferred_handoff.take()
-        {
-            self.apply_or_defer_gc_plan(result);
+        // A promote applying above may have been the last one a deferred
+        // plan or repack was waiting for.
+        if self.pipeline.promotes_in_flight == 0 {
+            if let Some(result) = self.parked.deferred_handoff.take() {
+                self.apply_or_defer_gc_plan(result);
+            }
+            if let Some(result) = self.parked.deferred_repack.take() {
+                self.apply_or_defer_repack(result);
+            }
         }
     }
 
@@ -1032,6 +1036,30 @@ impl VolumeActor {
     /// after this preps against post-apply state. Nothing starves: the
     /// worker has already finished the plan, and the wait is bounded by
     /// promotes that are running.
+    /// Apply a completed repack result, or hold it until every in-flight
+    /// promote has applied.
+    ///
+    /// Same window as [`Self::apply_or_defer_gc_plan`]: a promote can
+    /// commit a delta naming an input-owned hash as its source, and that
+    /// reference exists nowhere checkable until the promote applies — so
+    /// the stale-liveness refusal in `apply_repack_result` can only be
+    /// trusted once in-flight promotes have landed.
+    fn apply_or_defer_repack(&mut self, result: Box<RepackResult>) {
+        if self.pipeline.promotes_in_flight > 0 {
+            debug!(
+                "holding repack apply behind {} in-flight promote(s)",
+                self.pipeline.promotes_in_flight
+            );
+            self.parked.deferred_repack = Some(result);
+            return;
+        }
+        let reply = self.parked.repack.take();
+        let outcome = self.apply_repack_and_publish(*result);
+        if let Some(reply) = reply {
+            let _ = reply.send(outcome);
+        }
+    }
+
     fn apply_or_defer_gc_plan(&mut self, result: Box<crate::volume::GcPlanApplyResult>) {
         if self.pipeline.promotes_in_flight > 0 {
             debug!(
