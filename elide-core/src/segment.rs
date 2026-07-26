@@ -653,7 +653,7 @@ impl SegmentEntry {
     ///
     /// Used by the volume write path when the body bytes have just been
     /// appended to the WAL: the body source is recorded out-of-band
-    /// (`Volume::pending_body_offsets`) and the bytes are paired back in
+    /// (`PendingWrite::wal_body_offset`) and the bytes are paired back in
     /// as a [`PendingEntry`] at promote time. `stored_length` and `kind`
     /// are derived from the original payload length — the same way
     /// [`SegmentEntry::new_data`] would have classified the bytes.

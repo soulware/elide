@@ -2170,17 +2170,14 @@ pub(crate) fn execute_promote(
         return Err(fail(e, job));
     }
 
-    // Body bytes for entries written via `write_commit` live only in the
-    // WAL between commit and promote. Pair them with their WAL bytes via
-    // `body_offsets` for write_and_commit to consume.
-    let mut pendings = match crate::volume::materialise_pending_bodies(
-        &job.old_wal_path,
-        &job.entries,
-        &job.body_offsets,
-    ) {
-        Ok(p) => p,
-        Err(e) => return Err(fail(e, job)),
-    };
+    // Body bytes for entries written via `write_commit` live only in the WAL
+    // between commit and promote. Pair each pending write back with its bytes
+    // for write_and_commit to consume.
+    let mut pendings =
+        match crate::volume::materialise_pending_bodies(&job.old_wal_path, job.primary.writes()) {
+            Ok(p) => p,
+            Err(e) => return Err(fail(e, job)),
+        };
 
     // Delta tiers, in cascade order. Same-LBA first where the volume has a
     // sealed snapshot, then resemblance over what it left alone. Both are
@@ -2287,8 +2284,7 @@ pub(crate) fn execute_promote(
         Some(jpart) => {
             let j_pendings = match crate::volume::materialise_pending_bodies(
                 &job.old_wal_path,
-                &jpart.entries,
-                &jpart.body_offsets,
+                jpart.partition.writes(),
             ) {
                 Ok(p) => p,
                 Err(e) => return Err(fail(e, job)),
@@ -2310,7 +2306,7 @@ pub(crate) fn execute_promote(
                         segment_ulid: jpart.segment_ulid,
                         body_section_start: j_bss,
                         entries: j_entries,
-                        pre_promote_offsets: jpart.pre_promote_offsets.clone(),
+                        pre_promote_offsets: jpart.partition.pre_promote_offsets().to_vec(),
                     })
                 }
                 Err(e) => return Err(fail(e, job)),
@@ -2324,7 +2320,7 @@ pub(crate) fn execute_promote(
         old_wal_path: job.old_wal_path,
         body_section_start,
         entries,
-        pre_promote_offsets: job.pre_promote_offsets,
+        pre_promote_offsets: job.primary.into_pre_promote_offsets(),
         delta_region_body_length,
         journal,
     })

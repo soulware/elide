@@ -9,7 +9,7 @@
 //      segments, in ULID order (oldest first). Applying oldest-to-newest means
 //      each insert naturally overwrites earlier entries for the same LBA range.
 //   2. Volume::open() replays the in-progress WAL on top in a single pass
-//      that also rebuilds pending_entries (see src/volume.rs).
+//      that also rebuilds the pending writes (see src/volume.rs).
 //
 // Contrast with lab47/lsvd: the reference uses a red-black tree (TreeMap) with
 // a `compactPE` value encoding both logical and physical location. Palimpsest's

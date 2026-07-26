@@ -548,7 +548,7 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     // Step 4: GcSweep with an empty WAL.
     //
     // BUG C is created here: gc_checkpoint calls flush_wal(), which is a no-op
-    // because pending_entries is empty.  The active WAL ULID is therefore NOT
+    // because pending is empty.  The active WAL ULID is therefore NOT
     // advanced before minting the GC output ULIDs, so:
     //   WAL ULID < u_repack < u_sweep
     // After apply_done_handoffs moves the GC output into segments/, any segment
