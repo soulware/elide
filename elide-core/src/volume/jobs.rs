@@ -1,9 +1,5 @@
-//! Worker offload types — the data exchanged between the actor and
-//! worker threads. Each job is `Send` so the struct can cross a thread
-//! boundary; each result is consumed back on the actor.
-//!
-//! `impl Volume` for the prep/apply phases lives in `volume/mod.rs`
-//! because it touches private fields on `Volume`.
+//! Worker offload types — the jobs the actor hands to worker threads and the
+//! results it takes back. Every field is `Send`.
 
 use std::io;
 use std::path::PathBuf;
@@ -18,46 +14,33 @@ use super::{
 };
 
 /// Data needed by the worker thread to write a pending segment.
-///
-/// Produced by [`super::Volume::prepare_promote`] on the actor thread, consumed by
-/// the worker thread which calls [`segment::write_and_commit`].  All fields
-/// are `Send` so the struct can cross a thread boundary.
 pub struct PromoteJob {
     pub segment_ulid: Ulid,
     pub old_wal_ulid: Ulid,
     pub old_wal_path: PathBuf,
     pub entries: Vec<segment::SegmentEntry>,
-    /// CAS precondition tokens: the `body_offset` each Data/Inline entry
-    /// had in the extent index at prep time.  `None` for DedupRef/Zero/Delta.
+    /// CAS precondition tokens: the `body_offset` each Data/Inline entry had
+    /// in the extent index at prep time.
     pub pre_promote_offsets: Vec<Option<u64>>,
-    /// Where each body-bearing entry's bytes live in the WAL — `Some(off)`
-    /// for Data / Inline kinds, `None` otherwise. The worker reads from
-    /// the WAL via these offsets just before `write_and_commit`, so the
-    /// actor's `pending_entries` never carries body bytes between commit
-    /// and promote.
+    /// Where each Data/Inline entry's bytes live in the WAL. Bodies stay in
+    /// the WAL until the segment is written.
     pub body_offsets: Vec<Option<u64>>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
-    /// What the worker's delta tiers select sources from before writing
-    /// the segment.
     pub delta: PromoteDeltaSpec,
-    /// The epoch's journal-window share, written as its own segment.
-    /// `None` when the volume has no journal window or the epoch touched
-    /// no journal LBAs.
+    /// The epoch's journal-window share, present when the volume has a
+    /// journal window and the epoch touched journal LBAs.
     pub journal: Option<JournalPartition>,
 }
 
-/// The journal-window share of one promote: entries whose LBAs fall in
-/// the guest filesystem's jbd2 journal window form their own segment,
-/// so the whole segment dies together as the journal wraps and GC reaps
-/// it instead of folding live neighbours out. Same positionally
-/// parallel triple shape as the primary fields on [`PromoteJob`].
+/// The journal-window share of one promote: entries whose LBAs fall in the
+/// guest filesystem's jbd2 journal window form their own segment, so the whole
+/// segment dies together as the journal wraps.
 ///
-/// `segment_ulid` is always minted after the primary's, so the journal
-/// segment sorts above the data segment — load-bearing for rebuild:
-/// the ownership displacement rule keeps canonicals in the data
-/// segment, and a journal entry minted as a DedupRef then points at a
-/// lower ULID as required.
+/// `segment_ulid` is minted after the primary's, so the journal segment sorts
+/// above the data segment. Load-bearing for rebuild: the ownership
+/// displacement rule keeps canonicals in the data segment, and a journal entry
+/// minted as a DedupRef then points at a lower ULID as required.
 pub struct JournalPartition {
     pub segment_ulid: Ulid,
     pub entries: Vec<segment::SegmentEntry>,
@@ -65,46 +48,39 @@ pub struct JournalPartition {
     pub body_offsets: Vec<Option<u64>>,
 }
 
-/// What a promote's delta tiers need to find dictionaries.
-///
-/// Always present: the resemblance tier needs no snapshot, only the
-/// candidate map. `prior` carries the sealed snapshot the same-LBA tier
-/// sources from, for the volumes that have one.
+/// Where a promote's delta tiers find dictionaries.
 pub struct PromoteDeltaSpec {
-    /// Live extent-index snapshot for resolving source bodies by hash.
-    /// Any canonical serving a hash yields identical bytes, so the worker
-    /// needs no snapshot-pinned locations.
+    /// Live extent-index snapshot for resolving source bodies by hash. Any
+    /// canonical serving a hash yields identical bytes, so the live index
+    /// suffices.
     pub extent_index: Arc<extentindex::ExtentIndex>,
     /// Candidate map over the lineage's persisted sketches, for selecting
     /// sources by content resemblance.
     pub sketch_index: Arc<crate::sketch_index::SketchIndex>,
     /// Body-lookup roots: the fork directory first, then ancestor dirs.
     pub search_dirs: Vec<PathBuf>,
-    /// Which hashes were referenced when the job was prepared. The
-    /// resemblance tier declines an unreferenced source: deltaing against
-    /// one pins bytes GC was about to free and gets the GC plan that
-    /// omitted them refused on apply.
+    /// Which hashes were referenced at prep time. An unreferenced source is
+    /// declined: deltaing against one pins bytes GC was about to free and gets
+    /// the GC plan that omitted them refused on apply.
     pub referenced: crate::lbamap::ReferencedHashes,
+    /// The sealed snapshot the same-LBA tier sources from, present for the
+    /// volumes that have one. The resemblance tier needs only the candidate
+    /// map.
     pub prior: Option<PromoteDeltaPrior>,
 }
 
-/// The sealed snapshot the same-LBA delta tier sources dictionaries from.
 pub struct PromoteDeltaPrior {
     pub base_dir: PathBuf,
     pub snap_ulid: Ulid,
-    /// The volume's journal window: journal LBAs are excluded from the
-    /// source map, so journal content never seeds a dictionary.
+    /// The volume's journal window, whose LBAs are excluded from the source
+    /// map so dictionaries come from filesystem content alone.
     pub journal_ranges: crate::journal::JournalRanges,
 }
 
-/// A promote that failed on the worker, carrying the job back intact.
-///
-/// The old WAL file on disk remains the durable copy of the epoch, so the
-/// job can be re-dispatched as-is once the failure cause (e.g. ENOSPC)
-/// clears. The actor stashes it and retries on the next promote trigger;
-/// the synchronous path restores it into the volume via
-/// [`super::Volume`]'s failed-promote restore. Boxed so the error variant
-/// stays small.
+/// A promote that failed on the worker, carrying the job back intact. The old
+/// WAL file on disk remains the durable copy of the epoch, so the job can be
+/// re-dispatched as-is once the failure cause (e.g. ENOSPC) clears. Boxed so
+/// the error variant stays small.
 pub struct PromoteFailure {
     pub error: io::Error,
     pub job: Box<PromoteJob>,
@@ -120,8 +96,6 @@ impl std::fmt::Debug for PromoteFailure {
 }
 
 /// Result returned by the worker thread after writing the segment.
-///
-/// Consumed by [`super::Volume::apply_promote`] on the actor thread.
 pub struct PromoteResult {
     pub segment_ulid: Ulid,
     pub old_wal_ulid: Ulid,
@@ -129,18 +103,15 @@ pub struct PromoteResult {
     pub body_section_start: u64,
     pub entries: Vec<segment::SegmentEntry>,
     pub pre_promote_offsets: Vec<Option<u64>>,
-    /// Byte length of the body region holding Data entries; the delta
-    /// region (blobs for entries the worker converted to `Delta`) starts
-    /// at `body_section_start + delta_region_body_length`. Zero when no
-    /// entries were converted.
+    /// Byte length of the body region holding Data entries; the delta region
+    /// (blobs for entries the worker converted to `Delta`) starts at
+    /// `body_section_start + delta_region_body_length`.
     pub delta_region_body_length: u64,
-    /// The journal segment written alongside the primary, when the
-    /// epoch carried journal-window entries. The journal segment never
-    /// has a delta region.
     pub journal: Option<JournalSegmentResult>,
 }
 
-/// The journal segment's share of a [`PromoteResult`].
+/// The journal segment written alongside the primary. Its bodies are all
+/// stored whole.
 pub struct JournalSegmentResult {
     pub segment_ulid: Ulid,
     pub body_section_start: u64,
@@ -148,122 +119,82 @@ pub struct JournalSegmentResult {
     pub pre_promote_offsets: Vec<Option<u64>>,
 }
 
-/// The ULIDs needed for a GC checkpoint, minted atomically in order.
+/// The ULIDs a GC checkpoint needs, minted atomically in order from the
+/// volume's own monotonic mint: every `u_buckets[i] < u_flush`, so rebuild
+/// applies all GC outputs before the WAL segment flushed at `u_flush`.
 ///
-/// Ordering invariant: every `u_buckets[i] < u_flush`. All come from the
-/// volume's own monotonic mint (never from an external clock), and
-/// `UlidMint` guarantees strict monotonicity even within the same
-/// millisecond. Minting them all up front — before any I/O — is what makes
-/// the ordering self-documenting and crash-safe: the WAL segment flushed
-/// at `u_flush` is guaranteed > every bucket ULID, so rebuild applies all
-/// GC outputs before the flushed WAL segment.
-///
-/// `u_buckets` carries one ULID per potential output bucket the
-/// coordinator may emit this tick (capped by `max_buckets_per_tick`).
-/// Unused ULIDs are discarded by the coordinator — `UlidMint` is a
-/// `u128` counter, so over-reservation is free. The coordinator picks
-/// `bucket_ulids[i]` for the i-th packed bucket.
-///
-/// No `u_wal` is pre-minted for the *next* WAL. Any future `mint.next()`
-/// that opens a WAL is monotonically > `u_flush > all u_buckets` by
-/// construction, so the "new WAL above GC outputs" invariant holds
-/// without reservation. Deferring WAL open to first-write is what avoids
-/// per-tick WAL churn on idle volumes.
+/// `u_buckets` holds one ULID per output bucket the coordinator may emit this
+/// tick (capped by `max_buckets_per_tick`), and it picks `u_buckets[i]` for the
+/// i-th packed bucket. Unused ULIDs are discarded — `UlidMint` is a `u128`
+/// counter, so over-reservation is free.
 pub(super) struct GcCheckpointUlids {
     pub(super) u_buckets: Vec<Ulid>,
     pub(super) u_flush: Ulid,
 }
 
-/// Result of the GC checkpoint prep phase.
-///
-/// Carries the pre-minted ULIDs and an optional promote job.  The actor
-/// dispatches the job to the worker and stashes the reply.  When `job`
-/// is `None` the WAL was empty and the checkpoint completes immediately.
+/// Result of the GC checkpoint prep phase. `job` carries a promote when the
+/// WAL held entries; an empty WAL completes the checkpoint outright.
 pub struct GcCheckpointPrep {
     /// One pre-minted output ULID per potential bucket. Length equals
     /// `max_buckets_per_tick` from the request.
     pub u_buckets: Vec<Ulid>,
-    /// Segment ULID used for the promoted WAL.  Used to identify the
-    /// GC promote's `PromoteComplete` among other in-flight promotes.
+    /// Segment ULID used for the promoted WAL, and the key that identifies
+    /// this promote's `PromoteComplete` among other in-flight promotes.
     pub u_flush: Ulid,
     pub job: Option<PromoteJob>,
 }
 
-/// Data needed by the worker thread to materialise a coordinator-emitted
-/// GC plan (`gc/<ulid>.plan`).
-///
-/// Produced by [`super::Volume::prepare_plan_apply`] on the actor thread. The worker
-/// builds a `BodyResolver` from the owned fields, resolves bodies, assembles
-/// the output segment, signs it with the volume's key, and writes it to
-/// `gc/<ulid>.tmp`. It also collects the body-owning entries from each
-/// input's `.idx` so the actor's apply phase can derive extent-index updates
-/// against the **current** extent index (which may have diverged while the
-/// worker was running).
+/// Data needed by the worker thread to materialise a coordinator-emitted GC
+/// plan (`gc/<ulid>.plan`) into a signed `gc/<ulid>.tmp`.
 pub struct GcPlanApplyJob {
     pub plan_path: PathBuf,
     pub new_ulid: Ulid,
     pub gc_dir: PathBuf,
     pub index_dir: PathBuf,
     pub base_dir: PathBuf,
-    /// Cloned ancestor layers — the worker walks them via a local
-    /// `BodyResolver` impl for ancestor-aware body lookup.
     pub ancestor_layers: Vec<AncestorLayer>,
-    /// Demand-fetcher, if one is attached to the volume.
     pub fetcher: Option<BoxFetcher>,
-    /// Snapshot of the merged extent index at dispatch time. The worker uses
-    /// it to resolve DedupRef / Delta-base bodies. The actor's apply phase
-    /// uses a fresh snapshot of `self.extent_index` to compute updates so
-    /// concurrent writes don't get clobbered.
+    /// Merged extent index as of dispatch, for resolving DedupRef /
+    /// Delta-base bodies. Apply recomputes updates from a fresh snapshot, so
+    /// writes that land while the worker runs survive.
     pub extent_index: Arc<extentindex::ExtentIndex>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,
-    /// Pre-parsed plan. The actor validates parse + ULID match before
-    /// dispatch so the worker never sees a malformed plan.
+    /// Plan parsed and ULID-matched before dispatch.
     pub plan: rewrite_plan::RewritePlan,
 }
 
-/// Result returned by the worker after materialising a plan. The actor's
-/// apply phase uses it to derive extent-index updates, commit the rename,
-/// and clean up the plan file.
+/// Result returned by the worker after materialising a plan.
 pub struct GcPlanApplyResult {
     pub new_ulid: Ulid,
     pub plan_path: PathBuf,
     pub gc_dir: PathBuf,
-    /// `gc/<ulid>.tmp` — already written + signed. Apply phase renames it
-    /// to bare `gc/<ulid>`. `None` for cancelled materialisations.
+    /// `gc/<ulid>.tmp` — written and signed, awaiting the rename to bare
+    /// `gc/<ulid>`. Present when `outcome` is `Applied`.
     pub tmp_path: Option<PathBuf>,
     pub new_bss: u64,
     pub entries: Vec<segment::SegmentEntry>,
     pub inputs: Vec<Ulid>,
-    /// Body-owning entries from each input's `.idx` at dispatch time.
-    /// `(hash, kind, input_ulid)` — used by the apply phase to build the
-    /// to-remove + stale-cancel sets.
+    /// Body-owning entries from each input's `.idx` at dispatch time, as
+    /// `(hash, kind, input_ulid)` — the raw material for the to-remove and
+    /// stale-cancel sets.
     pub input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)>,
-    /// Inline bytes of the freshly written output segment, used to populate
-    /// `inline_data` on extent locations during apply.
+    /// Inline bytes of the freshly written output segment, for populating
+    /// `inline_data` on extent locations.
     pub handoff_inline: Vec<u8>,
     /// `Applied` when materialisation succeeded; `Cancelled` when the worker
-    /// decided to bail (missing input, unresolvable hash). Apply only does
-    /// cleanup for cancelled results.
+    /// bailed out on a missing input or unresolvable hash.
     pub outcome: StagedApply,
 }
 
-/// Data needed by the worker thread to promote a confirmed-in-S3 segment
-/// from `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into
-/// `cache/<ulid>.{body,present}` + `index/<ulid>.idx`.
-///
-/// Produced by [`super::Volume::prepare_promote_segment`] on the actor thread.
-/// The worker reads and verifies the segment index once, then writes idx
-/// and cache body (both operations idempotent on retry), and returns the
-/// parsed state the actor's apply phase needs for extent-index updates.
+/// Data needed by the worker thread to promote a confirmed-in-S3 segment from
+/// `pending/<ulid>` (drain path) or `gc/<ulid>` (GC path) into
+/// `cache/<ulid>.{body,present}` + `index/<ulid>.idx`. Both writes are
+/// idempotent on retry.
 pub struct PromoteSegmentJob {
     pub ulid: Ulid,
-    /// Full path of the source segment — `pending/<ulid>` if `is_drain`,
-    /// otherwise `gc/<ulid>`.
+    /// `pending/<ulid>` when `is_drain`, `gc/<ulid>` otherwise.
     pub src_path: PathBuf,
-    /// True when the source is in `pending/`, false when in `gc/`.
-    /// Selects the apply-phase branch (Local→Cached CAS + pending delete
-    /// vs input-idx cleanup).
     pub is_drain: bool,
     pub body_path: PathBuf,
     pub present_path: PathBuf,
@@ -273,51 +204,36 @@ pub struct PromoteSegmentJob {
 }
 
 /// Result returned by the worker after a `PromoteSegmentJob`.
-///
-/// Consumed by [`super::Volume::apply_promote_segment_result`] on the actor
-/// thread. Reuses the parsed segment index so the apply phase never
-/// re-reads the segment file.
 pub struct PromoteSegmentResult {
     pub ulid: Ulid,
     pub is_drain: bool,
-    /// Parsed segment index, shared with the segment-index cache. Carries
-    /// the entries, consumed input ULIDs (empty on drain), and
+    /// Parsed segment index, shared with the segment-index cache. Carries the
+    /// entries, consumed input ULIDs (empty on drain), and
     /// `body_section_start`.
     pub parsed: Arc<segment_cache::ParsedIndex>,
-    /// Inline section bytes. Populated only when the drain path has
-    /// Inline entries; empty otherwise.
+    /// Inline section bytes, populated when the drain path has Inline entries.
     pub inline: Vec<u8>,
-    /// True when the worker took the GC tombstone shortcut (zero-entry
-    /// output with a non-empty inputs list). Apply phase deletes the
-    /// input idx files and stops — no idx/body was written.
+    /// True when the worker took the GC tombstone shortcut — a zero-entry
+    /// output with a non-empty inputs list, leaving the input idx files to
+    /// delete.
     pub tombstone: bool,
 }
 
-/// Prep-phase outcome for `promote_segment`.
-///
-/// `AlreadyPromoted` short-circuits the apply phase: both `pending/<ulid>`
-/// and `gc/<ulid>` are absent but `cache/<ulid>.body` exists, meaning an
-/// earlier call already completed. `Job` carries the work for the worker
-/// thread to execute — boxed because `PromoteSegmentJob` is large compared
-/// to the unit `AlreadyPromoted` variant.
+/// Prep-phase outcome for `promote_segment`. `AlreadyPromoted` reports that an
+/// earlier call completed: `cache/<ulid>.body` exists and both source paths
+/// have been consumed. `Job` is boxed to keep the enum small.
 pub enum PromoteSegmentPrep {
     Job(Box<PromoteSegmentJob>),
     AlreadyPromoted,
 }
 
-/// Inputs for signing and writing a `snapshots/<snap_ulid>.manifest`
-/// file plus its `snapshots/<snap_ulid>` marker.
+/// Inputs for signing and writing a `snapshots/<snap_ulid>.manifest` file plus
+/// its `snapshots/<snap_ulid>` marker. The worker enumerates `index/` itself,
+/// keeping that `read_dir` off the actor.
 ///
-/// Produced by [`super::Volume::prepare_sign_snapshot_manifest`] on the actor
-/// thread. The worker enumerates `index/` itself — keeping the
-/// `read_dir` off the actor is the whole point of the offload.
-///
-/// `extent_index` and `lbamap` are snapshot `Arc`s used to filter fully-dead
-/// segments out of the manifest at sign time. A segment is omitted if every
-/// entry in its `.idx` is dead under the liveness predicate (no body still
-/// canonical in `extent_index`, no LBA still mapped to a thin entry's hash).
-/// Reclamation of those segment files remains GC's responsibility — the
-/// filter is a manifest-only optimisation.
+/// `extent_index` and `lbamap` are the snapshots the liveness filter runs
+/// against, so the manifest lists the segments holding at least one live entry.
+/// Reclaiming the segment files themselves stays GC's job.
 pub struct SignSnapshotManifestJob {
     pub snap_ulid: Ulid,
     pub base_dir: PathBuf,
@@ -327,14 +243,11 @@ pub struct SignSnapshotManifestJob {
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub segment_cache: Arc<segment_cache::SegmentIndexCache>,
     /// Which on-disk filename to write the signed manifest under —
-    /// `<ulid>.manifest` for `User`, `<ulid>-stop.manifest` for `Auto`.
-    /// The signed payload is identical for both.
+    /// `<ulid>.manifest` for `User`, `<ulid>-stop.manifest` for `Auto`. The
+    /// signed payload is identical for both.
     pub kind: crate::signing::SnapshotKind,
 }
 
-/// Result of a [`SignSnapshotManifestJob`]. Consumed by
-/// [`super::Volume::apply_sign_snapshot_manifest_result`] on the actor thread
-/// to flip the `has_new_segments` flag.
 pub struct SignSnapshotManifestResult {
     pub snap_ulid: Ulid,
 }
@@ -348,18 +261,14 @@ pub enum WorkerJob {
     SignSnapshotManifest(SignSnapshotManifestJob),
     Reclaim(ReclaimJob),
     /// Test seam: the worker blocks on the receiver, then returns
-    /// [`WorkerResult::Barrier`]. Lets tests hold the worker at a known
-    /// point to build full-queue states deterministically.
+    /// [`WorkerResult::Barrier`]. Lets tests hold the worker at a known point
+    /// to build full-queue states deterministically.
     #[cfg(test)]
     Barrier(crossbeam_channel::Receiver<()>),
 }
 
-/// Result returned by the worker thread to the actor.
-///
-/// Each variant wraps its own `io::Result` so the actor can distinguish
-/// which job type failed.  `PromoteSegment` carries the target ULID
-/// out-of-band so the actor can match a failed job to its parked reply
-/// (the `Err` path otherwise has no ULID to match on).
+/// Result returned by the worker thread to the actor. `PromoteSegment` carries
+/// the target ULID out-of-band, so a failed job still matches its parked reply.
 pub enum WorkerResult {
     Promote(Result<PromoteResult, PromoteFailure>),
     GcPlan(io::Result<GcPlanApplyResult>),
@@ -370,7 +279,7 @@ pub enum WorkerResult {
     Repack(io::Result<RepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),
-    /// Test seam: completion of a [`WorkerJob::Barrier`]. No-op on apply.
+    /// Test seam: completion of a [`WorkerJob::Barrier`].
     #[cfg(test)]
     Barrier,
 }
