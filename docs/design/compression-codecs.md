@@ -91,6 +91,8 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 
 **Raising the level to 19.** 11% for twenty times the CPU, on hosts that are already CPU- and memory-constrained.
 
+**A per-fd verified bitset as a stopgap.** Verify an extent once per open segment fd, then serve raw sub-ranges with plain preads — sound on immutable files, since inode-replacement events already clear the fd cache. It removes only the repeat hashing on raw extents; the decompression on compressed extents, the dominant shape, stays, and chunked frames remove both.
+
 ## Format
 
 `SegmentEntry.compressed` becomes a codec tag rather than a boolean, and `maybe_compress` becomes per-artefact rather than one shared function. `WalFlags::COMPRESSED` keeps its meaning, since the WAL keeps lz4. Existing volumes are not readable across this change.
@@ -109,12 +111,18 @@ Two ways to hold reads near raw-disk speed, cheapest first.
 
 Beyond that, a local lz4 sidecar per segment, built from the zstd `.body` on first read, in the shape `.dmat` already has. It leaves `.body` byte-identical to the object, so demand-fetch is untouched. Three things it has to answer that `.dmat` does not. `.dmat` is append-only with no eviction, which is affordable only because delta entries are a fraction of a percent of a volume; across all entries the sidecar is a second complete copy and needs reclamation, and eviction is what makes its truncate-at-first-bad-record recovery argument stop holding. Local footprint rises to about 21% of plaintext against 14.8% today, since both copies are kept. And lz4 is roughly 2.4 times the size of zstd for the same content, so the sidecar reads more bytes to spend less CPU — a win while those bytes are in page cache and a loss when they are not.
 
-Whole-extent materialisation pulls against the same aim from the other side. An extent is one guest write — there is no coalescing, and `src/ublk.rs`'s `IO_BUF_BYTES` caps a single request at 1 MiB — and that extent is the unit of compression and of the content hash alike, so a 4 KiB read decompresses and hashes up to a megabyte.
+Whole-extent materialisation pulls against the same aim from the other side. An extent is one guest write — there is no coalescing, and `src/ublk.rs`'s `IO_BUF_BYTES` caps a single request at 1 MiB — or one imported file fragment, which no request cap bounds. The extent is the unit of compression and of the content hash alike, and the read path verifies content on every serve (#800), raw extents included, so a 4 KiB read reads, decompresses and hashes up to the whole extent.
 
 The lever is compression granularity rather than hash granularity. Per-chunk hashes on their own remove the hashing pass and leave the rest, because a frame covering the whole extent is not randomly decodable: block 5 is unreachable without decompressing 0 through 4. Compressing in independently decodable chunks of fixed plaintext length bounds both, paying for it in a per-chunk table (compressed length and hash, offsets being a prefix sum) and in the cross-chunk matches the compressor no longer sees. The extent content hash is untouched — it covers plaintext and says nothing about layout — so dedup, the LBA map, sketches and delta source resolution all stand as they are.
 
 Chunk size is the knob. At 4 KiB the hashes alone run to ~7.8 MiB against the corpus's 61.5 MiB of body, 13% on the bytes this whole change exists to reduce; at 64 KiB they run to ~0.5 MiB, 0.8%, for a sixteenfold cut in decompression per read. The table belongs in the body section rather than the index, since `.idx` is fetched eagerly for every ancestor at open and a volume that never reads a body should not carry its hashes.
 
-`IO_BUF_BYTES` reaches the same variable with no format change, since it is what bounds an extent. Lowering it shrinks extents directly, at the cost of more I/Os per large sequential write and more entries in the eagerly-fetched `.idx`. It is the cheap way to find out whether read amplification is worth a format change before making one.
+The chunk table sits outside the signed region, so its hashes need an anchor. Either the signed `.idx` entry carries one hash of the table — 32 bytes per entry, against the eager-fetch concern above — or chunk boundaries align to BLAKE3's own tree so the chunk hashes are subtree values, verifiable against the extent content hash itself (the construction bao encodes). The table anchor is the simpler build; the subtree alignment adds no index bytes and no second trust root, and constrains the chunk size to a power-of-two number of BLAKE3's 1 KiB leaves.
+
+The lost cross-chunk matches are bounded by codec reach. lz4 matches within a 64 KiB window, so chunks at or above that size cost it nothing, and the dictionary table above shows zstd gaining little from history beyond ~128 KiB, because inputs that size supply their own. At 128 KiB the chunk table falls to ~0.4% of body bytes and a 4 KiB read decompresses at most 128 KiB.
+
+Chunked frames are a second body-format break beside the codec tag (§ Format). Existing volumes are already unreadable across the codec change, so both belong in one format revision — one break, not two.
+
+`IO_BUF_BYTES` reaches the same variable with no format change, since it is what bounds an extent. Lowering it shrinks extents directly, at the cost of more I/Os per large sequential write and more entries in the eagerly-fetched `.idx`. It is the cheap way to find out whether read amplification is worth a format change before making one — but it reaches only guest-write extents. Import fragments are unbounded by it, and boot-image volumes are where the largest raw extents are likeliest.
 
 Delta compression and a stronger body codec are substitutes at the margin. The first keep bar is "beat the stored body", which becomes a smaller number under zstd, so conversions drop. Delta's measured value needs re-baselining against zstd bodies rather than lz4 ones.
