@@ -7,8 +7,8 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    VolumeFetchInputs, coordinator_client, delta_sim, extents, inspect, inspect_files, parse_size,
-    resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
+    VolumeFetchInputs, coordinator_client, corpus_sim, delta_sim, extents, inspect, inspect_files,
+    parse_size, resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -54,6 +54,16 @@ enum Command {
         image2: Option<String>,
         #[arg(long, default_value_t = 3)]
         level: i32,
+    },
+
+    /// Measure dictionary and retention strategies over a captured volume corpus
+    #[command(hide = true)]
+    CorpusSim {
+        /// Volume directory holding index/*.idx and cache/*.body
+        dir: String,
+        /// Stop loading after this much entry plaintext
+        #[arg(long, default_value_t = 4096)]
+        max_mib: u64,
     },
 
     /// Measure delta source selection between two states of a live-written ext4 image
@@ -1009,6 +1019,17 @@ fn main() {
         } => {
             extents::run(Path::new(&image1), image2.as_deref().map(Path::new), level)
                 .expect("extents failed");
+        }
+
+        Command::CorpusSim { dir, max_mib } => {
+            corpus_sim::run(
+                Path::new(&dir),
+                corpus_sim::Options {
+                    max_mib,
+                    ..Default::default()
+                },
+            )
+            .expect("corpus-sim failed");
         }
 
         Command::DeltaSim {

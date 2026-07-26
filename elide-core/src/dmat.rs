@@ -242,9 +242,9 @@ impl Dmat {
     /// Append a materialised entry to the file.
     ///
     /// `materialised` is the canonical (uncompressed) extent bytes — the same
-    /// bytes whose BLAKE3 hash equals `segment.entry[entry_idx].hash`. The
-    /// shared entropy gate (`volume::maybe_compress`) decides whether to store
-    /// lz4-compressed or raw.
+    /// bytes whose BLAKE3 hash equals `segment.entry[entry_idx].hash`. They are
+    /// stored lz4-compressed when `volume::maybe_compress` finds lz4 reaches
+    /// its minimum ratio, raw otherwise.
     ///
     /// Returns the location of the newly-written record. The caller is free to
     /// read back via `read_materialised`, but typically already holds the
