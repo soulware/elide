@@ -290,11 +290,11 @@ impl BlockReader {
     /// Cache `body` as the materialised extent for `hash` and return the
     /// 4 KiB block at `block_offset`.
     ///
-    /// Every path that materialises extent plaintext for the guest funnels
-    /// through here, so the content check is the one place deciding whether
-    /// bytes reach the block device. A location that resolves to the wrong
-    /// bytes is otherwise indistinguishable from a correct read: lz4 rejects
-    /// some of them, raw-stored extents produce no error at all.
+    /// Every path this reader materialises extent plaintext through funnels
+    /// here, so the content check decides whether bytes leave the reader.
+    /// A location that resolves to the wrong bytes is otherwise
+    /// indistinguishable from a correct read: lz4 rejects some of them,
+    /// raw-stored extents produce no error at all.
     fn remember_and_slice(
         &self,
         hash: blake3::Hash,
