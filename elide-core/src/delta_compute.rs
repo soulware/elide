@@ -339,13 +339,8 @@ fn match_filemaps_into(
             let Some(loc) = source_index.lookup(&source_frag.hash) else {
                 continue;
             };
-            let Ok(source_body) = read_source_extent(source_dir, loc) else {
+            let Ok(source_plain) = read_source_extent(source_dir, loc, &source_frag.hash) else {
                 continue;
-            };
-            let source_plain = if loc.compressed {
-                decompress_lz4(&source_body)?
-            } else {
-                source_body
             };
 
             out.insert(
@@ -498,7 +493,7 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
     Ok(buf)
 }
 
-/// Read the stored (possibly lz4-compressed) bytes for a source extent.
+/// Read the full plaintext for a source extent, verified against `hash`.
 ///
 /// Inline entries are served directly from `loc.inline_data`, which the
 /// extent-index rebuild already populates from the source segment's
@@ -509,23 +504,62 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
 /// pending → bare gc/<id> → cache/.body) and pick the seek arithmetic
 /// from the returned layout: body-only files seek at `body_offset`
 /// alone, full segment files seek at `body_section_start + body_offset`.
-fn read_source_extent(source_dir: &Path, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
-    if let Some(inline) = loc.inline_data.as_deref() {
-        return Ok(inline.to_vec());
-    }
+///
+/// Errors when the plaintext fails its content hash: a wrong local read
+/// used as a dictionary would form a delta that can never reconstruct,
+/// while the caller skipping this candidate loses nothing but a delta.
+fn read_source_extent(
+    source_dir: &Path,
+    loc: &ExtentLocation,
+    hash: &blake3::Hash,
+) -> io::Result<Vec<u8>> {
+    let stored = if let Some(inline) = loc.inline_data.as_deref() {
+        inline.to_vec()
+    } else {
+        let (path, layout) =
+            segment::locate_segment_body(source_dir, loc.segment_id).ok_or_else(|| {
+                io::Error::other(format!(
+                    "source extent segment {} not found under {}",
+                    loc.segment_id,
+                    source_dir.display()
+                ))
+            })?;
+        let f = fs::File::open(&path)?;
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact_at(&mut buf, layout.body_seek(loc))?;
+        buf
+    };
+    let plain = if loc.compressed {
+        decompress_lz4(&stored)?
+    } else {
+        stored
+    };
+    verify_source_plaintext(&plain, hash, loc.segment_id)?;
+    Ok(plain)
+}
 
-    let (path, layout) =
-        segment::locate_segment_body(source_dir, loc.segment_id).ok_or_else(|| {
-            io::Error::other(format!(
-                "source extent segment {} not found under {}",
-                loc.segment_id,
-                source_dir.display()
-            ))
-        })?;
-    let f = fs::File::open(&path)?;
-    let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact_at(&mut buf, layout.body_seek(loc))?;
-    Ok(buf)
+/// Refuse source plaintext that fails its content hash.
+fn verify_source_plaintext(
+    plain: &[u8],
+    expected: &blake3::Hash,
+    segment_id: Ulid,
+) -> io::Result<()> {
+    let got = blake3::hash(plain);
+    if got == *expected {
+        return Ok(());
+    }
+    log::error!(
+        "delta source failed its content check: segment={segment_id} expected={} got={} ({} bytes)",
+        expected.to_hex(),
+        got.to_hex(),
+        plain.len(),
+    );
+    Err(io::Error::other(format!(
+        "source extent hashed {} instead of {} ({} bytes)",
+        got.to_hex(),
+        expected.to_hex(),
+        plain.len()
+    )))
 }
 
 fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
@@ -544,40 +578,45 @@ pub struct SegmentDeltaStats {
 /// as a delta dictionary. `None` when the hash has no DATA-map location
 /// (a delta-backed hash never serves as a source — no delta-of-delta
 /// chains), when a cached body's presence bit is unset (reading a sparse
-/// hole would silently dictionary against zeros), or when the bytes
-/// cannot be read — the delta tier is best-effort and never fetches.
+/// hole would silently dictionary against zeros), when the plaintext
+/// fails its content hash (a delta formed against wrong bytes can never
+/// reconstruct), or when the bytes cannot be read — the delta tier is
+/// best-effort and never fetches.
 fn read_source_plaintext(
     extent_index: &ExtentIndex,
     search_dirs: &[PathBuf],
     hash: &blake3::Hash,
 ) -> Option<Vec<u8>> {
     let loc = extent_index.lookup(hash)?;
-    if let Some(ref idata) = loc.inline_data {
-        return if loc.compressed {
-            decompress_lz4(idata).ok()
+    let plain = if let Some(ref idata) = loc.inline_data {
+        if loc.compressed {
+            decompress_lz4(idata).ok()?
         } else {
-            Some(idata.to_vec())
-        };
-    }
-    if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
-        let present = extent_index
-            .segment_presence(loc.segment_id)
-            .is_some_and(|p| p.test(entry_idx));
-        if !present {
-            return None;
+            idata.to_vec()
         }
-    }
-    let (path, layout) = search_dirs
-        .iter()
-        .find_map(|d| segment::locate_segment_body(d, loc.segment_id))?;
-    let f = fs::File::open(&path).ok()?;
-    let mut buf = vec![0u8; loc.body_length as usize];
-    f.read_exact_at(&mut buf, layout.body_seek(loc)).ok()?;
-    if loc.compressed {
-        decompress_lz4(&buf).ok()
     } else {
-        Some(buf)
-    }
+        if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
+            let present = extent_index
+                .segment_presence(loc.segment_id)
+                .is_some_and(|p| p.test(entry_idx));
+            if !present {
+                return None;
+            }
+        }
+        let (path, layout) = search_dirs
+            .iter()
+            .find_map(|d| segment::locate_segment_body(d, loc.segment_id))?;
+        let f = fs::File::open(&path).ok()?;
+        let mut buf = vec![0u8; loc.body_length as usize];
+        f.read_exact_at(&mut buf, layout.body_seek(loc)).ok()?;
+        if loc.compressed {
+            decompress_lz4(&buf).ok()?
+        } else {
+            buf
+        }
+    };
+    verify_source_plaintext(&plain, hash, loc.segment_id).ok()?;
+    Some(plain)
 }
 
 /// How far down the ranked candidates to look for a source whose body is
@@ -952,5 +991,75 @@ mod source_cache_tests {
 
         assert_eq!(cache.bytes, 300);
         assert_eq!(cache.entries.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod source_verify_tests {
+    use super::*;
+    use crate::extentindex::BodySource;
+
+    fn local_loc(segment_id: Ulid, body_length: u32) -> ExtentLocation {
+        ExtentLocation {
+            segment_id,
+            body_offset: 0,
+            body_length,
+            compressed: false,
+            body_source: BodySource::Local,
+            body_section_start: 0,
+            inline_data: None,
+        }
+    }
+
+    /// Lay `bytes` down as `pending/<seg>` so `locate_segment_body`
+    /// resolves it as a full-layout file with the body at offset 0.
+    fn dir_with_body(seg: Ulid, bytes: &[u8]) -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("pending")).expect("mkdir");
+        fs::write(tmp.path().join("pending").join(seg.to_string()), bytes).expect("write");
+        tmp
+    }
+
+    #[test]
+    fn a_source_whose_bytes_match_the_hash_is_served() {
+        let seg = Ulid::new();
+        let bytes = vec![0xABu8; 4096];
+        let tmp = dir_with_body(seg, &bytes);
+
+        let hash = blake3::hash(&bytes);
+        let mut index = ExtentIndex::new();
+        index.insert(hash, local_loc(seg, 4096));
+
+        let plain = read_source_plaintext(&index, &[tmp.path().to_owned()], &hash)
+            .expect("a correct source must be served");
+        assert_eq!(plain, bytes);
+    }
+
+    #[test]
+    fn a_source_whose_bytes_fail_the_content_check_is_skipped() {
+        let seg = Ulid::new();
+        let tmp = dir_with_body(seg, &vec![0xABu8; 4096]);
+
+        // The index claims a hash the stored bytes do not have — a wrong
+        // read must not become a dictionary.
+        let claimed = blake3::hash(b"content the file does not hold");
+        let mut index = ExtentIndex::new();
+        index.insert(claimed, local_loc(seg, 4096));
+
+        assert!(read_source_plaintext(&index, &[tmp.path().to_owned()], &claimed).is_none());
+    }
+
+    #[test]
+    fn read_source_extent_refuses_bytes_that_fail_the_content_check() {
+        let seg = Ulid::new();
+        let tmp = dir_with_body(seg, &vec![0xABu8; 4096]);
+
+        let claimed = blake3::hash(b"content the file does not hold");
+        let err = read_source_extent(tmp.path(), &local_loc(seg, 4096), &claimed)
+            .expect_err("a wrong source read must error, not become a dictionary");
+        assert!(
+            err.to_string().contains("hashed"),
+            "error should report the hash mismatch, got: {err}"
+        );
     }
 }
