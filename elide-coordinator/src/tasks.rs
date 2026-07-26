@@ -92,8 +92,13 @@ fn evict_one_body(fork_dir: &Path, ulid_str: &str) -> io::Result<usize> {
 /// `.body` and `.delta` are slices of the uploaded segment object and are
 /// demand-fetched on miss; `.dmat` and `.present` are derived locally and
 /// rebuild from those.
+///
+/// `.present` goes first: a set present bit implies durable body bytes,
+/// so dying mid-eviction must leave a body without bits — re-fetched
+/// harmlessly — never bits without a body, which reads as a permanently
+/// missing file under a fast-exiting fetch.
 fn evict_cache_files(cache_dir: &Path, ulid_str: &str) {
-    for suffix in [".body", ".delta", ".present", ".dmat"] {
+    for suffix in [".present", ".dmat", ".body", ".delta"] {
         let _ = std::fs::remove_file(cache_dir.join(format!("{ulid_str}{suffix}")));
     }
 }

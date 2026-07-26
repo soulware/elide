@@ -800,9 +800,11 @@ impl HandoffCursor<'_> {
             if let Ok(tmp) = elide_core::segment::tmp_sibling(&body) {
                 let _ = fs::remove_file(tmp);
             }
-            let _ = fs::remove_file(body);
+            // `.present` before `.body`: dying between the unlinks must
+            // leave a body without bits, never bits without a body.
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.present")));
             let _ = fs::remove_file(self.cache_dir.join(format!("{old_ulid_str}.dmat")));
+            let _ = fs::remove_file(body);
         }
 
         // Finalize: volume deletes bare `gc/<new>` inside the actor, under
