@@ -1,6 +1,8 @@
-//! Read-only volume view: rebuilds LBA map and extent index without
-//! claiming the WAL lock or replaying any in-flight writes. Used by the
-//! `--readonly` serve path.
+//! Read-only volume view: rebuilds LBA map and extent index with no WAL
+//! replay. Read-only describes the guest-facing surface — serving reads
+//! still warms `cache/` (dmat writeback and its truncating open-scan),
+//! so the view holds the fork's exclusive volume lock like any other
+//! serving process.
 //!
 //! Ancestor-chain helpers used by both readonly and writable opens live
 //! in `volume/ancestry.rs`; the shared open-time rebuild lives in
@@ -25,8 +27,14 @@ use super::{
 };
 
 /// Read-only view of a volume: rebuilds LBA map and extent index from
-/// segments + ancestor chain, no WAL replay, no exclusive lock.
+/// segments + ancestor chain, no WAL replay.
 pub struct ReadonlyVolume {
+    /// Exclusive lock on `base_dir/volume.lock`, held for the lifetime
+    /// of the view: reads mutate `cache/` (dmat writeback), so a fork
+    /// admits one serving process at a time. The `Flock` releases the
+    /// lock when dropped.
+    #[allow(dead_code)]
+    lock_file: nix::fcntl::Flock<std::fs::File>,
     base_dir: PathBuf,
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: Arc<lbamap::LbaMap>,
@@ -40,15 +48,18 @@ pub struct ReadonlyVolume {
 impl ReadonlyVolume {
     /// Open a volume directory for read-only access.
     ///
-    /// Does not create `wal/`, does not acquire an exclusive lock, and does not
-    /// replay the WAL. WAL records from an active writer on the same volume will
-    /// not be visible. Intended for the `--readonly` serve path.
+    /// Takes the fork's exclusive volume lock, does not create `wal/`,
+    /// and does not replay the WAL — records left by the last writer
+    /// session are not visible. Intended for the `--readonly` serve
+    /// path.
     pub fn open(fork_dir: &Path, by_id_dir: &Path) -> io::Result<Self> {
+        let lock_file = super::acquire_lock(fork_dir)?;
         // A readonly open forms no segments, so the candidate map the walk
         // harvests has no consumer here.
         let (ancestor_layers, lbamap, extent_index, _sketch_index) =
             super::open_state::open_read_state(fork_dir, by_id_dir)?;
         Ok(Self {
+            lock_file,
             base_dir: fork_dir.to_owned(),
             ancestor_layers,
             lbamap: Arc::new(lbamap),
@@ -208,7 +219,6 @@ mod tests {
             vol.snapshot().unwrap();
         }
         fork_volume(&child_dir, &default_dir).unwrap();
-        // ReadonlyVolume doesn't take a write lock, so this always works.
 
         let rv = ReadonlyVolume::open(&child_dir, &by_id).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), ancestor_data);
