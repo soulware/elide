@@ -76,25 +76,25 @@ fn make_entry(
     lba_length: u32,
     body: Cow<'_, [u8]>,
     parent_extent_index: Option<&ExtentIndex>,
-) -> EmittedEntry {
+) -> io::Result<EmittedEntry> {
     let parent_hit = parent_extent_index.and_then(|p| p.lookup(&hash));
     if parent_hit.is_some() {
-        return EmittedEntry {
+        return Ok(EmittedEntry {
             entry: PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
                 hash, start_lba, lba_length,
             )),
             raw_bytes: 0,
-        };
+        });
     }
     let raw_bytes = body.len();
-    let (flags, data) = match crate::volume::maybe_compress(&body) {
-        Some(compressed) => (Codec::Lz4, compressed),
+    let (codec, data) = match crate::volume::compress_body(&body, false)? {
+        Some(pair) => pair,
         None => (Codec::None, body.into_owned()),
     };
-    EmittedEntry {
-        entry: SegmentEntry::new_data(hash, start_lba, lba_length, flags, data),
+    Ok(EmittedEntry {
+        entry: SegmentEntry::new_data(hash, start_lba, lba_length, codec, data),
         raw_bytes,
-    }
+    })
 }
 
 /// Import an ext4 disk image into a new readonly Elide volume at `vol_dir`.
@@ -196,7 +196,7 @@ pub fn import_image(
                 lba_len,
                 Cow::Owned(f.body),
                 parent_extent_index,
-            );
+            )?;
             entries.push(emitted.entry);
             batch_raw_bytes += emitted.raw_bytes;
             filemap_rows.push(FilemapRow {
@@ -223,7 +223,7 @@ pub fn import_image(
 
             if block != ZERO_BLOCK {
                 let hash = blake3::hash(&block);
-                let emitted = make_entry(hash, lba, 1, Cow::Borrowed(&block), parent_extent_index);
+                let emitted = make_entry(hash, lba, 1, Cow::Borrowed(&block), parent_extent_index)?;
                 entries.push(emitted.entry);
                 batch_raw_bytes += emitted.raw_bytes;
             }
