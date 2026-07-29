@@ -386,9 +386,15 @@ fn multichunk_plaintext(blocks: usize) -> Vec<u8> {
     v
 }
 
+/// Blocks in a test extent: over three chunks, with a partial one at the end,
+/// whatever `CHUNK_BYTES` is.
+fn test_blocks() -> usize {
+    CHUNK_BYTES / 4096 * 3 + 7
+}
+
 #[test]
 fn the_live_path_serves_a_whole_chunked_extent() {
-    let blocks = 100; // ~410 KiB, four chunks
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     assert!(bytes.len() > 3 * CHUNK_BYTES);
     let hash = blake3::hash(&bytes);
@@ -410,7 +416,7 @@ fn the_live_path_serves_a_whole_chunked_extent() {
 /// either side of each chunk boundary.
 #[test]
 fn the_live_path_serves_every_block_of_a_chunked_extent() {
-    let blocks = 100;
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     let hash = blake3::hash(&bytes);
     let stored = chunked_form(&bytes);
@@ -434,7 +440,7 @@ fn the_live_path_serves_every_block_of_a_chunked_extent() {
 /// to line up in the caller's buffer.
 #[test]
 fn the_live_path_serves_a_range_straddling_a_chunk_boundary() {
-    let blocks = 100;
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     let hash = blake3::hash(&bytes);
     let stored = chunked_form(&bytes);
@@ -467,7 +473,7 @@ fn the_live_path_serves_a_range_straddling_a_chunk_boundary() {
 
 #[test]
 fn the_live_path_refuses_a_chunked_extent_that_hashes_wrong() {
-    let blocks = 100;
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
@@ -493,7 +499,7 @@ fn the_live_path_refuses_a_chunked_extent_that_hashes_wrong() {
 /// corrupt chunk is refused. That is the granularity of the check.
 #[test]
 fn a_chunked_read_verifies_the_chunks_it_serves() {
-    let blocks = 100;
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     let hash = blake3::hash(&bytes);
 
@@ -522,7 +528,7 @@ fn a_chunked_read_verifies_the_chunks_it_serves() {
 /// decode still has to be covered — every one of them feeds the root.
 #[test]
 fn a_chunked_read_refuses_a_tampered_chunk_table() {
-    let blocks = 100;
+    let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
     let hash = blake3::hash(&bytes);
 

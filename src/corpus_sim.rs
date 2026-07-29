@@ -24,7 +24,11 @@ use elide_core::sketch::MIN_SKETCH_BYTES;
 const ZSTD_LEVEL: i32 = 3;
 
 /// The level `volume::compress_body` takes for segment bodies.
-const BODY_LEVEL: i32 = 9;
+const BODY_LEVEL: i32 = 3;
+
+/// A level above [`BODY_LEVEL`], reported so the study prices what raising it
+/// would buy rather than only what the current one achieves.
+const HIGH_LEVEL: i32 = 9;
 
 /// Sample bytes to train on per byte of dictionary produced. Below roughly
 /// this ratio zstd's trainer warns and the dictionary overfits its samples.
@@ -59,32 +63,81 @@ impl Default for Options {
 }
 
 fn load(dir: &Path, max_bytes: u64) -> io::Result<Vec<Version>> {
+    // A promoted volume splits each segment into `index/<id>.idx` and
+    // `cache/<id>.body`; a freshly imported one holds whole segments in
+    // `pending/` with the body section at an offset inside the same file.
     let index_dir = dir.join("index");
     let cache_dir = dir.join("cache");
+    let pending_dir = dir.join("pending");
 
-    let mut ulids: Vec<ulid::Ulid> = Vec::new();
-    for entry in fs::read_dir(&index_dir)? {
-        let name = entry?.file_name();
-        let Some(stem) = name
-            .to_string_lossy()
-            .strip_suffix(".idx")
-            .map(str::to_owned)
-        else {
-            continue;
+    let ulids_in = |d: &Path, suffix: &str| -> io::Result<Vec<ulid::Ulid>> {
+        let mut out = Vec::new();
+        let Ok(rd) = fs::read_dir(d) else {
+            return Ok(out);
         };
-        let Ok(u) = ulid::Ulid::from_string(&stem) else {
-            continue;
-        };
-        ulids.push(u);
-    }
-    ulids.sort();
+        for entry in rd {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(suffix) else {
+                continue;
+            };
+            if let Ok(u) = ulid::Ulid::from_string(stem) {
+                out.push(u);
+            }
+        }
+        out.sort();
+        Ok(out)
+    };
+
+    let mut promoted = ulids_in(&index_dir, ".idx")?;
+    let pending = if promoted.is_empty() {
+        ulids_in(&pending_dir, "")?
+    } else {
+        Vec::new()
+    };
+    promoted.sort();
+
+    let sources: Vec<(std::path::PathBuf, std::path::PathBuf)> = if pending.is_empty() {
+        promoted
+            .iter()
+            .map(|seg| {
+                (
+                    index_dir.join(format!("{seg}.idx")),
+                    cache_dir.join(format!("{seg}.body")),
+                )
+            })
+            .collect()
+    } else {
+        pending
+            .iter()
+            .map(|seg| {
+                (
+                    pending_dir.join(seg.to_string()),
+                    pending_dir.join(seg.to_string()),
+                )
+            })
+            .collect()
+    };
 
     let mut out = Vec::new();
     let mut total = 0u64;
-    for seg in ulids {
-        let idx_path = index_dir.join(format!("{seg}.idx"));
-        let body_path = cache_dir.join(format!("{seg}.body"));
-        let (_, entries, _) = segment::read_segment_index(&idx_path)?;
+    for (idx_path, body_path) in sources {
+        let seg = ulid::Ulid::from_string(
+            idx_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .trim_end_matches(".idx"),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        let (body_section_start, entries, _) = segment::read_segment_index(&idx_path)?;
+        // A `.body` file is the body section alone, so entry offsets index it
+        // from zero; a whole segment carries a header and index before it.
+        let body_base = if body_path == idx_path {
+            body_section_start
+        } else {
+            0
+        };
         let Ok(f) = fs::File::open(&body_path) else {
             continue;
         };
@@ -93,9 +146,9 @@ fn load(dir: &Path, max_bytes: u64) -> io::Result<Vec<Version>> {
                 continue;
             }
             let mut buf = vec![0u8; e.stored_length as usize];
-            // A `.body` file is the body section alone, so entry offsets
-            // index it from zero.
-            if f.read_exact_at(&mut buf, e.stored_offset).is_err() {
+            if f.read_exact_at(&mut buf, body_base + e.stored_offset)
+                .is_err()
+            {
                 continue;
             }
             let Ok(plain) = e.codec.decode(std::borrow::Cow::Owned(buf)) else {
@@ -230,14 +283,19 @@ fn training_samples(entries: &[&Version], dict_bytes: usize) -> Vec<Vec<u8>> {
 /// Per-entry lz4 against zstd, both recomputed from plaintext so the
 /// comparison is between codecs rather than against whatever the write path
 /// happened to store.
-/// Stored size of `plain` as a chunked body: the table plus one frame per
-/// chunk. Mirrors `volume::compress_body`'s layout, including the 4-byte
-/// header and the 36 bytes each chunk costs in the table.
-fn chunked_len(level: i32, plain: &[u8]) -> io::Result<usize> {
-    let count = chunk_tree::chunk_count(plain.len());
+/// Chunk sizes to sweep. Each is a power-of-two multiple of BLAKE3's 1 KiB
+/// chunk, which is what makes a slice at a multiple of it a subtree.
+const CHUNK_SIZES: [usize; 4] = [64 << 10, 128 << 10, 256 << 10, 512 << 10];
+
+/// Stored size of `plain` as a chunked body at `chunk_bytes`: the table plus
+/// one frame per chunk. Mirrors `volume::compress_body`'s layout, including
+/// the 4-byte header and the 36 bytes each chunk costs in the table.
+fn chunked_len(level: i32, plain: &[u8], chunk_bytes: usize) -> io::Result<usize> {
+    let count = plain.len().div_ceil(chunk_bytes);
     let mut total = 4 + count * 36;
     for index in 0..count {
-        total += zstd_len(level, &plain[chunk_tree::chunk_range(index, plain.len())])?;
+        let start = index * chunk_bytes;
+        total += zstd_len(level, &plain[start..(start + chunk_bytes).min(plain.len())])?;
     }
     Ok(total)
 }
@@ -254,14 +312,14 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     // below one chunk are stored as a single frame either way.
     let mut big_entries = 0u64;
     let mut big_plain = 0u64;
-    let mut big_whole9 = 0u64;
-    let mut big_chunked9 = 0u64;
+    let mut big_whole = 0u64;
+    let mut big_chunked = [0u64; CHUNK_SIZES.len()];
     let mut zstd9_total = 0u64;
 
     for v in versions {
         let lz4 = lz4_flex::compress_prepend_size(&v.plain).len() as u64;
         let zst = zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
-        let zst9 = zstd_len(BODY_LEVEL, &v.plain)? as u64;
+        let zst9 = zstd_len(HIGH_LEVEL, &v.plain)? as u64;
         plain += v.plain.len() as u64;
         lz4_total += lz4;
         zstd_total += zst;
@@ -271,11 +329,15 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
             lz4_win_margin += zst - lz4;
             *win_sizes.entry(size_bucket(v.plain.len())).or_default() += 1;
         }
-        if v.plain.len() > chunk_tree::CHUNK_BYTES {
+        // Sized against the smallest chunk swept, so every size is reported
+        // over one population.
+        if v.plain.len() > CHUNK_SIZES[0] {
             big_entries += 1;
             big_plain += v.plain.len() as u64;
-            big_whole9 += zst9;
-            big_chunked9 += chunked_len(BODY_LEVEL, &v.plain)? as u64;
+            big_whole += zstd_len(BODY_LEVEL, &v.plain)? as u64;
+            for (slot, chunk_bytes) in big_chunked.iter_mut().zip(CHUNK_SIZES) {
+                *slot += chunked_len(BODY_LEVEL, &v.plain, chunk_bytes)? as u64;
+            }
         }
     }
 
@@ -293,7 +355,7 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     );
     println!(
         "zstd-{}             {:.1} MiB ({:.1}% of plain), {:.1}% under zstd-{}",
-        BODY_LEVEL,
+        HIGH_LEVEL,
         mib(zstd9_total),
         pct(zstd9_total, plain),
         pct(zstd_total.saturating_sub(zstd9_total), zstd_total),
@@ -311,30 +373,35 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     }
 
     println!(
-        "\nchunking ({} KiB chunks), over the {} of {} entries above one chunk",
-        chunk_tree::CHUNK_BYTES / 1024,
+        "\nchunking at zstd-{}, over the {} of {} entries above {} KiB \
+         ({:.1} MiB, {:.1}% of all plaintext)",
+        BODY_LEVEL,
         big_entries,
         versions.len(),
+        CHUNK_SIZES[0] / 1024,
+        mib(big_plain),
+        pct(big_plain, plain),
     );
     if big_entries == 0 {
         println!("  no entry exceeds one chunk; chunking changes nothing here");
         return Ok(());
     }
     println!(
-        "  plaintext        {:.1} MiB ({:.1}% of all plaintext)\n  \
-         one frame        {:.1} MiB ({:.1}% of it)\n  \
-         chunked          {:.1} MiB ({:.1}% of it)\n  \
-         chunking costs   {:.1} MiB ({:+.2}% against one frame, {:+.2}% of all plaintext)",
-        mib(big_plain),
-        pct(big_plain, plain),
-        mib(big_whole9),
-        pct(big_whole9, big_plain),
-        mib(big_chunked9),
-        pct(big_chunked9, big_plain),
-        mib(big_chunked9.saturating_sub(big_whole9)),
-        100.0 * (big_chunked9 as f64 - big_whole9 as f64) / big_whole9 as f64,
-        100.0 * (big_chunked9 as f64 - big_whole9 as f64) / plain as f64,
+        "  one frame        {:.1} MiB ({:.1}% of that plaintext)",
+        mib(big_whole),
+        pct(big_whole, big_plain),
     );
+    for (chunked, chunk_bytes) in big_chunked.iter().zip(CHUNK_SIZES) {
+        println!(
+            "  {:>4} KiB chunks  {:.1} MiB ({:.1}% of it)  costs {:+.2}% against one frame, \
+             {:+.3}% of all plaintext",
+            chunk_bytes / 1024,
+            mib(*chunked),
+            pct(*chunked, big_plain),
+            100.0 * (*chunked as f64 - big_whole as f64) / big_whole as f64,
+            100.0 * (*chunked as f64 - big_whole as f64) / plain as f64,
+        );
+    }
     Ok(())
 }
 

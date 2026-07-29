@@ -20,11 +20,15 @@ use blake3::hazmat::{
 /// Plaintext bytes per chunk.
 ///
 /// A power-of-two multiple of BLAKE3's 1 KiB chunk, which is what makes a
-/// slice at a multiple of it a subtree rather than an arbitrary range. At
-/// this size a 4 KiB read decodes at most 128 KiB, the table costs 36 bytes
-/// per chunk, and lz4's 64 KiB match window and zstd's useful history both
-/// fit inside one chunk, so little cross-chunk matching is given up.
-pub const CHUNK_BYTES: usize = 128 * 1024;
+/// slice at a multiple of it a subtree rather than an arbitrary range.
+///
+/// The size trades stored bytes against how much a read decodes. Measured
+/// over three corpora at the body level, the matches a compressor gives up at
+/// a chunk boundary cost 6.7 to 9.8% of the stored bytes of the extents they
+/// chunk at 64 KiB, 4.8 to 6.5% at 128 KiB, and 1.3 to 2.7% at 256 KiB, where
+/// the curve flattens — 512 KiB buys little more and is worse on one corpus.
+/// See `docs/design/compression-codecs.md`.
+pub const CHUNK_BYTES: usize = 256 * 1024;
 
 /// Number of chunks `plain_len` bytes of plaintext divide into.
 pub fn chunk_count(plain_len: usize) -> usize {
