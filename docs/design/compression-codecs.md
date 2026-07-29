@@ -1,6 +1,6 @@
 # Design: compression codecs
 
-Status: Proposed, not started. § Measurement covers a bulk-load-dominated and a churned postgres corpus. Guest read latency, in § Open questions, is what still gates the codec change.
+Status: Proposed, not started. § Measurement covers a bulk-load-dominated and a churned postgres corpus. This change lands on its own; the read-side answers in § Open questions follow it, and § Format carries what it has to preserve for them to stay available.
 
 Date: 2026-07-25
 
@@ -13,8 +13,6 @@ Segment bodies are uploaded to S3. Their byte count is the upload bandwidth, the
 The WAL is never uploaded. It absorbs guest writes and is consumed at formation. Its compression sits inside `Volume::write` (`actor.rs:1467`), before the WAL append, so it is on the guest's synchronous write path and its cost is write latency.
 
 `cache/<ULID>.dmat` is a local-only read cache. Its compression is paid on write-back and its decompression on every subsequent cold delta read, so its cost is read latency.
-
-Local reads are held to a standard rather than a budget: the aim is to serve them as close to raw-disk performance as the format allows. Decompression cost on the read path is therefore a constraint on the design, not one term to trade off against uploaded bytes, and it is what the local cache in § Open questions exists to serve.
 
 ## Where compression happens today
 
@@ -99,17 +97,19 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 
 `SegmentEntry.compressed` becomes a codec tag rather than a boolean, and `maybe_compress` becomes per-artefact rather than one shared function. `WalFlags::COMPRESSED` keeps its meaning, since the WAL keeps lz4. Existing volumes are not readable across this change.
 
+The tag names the codec of the uploaded body, and the read path takes its codec from the location it resolved rather than from the tag alone. Written that way a second local source in a different codec is one more arm on a choice the read path already makes. Written as one decompress keyed off `entry.compressed`, adding one means reworking the path. The local read cache in [body-materialisation.md](body-materialisation.md) is that second source, and it holds lz4 whatever the tag says.
+
 ## Open questions
 
 A trained dictionary pays on the churned corpus, on the shape the per-size table predicts. Its 8 KiB entries, 26,117 of them and the population that carries the corpus, gain 32.8%; 16 KiB gains 17.7% and 32 to 64 KiB around 10%. The held-out aggregate runs 29.6 MiB down to 22.4 MiB, 24% under dictionaryless zstd, with 0.1 points of drift against a dictionary trained on the test set. What stays open is which distribution real volumes settle into, since the bulk corpus above wants no dictionary at all.
 
-Guest read latency under zstd is unmeasured, and under the aim above it gates the change rather than costing against it. Decompression is roughly three to four times slower than lz4. What decides whether that is visible is extent-level read locality under the guest, which nothing measures today.
+Guest read latency under zstd is unmeasured. Decompression is roughly three to four times slower than lz4, and what decides whether that is visible is extent-level read locality under the guest, which nothing measures today. The codec change is taken on its own and the read-side answers follow it, so the measurement runs against zstd bodies in place rather than ahead of them.
 
 Two ways to hold reads near raw-disk speed, cheapest first.
 
 `BlockReader.materialised` caches one extent, so a guest alternating between two hot extents re-materialises both on every read. A bounded LRU keyed by content hash with a byte budget — the shape `delta_compute::SourceCache` already uses — costs no format change, no disk and no recovery story, and targets that thrash directly.
 
-Beyond that, a local lz4 sidecar per segment, built from the zstd `.body` on first read, in the shape `.dmat` already has. It leaves `.body` byte-identical to the object, so demand-fetch is untouched. Three things it has to answer that `.dmat` does not. `.dmat` is append-only with no eviction, which is affordable only because delta entries are a fraction of a percent of a volume; across all entries the sidecar is a second complete copy and needs reclamation, and eviction is what makes its truncate-at-first-bad-record recovery argument stop holding. Local footprint rises to about 21% of plaintext against 14.8% today, since both copies are kept. And lz4 is roughly 2.4 times the size of zstd for the same content, so the sidecar reads more bytes to spend less CPU — a win while those bytes are in page cache and a loss when they are not.
+Beyond that, a local lz4 sidecar per segment, built from the zstd `.body` on first read, in the shape `.dmat` already has. It leaves `.body` byte-identical to the object, so demand-fetch is untouched. Specified in [body-materialisation.md](body-materialisation.md), which takes it after this change rather than with it, and lists the three properties this change has to keep so that order stays open.
 
 Whole-extent materialisation pulls against the same aim from the other side. An extent is one guest write — there is no coalescing, and `src/ublk.rs`'s `IO_BUF_BYTES` caps a single request at 1 MiB — or one imported file fragment, which no request cap bounds. The extent is the unit of compression and of the content hash alike, and the read path verifies content on every serve (#800), raw extents included, so a 4 KiB read reads, decompresses and hashes up to the whole extent.
 
