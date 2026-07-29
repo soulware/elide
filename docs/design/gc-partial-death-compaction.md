@@ -120,10 +120,12 @@ the canonical body is stored uncompressed, not re-encoded as a Delta —
 trading compactness for O(1) dedup reads. DedupRef emits no canonical:
 the body lives in a segment this pass doesn't touch.
 
-The sub-run path is shared: each live run is hashed, and a fresh `Data`
-entry carries the slice bytes (always `Data`, never `DedupRef` — the
-latter would depend on the target segment surviving this pass, which
-isn't determinable at expand time).
+The sub-run path is shared: each live run is hashed, then takes
+`maybe_compress` like every other producer of fresh plaintext, and a
+fresh entry carries the resulting bytes. The run is self-contained,
+either `Data` or `Inline` when the compressed size falls under the inline
+threshold. `DedupRef` would depend on the target segment surviving this
+pass, which isn't determinable at expand time.
 
 ### Defer cases
 
