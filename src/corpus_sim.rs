@@ -466,7 +466,7 @@ fn dict_study(versions: &[Version], dict_sizes: &[usize]) -> io::Result<()> {
         segs.len() - segs.len() / 2,
     );
     println!(
-        "test plain         {:.1} MiB\ntest as-stored     {:.1} MiB ({:.1}% of plain, lz4)\ntest zstd-{}       {:.1} MiB ({:.1}% of plain)",
+        "test plain         {:.1} MiB\ntest as-stored     {:.1} MiB ({:.1}% of plain)\ntest zstd-{}       {:.1} MiB ({:.1}% of plain)",
         mib(plain),
         mib(stored),
         pct(stored, plain),
