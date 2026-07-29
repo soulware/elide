@@ -977,9 +977,13 @@ fn same_epoch_duplicate_minted_as_dedup_ref_at_formation() {
 
     let stats = vol.dedup_mint_stats();
     assert_eq!(stats.minted_entries, 1);
+    // The stat counts WAL bytes, which the WAL's own codec sizes. Formation
+    // re-encodes what it keeps, so the owner's segment body is a different
+    // number for the same content.
+    let wal_stored = super::maybe_compress(&data).map_or(data.len(), |c| c.len());
     assert_eq!(
-        stats.wal_body_bytes, owner.stored_length as u64,
-        "foregone WAL bytes are the duplicate's stored body"
+        stats.wal_body_bytes, wal_stored as u64,
+        "foregone WAL bytes are the duplicate's WAL-stored body"
     );
 
     // The extent index owner is the segment's Data entry, not a stale WAL
@@ -1280,6 +1284,85 @@ fn derived_empty_window_persists_and_stops_polling() {
     assert!(jcfg.ranges.is_empty());
     assert!(vol.journal_derived);
     assert!(vol.journal.is_empty());
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The WAL carries lz4 because its cost is guest write latency; a segment
+/// body carries zstd because its cost is upload bytes. Formation is where
+/// the two artefacts part, and the plaintext survives the change.
+#[test]
+fn formation_re_encodes_a_body_from_the_wal_codec_to_the_body_codec() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    // Compressible enough that both codecs beat raw, and large enough that
+    // neither stored form lands in the inline section.
+    let data: Vec<u8> = (0..64 * 1024).map(|i| (i / 97 % 251) as u8).collect();
+    vol.write(0, &data).unwrap();
+
+    let wal_stored = vol.pending[0].entry.stored_length;
+    assert_eq!(
+        vol.pending[0].entry.codec,
+        segment::Codec::Lz4,
+        "the WAL keeps lz4"
+    );
+
+    vol.promote_for_test().unwrap();
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 1);
+    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].codec, segment::Codec::Zstd);
+    assert_eq!(entries[0].kind, segment::EntryKind::Data);
+    assert_ne!(
+        entries[0].stored_length, wal_stored,
+        "the segment body is sized by its own codec, not the WAL's"
+    );
+    assert_eq!(
+        entries[0].hash,
+        blake3::hash(&data),
+        "hash covers plaintext"
+    );
+
+    assert_eq!(vol.read(0, 16).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// Journal bytes reap whole with their segment and are never a dedup or
+/// delta source, so they keep lz4 where durable bodies take zstd.
+#[test]
+fn formation_keeps_lz4_for_journal_bodies() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data: Vec<u8> = (0..64 * 1024).map(|i| (i / 97 % 251) as u8).collect();
+    vol.write(100, &data).unwrap();
+    vol.write(0, &data).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let ulids = pending_ulids(&base);
+    assert_eq!(ulids.len(), 2);
+    let read_entries = |seg: Ulid| {
+        let seg_path = base.join("pending").join(seg.to_string());
+        let (_, entries, _) =
+            segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+        entries
+    };
+    let durable = read_entries(ulids[0]);
+    let journal = read_entries(ulids[1]);
+    assert!(!durable[0].journal);
+    assert!(journal[0].journal);
+    assert_eq!(durable[0].codec, segment::Codec::Zstd);
+    assert_eq!(journal[0].codec, segment::Codec::Lz4);
+
+    assert_eq!(vol.read(100, 16).unwrap(), data);
+    assert_eq!(vol.read(0, 16).unwrap(), data);
 
     fs::remove_dir_all(base).unwrap();
 }

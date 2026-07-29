@@ -1,6 +1,6 @@
 # Design: compression codecs
 
-Status: Proposed, not started. § Measurement covers a bulk-load-dominated and a churned postgres corpus. This change lands on its own; the read-side answers in § Open questions follow it, and § Format carries what it has to preserve for them to stay available.
+Status: Built. § Measurement covers a bulk-load-dominated and a churned postgres corpus. The read-side answers in § Open questions follow this change rather than gating it, and § Format carries what it preserves for them to stay available.
 
 Date: 2026-07-25
 
@@ -20,7 +20,7 @@ There is one compression, and it is on the write path. `Volume::write` calls `ma
 
 So the codec that decides how many bytes reach S3 is selected on the guest ack path, by a function chosen for write latency. lz4 is the right answer to the question that call site asks. It is not the question the uploaded artefact asks.
 
-## Proposed: one codec per artefact
+## One codec per artefact
 
 Formation is the seam. It is asynchronous, off the ack path, and already visits every entry.
 
@@ -28,11 +28,13 @@ Formation is the seam. It is asynchronous, off the ack path, and already visits 
 
 **Segment body — zstd.** Every `Data` and `CanonicalData` entry, re-encoded at formation: lz4-decompress the WAL body, zstd-compress the plaintext, store that. This is the artefact whose bytes are uploaded, and the only one whose size is charged to S3. The delta body section alongside it already holds zstd blobs, produced against a source extent as dictionary, so this extends a codec the segment format already carries rather than introducing one.
 
-**Inline section — lz4.** An `Inline` entry holds under 256 stored bytes, and below roughly 1 KiB zstd's frame header costs more than its coding saves — one to four bytes, on every content pattern measured. The crossover is framing overhead, so it sits at a fixed size rather than moving with content.
+**Inline section — lz4.** Inline bytes ride in the `.idx`, which every host fetches eagerly and decodes from memory, so the cost is the same one the ratio threshold prices. `compress_body` takes lz4 when the stored form lands under `INLINE_THRESHOLD` under both codecs, and only entries that small pay for the second encode.
+
+**Journal tier — lz4.** Journal bytes reap whole with their segment and are never a dedup or delta source, so a better ratio buys little on content that does not outlive its segment, and lz4 keeps formation CPU off a tier that is a large share of segments on a churning volume. The codec byte is per entry, so one segment carries journal entries in lz4 beside durable ones in zstd.
 
 **`.dmat` — lz4.** A local read cache whose whole purpose is to be faster to read than re-materialising a delta.
 
-Bodies take level 3. Level 19 measured 11% smaller on a 64 KiB entry (1,640 bytes against 1,835) for roughly twenty times the compression CPU.
+**Bodies take level 9,** on the same asymmetry as the delta tier below: a body compresses once at formation, off the ack path, and decompresses faster as the level rises, so the level is paid for in formation CPU alone. The ratio the level buys is measured for delta residuals, not for whole extents — the body figure is unmeasured, and `corpus_sim` computes it.
 
 **Delta blobs take level 9.** Measured over two Ubuntu cloud-image pairs, 429 and 1,652 fragments, deltas against the same-path parent fragment:
 
@@ -50,7 +52,7 @@ Decompression rises with the level rather than holding flat, because a denser bl
 
 The level is a write-time choice with no read-time dependency. A zstd frame declares its window, its content size and optionally a dictionary id, never the level that produced it, so a segment written at any level decodes under any configuration. Changing the level needs no tag, no migration and no compatibility path, which is what separates it from the codec choice in § Format.
 
-Formation gains an lz4-decompress plus a zstd-compress per entry, asynchronous, roughly eight seconds of CPU per GiB of plaintext at level 3.
+Formation gains an lz4-decompress plus a zstd-compress per entry, asynchronous. Formation compresses every entry where the delta tier reaches a fraction of a percent of them, so the level's throughput cost lands on the whole write volume rather than a slice of it.
 
 Codec contexts are pooled for the allocation rather than the CPU, which the timing above prices at nothing on the read path. Pooling is per formation worker and per queue thread. At body scope every entry compresses once and every cold extent read decompresses, so a context constructed per call runs at the rate of the whole workload rather than the 0.2% of entries that carry deltas. Per-call construction is the allocation shape that ratcheted RSS into the OOMs behind `malloc_policy.rs`, which makes pooling a constraint on the design rather than a tuning step. `delta_compute::apply_delta` builds a decompression context per call today and is the pattern not to extend.
 
@@ -58,11 +60,11 @@ Codec contexts are pooled for the allocation rather than the CPU, which the timi
 
 `maybe_compress` (`volume/compress.rs:18`) compresses, then keeps the result only if it is at least 1.5× smaller. Data compressing 1.4× is stored raw, giving up 29%.
 
-The threshold prices decompression CPU on read. Under the asymmetry above that is the wrong quantity for segment bodies, whose cost is upload bytes and whose reads mostly never happen. It remains the right quantity for `.dmat`.
+The threshold prices decompression CPU on read. Under the asymmetry above that is the wrong quantity for segment bodies, whose cost is upload bytes and whose reads mostly never happen, so `compress_body` keeps the compressed form whenever it is smaller than the plaintext. The threshold remains the right quantity for the WAL, the inline section and `.dmat`, which `maybe_compress` still serves.
 
 It is also a weaker safety net under zstd than under lz4. On incompressible input lz4 expands by about 0.4% (65,536 bytes of random data becomes 65,798) while zstd emits a raw block and adds a flat ~13 bytes (65,546). The expansion the threshold guards against is an lz4 property.
 
-The churned corpus prices the bar. Stored bytes there run 18.0% of plaintext against a per-entry lz4 recompute of 18.0%, so the ratio turns away too little to be the lever. What stays open is whether segment bodies and `.dmat` share one.
+The churned corpus prices the bar. Stored bytes there run 18.0% of plaintext against a per-entry lz4 recompute of 18.0%, so the ratio turns away too little to be the lever.
 
 ## zstd and dictionaries
 
