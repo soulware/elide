@@ -99,6 +99,29 @@ fn verify_extent_content(
     )))
 }
 
+/// Verify `plain` against the extent's content hash, then copy
+/// `src_start..src_end` of it into `out_slice`.
+///
+/// Every source ends here, so a source arm's job is to produce the extent's
+/// plaintext and nothing else. A caller that wants the whole extent can
+/// decode into `out_slice` directly and call [`verify_extent_content`] on it.
+fn verify_and_slice(
+    plain: &[u8],
+    expected: &blake3::Hash,
+    lba: u64,
+    segment_id: Ulid,
+    src_start: usize,
+    src_end: usize,
+    out_slice: &mut [u8],
+) -> io::Result<()> {
+    verify_extent_content(expected, plain, lba, segment_id)?;
+    let src = plain
+        .get(src_start..src_end)
+        .ok_or_else(|| io::Error::other("corrupt segment: payload too short"))?;
+    out_slice.copy_from_slice(src);
+    Ok(())
+}
+
 /// Default capacity for the segment file handle LRU cache.
 const FILE_CACHE_CAPACITY: usize = 16;
 
@@ -354,23 +377,18 @@ pub(crate) fn read_extents(
         let src_end = src_start + block_count * 4096;
 
         // Inline extents: bytes are held in the extent index, no file I/O.
+        // A raw inline payload borrows straight out of the index buffer.
         if let Some(idata) = &loc.inline_data {
-            if loc.codec == segment::Codec::Lz4 {
-                let raw = lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?;
-                verify_extent_content(&er.hash, &raw, lba, loc.segment_id)?;
-                let src_slice = raw
-                    .get(src_start..src_end)
-                    .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
-                out_slice.copy_from_slice(src_slice);
-            } else {
-                // Slice straight out of the inline buffer — no allocation,
-                // no intermediate to_vec.
-                verify_extent_content(&er.hash, idata, lba, loc.segment_id)?;
-                let src_slice = idata
-                    .get(src_start..src_end)
-                    .ok_or_else(|| io::Error::other("corrupt segment: inline payload too short"))?;
-                out_slice.copy_from_slice(src_slice);
-            }
+            let plain = loc.codec.decode(Cow::Borrowed(idata))?;
+            verify_and_slice(
+                &plain,
+                &er.hash,
+                lba,
+                loc.segment_id,
+                src_start,
+                src_end,
+                out_slice,
+            )?;
             continue;
         }
 
@@ -426,117 +444,97 @@ pub(crate) fn read_extents(
             SegmentLayout::Full => loc.body_section_start + loc.body_offset,
         };
 
-        if loc.codec == segment::Codec::Lz4 {
-            READ_SCRATCH.with(|s| -> io::Result<()> {
-                let mut s = s.borrow_mut();
-                let s = &mut *s;
+        let log_err = |stage: &str, read_len: usize, e: &dyn std::fmt::Display| {
+            let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            log::error!(
+                "read_extents {stage} failed: lba={lba} segment={} codec={} layout={layout:?} \
+                 bss={} body_offset={} body_length={} payload_block_offset={} \
+                 file_body_offset={file_body_offset} read_len={read_len} \
+                 file_size={file_size} err={e}",
+                loc.segment_id,
+                loc.codec,
+                loc.body_section_start,
+                loc.body_offset,
+                loc.body_length,
+                er.payload_block_offset,
+            );
+        };
 
-                // Read compressed bytes into the TLS scratch.
-                s.compressed.resize(loc.body_length as usize, 0);
-                f.read_exact_at(&mut s.compressed, file_body_offset)?;
-
-                // Parse the 4-byte LE size prefix that compress_prepend_size emits.
-                if s.compressed.len() < 4 {
-                    return Err(io::Error::other("compressed payload missing size prefix"));
-                }
-                let decompressed_size =
-                    u32::from_le_bytes(s.compressed[..4].try_into().expect("4-byte slice"))
-                        as usize;
-                let payload = &s.compressed[4..];
-
-                // Fast path: caller wants the entire decompressed payload —
-                // decompress straight into the caller's buffer.
-                if src_start == 0
-                    && src_end == decompressed_size
-                    && out_slice.len() == decompressed_size
-                {
-                    lz4_flex::decompress_into(payload, out_slice).map_err(|e| {
-                        log::error!(
-                            "lz4 decompression failed: lba={lba} segment={} \
-                             layout={layout:?} bss={} body_offset={} body_length={} \
-                             body_source={:?} file_body_offset={file_body_offset} \
-                             first_bytes={:?} err={e}",
-                            loc.segment_id,
-                            loc.body_section_start,
-                            loc.body_offset,
-                            loc.body_length,
-                            loc.body_source,
-                            &s.compressed[..s.compressed.len().min(16)],
-                        );
-                        io::Error::other(e)
-                    })?;
-                    return verify_extent_content(&er.hash, out_slice, lba, loc.segment_id);
-                }
-
-                // Slow path: caller wants a sub-range — decompress into the
-                // TLS scratch, then copy the requested slice into `out`.
-                s.decompressed.resize(decompressed_size, 0);
-                lz4_flex::decompress_into(payload, &mut s.decompressed).map_err(|e| {
-                    log::error!(
-                        "lz4 decompression failed: lba={lba} segment={} \
-                         layout={layout:?} bss={} body_offset={} body_length={} \
-                         body_source={:?} file_body_offset={file_body_offset} \
-                         first_bytes={:?} err={e}",
-                        loc.segment_id,
-                        loc.body_section_start,
-                        loc.body_offset,
-                        loc.body_length,
-                        loc.body_source,
-                        &s.compressed[..s.compressed.len().min(16)],
-                    );
-                    io::Error::other(e)
-                })?;
-                verify_extent_content(&er.hash, &s.decompressed, lba, loc.segment_id)?;
-                let src_slice = s.decompressed.get(src_start..src_end).ok_or_else(|| {
-                    io::Error::other("corrupt segment: decompressed payload too short")
-                })?;
-                out_slice.copy_from_slice(src_slice);
-                Ok(())
-            })?;
-        } else {
-            // The whole stored payload, not just the requested blocks: the
-            // content hash covers the extent, so it can only be checked
-            // against all of it.
-            let log_read_err = |target_len: usize, e: &io::Error| {
-                let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                log::error!(
-                    "read_extents failed: lba={} segment={} layout={:?} \
-                     bss={} body_offset={} body_length={} payload_block_offset={} \
-                     file_body_offset={} read_len={} file_size={} err={}",
-                    lba,
-                    loc.segment_id,
-                    layout,
-                    loc.body_section_start,
-                    loc.body_offset,
-                    loc.body_length,
-                    er.payload_block_offset,
-                    file_body_offset,
-                    target_len,
-                    file_size,
-                    e,
-                );
-            };
-            let body_len = loc.body_length as usize;
-            if src_start == 0 && out_slice.len() == body_len {
-                if let Err(e) = f.read_exact_at(out_slice, file_body_offset) {
-                    log_read_err(out_slice.len(), &e);
-                    return Err(e);
-                }
-                verify_extent_content(&er.hash, out_slice, lba, loc.segment_id)?;
-            } else {
-                READ_SCRATCH.with(|s| -> io::Result<()> {
-                    let mut s = s.borrow_mut();
-                    s.decompressed.resize(body_len, 0);
-                    if let Err(e) = f.read_exact_at(&mut s.decompressed, file_body_offset) {
-                        log_read_err(body_len, &e);
+        // Each arm produces the extent's plaintext, either straight into
+        // `out_slice` when the caller wants the whole extent or into the TLS
+        // scratch when it wants a sub-range of it. The content hash covers
+        // the extent, so even a one-block read materialises all of it.
+        match loc.codec {
+            segment::Codec::None => {
+                let body_len = loc.body_length as usize;
+                if src_start == 0 && out_slice.len() == body_len {
+                    if let Err(e) = f.read_exact_at(out_slice, file_body_offset) {
+                        log_err("read", out_slice.len(), &e);
                         return Err(e);
                     }
-                    verify_extent_content(&er.hash, &s.decompressed, lba, loc.segment_id)?;
-                    let src_slice = s.decompressed.get(src_start..src_end).ok_or_else(|| {
-                        io::Error::other("corrupt segment: stored payload too short")
+                    verify_extent_content(&er.hash, out_slice, lba, loc.segment_id)?;
+                } else {
+                    READ_SCRATCH.with(|s| -> io::Result<()> {
+                        let mut s = s.borrow_mut();
+                        s.decompressed.resize(body_len, 0);
+                        if let Err(e) = f.read_exact_at(&mut s.decompressed, file_body_offset) {
+                            log_err("read", body_len, &e);
+                            return Err(e);
+                        }
+                        verify_and_slice(
+                            &s.decompressed,
+                            &er.hash,
+                            lba,
+                            loc.segment_id,
+                            src_start,
+                            src_end,
+                            out_slice,
+                        )
                     })?;
-                    out_slice.copy_from_slice(src_slice);
-                    Ok(())
+                }
+            }
+            segment::Codec::Lz4 => {
+                READ_SCRATCH.with(|s| -> io::Result<()> {
+                    let mut s = s.borrow_mut();
+                    let s = &mut *s;
+
+                    s.compressed.resize(loc.body_length as usize, 0);
+                    if let Err(e) = f.read_exact_at(&mut s.compressed, file_body_offset) {
+                        log_err("read", loc.body_length as usize, &e);
+                        return Err(e);
+                    }
+
+                    // The 4-byte LE size prefix `compress_prepend_size` emits.
+                    if s.compressed.len() < 4 {
+                        return Err(io::Error::other("compressed payload missing size prefix"));
+                    }
+                    let plain_len =
+                        u32::from_le_bytes(s.compressed[..4].try_into().expect("4-byte slice"))
+                            as usize;
+                    let payload = &s.compressed[4..];
+
+                    if src_start == 0 && src_end == plain_len && out_slice.len() == plain_len {
+                        lz4_flex::decompress_into(payload, out_slice).map_err(|e| {
+                            log_err("lz4 decompress", plain_len, &e);
+                            io::Error::other(e)
+                        })?;
+                        return verify_extent_content(&er.hash, out_slice, lba, loc.segment_id);
+                    }
+
+                    s.decompressed.resize(plain_len, 0);
+                    lz4_flex::decompress_into(payload, &mut s.decompressed).map_err(|e| {
+                        log_err("lz4 decompress", plain_len, &e);
+                        io::Error::other(e)
+                    })?;
+                    verify_and_slice(
+                        &s.decompressed,
+                        &er.hash,
+                        lba,
+                        loc.segment_id,
+                        src_start,
+                        src_end,
+                        out_slice,
+                    )
                 })?;
             }
         }
