@@ -12,6 +12,7 @@
 //   Phase 4 filemap generation to parse the ext4 filesystem exactly as it
 //   existed at snapshot time, with no WAL replay and no `pending/` state.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
@@ -147,7 +148,7 @@ impl BlockReader {
                             segment_id: ulid,
                             body_offset,
                             body_length: data.len() as u32,
-                            compressed: flags.contains(writelog::WalFlags::COMPRESSED),
+                            codec: segment::Codec::from_wal_flags(flags),
                             body_source: extentindex::BodySource::Local,
                             body_section_start: 0,
                             inline_data: None,
@@ -332,11 +333,7 @@ impl BlockReader {
         block_offset: u32,
     ) -> io::Result<[u8; 4096]> {
         if let Some(ref idata) = loc.inline_data {
-            let raw = if loc.compressed {
-                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
-            } else {
-                idata.to_vec()
-            };
+            let raw = loc.codec.decode(Cow::Borrowed(idata))?.into_owned();
             return self.remember_and_slice(*hash, raw, block_offset);
         }
 
@@ -351,12 +348,8 @@ impl BlockReader {
         // the cache below, which is what keeps the extra read amortised.
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact_at(&mut buf, seek)?;
-        if loc.compressed {
-            let decompressed =
-                lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?;
-            return self.remember_and_slice(*hash, decompressed, block_offset);
-        }
-        self.remember_and_slice(*hash, buf, block_offset)
+        let plain = loc.codec.decode(Cow::Owned(buf))?.into_owned();
+        self.remember_and_slice(*hash, plain, block_offset)
     }
 
     /// Read a 4 KiB block from a Delta extent.
@@ -562,22 +555,14 @@ impl BlockReader {
     /// that ends the scan.
     fn read_extent_body_unverified(&self, loc: &ExtentLocation) -> io::Result<Vec<u8>> {
         if let Some(ref idata) = loc.inline_data {
-            return if loc.compressed {
-                lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
-            } else {
-                Ok(idata.to_vec())
-            };
+            return Ok(loc.codec.decode(Cow::Borrowed(idata))?.into_owned());
         }
         self.ensure_extent_present(loc)?;
         let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
         let f = fs::File::open(path)?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact_at(&mut buf, layout.body_seek(loc))?;
-        if loc.compressed {
-            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
-        } else {
-            Ok(buf)
-        }
+        Ok(loc.codec.decode(Cow::Owned(buf))?.into_owned())
     }
 
     /// Read the full plaintext bytes of the extent with content hash `hash`.

@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use elide_core::block_reader::BlockReader;
 use elide_core::config::VolumeConfig;
 use elide_core::segment::{
-    DeltaOption, ExtentFetch, PendingEntry, SegmentEntry, SegmentFetcher, SegmentFlags,
-    SegmentSigner, extract_idx, promote_to_cache, write_segment, write_segment_with_delta_body,
+    Codec, DeltaOption, ExtentFetch, PendingEntry, SegmentEntry, SegmentFetcher, SegmentSigner,
+    extract_idx, promote_to_cache, write_segment, write_segment_with_delta_body,
 };
 use elide_core::signing;
 use elide_core::ulid_mint::UlidMint;
@@ -88,7 +88,7 @@ fn delta_entry_end_to_end_decompression() {
         parent_hash,
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
@@ -173,7 +173,7 @@ fn delta_entry_roundtrip_from_drained_cache() {
         parent_hash,
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
@@ -275,7 +275,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
         parent_hash,
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
@@ -433,7 +433,7 @@ fn block_reader_read_block_dispatches_to_delta() {
         parent_hash,
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
@@ -521,7 +521,7 @@ fn delta_read_populates_dmat_and_second_read_matches() {
         parent_hash,
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
@@ -650,7 +650,7 @@ fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
             parent_hash,
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             parent_bytes,
         )],
         signer.as_ref(),
@@ -744,7 +744,7 @@ fn readers_share_one_dmat_instance() {
             parent_hash,
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             parent_bytes,
         )],
         signer.as_ref(),

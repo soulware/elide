@@ -88,7 +88,7 @@ The codec change lands first and `.bmat` follows. Three properties keep that ord
 
 **`.body` stays byte-identical to the uploaded object.** [compression-codecs.md](compression-codecs.md) already rejects re-encoding `.body` locally, on the grounds that demand-fetch range-GETs land at signed-index offsets. That rejection is also what gives `.bmat` a canonical local source to rebuild from.
 
-**Codec travels with the resolved location, not with the entry alone.** `SegmentEntry.compressed` becomes a codec tag naming the codec of the uploaded body. A read from `.bmat` gets lz4 regardless of that tag, so the read path has to take its codec from the location it resolved, with the entry's tag as the answer for `.body`. Written that way, `.bmat` is one more arm on an existing choice. Written as one decompress keyed off `entry.compressed`, adding it means reworking the read path.
+**Codec travels with the resolved location, not with the entry alone.** `SegmentEntry.codec` names the codec of the uploaded body. A read from `.bmat` gets lz4 regardless of that tag, so the read path takes its codec from the location it resolved, with the entry's tag as the answer for `.body`. Written that way, `.bmat` is one more arm on an existing choice. Written as one decode keyed off `entry.codec`, adding it means reworking the read path.
 
 **Chunk geometry is shared.** If chunked frames land (#807), a `.bmat` record covers the same plaintext boundaries as the `.body` chunk it came from, so a read decompresses one chunk from whichever source serves it. A `.bmat` holding whole-extent frames would reintroduce the whole-extent materialisation that chunking exists to remove.
 

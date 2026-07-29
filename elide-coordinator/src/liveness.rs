@@ -331,7 +331,7 @@ mod tests {
         data_dir: &Path,
         store: &Arc<dyn object_store::ObjectStore>,
     ) -> ([u8; 32], PathBuf) {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use elide_core::signing::{build_snapshot_manifest_bytes, load_signer};
 
         let scratch = data_dir.join("scratch-parent");
@@ -351,7 +351,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         let staging = data_dir.join("seg-staging");

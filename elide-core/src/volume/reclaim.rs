@@ -226,10 +226,11 @@ pub fn scan_reclaim_candidates(
                 if loc.inline_data.is_some() {
                     continue;
                 }
-                if loc.compressed {
-                    (agg.max_offset_end, true, loc.body_length as u64)
-                } else {
-                    (loc.body_length as u64 / 4096, false, loc.body_length as u64)
+                match loc.codec {
+                    segment::Codec::None => {
+                        (loc.body_length as u64 / 4096, false, loc.body_length as u64)
+                    }
+                    segment::Codec::Lz4 => (agg.max_offset_end, true, loc.body_length as u64),
                 }
             } else if extent_index.lookup_delta(hash).is_some() {
                 // Delta-backed: the logical fragment size is not

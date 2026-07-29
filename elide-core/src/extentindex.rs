@@ -64,10 +64,10 @@ pub struct ExtentLocation {
     /// from the segment index). For WAL entries, equals the absolute WAL file
     /// offset (WAL has no header, so body_section_start == 0 and the two coincide).
     pub body_offset: u64,
-    /// Byte length of the stored payload (compressed size if `compressed`).
+    /// Byte length of the stored payload, in the form `codec` names.
     pub body_length: u32,
-    /// True if the payload is lz4-compressed.
-    pub compressed: bool,
+    /// Codec of the stored payload at this location.
+    pub codec: segment::Codec,
     /// How this extent's body is stored locally.
     pub body_source: BodySource,
     /// Absolute offset of the body section within the full segment file.
@@ -781,7 +781,7 @@ impl ExtentIndex {
                     segment_id: ctx.segment_id,
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
-                    compressed: entry.compressed,
+                    codec: entry.codec,
                     body_source: match ctx.body_tier {
                         RegistrationBodyTier::Local => BodySource::Local,
                         RegistrationBodyTier::Cached => BodySource::Cached(raw_idx),
@@ -1309,7 +1309,7 @@ mod tests {
                 segment_id: Ulid::from_string("01JQTEST000000000000000001").unwrap(),
                 body_offset: 1024,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
@@ -1322,7 +1322,7 @@ mod tests {
         );
         assert_eq!(loc.body_offset, 1024);
         assert_eq!(loc.body_length, 4096);
-        assert!(!loc.compressed);
+        assert_eq!(loc.codec, segment::Codec::None);
     }
 
     #[test]
@@ -1341,7 +1341,7 @@ mod tests {
                 segment_id: wal_ulid,
                 body_offset: wal_offset,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
@@ -1357,7 +1357,7 @@ mod tests {
                 segment_id: seg_ulid,
                 body_offset: 200,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
@@ -1388,7 +1388,7 @@ mod tests {
                 segment_id: superseder,
                 body_offset: 9999,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
@@ -1404,7 +1404,7 @@ mod tests {
                 segment_id: seg_ulid,
                 body_offset: 200,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 512,
                 inline_data: None,
@@ -1430,7 +1430,7 @@ mod tests {
                 segment_id: wal_ulid,
                 body_offset: 8192,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
@@ -1445,7 +1445,7 @@ mod tests {
                 segment_id: wal_ulid,
                 body_offset: 0,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
@@ -1468,7 +1468,7 @@ mod tests {
                 segment_id: wal_ulid,
                 body_offset: 0,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
@@ -1493,7 +1493,7 @@ mod tests {
                 segment_id: seg_ulid,
                 body_offset,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 0,
                 inline_data: None,
@@ -1521,7 +1521,7 @@ mod tests {
                 segment_id: live_ulid,
                 body_offset: 8192,
                 body_length: 4096,
-                compressed: false,
+                codec: segment::Codec::None,
                 body_source: BodySource::Local,
                 body_section_start: 64,
                 inline_data: None,
@@ -1578,7 +1578,7 @@ mod tests {
             segment_id,
             body_offset: 0,
             body_length: 4096,
-            compressed: false,
+            codec: segment::Codec::None,
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,
@@ -1704,9 +1704,7 @@ mod tests {
         // precedence), matching `insert`.
         let mut index = ExtentIndex::new();
         index.insert_delta(h(1), delta_loc(useg(3)));
-        let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
-                .entry;
+        let entry = SegmentEntry::new_data(h(1), 0, 1, segment::Codec::None, vec![0u8; 4096]).entry;
         let consumed = std::iter::once(useg(3)).collect();
         index
             .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
@@ -1719,9 +1717,7 @@ mod tests {
     fn register_consuming_preserves_concurrent_data_owner() {
         let mut index = ExtentIndex::new();
         index.insert(h(1), data_loc(useg(9)));
-        let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
-                .entry;
+        let entry = SegmentEntry::new_data(h(1), 0, 1, segment::Codec::None, vec![0u8; 4096]).entry;
         let consumed = std::iter::once(useg(3)).collect();
         index
             .register_entry_consuming_inputs(&entry, 0, &reg_ctx(useg(7)), &consumed)
@@ -1737,9 +1733,7 @@ mod tests {
         // `insert_if_absent` semantics, unlike the live path.
         let mut index = ExtentIndex::new();
         index.insert_delta(h(1), delta_loc(useg(3)));
-        let entry =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
-                .entry;
+        let entry = SegmentEntry::new_data(h(1), 0, 1, segment::Codec::None, vec![0u8; 4096]).entry;
         index
             .register_entry_if_absent(&entry, 0, &reg_ctx(useg(7)))
             .unwrap();
@@ -1756,11 +1750,9 @@ mod tests {
         index.insert(h(1), data_loc(useg(9)));
         index.insert_delta(h(2), delta_loc(useg(3)));
         let over_data =
-            SegmentEntry::new_data(h(1), 0, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
-                .entry;
+            SegmentEntry::new_data(h(1), 0, 1, segment::Codec::None, vec![0u8; 4096]).entry;
         let over_delta =
-            SegmentEntry::new_data(h(2), 1, 1, segment::SegmentFlags::empty(), vec![0u8; 4096])
-                .entry;
+            SegmentEntry::new_data(h(2), 1, 1, segment::Codec::None, vec![0u8; 4096]).entry;
         index
             .register_entry_unconditional(&over_data, 0, &reg_ctx(useg(7)))
             .unwrap();
@@ -1852,7 +1844,7 @@ mod tests {
             hash,
             0,
             1,
-            segment::SegmentFlags::empty(),
+            segment::Codec::None,
             data,
         )];
         let (bss, entries) = segment::write_segment(
@@ -1891,7 +1883,7 @@ mod tests {
         let data_hash = blake3::hash(&data_body);
         let entries = vec![
             ref_entry,
-            SegmentEntry::new_data(data_hash, 2, 1, segment::SegmentFlags::empty(), data_body),
+            SegmentEntry::new_data(data_hash, 2, 1, segment::Codec::None, data_body),
         ];
         segment::write_segment(
             &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -1927,7 +1919,7 @@ mod tests {
                 hash,
                 0,
                 1,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 data.clone(),
             )];
             let (bss, written) = segment::write_segment(
@@ -1944,8 +1936,8 @@ mod tests {
             let data2 = vec![0u8; 8192]; // put something before it
             let hash2 = blake3::hash(&data2);
             let entries = vec![
-                SegmentEntry::new_data(hash2, 10, 2, segment::SegmentFlags::empty(), data2),
-                SegmentEntry::new_data(hash, 0, 1, segment::SegmentFlags::empty(), data),
+                SegmentEntry::new_data(hash2, 10, 2, segment::Codec::None, data2),
+                SegmentEntry::new_data(hash, 0, 1, segment::Codec::None, data),
             ];
             segment::write_segment(
                 &pending.join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
@@ -1992,7 +1984,7 @@ mod tests {
                 hash,
                 0,
                 1,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 data,
             )];
             let (b, written) = segment::write_segment(
@@ -2029,7 +2021,7 @@ mod tests {
             hash,
             0,
             1,
-            segment::SegmentFlags::empty(),
+            segment::Codec::None,
             data.clone(),
         )];
         assert_eq!(entries[0].entry.kind, segment::EntryKind::Inline);
@@ -2070,7 +2062,7 @@ mod tests {
             hash,
             0,
             1,
-            segment::SegmentFlags::empty(),
+            segment::Codec::None,
             data.clone(),
         )];
 

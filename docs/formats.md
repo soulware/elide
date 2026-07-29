@@ -47,17 +47,17 @@ flags       (u8)          FLAG_ZERO set; no further fields
 Zero extents differ from unwritten regions in one important way: an unwritten LBA range in a descendant falls through to the ancestor layer during LBA map reconstruction. A zero extent explicitly overrides the ancestor — any ancestor data at those LBAs is masked.
 
 **Flag bits:**
-- `0x01` `FLAG_COMPRESSED` — payload is zstd-compressed; `data_length` is compressed size
+- `0x01` `FLAG_COMPRESSED` — payload is lz4-compressed; `data_length` is the compressed size
 - `0x02` `FLAG_DEDUP_REF` — REF record; no data payload (thin; body lives in canonical segment; parse-only)
 - `0x04` `FLAG_ZERO` — ZERO record; no data payload; hash field is ZERO_HASH
 
 **Flag namespace note:** WAL flag bits and segment index flag bits are **distinct namespaces with different values**. When promoting WAL records to segment entries, `recover_wal` must translate between them:
 
-| Meaning | WAL bit | Segment bit |
+| Meaning | WAL bit | Segment entry |
 |---|---|---|
-| `FLAG_COMPRESSED` | `0x01` | `0x04` |
-| `FLAG_DEDUP_REF` | `0x02` | `0x08` |
-| `FLAG_ZERO`      | `0x04` | `0x10` |
+| `FLAG_COMPRESSED` | `0x01` | codec byte, via `Codec::from_wal_flags` |
+| `FLAG_DEDUP_REF` | `0x02` | flag bit `0x08` |
+| `FLAG_ZERO`      | `0x04` | flag bit `0x10` |
 
 The segment format also has `FLAG_INLINE` (`0x01`) and `FLAG_HAS_DELTAS` (`0x02`), which have no WAL equivalents. Never copy a WAL `flags` byte directly into a segment index entry.
 
@@ -122,7 +122,7 @@ Repack uses the same checkpoint pattern as GC and sweep: pre-mint `u_repack_i < 
 
 Deferring dead-body removal to drain time (rather than doing it at overwrite time) lets multiple dead hashes accumulate in a single repack pass and avoids coupling the write path to hash-liveness bookkeeping.
 
-**WAL-to-segment flag translation:** WAL and segment index use different bit values for `FLAG_COMPRESSED` and `FLAG_DEDUP_REF` (see the WAL flag namespace note above). `recover_wal` translates WAL flags to segment flags before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
+**WAL-to-segment flag translation:** the WAL names its codec in a flag bit and a segment entry names it in a codec byte, and `FLAG_DEDUP_REF` sits at a different bit in each (see the WAL flag namespace note above). `recover_wal` translates before constructing `SegmentEntry` values — never copy a WAL `flags` byte directly into a segment index entry.
 
 **Directory layout within a live node:**
 
@@ -207,7 +207,7 @@ Each segment is a **single file** both locally and in S3. The same format is use
 
 ```
 [Header: 100 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x07"
+  magic          (8 bytes)  — "ELIDSEG\x08"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
@@ -241,19 +241,18 @@ delta_offset  = 100 + index_length + inline_length + body_length
 **Flag bits** (1 byte per entry):
 - `0x01` `FLAG_INLINE` — extent data is in the inline section; no body fetch needed
 - `0x02` `FLAG_HAS_DELTAS` — one or more delta options follow
-- `0x04` `FLAG_COMPRESSED` — stored data is compressed; lengths are compressed sizes
 - `0x08` `FLAG_DEDUP_REF` — dedup reference; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry layout is the same 64 bytes as DATA. See § Segment File Format — FLAG_DEDUP_REF below.
 - `0x10` `FLAG_ZERO` — zero extent; hash field is ZERO_HASH; no body in this segment; reads as zeros
 - `0x20` `FLAG_DELTA` — thin delta entry; no body bytes, no body reservation (`stored_offset = 0`, `stored_length = 0`). Entry implies `FLAG_HAS_DELTAS` and must have at least one delta option; the content is served by fetching a delta blob from the segment's delta body section and decompressing it against the `source_hash` extent body located via the extent index. See § Segment File Format — FLAG_DELTA below.
 - `0x40` `FLAG_CANONICAL_ONLY` — canonical-body-only entry. Co-exists with DATA (body in body section) or `FLAG_INLINE` (body in inline section); incompatible with `FLAG_DEDUP_REF`, `FLAG_ZERO`, `FLAG_DELTA`. The entry carries body bytes (its hash is canonical in this segment, resolvable via `extent_index.lookup`) but makes **no LBA claim**: `start_lba` and `lba_length` are serialised as zero and the entry is skipped by `lbamap::rebuild_segments`. Emitted by GC when a DATA/INLINE entry's original LBA has been overwritten (LBA-dead) but its hash is still referenced elsewhere via a DedupRef. Preserves the canonical body for dedup resolution without re-asserting the stale LBA→hash binding on rebuild. See § Segment File Format — FLAG_CANONICAL_ONLY below.
 
-**Compression algorithm:** lz4_flex (LZ4) is used for all locally-written body extents. LZ4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is negligible relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason.
+**Codec byte** (1 byte per entry): `0` raw, `1` lz4_flex with a `u32` le uncompressed-length prefix. A codec byte the reader does not know fails the parse, so stored bytes are never handed back as plaintext by default. The byte names the codec of the uploaded body; a read takes its codec from the location it resolved. lz4 decompresses at ~4 GB/s on modern hardware, well above local disk bandwidth, so the decompression cost per read is small relative to the I/O. This matches the lsvd reference implementation, which uses LZ4 for the same reason. See [compression-codecs.md](design/compression-codecs.md) for the codec each artefact takes.
 
-**Delta bodies** use zstd dictionary compression (`FLAG_HAS_DELTAS` option entries). The source extent is used as the zstd dictionary; the delta blob is much smaller than the full extent for in-place file updates. Delta blobs are computed in-process by `elide-import` after pending segments are written but before `serve_promote` publishes the control socket, and appended to the segment's delta body section. `FLAG_COMPRESSED` continues to apply uniformly to full-body entries (LZ4); the algorithm is implied by context (full-body entry = LZ4, delta option = zstd).
+`volume::maybe_compress` keeps the compressed form only when it is at least 1.5× smaller. Incompressible data fails that ratio naturally, so lz4 itself decides where a precomputed entropy gate would.
 
-Both algorithms apply the same entropy gate (≥ 7.0 bits/byte skips compression) and minimum ratio threshold (< 1.5× skips storage).
+**Delta bodies** use zstd dictionary compression (`FLAG_HAS_DELTAS` option entries). The source extent is the zstd dictionary, so the delta blob is much smaller than the full extent for in-place file updates. Delta blobs are computed in-process by `elide-import` after pending segments are written but before `serve_promote` publishes the control socket, and appended to the segment's delta body section. The codec byte describes the full-body payload; a delta option's blob is always zstd.
 
-**Compression granularity:** `FLAG_COMPRESSED` applies to the full stored payload of an entry — the entire extent is compressed as a unit. There is no sub-extent compression granularity. A read of any portion of a compressed extent must decompress the full payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
+**Compression granularity:** the codec applies to the full stored payload of an entry — the entire extent is compressed as a unit, and a read of any portion of it decompresses the whole payload. This matches lsvd. The practical impact is bounded by the pre-log coalescing block limit, which caps maximum extent size at write time.
 
 The index section has four parts in order: fixed-size base entries, a sketch table, a delta table, and an inputs table.
 
@@ -267,7 +266,8 @@ For each extent (64 bytes, fixed-size):
   flags           (1 byte)   — flag bits above
   stored_offset   (8 bytes)  — byte offset within body or inline section (u64 le)
   stored_length   (4 bytes)  — byte length of stored data (u32 le)
-  reserved        (7 bytes)  — must be zero
+  codec           (1 byte)   — codec of the stored bytes; see below
+  reserved        (6 bytes)  — must be zero
 ```
 
 All entry kinds (DATA, DEDUP_REF, ZERO, INLINE, and DELTA) use the same 64-byte layout. `stored_offset` and `stored_length` are interpreted per kind: body-section-relative for DATA, inline-section-relative for INLINE, zero for DEDUP_REF, ZERO, and DELTA.
@@ -369,7 +369,7 @@ In `cache/`, `promote_to_cache` treats Delta entries the same as DedupRef entrie
 
 Emitted only by GC, never by the write path. The trigger: `collect_stats` encounters a DATA/INLINE entry whose original `start_lba` is LBA-dead (`lbamap[start_lba] != hash`) but whose hash is still referenced elsewhere via a DedupRef (`live_hashes.contains(&hash)`). Preserving the entry at its original LBA would re-assert the stale LBA→hash binding on rebuild with a higher ULID than whatever wrote the live content — silently shadowing the correct mapping (bug H; see `elide-coordinator/src/gc.rs::tests::collect_stats_preserves_dead_lba_entry_when_hash_live_elsewhere` for the regression test). Demoting to `FLAG_CANONICAL_ONLY` carries the canonical body forward for DedupRef / Delta source resolution while cleanly dropping the dead LBA claim.
 
-**Compatible with**: DATA (body in body section) or INLINE (body in inline section), with optional `FLAG_COMPRESSED`. **Incompatible with**: `FLAG_DEDUP_REF` (thin, no body), `FLAG_ZERO` (sentinel hash), `FLAG_DELTA` (thin, no body).
+**Compatible with**: DATA (body in body section) or INLINE (body in inline section), under any codec. **Incompatible with**: `FLAG_DEDUP_REF` (thin, no body), `FLAG_ZERO` (sentinel hash), `FLAG_DELTA` (thin, no body).
 
 DedupRef and Delta consumers are kind-agnostic: `extent_index.lookup(hash)` resolves to a canonical entry regardless of whether it's a plain DATA/INLINE or a `CANONICAL_ONLY`-demoted one.
 

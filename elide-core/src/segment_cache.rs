@@ -179,7 +179,7 @@ mod tests {
                 hash: blake3::hash(&lba.to_le_bytes()),
                 start_lba: lba,
                 lba_length: 1,
-                compressed: false,
+                codec: segment::Codec::None,
                 stored_offset: 0,
                 stored_length: 8,
                 kind: EntryKind::Data,

@@ -820,7 +820,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+    use elide_core::segment::{Codec, SegmentEntry, write_segment};
     use elide_core::signing::{
         ProvenanceLineage, VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FILE,
         build_snapshot_manifest_bytes, generate_keypair, load_signer, write_provenance,
@@ -870,13 +870,7 @@ mod tests {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, entries, parent_signer.as_ref()).unwrap();
@@ -1003,13 +997,7 @@ mod tests {
         let data = vec![0x5Au8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let parent_signer = load_signer(&parent_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, entries, parent_signer.as_ref()).unwrap();
@@ -1093,13 +1081,7 @@ mod tests {
         let data = vec![0xCDu8; 4096];
         let hash = blake3::hash(&data);
         let seg_ulid = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();
         let staging = tmp.path().join(seg_ulid);
         write_segment(&staging, entries, signer.as_ref()).unwrap();
@@ -1181,7 +1163,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         let signer = load_signer(&root_dir, VOLUME_KEY_FILE).unwrap();

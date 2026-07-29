@@ -1092,7 +1092,7 @@ mod tests {
     // --- .body route tests ---
 
     use elide_core::segment::{
-        PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, set_present_bit,
+        Codec, PendingEntry, SegmentEntry, SegmentSigner, promote_to_cache, set_present_bit,
         write_segment,
     };
     use std::path::Path as StdPath;
@@ -1180,7 +1180,7 @@ mod tests {
         let seg_ulid = Ulid::new();
         let payload = vec![0xABu8; 4096];
         let hash = blake3::hash(&payload);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), payload.clone());
+        let entry = SegmentEntry::new_data(hash, 0, 1, Codec::None, payload.clone());
         write_segment_files(
             f.data_dir.path(),
             f.vol_ulid,
@@ -1207,7 +1207,7 @@ mod tests {
         let seg_ulid = Ulid::new();
         let payload = vec![0u8; 4096];
         let hash = blake3::hash(&payload);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), payload);
+        let entry = SegmentEntry::new_data(hash, 0, 1, Codec::None, payload);
         write_segment_files(
             f.data_dir.path(),
             f.vol_ulid,
@@ -1231,7 +1231,7 @@ mod tests {
         let seg_ulid = Ulid::new();
         let payload = vec![0u8; 4096];
         let hash = blake3::hash(&payload);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), payload);
+        let entry = SegmentEntry::new_data(hash, 0, 1, Codec::None, payload);
         write_segment_files(
             f.data_dir.path(),
             f.vol_ulid,
@@ -1287,7 +1287,7 @@ mod tests {
         let seg_ulid = Ulid::new();
         let payload = vec![0xCDu8; 4096];
         let hash = blake3::hash(&payload);
-        let entry = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), payload);
+        let entry = SegmentEntry::new_data(hash, 0, 1, Codec::None, payload);
         // Build segment files with the present bit set, then clear it
         // for this test.
         write_segment_files(
@@ -1357,14 +1357,8 @@ mod tests {
         let first = vec![0xAAu8; 4096];
         let second = vec![0xBBu8; 4096];
         let entries = vec![
-            SegmentEntry::new_data(
-                blake3::hash(&first),
-                0,
-                1,
-                SegmentFlags::empty(),
-                first.clone(),
-            ),
-            SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
+            SegmentEntry::new_data(blake3::hash(&first), 0, 1, Codec::None, first.clone()),
+            SegmentEntry::new_data(blake3::hash(&second), 1, 1, Codec::None, second),
         ];
         write_segment_files(
             f.data_dir.path(),
@@ -1411,8 +1405,8 @@ mod tests {
         let first = vec![0xAAu8; 4096];
         let second = vec![0xBBu8; 4096];
         let entries = vec![
-            SegmentEntry::new_data(blake3::hash(&first), 0, 1, SegmentFlags::empty(), first),
-            SegmentEntry::new_data(blake3::hash(&second), 1, 1, SegmentFlags::empty(), second),
+            SegmentEntry::new_data(blake3::hash(&first), 0, 1, Codec::None, first),
+            SegmentEntry::new_data(blake3::hash(&second), 1, 1, Codec::None, second),
         ];
         write_segment_files(
             f.data_dir.path(),

@@ -11,6 +11,7 @@
 //
 // See docs/design/delta-compression.md §"Filemap-based delta".
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -407,13 +408,8 @@ fn maybe_rewrite_segment(
         let Some(stored) = pending.body.as_deref() else {
             continue;
         };
-        let child_plain_owned: Vec<u8>;
-        let child_plain: &[u8] = if entry.compressed {
-            child_plain_owned = decompress_lz4(stored)?;
-            &child_plain_owned
-        } else {
-            stored
-        };
+        let child_plain = entry.codec.decode(Cow::Borrowed(stored))?;
+        let child_plain: &[u8] = &child_plain;
 
         let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &conv.delta_blob)
             .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
@@ -439,7 +435,7 @@ fn maybe_rewrite_segment(
         entry.kind = EntryKind::Delta;
         entry.stored_offset = 0;
         entry.stored_length = 0;
-        entry.compressed = false;
+        entry.codec = segment::Codec::None;
         entry.delta_options.push(DeltaOption {
             source_hash: conv.source_hash,
             delta_offset,
@@ -530,11 +526,7 @@ fn read_source_extent(
         f.read_exact_at(&mut buf, layout.body_seek(loc))?;
         buf
     };
-    let plain = if loc.compressed {
-        decompress_lz4(&stored)?
-    } else {
-        stored
-    };
+    let plain = loc.codec.decode(Cow::Owned(stored))?.into_owned();
     verify_source_plaintext(&plain, hash, loc.segment_id)?;
     Ok(plain)
 }
@@ -563,11 +555,6 @@ fn verify_source_plaintext(
     )))
 }
 
-fn decompress_lz4(data: &[u8]) -> io::Result<Vec<u8>> {
-    lz4_flex::decompress_size_prepended(data)
-        .map_err(|e| io::Error::other(format!("lz4 decompression failed: {e}")))
-}
-
 #[derive(Default, Debug)]
 pub struct SegmentDeltaStats {
     pub entries_converted: usize,
@@ -590,11 +577,7 @@ fn read_source_plaintext(
 ) -> Option<Vec<u8>> {
     let loc = extent_index.lookup(hash)?;
     let plain = if let Some(ref idata) = loc.inline_data {
-        if loc.compressed {
-            decompress_lz4(idata).ok()?
-        } else {
-            idata.to_vec()
-        }
+        loc.codec.decode(Cow::Borrowed(idata)).ok()?.into_owned()
     } else {
         if let extentindex::BodySource::Cached(entry_idx) = loc.body_source {
             let present = extent_index
@@ -610,11 +593,7 @@ fn read_source_plaintext(
         let f = fs::File::open(&path).ok()?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact_at(&mut buf, layout.body_seek(loc)).ok()?;
-        if loc.compressed {
-            decompress_lz4(&buf).ok()?
-        } else {
-            buf
-        }
+        loc.codec.decode(Cow::Owned(buf)).ok()?.into_owned()
     };
     verify_source_plaintext(&plain, hash, loc.segment_id).ok()?;
     Some(plain)
@@ -699,13 +678,8 @@ pub fn delta_pendings_by_resemblance(
             continue;
         };
 
-        let child_plain_owned: Vec<u8>;
-        let child_plain: &[u8] = if entry.compressed {
-            child_plain_owned = decompress_lz4(stored)?;
-            &child_plain_owned
-        } else {
-            stored
-        };
+        let child_plain = entry.codec.decode(Cow::Borrowed(stored))?;
+        let child_plain: &[u8] = &child_plain;
         let Some(target_sketch) = crate::sketch::compute(child_plain) else {
             continue;
         };
@@ -786,7 +760,7 @@ pub fn delta_pendings_by_resemblance(
         entry.kind = EntryKind::Delta;
         entry.stored_offset = 0;
         entry.stored_length = 0;
-        entry.compressed = false;
+        entry.codec = segment::Codec::None;
         // A delta-bearing entry is not a valid source, so it advertises no
         // sketch.
         entry.sketch = None;
@@ -852,13 +826,8 @@ pub fn delta_pendings_against_prior(
             continue;
         };
 
-        let child_plain_owned: Vec<u8>;
-        let child_plain: &[u8] = if entry.compressed {
-            child_plain_owned = decompress_lz4(stored)?;
-            &child_plain_owned
-        } else {
-            stored
-        };
+        let child_plain = entry.codec.decode(Cow::Borrowed(stored))?;
+        let child_plain: &[u8] = &child_plain;
 
         let delta_blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, source_plain)
             .map_err(|e| io::Error::other(format!("zstd compressor init failed: {e}")))?
@@ -882,7 +851,7 @@ pub fn delta_pendings_against_prior(
         entry.kind = EntryKind::Delta;
         entry.stored_offset = 0;
         entry.stored_length = 0;
-        entry.compressed = false;
+        entry.codec = segment::Codec::None;
         entry.delta_options.push(DeltaOption {
             source_hash,
             delta_offset,
@@ -1027,7 +996,7 @@ mod source_verify_tests {
             segment_id,
             body_offset: 0,
             body_length,
-            compressed: false,
+            codec: segment::Codec::None,
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use elide_core::block_reader::BlockReader;
 use elide_core::config::VolumeConfig;
-use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
+use elide_core::segment::{Codec, SegmentEntry, SegmentSigner, write_segment};
 use elide_core::signing;
 use elide_core::volume::ReadonlyVolume;
 use tempfile::TempDir;
@@ -38,13 +38,13 @@ fn setup_volume_dir(tmp: &TempDir) -> (PathBuf, Arc<dyn SegmentSigner>) {
 /// Write one Data entry at LBA 0 claiming `claimed_hash`, then read it back.
 fn write_then_read(
     stored: Vec<u8>,
-    flags: SegmentFlags,
+    codec: Codec,
     claimed_hash: blake3::Hash,
 ) -> std::io::Result<[u8; 4096]> {
     let tmp = TempDir::new().unwrap();
     let (vol_dir, signer) = setup_volume_dir(&tmp);
     let seg_path = vol_dir.join(format!("pending/{}", Ulid::new()));
-    let entries = vec![SegmentEntry::new_data(claimed_hash, 0, 1, flags, stored)];
+    let entries = vec![SegmentEntry::new_data(claimed_hash, 0, 1, codec, stored)];
     write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
     let reader = BlockReader::open_live(Path::new(&vol_dir), Box::new(|_| None))?;
@@ -64,7 +64,7 @@ fn a_raw_extent_whose_bytes_do_not_match_the_claimed_hash_is_refused() {
     let bytes = plaintext();
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
-    let err = write_then_read(bytes, SegmentFlags::empty(), wrong)
+    let err = write_then_read(bytes, Codec::None, wrong)
         .expect_err("a raw extent that fails its content hash must not be served");
 
     let msg = err.to_string();
@@ -81,7 +81,7 @@ fn a_compressed_extent_that_decompresses_cleanly_but_hashes_wrong_is_refused() {
     let stored = lz4_flex::compress_prepend_size(&plaintext());
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
-    let err = write_then_read(stored, SegmentFlags::COMPRESSED, wrong)
+    let err = write_then_read(stored, Codec::Lz4, wrong)
         .expect_err("a compressed extent that fails its content hash must not be served");
 
     assert!(
@@ -95,7 +95,7 @@ fn a_raw_extent_matching_its_hash_still_reads() {
     let bytes = plaintext();
     let hash = blake3::hash(&bytes);
 
-    let block = write_then_read(bytes.clone(), SegmentFlags::empty(), hash)
+    let block = write_then_read(bytes.clone(), Codec::None, hash)
         .expect("a correct extent must still read");
 
     assert_eq!(&block[..], &bytes[..]);
@@ -107,7 +107,7 @@ fn a_compressed_extent_matching_its_hash_still_reads() {
     let hash = blake3::hash(&bytes);
     let stored = lz4_flex::compress_prepend_size(&bytes);
 
-    let block = write_then_read(stored, SegmentFlags::COMPRESSED, hash)
+    let block = write_then_read(stored, Codec::Lz4, hash)
         .expect("a correct compressed extent must still read");
 
     assert_eq!(&block[..], &bytes[..]);
@@ -119,7 +119,7 @@ fn a_compressed_extent_matching_its_hash_still_reads() {
 fn write_then_read_live(
     stored: Vec<u8>,
     lba_length: u32,
-    flags: SegmentFlags,
+    codec: Codec,
     claimed_hash: blake3::Hash,
     read_lba: u64,
     lba_count: u32,
@@ -131,7 +131,7 @@ fn write_then_read_live(
         claimed_hash,
         0,
         lba_length,
-        flags,
+        codec,
         stored,
     )];
     write_segment(&seg_path, entries, signer.as_ref()).unwrap();
@@ -157,7 +157,7 @@ fn multiblock_plaintext() -> Vec<u8> {
 fn the_live_path_refuses_a_raw_extent_whose_bytes_do_not_match_the_hash() {
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
-    let err = write_then_read_live(plaintext(), 1, SegmentFlags::empty(), wrong, 0, 1)
+    let err = write_then_read_live(plaintext(), 1, Codec::None, wrong, 0, 1)
         .expect_err("the live path must not serve a raw extent that fails its content hash");
 
     assert!(
@@ -171,7 +171,7 @@ fn the_live_path_refuses_a_compressed_extent_that_decompresses_cleanly_but_hashe
     let stored = lz4_flex::compress_prepend_size(&plaintext());
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
-    let err = write_then_read_live(stored, 1, SegmentFlags::COMPRESSED, wrong, 0, 1)
+    let err = write_then_read_live(stored, 1, Codec::Lz4, wrong, 0, 1)
         .expect_err("the live path must not serve a compressed extent that fails its content hash");
 
     assert!(
@@ -188,7 +188,7 @@ fn the_live_path_refuses_an_inline_extent_that_hashes_wrong() {
     assert!(stored.len() < 256, "stored form must be inline-sized");
     let wrong = blake3::hash(b"a hash no stored extent holds");
 
-    let err = write_then_read_live(stored, 1, SegmentFlags::COMPRESSED, wrong, 0, 1)
+    let err = write_then_read_live(stored, 1, Codec::Lz4, wrong, 0, 1)
         .expect_err("the live path must not serve an inline extent that fails its content hash");
 
     assert!(
@@ -207,7 +207,7 @@ fn a_sub_range_read_verifies_the_whole_extent() {
     let mut stored = clean;
     stored[3 * 4096 + 100] ^= 0xFF;
 
-    let err = write_then_read_live(stored, 4, SegmentFlags::empty(), hash, 0, 1)
+    let err = write_then_read_live(stored, 4, Codec::None, hash, 0, 1)
         .expect_err("a sub-range read of a corrupt extent must be refused");
 
     assert!(
@@ -221,7 +221,7 @@ fn the_live_path_serves_a_sub_range_of_a_raw_extent() {
     let bytes = multiblock_plaintext();
     let hash = blake3::hash(&bytes);
 
-    let block = write_then_read_live(bytes.clone(), 4, SegmentFlags::empty(), hash, 2, 1)
+    let block = write_then_read_live(bytes.clone(), 4, Codec::None, hash, 2, 1)
         .expect("a correct raw extent must still read");
 
     assert_eq!(&block[..], &bytes[2 * 4096..3 * 4096]);
@@ -233,7 +233,7 @@ fn the_live_path_serves_a_whole_compressed_extent() {
     let hash = blake3::hash(&bytes);
     let stored = lz4_flex::compress_prepend_size(&bytes);
 
-    let read = write_then_read_live(stored, 4, SegmentFlags::COMPRESSED, hash, 0, 4)
+    let read = write_then_read_live(stored, 4, Codec::Lz4, hash, 0, 4)
         .expect("a correct compressed extent must still read");
 
     assert_eq!(&read[..], &bytes[..]);
@@ -246,7 +246,7 @@ fn the_live_path_serves_a_correct_inline_extent() {
     let stored = lz4_flex::compress_prepend_size(&bytes);
     assert!(stored.len() < 256, "stored form must be inline-sized");
 
-    let read = write_then_read_live(stored, 1, SegmentFlags::COMPRESSED, hash, 0, 1)
+    let read = write_then_read_live(stored, 1, Codec::Lz4, hash, 0, 1)
         .expect("a correct inline extent must still read");
 
     assert_eq!(&read[..], &bytes[..]);

@@ -1716,7 +1716,7 @@ mod tests {
                     blake3::hash(&[i as u8]),
                     i as u64,
                     1,
-                    elide_core::segment::SegmentFlags::empty(),
+                    elide_core::segment::Codec::None,
                     vec![0u8; BLOCK_BYTES as usize],
                 )
                 .entry
@@ -1890,7 +1890,7 @@ mod tests {
                     blake3::hash(&[i as u8]),
                     0,
                     1,
-                    elide_core::segment::SegmentFlags::empty(),
+                    elide_core::segment::Codec::None,
                     vec![0u8; BLOCK_BYTES as usize],
                 )
                 .entry

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use elide_core::delta_compute;
 use elide_core::filemap::{self, FilemapRow};
 use elide_core::segment::{
-    self, EntryKind, SegmentEntry, SegmentFlags, SegmentSigner, extract_idx, promote_to_cache,
+    self, Codec, EntryKind, SegmentEntry, SegmentSigner, extract_idx, promote_to_cache,
     write_segment,
 };
 use elide_core::signing::{
@@ -68,7 +68,7 @@ fn write_single_entry_segment(
         hash,
         start_lba,
         lba_length,
-        SegmentFlags::empty(),
+        Codec::None,
         body,
     )];
     write_segment(&seg_path, entries, signer).unwrap();
@@ -245,7 +245,7 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
         parent_hash,
         0,
         2,
-        SegmentFlags::COMPRESSED,
+        Codec::Lz4,
         parent_stored,
     )];
     assert_eq!(source_entries[0].entry.kind, EntryKind::Data);
@@ -334,7 +334,7 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
         parent_hash,
         0,
         2,
-        SegmentFlags::COMPRESSED,
+        Codec::Lz4,
         parent_stored,
     )];
     assert_eq!(source_entries[0].entry.kind, EntryKind::Data);
@@ -434,7 +434,7 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
         parent_hash,
         0,
         1,
-        SegmentFlags::COMPRESSED,
+        Codec::Lz4,
         parent_stored,
     )];
     assert_eq!(source_entries[0].entry.kind, EntryKind::Inline);

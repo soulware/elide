@@ -2156,7 +2156,7 @@ mod tests {
             hash,
             0,
             1,
-            elide_core::segment::SegmentFlags::empty(),
+            elide_core::segment::Codec::None,
             body,
         )];
         elide_core::segment::write_segment(path, entries, signer).unwrap();

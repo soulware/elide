@@ -342,7 +342,7 @@ mod tests {
     /// `<owner_dir>/cache/` is also created so the test can drop a
     /// `.prefetch-hint` next to where `.body` would land.
     fn write_test_segment(owner_dir: &Path, entry_count: u32) -> std::io::Result<Ulid> {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
 
         let index_dir = owner_dir.join("index");
         std::fs::create_dir_all(&index_dir)?;
@@ -353,13 +353,7 @@ mod tests {
         let entries: Vec<_> = (0..entry_count)
             .map(|i| {
                 let data = vec![i as u8; body_size];
-                SegmentEntry::new_data(
-                    blake3::hash(&data),
-                    (i as u64) * 8,
-                    8,
-                    SegmentFlags::empty(),
-                    data,
-                )
+                SegmentEntry::new_data(blake3::hash(&data), (i as u64) * 8, 8, Codec::None, data)
             })
             .collect();
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
