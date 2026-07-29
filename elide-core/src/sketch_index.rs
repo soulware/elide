@@ -337,7 +337,7 @@ impl Default for SketchIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::SegmentFlags;
+    use crate::segment::Codec;
 
     /// A `Data` entry with a body matching `lba_length`. The body has to
     /// clear the inline threshold, or `new_data` yields an `Inline` entry
@@ -347,7 +347,7 @@ mod tests {
             blake3::hash(&[seed]),
             seed as u64 * 64,
             lba_length,
-            SegmentFlags::empty(),
+            Codec::None,
             vec![seed; lba_length as usize * LBA_BYTES as usize],
         )
         .entry;

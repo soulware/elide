@@ -7,6 +7,7 @@
 //! `(lbamap, extent_index, file_cache, dirs, fetcher)` and serve reads
 //! without depending on the broader volume actor state.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -354,7 +355,7 @@ pub(crate) fn read_extents(
 
         // Inline extents: bytes are held in the extent index, no file I/O.
         if let Some(idata) = &loc.inline_data {
-            if loc.compressed {
+            if loc.codec == segment::Codec::Lz4 {
                 let raw = lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?;
                 verify_extent_content(&er.hash, &raw, lba, loc.segment_id)?;
                 let src_slice = raw
@@ -425,7 +426,7 @@ pub(crate) fn read_extents(
             SegmentLayout::Full => loc.body_section_start + loc.body_offset,
         };
 
-        if loc.compressed {
+        if loc.codec == segment::Codec::Lz4 {
             READ_SCRATCH.with(|s| -> io::Result<()> {
                 let mut s = s.borrow_mut();
                 let s = &mut *s;
@@ -636,11 +637,7 @@ fn try_read_delta_extent(
 
     // --- Read the source body (full extent, lz4-decompressed if needed). ---
     let source_bytes: Vec<u8> = if let Some(ref idata) = source_loc.inline_data {
-        if source_loc.compressed {
-            lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)?
-        } else {
-            idata.to_vec()
-        }
+        source_loc.codec.decode(Cow::Borrowed(idata))?.into_owned()
     } else {
         // Same FD-cache + bitset short-circuit as the main read path:
         // skip `find_segment` when the FD is hot and presence is known
@@ -671,11 +668,7 @@ fn try_read_delta_extent(
         };
         let mut buf = vec![0u8; source_loc.body_length as usize];
         f.read_exact_at(&mut buf, file_body_offset)?;
-        if source_loc.compressed {
-            lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)?
-        } else {
-            buf
-        }
+        source_loc.codec.decode(Cow::Owned(buf))?.into_owned()
     };
 
     // --- Read the delta blob from the Delta segment's delta body section. ---

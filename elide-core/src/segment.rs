@@ -8,7 +8,7 @@
 //   [Delta body: delta_length bytes]      — starts at byte 100 + index_length + inline_length + body_length
 //
 // Header (100 bytes):
-//   0..8    magic         "ELIDSEG\x07"
+//   0..8    magic         "ELIDSEG\x08"
 //   8..12   entry_count   u32 le
 //   12..16  index_length  u32 le; total bytes of the index section (base + sketch table + delta table + inputs)
 //   16..20  inline_length u32 le; 0 if no inline data
@@ -33,10 +33,11 @@
 //   hash          (32 bytes) BLAKE3 extent hash
 //   start_lba     (8 bytes)  u64 le
 //   lba_length    (4 bytes)  u32 le
-//   flags         (1 byte)   see FLAG_* constants
+//   flags         (1 byte)   see SegmentFlags
 //   stored_offset (8 bytes)  u64 le — offset within body or inline section
 //   stored_length (4 bytes)  u32 le — byte length of stored data
-//   reserved      (7 bytes)  must be zero
+//   codec         (1 byte)   see Codec; names the codec of the stored bytes
+//   reserved      (6 bytes)  must be zero
 //
 // Delta table (appended after base entries within index section):
 //   per entry with deltas:
@@ -70,6 +71,7 @@
 //   4. Delete wal/<ULID>
 //   5. Caller updates extent index (WAL offsets → segment offsets) and LBA map
 
+use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -81,7 +83,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 // --- constants ---
 
-pub const MAGIC: &[u8; 8] = b"ELIDSEG\x07";
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x08";
 pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
@@ -287,7 +289,7 @@ pub struct ExtentFetch {
 pub type BoxFetcher = Arc<dyn SegmentFetcher>;
 
 /// Size of every index entry: hash(32) + start_lba(8) + lba_length(4) +
-/// flags(1) + stored_offset(8) + stored_length(4) + reserved(7) = 64 bytes.
+/// flags(1) + stored_offset(8) + stored_length(4) + codec(1) + reserved(6) = 64 bytes.
 ///
 /// Fixed-size, cache-line-aligned. Delta options are stored in a separate
 /// delta table appended after the base entries within the index section.
@@ -358,6 +360,72 @@ fn inputs_region_length(inputs: &[ulid::Ulid]) -> u32 {
     (inputs.len() * INPUT_ULID_LEN) as u32
 }
 
+// --- codec tag ---
+
+/// Codec of an entry's stored bytes.
+///
+/// Occupies its own byte in the index entry, so it names which codec produced
+/// the stored bytes where a flag bit could only say that one had been applied.
+/// Each artefact in the format chooses its own codec (see
+/// `docs/design/compression-codecs.md`), so an entry's stored bytes and the
+/// WAL record they came from can be in different ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Codec {
+    /// Stored bytes are the plaintext.
+    #[default]
+    None = 0,
+    /// lz4 with a `u32` le uncompressed-length prefix, as
+    /// `lz4_flex::compress_prepend_size` produces.
+    Lz4 = 1,
+}
+
+impl Codec {
+    /// The byte written to the index entry.
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The codec `b` names, or an error for a byte this build cannot decode.
+    pub fn from_u8(b: u8) -> io::Result<Self> {
+        match b {
+            0 => Ok(Codec::None),
+            1 => Ok(Codec::Lz4),
+            other => Err(io::Error::other(format!("unknown entry codec {other}"))),
+        }
+    }
+
+    /// The codec `flags` names. `WalFlags` is its own bit namespace, so a
+    /// WAL record's codec reaches a segment entry through this call.
+    pub fn from_wal_flags(flags: crate::writelog::WalFlags) -> Self {
+        if flags.contains(crate::writelog::WalFlags::COMPRESSED) {
+            Codec::Lz4
+        } else {
+            Codec::None
+        }
+    }
+
+    /// Plaintext of `stored`, passed straight through when the stored bytes
+    /// are already plain.
+    pub fn decode<'a>(self, stored: Cow<'a, [u8]>) -> io::Result<Cow<'a, [u8]>> {
+        match self {
+            Codec::None => Ok(stored),
+            Codec::Lz4 => lz4_flex::decompress_size_prepended(&stored)
+                .map(Cow::Owned)
+                .map_err(|e| io::Error::other(format!("lz4 decompress failed: {e}"))),
+        }
+    }
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Codec::None => "raw",
+            Codec::Lz4 => "lz4",
+        })
+    }
+}
+
 // --- flag bits ---
 
 bitflags! {
@@ -372,8 +440,6 @@ bitflags! {
         const INLINE     = 0x01;
         /// One or more delta options follow this entry (S3 only; not used locally).
         const HAS_DELTAS = 0x02;
-        /// Stored data is lz4-compressed; stored_length is the compressed size.
-        const COMPRESSED = 0x04;
         /// Dedup reference; no body bytes, no body reservation. Reads resolve
         /// through the extent index to the canonical segment's body.
         const DEDUP_REF    = 0x08;
@@ -552,14 +618,15 @@ pub struct SegmentEntry {
     pub hash: blake3::Hash,
     pub start_lba: u64,
     pub lba_length: u32,
-    pub compressed: bool,
+    /// Codec of the stored bytes this entry addresses.
+    pub codec: Codec,
     /// Entry kind: discriminates between Data, DedupRef, Zero, and Inline.
     pub kind: EntryKind,
     /// Section-relative byte offset. For body entries: offset within the body
     /// section. For inline entries: offset within the inline section. Zero for
     /// dedup refs. Set by `write_segment` when writing; already set when reading.
     pub stored_offset: u64,
-    /// Byte length of the stored data (compressed size if `compressed`).
+    /// Byte length of the stored data, in the form `codec` names.
     /// Zero for dedup refs.
     pub stored_length: u32,
     /// Inline-section bytes for `Inline` / `CanonicalInline` entries —
@@ -615,13 +682,12 @@ impl PendingEntry {
 impl SegmentEntry {
     /// Create a DATA entry from a written extent.
     ///
-    /// `flags` may include `SegmentFlags::COMPRESSED` if `data` is already compressed.
-    /// `data` is moved in — no copy.
+    /// `codec` names the form `data` is already in. `data` is moved in — no copy.
     pub fn new_data(
         hash: blake3::Hash,
         start_lba: u64,
         lba_length: u32,
-        flags: SegmentFlags,
+        codec: Codec,
         data: Vec<u8>,
     ) -> PendingEntry {
         let stored_length = data.len() as u32;
@@ -635,7 +701,7 @@ impl SegmentEntry {
                 hash,
                 start_lba,
                 lba_length,
-                compressed: flags.contains(SegmentFlags::COMPRESSED),
+                codec,
                 kind,
                 stored_offset: 0, // filled by write_segment
                 stored_length,
@@ -661,7 +727,7 @@ impl SegmentEntry {
         hash: blake3::Hash,
         start_lba: u64,
         lba_length: u32,
-        flags: SegmentFlags,
+        codec: Codec,
         stored_length: u32,
     ) -> Self {
         let kind = if would_be_inline(stored_length as usize) {
@@ -673,7 +739,7 @@ impl SegmentEntry {
             hash,
             start_lba,
             lba_length,
-            compressed: flags.contains(SegmentFlags::COMPRESSED),
+            codec,
             kind,
             stored_offset: 0,
             stored_length,
@@ -695,7 +761,7 @@ impl SegmentEntry {
             hash,
             start_lba,
             lba_length,
-            compressed: false,
+            codec: Codec::None,
             kind: EntryKind::DedupRef,
             stored_offset: 0,
             stored_length: 0,
@@ -712,7 +778,7 @@ impl SegmentEntry {
             hash: blake3::Hash::from_bytes([0u8; 32]),
             start_lba,
             lba_length,
-            compressed: false,
+            codec: Codec::None,
             kind: EntryKind::Zero,
             stored_offset: 0,
             stored_length: 0,
@@ -771,7 +837,7 @@ impl SegmentEntry {
             hash,
             start_lba,
             lba_length,
-            compressed: false,
+            codec: Codec::None,
             kind: EntryKind::Delta,
             stored_offset: 0,
             stored_length: 0,
@@ -895,16 +961,11 @@ pub fn write_segment_full(
             continue;
         }
         let Some(body) = body else { continue };
-        let raw = if entry.compressed {
-            match lz4_flex::decompress_size_prepended(body) {
-                Ok(v) => std::borrow::Cow::Owned(v),
-                // Sketching is a best-effort optimisation, not a correctness
-                // property: a body that fails to decompress is left unsketched
-                // rather than failing the segment write.
-                Err(_) => continue,
-            }
-        } else {
-            std::borrow::Cow::Borrowed(body.as_slice())
+        // Sketching is a best-effort optimisation, not a correctness
+        // property: a body that fails to decode is left unsketched rather
+        // than failing the segment write.
+        let Ok(raw) = entry.codec.decode(Cow::Borrowed(body.as_slice())) else {
+            continue;
         };
         entry.sketch = crate::sketch::compute(&raw);
     }
@@ -1034,9 +1095,6 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
         EntryKind::Delta | EntryKind::CanonicalDelta => flags |= SegmentFlags::DELTA,
         EntryKind::Data | EntryKind::CanonicalData => {}
     }
-    if e.compressed {
-        flags |= SegmentFlags::COMPRESSED;
-    }
     if !e.delta_options.is_empty() {
         flags |= SegmentFlags::HAS_DELTAS;
     }
@@ -1055,7 +1113,8 @@ fn write_index_entry<W: Write>(w: &mut W, e: &SegmentEntry) -> io::Result<()> {
     w.write_all(&[flags.bits()])?; // 1
     w.write_all(&e.stored_offset.to_le_bytes())?; // 8
     w.write_all(&e.stored_length.to_le_bytes())?; // 4
-    w.write_all(&[0u8; 7])?; // 7 reserved
+    w.write_all(&[e.codec.to_u8()])?; // 1
+    w.write_all(&[0u8; 6])?; // 6 reserved
     Ok(())
 }
 
@@ -1569,7 +1628,6 @@ fn parse_index_section(
         let lba_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let flags = SegmentFlags::from_bits_retain(read_u8(entries_data, &mut pos)?);
 
-        let compressed = flags.contains(SegmentFlags::COMPRESSED);
         if flags.contains(SegmentFlags::HAS_DELTAS) {
             has_deltas = true;
         }
@@ -1597,7 +1655,8 @@ fn parse_index_section(
 
         let stored_offset = u64::from_le_bytes(read_fixed(entries_data, &mut pos)?);
         let stored_length = u32::from_le_bytes(read_fixed(entries_data, &mut pos)?);
-        let _reserved: [u8; 7] = read_fixed(entries_data, &mut pos)?;
+        let codec = Codec::from_u8(read_u8(entries_data, &mut pos)?)?;
+        let _reserved: [u8; 6] = read_fixed(entries_data, &mut pos)?;
 
         validate_entry_bounds(
             i,
@@ -1612,7 +1671,7 @@ fn parse_index_section(
             hash,
             start_lba,
             lba_length,
-            compressed,
+            codec,
             kind,
             stored_offset,
             stored_length,
@@ -1954,12 +2013,7 @@ pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
     ) {
         return Ok(());
     }
-    let computed = if entry.compressed {
-        let decompressed = lz4_flex::decompress_size_prepended(body).map_err(io::Error::other)?;
-        blake3::hash(&decompressed)
-    } else {
-        blake3::hash(body)
-    };
+    let computed = blake3::hash(&entry.codec.decode(Cow::Borrowed(body))?);
     if computed == entry.hash {
         Ok(())
     } else {
@@ -2902,7 +2956,7 @@ mod tests {
             hash,
             10,
             2,
-            SegmentFlags::empty(),
+            Codec::None,
             data.clone(),
         )];
         let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -2915,7 +2969,7 @@ mod tests {
         assert_eq!(e.hash, hash);
         assert_eq!(e.start_lba, 10);
         assert_eq!(e.lba_length, 2);
-        assert!(!e.compressed);
+        assert_eq!(e.codec, Codec::None);
         assert_eq!(e.kind, EntryKind::Data);
         assert_eq!(e.stored_offset, 0);
         assert_eq!(e.stored_length, 8192);
@@ -2930,13 +2984,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x11u8; 4096];
         let hash = blake3::hash(&data);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         write_segment(&path, entries, signer.as_ref()).unwrap();
         let (_, _, inputs) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert!(inputs.is_empty());
@@ -2951,13 +2999,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x33u8; 4096];
         let hash = blake3::hash(&data);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let inputs_in = vec![ulid::Ulid::new(), ulid::Ulid::new(), ulid::Ulid::new()];
         write_gc_segment(&path, entries, &inputs_in, signer.as_ref()).unwrap();
 
@@ -2980,13 +3022,7 @@ mod tests {
         let (signer, vk) = test_signer();
         let data = vec![0x44u8; 4096];
         let hash = blake3::hash(&data);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let inputs_in = vec![ulid::Ulid::new()];
         write_gc_segment(&path, entries, &inputs_in, signer.as_ref()).unwrap();
 
@@ -3014,7 +3050,7 @@ mod tests {
             .map(|i| {
                 let data = vec![i as u8; 4096];
                 let hash = blake3::hash(&data);
-                SegmentEntry::new_data(hash, i * 8, 2, SegmentFlags::empty(), data)
+                SegmentEntry::new_data(hash, i * 8, 2, Codec::None, data)
             })
             .collect();
 
@@ -3068,11 +3104,11 @@ mod tests {
         let ddata = b"d".repeat(8192);
         let dhash = blake3::hash(&ddata);
 
-        let mut journal_entry = SegmentEntry::new_data(jhash, 0, 2, SegmentFlags::empty(), jdata);
+        let mut journal_entry = SegmentEntry::new_data(jhash, 0, 2, Codec::None, jdata);
         journal_entry.entry.journal = true;
         let entries = vec![
             journal_entry,
-            SegmentEntry::new_data(dhash, 2, 2, SegmentFlags::empty(), ddata),
+            SegmentEntry::new_data(dhash, 2, 2, Codec::None, ddata),
         ];
 
         write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -3114,19 +3150,12 @@ mod tests {
 
         // e0 carries an explicit sketch: the writer must preserve it verbatim,
         // not recompute over the body.
-        let mut e0 =
-            SegmentEntry::new_data(blake3::hash(&d0), 0, blocks, SegmentFlags::empty(), d0);
+        let mut e0 = SegmentEntry::new_data(blake3::hash(&d0), 0, blocks, Codec::None, d0);
         e0.entry.sketch = Some(sketch);
         let entries = vec![
             e0,
             // A fresh Data entry: the writer populates its sketch.
-            SegmentEntry::new_data(
-                blake3::hash(&d1),
-                blocks as u64,
-                blocks,
-                SegmentFlags::empty(),
-                d1,
-            ),
+            SegmentEntry::new_data(blake3::hash(&d1), blocks as u64, blocks, Codec::None, d1),
             // A body-less ref is never sketched — keeps the table sparse.
             PendingEntry::from_entry(SegmentEntry::new_dedup_ref(
                 blake3::hash(b"anc"),
@@ -3169,11 +3198,11 @@ mod tests {
         let hash0 = blake3::hash(&d0);
         let sketch = [9u32, 8, 7, 6, 5, 4, 3, 2];
 
-        let mut e0 = SegmentEntry::new_data(hash0, 0, 2, SegmentFlags::empty(), d0);
+        let mut e0 = SegmentEntry::new_data(hash0, 0, 2, Codec::None, d0);
         e0.entry.sketch = Some(sketch);
         let entries = vec![
             e0,
-            SegmentEntry::new_data(blake3::hash(&d1), 2, 2, SegmentFlags::empty(), d1),
+            SegmentEntry::new_data(blake3::hash(&d1), 2, 2, Codec::None, d1),
         ];
         write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
@@ -3220,9 +3249,9 @@ mod tests {
 
         let data2 = b"x".repeat(8192);
         let entries = vec![
-            SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data),
+            SegmentEntry::new_data(data_hash, 0, 2, Codec::None, data),
             PendingEntry::from_entry(SegmentEntry::new_dedup_ref(ref_hash, 2, 1)),
-            SegmentEntry::new_data(blake3::hash(&data2), 10, 2, SegmentFlags::empty(), data2),
+            SegmentEntry::new_data(blake3::hash(&data2), 10, 2, Codec::None, data2),
         ];
 
         write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -3254,19 +3283,61 @@ mod tests {
         let data = vec![0xCDu8; 2048]; // "compressed" payload
         let hash = blake3::hash(&data);
 
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            20,
-            1,
-            SegmentFlags::COMPRESSED,
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 20, 1, Codec::Lz4, data)];
         write_segment(&path, entries, signer.as_ref()).unwrap();
 
         let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
         assert_eq!(read_back.len(), 1);
-        assert!(read_back[0].compressed);
+        assert_eq!(read_back[0].codec, Codec::Lz4);
         assert_eq!(read_back[0].stored_length, 2048);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A codec byte this build does not know names bytes it cannot decode, so
+    /// the parse fails rather than handing back stored bytes as plaintext.
+    #[test]
+    fn an_unknown_codec_byte_is_rejected() {
+        let path = temp_path(".seg");
+        let (signer, _) = test_signer();
+        let data = vec![7u8; 2048];
+        let hash = blake3::hash(&data);
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
+        write_segment(&path, entries, signer.as_ref()).unwrap();
+
+        // Entry 0's codec byte follows hash(32) + start_lba(8) + lba_length(4)
+        // + flags(1) + stored_offset(8) + stored_length(4).
+        let codec_off = HEADER_LEN as usize + 32 + 8 + 4 + 1 + 8 + 4;
+        let mut raw = fs::read(&path).unwrap();
+        raw[codec_off] = 0xFF;
+        fs::write(&path, &raw).unwrap();
+
+        let err = read_segment_index(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown entry codec 255"),
+            "expected an unknown-codec error, got: {err}"
+        );
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// The codec byte and the flag byte are separate fields, so a codec never
+    /// disturbs the kind, journal or delta bits that share the entry.
+    #[test]
+    fn the_codec_byte_is_independent_of_the_flag_byte() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+        let data = vec![0x5Au8; 4096];
+        let hash = blake3::hash(&data);
+
+        let mut pending = SegmentEntry::new_data(hash, 8, 1, Codec::Lz4, data);
+        pending.entry.journal = true;
+        write_segment(&path, vec![pending], signer.as_ref()).unwrap();
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back[0].codec, Codec::Lz4);
+        assert!(read_back[0].journal);
+        assert_eq!(read_back[0].kind, EntryKind::Data);
 
         fs::remove_file(&path).unwrap();
     }
@@ -3282,7 +3353,7 @@ mod tests {
             blake3::hash(&raw),
             0,
             (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32,
-            SegmentFlags::COMPRESSED,
+            Codec::Lz4,
             compressed,
         )];
 
@@ -3316,7 +3387,7 @@ mod tests {
             blake3::hash(&data),
             0,
             (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         );
         e.entry.journal = true;
@@ -3347,8 +3418,8 @@ mod tests {
         let h2 = blake3::hash(&data2);
 
         let entries = vec![
-            SegmentEntry::new_data(h1, 0, 2, SegmentFlags::empty(), data1.clone()),
-            SegmentEntry::new_data(h2, 2, 2, SegmentFlags::empty(), data2.clone()),
+            SegmentEntry::new_data(h1, 0, 2, Codec::None, data1.clone()),
+            SegmentEntry::new_data(h2, 2, 2, Codec::None, data2.clone()),
         ];
 
         let (bss, _) = write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -3427,7 +3498,7 @@ mod tests {
             hash,
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             payload.to_vec(),
         )];
         let (bss, entries) = promote(
@@ -3682,13 +3753,7 @@ mod tests {
 
         let data = vec![0xAAu8; 4096];
         let hash = blake3::hash(&data);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, data)];
         let (signer, vk) = test_signer();
         let path = dir.join("01AAAAAAAAAAAAAAAAAAAAAAAA");
         write_segment(&path, entries, signer.as_ref()).unwrap();
@@ -3719,7 +3784,7 @@ mod tests {
             hash,
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data.clone(),
         )];
         assert_eq!(entries[0].entry.kind, EntryKind::Inline);
@@ -3758,8 +3823,8 @@ mod tests {
         let large_hash = blake3::hash(&large);
 
         let entries = vec![
-            SegmentEntry::new_data(small_hash, 0, 1, SegmentFlags::empty(), small.clone()),
-            SegmentEntry::new_data(large_hash, 1, 2, SegmentFlags::empty(), large.clone()),
+            SegmentEntry::new_data(small_hash, 0, 1, Codec::None, small.clone()),
+            SegmentEntry::new_data(large_hash, 1, 2, Codec::None, large.clone()),
         ];
         assert_eq!(entries[0].entry.kind, EntryKind::Inline);
         assert_eq!(entries[1].entry.kind, EntryKind::Data);
@@ -3802,8 +3867,8 @@ mod tests {
         let d1 = vec![0x11u8; 32];
         let d2 = vec![0x22u8; 64];
         let entries = vec![
-            SegmentEntry::new_data(blake3::hash(&d1), 0, 1, SegmentFlags::empty(), d1.clone()),
-            SegmentEntry::new_data(blake3::hash(&d2), 1, 1, SegmentFlags::empty(), d2.clone()),
+            SegmentEntry::new_data(blake3::hash(&d1), 0, 1, Codec::None, d1.clone()),
+            SegmentEntry::new_data(blake3::hash(&d2), 1, 1, Codec::None, d2.clone()),
         ];
         assert!(entries.iter().all(|e| e.entry.kind == EntryKind::Inline));
 
@@ -3841,7 +3906,7 @@ mod tests {
             hash,
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data.clone(),
         )];
         write_segment(&seg_path, entries, signer.as_ref()).unwrap();
@@ -3876,8 +3941,8 @@ mod tests {
         let hash1 = blake3::hash(&data1);
         let hash2 = blake3::hash(&data2);
         let entries = vec![
-            SegmentEntry::new_data(hash1, 0, 2, SegmentFlags::empty(), data1),
-            SegmentEntry::new_data(hash2, 2, 1, SegmentFlags::empty(), data2),
+            SegmentEntry::new_data(hash1, 0, 2, Codec::None, data1),
+            SegmentEntry::new_data(hash2, 2, 1, Codec::None, data2),
         ];
         write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
@@ -3971,7 +4036,7 @@ mod tests {
         };
 
         let entries = vec![
-            SegmentEntry::new_data(data_hash, 0, 2, SegmentFlags::empty(), data_body.clone()),
+            SegmentEntry::new_data(data_hash, 0, 2, Codec::None, data_body.clone()),
             PendingEntry::from_entry(SegmentEntry::new_delta(
                 delta_content_hash,
                 10,
@@ -4137,7 +4202,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         write_segment(&seg_path, entries, signer.as_ref()).unwrap();
@@ -4149,7 +4214,7 @@ mod tests {
         let mut raw = fs::read(&seg_path).unwrap();
         // Entry i=0: starts at HEADER_LEN, layout is
         //   hash(32) + start_lba(8) + lba_length(4) + flags(1)
-        //   + stored_offset(8) + stored_length(4) + reserved(7)
+        //   + stored_offset(8) + stored_length(4) + codec(1) + reserved(6)
         // stored_length sits at offset 32+8+4+1+8 = 53 within the entry.
         let stored_length_off = HEADER_LEN as usize + 32 + 8 + 4 + 1 + 8;
         raw[stored_length_off..stored_length_off + 4].copy_from_slice(&8192u32.to_le_bytes());
@@ -4211,7 +4276,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         write_segment(&seg_path, entries, signer.as_ref()).unwrap();
@@ -4316,7 +4381,7 @@ mod tests {
     fn verify_body_hash_accepts_matching_uncompressed_body() {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
-        let pending = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data.clone());
+        let pending = SegmentEntry::new_data(hash, 0, 1, Codec::None, data.clone());
         assert!(verify_body_hash(&pending.entry, &data).is_ok());
     }
 
@@ -4324,7 +4389,7 @@ mod tests {
     fn verify_body_hash_rejects_zero_filled_body() {
         let data = vec![0xABu8; 4096];
         let hash = blake3::hash(&data);
-        let pending = SegmentEntry::new_data(hash, 0, 1, SegmentFlags::empty(), data);
+        let pending = SegmentEntry::new_data(hash, 0, 1, Codec::None, data);
         let zeros = vec![0u8; 4096];
         let err = verify_body_hash(&pending.entry, &zeros).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -4336,8 +4401,7 @@ mod tests {
         let data = vec![0x55u8; 4096];
         let hash = blake3::hash(&data);
         let compressed = lz4_flex::compress_prepend_size(&data);
-        let pending =
-            SegmentEntry::new_data(hash, 0, 1, SegmentFlags::COMPRESSED, compressed.clone());
+        let pending = SegmentEntry::new_data(hash, 0, 1, Codec::Lz4, compressed.clone());
         assert!(verify_body_hash(&pending.entry, &compressed).is_ok());
     }
 
@@ -4347,13 +4411,8 @@ mod tests {
         let declared_hash = blake3::hash(&declared_data);
         let other_data = vec![0xAAu8; 4096];
         let other_compressed = lz4_flex::compress_prepend_size(&other_data);
-        let pending = SegmentEntry::new_data(
-            declared_hash,
-            0,
-            1,
-            SegmentFlags::COMPRESSED,
-            other_compressed.clone(),
-        );
+        let pending =
+            SegmentEntry::new_data(declared_hash, 0, 1, Codec::Lz4, other_compressed.clone());
         let err = verify_body_hash(&pending.entry, &other_compressed).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -4374,13 +4433,7 @@ mod tests {
         let (signer_b, vk_b) = test_signer();
         let body = vec![0xABu8; INLINE_THRESHOLD + 100];
         let hash = blake3::hash(&body);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            body,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, body)];
         write_segment(&path, entries, signer_a.as_ref()).unwrap();
         let original = fs::read(&path).unwrap();
         verify_segment_bytes(&original, "seg", &vk_a).unwrap();

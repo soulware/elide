@@ -987,7 +987,7 @@ mod tests {
     use elide_coordinator::identity::CoordinatorIdentity;
     use elide_coordinator::stores::{PassthroughStores, ScopedStores};
     use elide_core::name_record::NameRecord;
-    use elide_core::segment::{SegmentEntry, SegmentFlags, SegmentSigner};
+    use elide_core::segment::{Codec, SegmentEntry, SegmentSigner};
     use elide_core::signing::encode_hex;
     use elide_core::ulid_mint::UlidMint;
     use object_store::path::Path as StorePath;
@@ -1039,13 +1039,7 @@ mod tests {
         let path = dir.path().join("seg");
         let body = vec![fill; 4096];
         let hash = blake3::hash(&body);
-        let entries = vec![SegmentEntry::new_data(
-            hash,
-            0,
-            1,
-            SegmentFlags::empty(),
-            body,
-        )];
+        let entries = vec![SegmentEntry::new_data(hash, 0, 1, Codec::None, body)];
         elide_core::segment::write_segment(&path, entries, signer).unwrap();
         std::fs::read(&path).unwrap()
     }
@@ -1352,13 +1346,7 @@ mod tests {
         let src_bytes = {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("seg");
-            let entries = vec![SegmentEntry::new_data(
-                h1,
-                0,
-                1,
-                SegmentFlags::empty(),
-                v1.clone(),
-            )];
+            let entries = vec![SegmentEntry::new_data(h1, 0, 1, Codec::None, v1.clone())];
             elide_core::segment::write_segment(&path, entries, dead.signer.as_ref()).unwrap();
             std::fs::read(&path).unwrap()
         };

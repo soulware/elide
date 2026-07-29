@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn journal_segments_flagged_and_blocks_summed() {
-        use elide_core::segment::{self, SegmentEntry, SegmentFlags};
+        use elide_core::segment::{self, Codec, SegmentEntry};
         use ulid::Ulid;
 
         let tmp = temp_vol_dir();
@@ -1172,28 +1172,24 @@ mod tests {
 
         // Pure journal segment: two journal-tier entries, 2 + 3 = 5 blocks.
         let ju = Ulid::new();
-        let mut j0 =
-            SegmentEntry::new_data(blake3::hash(b"j0"), 100, 2, SegmentFlags::empty(), body(2));
+        let mut j0 = SegmentEntry::new_data(blake3::hash(b"j0"), 100, 2, Codec::None, body(2));
         j0.entry.journal = true;
-        let mut j1 =
-            SegmentEntry::new_data(blake3::hash(b"j1"), 102, 3, SegmentFlags::empty(), body(3));
+        let mut j1 = SegmentEntry::new_data(blake3::hash(b"j1"), 102, 3, Codec::None, body(3));
         j1.entry.journal = true;
         segment::write_segment(&pending.join(ju.to_string()), vec![j0, j1], signer.as_ref())
             .unwrap();
 
         // Pure data segment: no journal entries.
         let du = Ulid::new();
-        let d0 = SegmentEntry::new_data(blake3::hash(b"d0"), 0, 4, SegmentFlags::empty(), body(4));
+        let d0 = SegmentEntry::new_data(blake3::hash(b"d0"), 0, 4, Codec::None, body(4));
         segment::write_segment(&pending.join(du.to_string()), vec![d0], signer.as_ref()).unwrap();
 
         // Mixed segment: one journal entry (3 blocks) beside a data entry. Not a
         // pure journal segment, but its journal blocks still count.
         let mu = Ulid::new();
-        let mut m0 =
-            SegmentEntry::new_data(blake3::hash(b"m0"), 200, 3, SegmentFlags::empty(), body(3));
+        let mut m0 = SegmentEntry::new_data(blake3::hash(b"m0"), 200, 3, Codec::None, body(3));
         m0.entry.journal = true;
-        let m1 =
-            SegmentEntry::new_data(blake3::hash(b"m1"), 203, 1, SegmentFlags::empty(), body(1));
+        let m1 = SegmentEntry::new_data(blake3::hash(b"m1"), 203, 1, Codec::None, body(1));
         segment::write_segment(&pending.join(mu.to_string()), vec![m0, m1], signer.as_ref())
             .unwrap();
 
@@ -1228,7 +1224,7 @@ mod tests {
 
     #[test]
     fn dmat_bytes_are_read_from_the_sidecar_and_absent_when_it_is() {
-        use elide_core::segment::{self, SegmentEntry, SegmentFlags};
+        use elide_core::segment::{self, Codec, SegmentEntry};
         use ulid::Ulid;
 
         let tmp = temp_vol_dir();
@@ -1246,7 +1242,7 @@ mod tests {
                 blake3::hash(u.to_string().as_bytes()),
                 0,
                 1,
-                SegmentFlags::empty(),
+                Codec::None,
                 vec![7u8; 4096],
             );
             let seg_path = tmp.join(format!("{u}"));
@@ -1272,7 +1268,7 @@ mod tests {
 
     #[test]
     fn cache_counts_fold_canonical_into_storage_class() {
-        use elide_core::segment::{self, PendingEntry, SegmentEntry, SegmentFlags};
+        use elide_core::segment::{self, Codec, PendingEntry, SegmentEntry};
         use ulid::Ulid;
 
         let tmp = temp_vol_dir();
@@ -1287,15 +1283,12 @@ mod tests {
         // 4 KiB body forces a body-section Data entry and a tiny body an Inline.
         let big = || vec![7u8; 4096];
         let small = |b: u8| vec![b; 8];
-        let data =
-            SegmentEntry::new_data(blake3::hash(b"data"), 0, 1, SegmentFlags::empty(), big());
-        let canon_data =
-            SegmentEntry::new_data(blake3::hash(b"cdata"), 1, 1, SegmentFlags::empty(), big())
-                .into_canonical();
-        let inline =
-            SegmentEntry::new_data(blake3::hash(b"inl"), 2, 1, SegmentFlags::empty(), small(1));
+        let data = SegmentEntry::new_data(blake3::hash(b"data"), 0, 1, Codec::None, big());
+        let canon_data = SegmentEntry::new_data(blake3::hash(b"cdata"), 1, 1, Codec::None, big())
+            .into_canonical();
+        let inline = SegmentEntry::new_data(blake3::hash(b"inl"), 2, 1, Codec::None, small(1));
         let canon_inline =
-            SegmentEntry::new_data(blake3::hash(b"cinl"), 3, 1, SegmentFlags::empty(), small(2))
+            SegmentEntry::new_data(blake3::hash(b"cinl"), 3, 1, Codec::None, small(2))
                 .into_canonical();
         let dref = PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"r"), 4, 1));
         let zero = PendingEntry::from_entry(SegmentEntry::new_zero(5, 1));

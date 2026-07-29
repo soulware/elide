@@ -782,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_pending_uploads_and_commits() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use elide_core::signing::generate_ephemeral_signer;
 
         let tmp = TempDir::new().unwrap();
@@ -805,24 +805,12 @@ mod tests {
 
         let data1 = vec![0xABu8; 4096];
         let h1 = blake3::hash(&data1);
-        let entries1 = vec![SegmentEntry::new_data(
-            h1,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data1,
-        )];
+        let entries1 = vec![SegmentEntry::new_data(h1, 0, 1, Codec::None, data1)];
         write_segment(&pending_dir.join(&ulid1), entries1, signer.as_ref()).unwrap();
 
         let data2 = vec![0xCDu8; 4096];
         let h2 = blake3::hash(&data2);
-        let entries2 = vec![SegmentEntry::new_data(
-            h2,
-            1,
-            1,
-            SegmentFlags::empty(),
-            data2,
-        )];
+        let entries2 = vec![SegmentEntry::new_data(h2, 1, 1, Codec::None, data2)];
         write_segment(&pending_dir.join(&ulid2), entries2, signer.as_ref()).unwrap();
 
         // .tmp files must be left in place.
@@ -1198,7 +1186,7 @@ mod tests {
     /// Write two one-entry pending segments and return their ULID strings
     /// in ascending order.
     fn write_two_pending(pending_dir: &Path) -> (String, String) {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use elide_core::signing::generate_ephemeral_signer;
 
         let (signer, _) = generate_ephemeral_signer();
@@ -1207,13 +1195,7 @@ mod tests {
         for (ulid, fill, lba) in [(&ulid1, 0xABu8, 0), (&ulid2, 0xCDu8, 1)] {
             let data = vec![fill; 4096];
             let h = blake3::hash(&data);
-            let entries = vec![SegmentEntry::new_data(
-                h,
-                lba,
-                1,
-                SegmentFlags::empty(),
-                data,
-            )];
+            let entries = vec![SegmentEntry::new_data(h, lba, 1, Codec::None, data)];
             write_segment(&pending_dir.join(ulid), entries, signer.as_ref()).unwrap();
         }
         (ulid1, ulid2)

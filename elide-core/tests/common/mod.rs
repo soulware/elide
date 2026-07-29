@@ -266,7 +266,7 @@ pub fn populate_cache(fork_dir: &Path, ulid: Ulid, lba: u64, seed: u8) {
         hash,
         lba,
         1,
-        segment::SegmentFlags::empty(),
+        segment::Codec::None,
         data,
     )];
 

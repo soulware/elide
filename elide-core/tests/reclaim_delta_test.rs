@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use elide_core::extentindex::DeltaBodySource;
 use elide_core::segment::{
-    DeltaOption, EntryKind, PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner, write_segment,
+    Codec, DeltaOption, EntryKind, PendingEntry, SegmentEntry, SegmentSigner, write_segment,
     write_segment_with_delta_body,
 };
 use elide_core::signing;
@@ -93,7 +93,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
@@ -322,7 +322,7 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
@@ -479,7 +479,7 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
@@ -582,7 +582,7 @@ fn scanner_surfaces_bloated_delta_hash() {
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();

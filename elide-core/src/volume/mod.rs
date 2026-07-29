@@ -403,7 +403,7 @@ fn apply_promoted_partition(
                     segment_id: segment_ulid,
                     body_offset: entry.stored_offset,
                     body_length: entry.stored_length,
-                    compressed: entry.compressed,
+                    codec: entry.codec,
                     body_source: BodySource::Local,
                     body_section_start,
                     inline_data: idata,
@@ -427,7 +427,7 @@ fn apply_promoted_partition(
                 segment_id: segment_ulid,
                 body_offset: entry.stored_offset,
                 body_length: entry.stored_length,
-                compressed: entry.compressed,
+                codec: entry.codec,
                 body_source: BodySource::Local,
                 body_section_start,
                 inline_data: idata,
@@ -1191,11 +1191,7 @@ impl Volume {
             writelog::WalFlags::empty()
         };
 
-        let seg_flags = if is_compressed {
-            segment::SegmentFlags::COMPRESSED
-        } else {
-            segment::SegmentFlags::empty()
-        };
+        let codec = segment::Codec::from_wal_flags(wal_flags);
 
         let stored_length = bytes_to_write.len() as u32;
         let (body_offset, wal_ulid) = {
@@ -1219,7 +1215,7 @@ impl Volume {
             segment_id: wal_ulid,
             body_offset,
             body_length: stored_length,
-            compressed: is_compressed,
+            codec,
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,
@@ -1230,13 +1226,8 @@ impl Volume {
         } else {
             ei.insert_if_absent(hash, location);
         }
-        let mut entry = segment::SegmentEntry::new_data_no_body(
-            hash,
-            lba,
-            lba_length,
-            seg_flags,
-            stored_length,
-        );
+        let mut entry =
+            segment::SegmentEntry::new_data_no_body(hash, lba, lba_length, codec, stored_length);
         entry.journal = is_journal;
         self.pending.push(PendingWrite {
             entry,
@@ -2569,7 +2560,7 @@ impl Volume {
                         segment_id: ulid,
                         body_offset: entry.stored_offset,
                         body_length: entry.stored_length,
-                        compressed: entry.compressed,
+                        codec: entry.codec,
                         body_source: BodySource::Cached(i as u32),
                         body_section_start,
                         inline_data: idata,

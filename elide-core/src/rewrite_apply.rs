@@ -26,7 +26,7 @@ use ulid::Ulid;
 use crate::extentindex::{BodySource, ExtentIndex};
 use crate::rewrite_plan::{PlanOutput, RewritePlan};
 use crate::segment::{
-    self, BoxFetcher, EntryKind, PendingEntry, SegmentBodyLayout, SegmentEntry, SegmentFlags,
+    self, BoxFetcher, Codec, EntryKind, PendingEntry, SegmentBodyLayout, SegmentEntry,
 };
 
 /// Block size in bytes (4 KiB).
@@ -370,7 +370,7 @@ fn emit_keep(
                 entry.hash,
                 entry.start_lba,
                 entry.lba_length,
-                compression_flags(entry),
+                entry.codec,
                 bytes,
             ));
         }
@@ -381,7 +381,7 @@ fn emit_keep(
                 entry.hash,
                 entry.start_lba,
                 entry.lba_length,
-                compression_flags(entry),
+                entry.codec,
                 bytes.to_vec(),
             ));
         }
@@ -389,14 +389,13 @@ fn emit_keep(
             let bytes =
                 read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
             verify_body_hash(entry, &bytes)?;
-            let built = SegmentEntry::new_data(entry.hash, 0, 0, compression_flags(entry), bytes);
+            let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
             verify_body_hash(entry, bytes)?;
-            let built =
-                SegmentEntry::new_data(entry.hash, 0, 0, compression_flags(entry), bytes.to_vec());
+            let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
         EntryKind::Delta => {
@@ -483,14 +482,13 @@ fn emit_canonical(
             let bytes =
                 read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
             verify_body_hash(entry, &bytes)?;
-            let built = SegmentEntry::new_data(entry.hash, 0, 0, compression_flags(entry), bytes);
+            let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::Inline | EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
             verify_body_hash(entry, bytes)?;
-            let built =
-                SegmentEntry::new_data(entry.hash, 0, 0, compression_flags(entry), bytes.to_vec());
+            let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
         EntryKind::Delta | EntryKind::CanonicalDelta => {
@@ -551,12 +549,12 @@ fn emit_run(
     // A run is fresh plaintext sliced out of a materialised composite, so it
     // carries no stored form to inherit the way `compression_flags` copy-through
     // does. It takes the same gate every other producer of plaintext takes.
-    let (flags, body) = match crate::volume::maybe_compress(slice) {
-        Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
-        None => (SegmentFlags::empty(), slice.to_vec()),
+    let (codec, body) = match crate::volume::maybe_compress(slice) {
+        Some(compressed) => (Codec::Lz4, compressed),
+        None => (Codec::None, slice.to_vec()),
     };
     out_entries.push(SegmentEntry::new_data(
-        run_hash, start_lba, lba_length, flags, body,
+        run_hash, start_lba, lba_length, codec, body,
     ));
     Ok(())
 }
@@ -599,12 +597,12 @@ fn compute_composite_body(
             let stored =
                 read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
             verify_body_hash(entry, &stored)?;
-            decompress_if_needed(Cow::Owned(stored), entry.compressed)?
+            decode_body(Cow::Owned(stored), entry.codec)?
         }
         EntryKind::Inline => {
             let stored = read_input_inline_stored_bytes(state, entry)?;
             verify_body_hash(entry, stored)?;
-            decompress_if_needed(Cow::Borrowed(stored), entry.compressed)?
+            decode_body(Cow::Borrowed(stored), entry.codec)?
         }
         EntryKind::DedupRef => resolve_body_by_hash_decompressed(&entry.hash, ctx)?,
         EntryKind::Delta => {
@@ -670,27 +668,11 @@ fn compute_composite_body(
     Ok(body)
 }
 
-fn compression_flags(entry: &SegmentEntry) -> SegmentFlags {
-    if entry.compressed {
-        SegmentFlags::COMPRESSED
-    } else {
-        SegmentFlags::empty()
-    }
-}
-
-fn decompress_if_needed(
-    stored: Cow<'_, [u8]>,
-    compressed: bool,
-) -> Result<Vec<u8>, MaterialiseOutcome> {
-    if compressed {
-        lz4_flex::decompress_size_prepended(&stored).map_err(|e| {
-            MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!(
-                "lz4 decompress failed: {e}"
-            )))
-        })
-    } else {
-        Ok(stored.into_owned())
-    }
+fn decode_body(stored: Cow<'_, [u8]>, codec: Codec) -> Result<Vec<u8>, MaterialiseOutcome> {
+    codec
+        .decode(stored)
+        .map(Cow::into_owned)
+        .map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(e.to_string())))
 }
 
 /// Resolve the uncompressed body for `hash` via the merged extent index and
@@ -711,7 +693,7 @@ fn resolve_body_by_hash_decompressed(
         .clone();
 
     if let Some(idata) = &loc.inline_data {
-        return decompress_if_needed(Cow::Borrowed(idata), loc.compressed);
+        return decode_body(Cow::Borrowed(idata), loc.codec);
     }
 
     let (path, layout) =
@@ -721,7 +703,7 @@ fn resolve_body_by_hash_decompressed(
     let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
     f.read_exact_at(&mut buf, seek)?;
-    decompress_if_needed(Cow::Owned(buf), loc.compressed)
+    decode_body(Cow::Owned(buf), loc.codec)
 }
 
 /// Read the stored (possibly compressed) bytes for a Data-kind entry in an
@@ -895,7 +877,7 @@ mod tests {
 
     use super::*;
     use crate::rewrite_plan::{PlanOutput, RewritePlan};
-    use crate::segment::{self, DeltaOption, SegmentEntry, SegmentFlags};
+    use crate::segment::{self, DeltaOption, SegmentEntry};
 
     struct MockResolver {
         files: HashMap<Ulid, (std::path::PathBuf, SegmentBodyLayout)>,
@@ -953,7 +935,7 @@ mod tests {
             hash,
             100,
             (body.len() / BLOCK_BYTES as usize) as u32,
-            SegmentFlags::empty(),
+            Codec::None,
             body.to_vec(),
         )];
         let (bss, _) = segment::write_segment(&path, entries, ephemeral_signer().as_ref()).unwrap();
@@ -970,7 +952,7 @@ mod tests {
             (None, Some(i)) => i,
             (None, None) => panic!("entry carries no bytes"),
         };
-        if e.entry.compressed {
+        if e.entry.codec == Codec::Lz4 {
             lz4_flex::decompress_size_prepended(stored).expect("run body decompresses")
         } else {
             stored.to_vec()
@@ -1049,7 +1031,7 @@ mod tests {
 
         let input_ulid = Ulid::new();
         let input_path = dir.path().join(input_ulid.to_string());
-        let mut pending = SegmentEntry::new_data(hash, 100, 1, SegmentFlags::empty(), body.clone());
+        let mut pending = SegmentEntry::new_data(hash, 100, 1, Codec::None, body.clone());
         pending.entry.journal = true;
         segment::write_segment(&input_path, vec![pending], ephemeral_signer().as_ref()).unwrap();
 
@@ -1102,7 +1084,7 @@ mod tests {
 
         let input_ulid = Ulid::new();
         let input_path = dir.path().join(input_ulid.to_string());
-        let mut pending = SegmentEntry::new_data(hash, 100, 1, SegmentFlags::empty(), body.clone());
+        let mut pending = SegmentEntry::new_data(hash, 100, 1, Codec::None, body.clone());
         pending.entry.journal = true;
         segment::write_segment(&input_path, vec![pending], ephemeral_signer().as_ref()).unwrap();
 
@@ -1294,7 +1276,7 @@ mod tests {
 
         let m = &out.entries[0];
         assert!(
-            m.entry.compressed,
+            m.entry.codec == Codec::Lz4,
             "a run lz4 shrinks past the ratio must be stored compressed"
         );
         assert_eq!(m.entry.kind, EntryKind::Data);
@@ -1302,7 +1284,7 @@ mod tests {
         assert_eq!(plain_body(m), mixed);
 
         let c = &out.entries[1];
-        assert!(c.entry.compressed);
+        assert_eq!(c.entry.codec, Codec::Lz4);
         assert_eq!(
             c.entry.kind,
             EntryKind::Inline,
@@ -1312,7 +1294,7 @@ mod tests {
 
         let e = &out.entries[2];
         assert!(
-            !e.entry.compressed,
+            e.entry.codec == Codec::None,
             "a run lz4 cannot shrink past the ratio stays raw"
         );
         assert_eq!(e.entry.kind, EntryKind::Data);

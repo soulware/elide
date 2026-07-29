@@ -56,7 +56,7 @@ fn dummy_location(seed: u32) -> ExtentLocation {
         segment_id: Ulid::from_parts(0, seed as u128),
         body_offset: 0,
         body_length: 4096,
-        compressed: false,
+        codec: elide_core::segment::Codec::None,
         body_source: BodySource::Local,
         body_section_start: 0,
         inline_data: None,

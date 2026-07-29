@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use elide_core::extentindex::DeltaBodySource;
 use elide_core::segment::{
-    DeltaOption, PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner, write_segment,
+    Codec, DeltaOption, PendingEntry, SegmentEntry, SegmentSigner, write_segment,
     write_segment_with_delta_body,
 };
 use elide_core::signing;
@@ -88,7 +88,7 @@ fn setup_delta_volume() -> (
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
@@ -243,7 +243,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
         parent_hash,
         0,
         8,
-        SegmentFlags::empty(),
+        Codec::None,
         parent_bytes.clone(),
     )];
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();

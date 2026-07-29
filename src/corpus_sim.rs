@@ -95,14 +95,10 @@ fn load(dir: &Path, max_bytes: u64) -> io::Result<Vec<Version>> {
             if f.read_exact_at(&mut buf, e.stored_offset).is_err() {
                 continue;
             }
-            let plain = if e.compressed {
-                match lz4_flex::decompress_size_prepended(&buf) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                }
-            } else {
-                buf
+            let Ok(plain) = e.codec.decode(std::borrow::Cow::Owned(buf)) else {
+                continue;
             };
+            let plain = plain.into_owned();
             total += plain.len() as u64;
             out.push(Version {
                 seg,

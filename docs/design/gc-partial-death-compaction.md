@@ -101,8 +101,8 @@ per-entry `partial_death_runs` list (parallel to `live_entries`).
 acquire the composite body:
 
 - **Data / Inline**: read from `entry.data` (populated by `fetch_live_bodies`
-  for Data, or inline pre-population for Inline). Decompressed if
-  `entry.compressed`.
+  for Data, or inline pre-population for Inline). Decoded through
+  `entry.codec`.
 - **DedupRef**: fetched via `resolve_body_by_hash(entry.hash, ...)` — handles
   the local-cache / S3 range-GET / inline tiers behind a single interface.
 - **Delta**: two-step reconstruction. Pick the first

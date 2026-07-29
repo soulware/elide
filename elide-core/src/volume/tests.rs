@@ -468,11 +468,9 @@ fn read_after_reopen() {
     fs::remove_dir_all(base).unwrap();
 }
 
-/// Regression: compressed WAL entries must be promoted with the correct
-/// SegmentFlags::COMPRESSED so reads after recovery+promote work.
-///
-/// WalFlags::COMPRESSED=0x01; SegmentFlags::COMPRESSED=0x04.
-/// recover_wal must translate between them before calling new_data().
+/// Regression: an lz4 WAL record must be promoted carrying `Codec::Lz4` so
+/// reads after recovery+promote work. `WalFlags` is a separate bit namespace,
+/// so `recover_wal` translates before calling `new_data`.
 #[test]
 fn compressed_entry_survives_recover_and_promote() {
     let base = keyed_temp_dir();
@@ -2901,7 +2899,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
             pop_hash,
             0,
             1,
-            segment::SegmentFlags::empty(),
+            segment::Codec::None,
             pop_data,
         )];
 

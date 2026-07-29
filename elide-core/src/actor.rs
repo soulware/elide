@@ -20,6 +20,7 @@
 //
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
@@ -3299,11 +3300,7 @@ fn read_full_extent_body(
     search_dirs: &[PathBuf],
 ) -> io::Result<Vec<u8>> {
     if let Some(ref idata) = loc.inline_data {
-        return if loc.compressed {
-            lz4_flex::decompress_size_prepended(idata).map_err(io::Error::other)
-        } else {
-            Ok(idata.to_vec())
-        };
+        return Ok(loc.codec.decode(Cow::Borrowed(idata))?.into_owned());
     }
     let mut found = None;
     for dir in search_dirs {
@@ -3323,11 +3320,7 @@ fn read_full_extent_body(
     let f = std::fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
     f.read_exact_at(&mut buf, seek)?;
-    if loc.compressed {
-        lz4_flex::decompress_size_prepended(&buf).map_err(io::Error::other)
-    } else {
-        Ok(buf)
-    }
+    Ok(loc.codec.decode(Cow::Owned(buf))?.into_owned())
 }
 
 /// Read a delta blob from the segment identified by `loc`.
@@ -3496,8 +3489,8 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 .max()
                 .unwrap_or(0);
             let logical_blocks = match job.extent_index_snapshot.lookup(&er.hash) {
-                Some(loc) if loc.inline_data.is_none() && !loc.compressed => {
-                    // Uncompressed Data: body_length is the exact logical
+                Some(loc) if loc.inline_data.is_none() && loc.codec == segment::Codec::None => {
+                    // Plaintext Data: body_length is the exact logical
                     // size in bytes. Divide to get blocks. Catches tail
                     // overwrites where max_offset_end == live_blocks.
                     loc.body_length as u64 / 4096
@@ -3632,8 +3625,8 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 }
 
                 let (stored_body, flags) = match crate::volume::maybe_compress(bytes) {
-                    Some(c) => (c, segment::SegmentFlags::COMPRESSED),
-                    None => (bytes.to_vec(), segment::SegmentFlags::empty()),
+                    Some(c) => (c, segment::Codec::Lz4),
+                    None => (bytes.to_vec(), segment::Codec::None),
                 };
                 entries.push(segment::SegmentEntry::new_data(
                     new_hash,

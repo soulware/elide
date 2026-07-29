@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use elide_core::extentindex;
-use elide_core::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner, write_segment};
+use elide_core::segment::{self, Codec, SegmentEntry, SegmentSigner, write_segment};
 use elide_core::signing;
 use elide_core::sketch;
 use tempfile::TempDir;
@@ -47,7 +47,7 @@ fn write_segment_with(
             let hash = blake3::hash(b);
             hashes.push(hash);
             let blocks = (b.len() / 4096) as u32;
-            let e = SegmentEntry::new_data(hash, lba, blocks, SegmentFlags::empty(), b.clone());
+            let e = SegmentEntry::new_data(hash, lba, blocks, Codec::None, b.clone());
             lba += blocks as u64;
             e
         })
@@ -161,7 +161,7 @@ fn a_journal_entry_contributes_no_source() {
         blake3::hash(&body),
         0,
         (sketch::MIN_SKETCH_BYTES / 4096) as u32,
-        SegmentFlags::empty(),
+        Codec::None,
         body,
     );
     e.entry.journal = true;

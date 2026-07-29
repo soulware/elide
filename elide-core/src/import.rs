@@ -31,7 +31,7 @@ use ulid::Ulid;
 use crate::ext4_scan::{self, Ext4Scan, FileFragment};
 use crate::extentindex::ExtentIndex;
 use crate::filemap::{self, FilemapRow};
-use crate::segment::{self, PendingEntry, SegmentEntry, SegmentFlags, SegmentSigner};
+use crate::segment::{self, Codec, PendingEntry, SegmentEntry, SegmentSigner};
 
 const LBA_SIZE: usize = 4096;
 const ZERO_BLOCK: [u8; LBA_SIZE] = [0u8; LBA_SIZE];
@@ -88,8 +88,8 @@ fn make_entry(
     }
     let raw_bytes = body.len();
     let (flags, data) = match crate::volume::maybe_compress(&body) {
-        Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
-        None => (SegmentFlags::empty(), body.into_owned()),
+        Some(compressed) => (Codec::Lz4, compressed),
+        None => (Codec::None, body.into_owned()),
     };
     EmittedEntry {
         entry: SegmentEntry::new_data(hash, start_lba, lba_length, flags, data),

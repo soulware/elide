@@ -49,7 +49,7 @@ use elide_coordinator::volume_data::VolumeData;
 fn world_vd(world: &World) -> VolumeData {
     VolumeData::new(std::sync::Arc::clone(&world.store), world.vol_ulid)
 }
-use elide_core::segment::{self, SegmentEntry, SegmentFlags, SegmentSigner};
+use elide_core::segment::{self, Codec, SegmentEntry, SegmentSigner};
 use elide_core::signing::{self, VerifyingKey};
 use elide_core::ulid_mint::UlidMint;
 use futures::TryStreamExt;
@@ -124,7 +124,7 @@ fn build_segment_bytes(signer: &dyn SegmentSigner, inputs: &[Ulid]) -> Vec<u8> {
         blake3::hash(&body),
         0,
         1,
-        SegmentFlags::empty(),
+        Codec::None,
         body,
     )];
     if inputs.is_empty() {

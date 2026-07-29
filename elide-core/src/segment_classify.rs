@@ -280,10 +280,10 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
 mod tests {
     use super::*;
     use crate::extentindex::{BodySource, DeltaBodySource, DeltaLocation, ExtentLocation};
-    use crate::segment::{DeltaOption, SegmentFlags};
+    use crate::segment::{Codec, DeltaOption};
 
     fn canonical(hash: blake3::Hash) -> SegmentEntry {
-        SegmentEntry::new_data_no_body(hash, 7, 1, SegmentFlags::empty(), 4096).into_canonical()
+        SegmentEntry::new_data_no_body(hash, 7, 1, Codec::None, 4096).into_canonical()
     }
 
     fn delta(hash: blake3::Hash) -> SegmentEntry {
@@ -314,7 +314,7 @@ mod tests {
             segment_id,
             body_offset: 0,
             body_length: 4096,
-            compressed: false,
+            codec: crate::segment::Codec::None,
             body_source: BodySource::Local,
             body_section_start: 0,
             inline_data: None,
@@ -512,7 +512,7 @@ mod tests {
     }
 
     fn journal_data(hash: blake3::Hash, start_lba: u64) -> SegmentEntry {
-        let mut e = SegmentEntry::new_data_no_body(hash, start_lba, 1, SegmentFlags::empty(), 4096);
+        let mut e = SegmentEntry::new_data_no_body(hash, start_lba, 1, Codec::None, 4096);
         e.journal = true;
         e
     }

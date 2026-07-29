@@ -62,14 +62,7 @@ pub(super) fn replay_wal_records(
                 data,
             } => {
                 let body_length = data.len() as u32;
-                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
-                // Translate WalFlags → SegmentFlags: the two namespaces use different
-                // bit values (WalFlags::COMPRESSED = 0x01, SegmentFlags::COMPRESSED = 0x04).
-                let seg_flags = if compressed {
-                    segment::SegmentFlags::COMPRESSED
-                } else {
-                    segment::SegmentFlags::empty()
-                };
+                let codec = segment::Codec::from_wal_flags(flags);
                 lbamap.insert(start_lba, lba_length, hash, ulid);
                 // Temporary WAL offset — updated to segment offset on
                 // promotion. Mirrors `write_commit`: a journal-window record
@@ -81,7 +74,7 @@ pub(super) fn replay_wal_records(
                     segment_id: ulid,
                     body_offset,
                     body_length,
-                    compressed,
+                    codec,
                     body_source: BodySource::Local,
                     body_section_start: 0,
                     inline_data: None,
@@ -99,7 +92,7 @@ pub(super) fn replay_wal_records(
                     hash,
                     start_lba,
                     lba_length,
-                    seg_flags,
+                    codec,
                     body_length,
                 );
                 entry.journal = is_journal;

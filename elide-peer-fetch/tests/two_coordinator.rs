@@ -20,9 +20,7 @@ use std::sync::Mutex as StdMutex;
 use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey};
 use elide_core::name_record::{NameRecord, NameState};
-use elide_core::segment::{
-    SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, write_segment,
-};
+use elide_core::segment::{Codec, SegmentEntry, SegmentSigner, promote_to_cache, write_segment};
 use elide_core::signing::{ProvenanceLineage, write_provenance};
 use elide_fetch::RangeFetcher;
 use elide_peer_fetch::auth::AuthState;
@@ -98,7 +96,7 @@ fn mk_segment(
         .enumerate()
         .map(|(i, (payload, _))| {
             let hash = blake3::hash(payload);
-            SegmentEntry::new_data(hash, i as u64, 1, SegmentFlags::empty(), payload.clone())
+            SegmentEntry::new_data(hash, i as u64, 1, Codec::None, payload.clone())
         })
         .collect();
     let staging = data_dir.join(format!("staging-{seg_ulid}"));

@@ -320,7 +320,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use elide_core::name_record::{NameRecord, NameState};
     use elide_core::segment::{
-        SegmentEntry, SegmentFlags, SegmentSigner, promote_to_cache, write_segment,
+        Codec, SegmentEntry, SegmentSigner, promote_to_cache, write_segment,
     };
     use elide_core::signing::{ProvenanceLineage, write_provenance};
     use object_store::ObjectStore;
@@ -516,7 +516,7 @@ mod tests {
             .enumerate()
             .map(|(i, (payload, _))| {
                 let hash = blake3::hash(payload);
-                SegmentEntry::new_data(hash, i as u64, 1, SegmentFlags::empty(), payload.clone())
+                SegmentEntry::new_data(hash, i as u64, 1, Codec::None, payload.clone())
             })
             .collect();
         let staging = data_dir.path().join("staging");

@@ -1144,7 +1144,7 @@ mod tests {
             hash,
             start_lba,
             lba_length,
-            compressed: false,
+            codec: segment::Codec::None,
             kind,
             stored_offset: 0,
             stored_length: 0,
@@ -1373,7 +1373,7 @@ mod tests {
                 h(1),
                 0,
                 10,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 vec![0u8; 40960],
             )];
             segment::write_segment(
@@ -1390,7 +1390,7 @@ mod tests {
                 h(2),
                 5,
                 5,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 vec![0u8; 20480],
             )];
             segment::write_segment(
@@ -1440,7 +1440,7 @@ mod tests {
                 h(1),
                 0,
                 10,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 vec![0u8; 40960],
             )];
             segment::write_segment(
@@ -1456,7 +1456,7 @@ mod tests {
                 h(2),
                 5,
                 5,
-                segment::SegmentFlags::empty(),
+                segment::Codec::None,
                 vec![0u8; 20480],
             )];
             segment::write_segment(

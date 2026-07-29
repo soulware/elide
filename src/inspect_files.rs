@@ -116,8 +116,8 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
 
     println!();
     println!(
-        "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  status",
-        "type", "lba_range", "body_off", "len", "comp"
+        "{:<6}  {:<14}  {:>10}  {:>8}  {:<5}  status",
+        "type", "lba_range", "body_off", "len", "codec"
     );
     println!("{}", "-".repeat(65));
 
@@ -138,12 +138,12 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
             EntryKind::CanonicalDelta => "canon-delta",
         };
         println!(
-            "{:<6}  {:<14}  {:>10}  {:>8}  {:<4}  {:<8}  {}",
+            "{:<6}  {:<14}  {:>10}  {:>8}  {:<5}  {:<8}  {}",
             kind_str,
             format!("[{}+{})", e.start_lba, e.lba_length),
             e.stored_offset,
             e.stored_length,
-            if e.compressed { "yes" } else { "no" },
+            e.codec.to_string(),
             status,
             e.hash.to_hex(),
         );
@@ -348,7 +348,7 @@ pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
 
     println!();
     println!(
-        "{:<6}  {:<14}  {:>10}  {:>8}  comp",
+        "{:<6}  {:<14}  {:>10}  {:>8}  codec",
         "type", "lba_range", "body_off", "len"
     );
     println!("{}", "-".repeat(55));
@@ -363,14 +363,14 @@ pub fn inspect_wal(path: &Path) -> std::io::Result<()> {
                 data,
                 ..
             } => {
-                let compressed = flags.contains(writelog::WalFlags::COMPRESSED);
+                let codec = segment::Codec::from_wal_flags(*flags);
                 println!(
                     "{:<6}  {:<14}  {:>10}  {:>8}  {}",
                     "data",
                     format!("[{}+{})", start_lba, lba_length),
                     body_offset,
                     data.len(),
-                    if compressed { "yes" } else { "no" },
+                    codec,
                 );
             }
             writelog::LogRecord::Ref {

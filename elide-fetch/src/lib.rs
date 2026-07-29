@@ -1423,7 +1423,7 @@ mod tests {
     /// both absent should fetch both in one call and set both present bits.
     #[test]
     fn fetch_extent_coalesces_adjacent_entries() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, check_present_bit, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1444,9 +1444,9 @@ mod tests {
         let h1 = blake3::hash(&data1);
         let h2 = blake3::hash(&data2);
         let entries = vec![
-            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
-            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
-            SegmentEntry::new_data(h2, 2, 1, SegmentFlags::empty(), data2.clone()),
+            SegmentEntry::new_data(h0, 0, 1, Codec::None, data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, Codec::None, data1.clone()),
+            SegmentEntry::new_data(h2, 2, 1, Codec::None, data2.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -1526,7 +1526,7 @@ mod tests {
     #[test]
     fn fetch_extent_recovers_from_present_bits_without_a_body() {
         use elide_core::segment::{
-            SegmentEntry, SegmentFlags, check_present_bit, set_present_bit, write_segment,
+            Codec, SegmentEntry, check_present_bit, set_present_bit, write_segment,
         };
         use tempfile::TempDir;
 
@@ -1545,8 +1545,8 @@ mod tests {
         let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
         let entries = vec![
-            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
-            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
+            SegmentEntry::new_data(h0, 0, 1, Codec::None, data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, Codec::None, data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -1619,7 +1619,7 @@ mod tests {
     /// leaving the non-adjacent entry unset.
     #[test]
     fn fetch_extent_stops_at_body_gap() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, check_present_bit, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1643,8 +1643,8 @@ mod tests {
         let h0 = blake3::hash(&data0);
         let h1 = blake3::hash(&data1);
         let entries = vec![
-            SegmentEntry::new_data(h0, 0, 1, SegmentFlags::empty(), data0.clone()),
-            SegmentEntry::new_data(h1, 1, 1, SegmentFlags::empty(), data1.clone()),
+            SegmentEntry::new_data(h0, 0, 1, Codec::None, data0.clone()),
+            SegmentEntry::new_data(h1, 1, 1, Codec::None, data1.clone()),
         ];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -1720,7 +1720,7 @@ mod tests {
     /// at fetch time: no `.body` is written and no present bits are set.
     #[test]
     fn fetch_extent_rejects_tampered_body() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, check_present_bit, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, check_present_bit, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1735,13 +1735,7 @@ mod tests {
 
         let data0 = vec![0x55u8; 4096];
         let h0 = blake3::hash(&data0);
-        let entries = vec![SegmentEntry::new_data(
-            h0,
-            0,
-            1,
-            SegmentFlags::empty(),
-            data0.clone(),
-        )];
+        let entries = vec![SegmentEntry::new_data(h0, 0, 1, Codec::None, data0.clone())];
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
         let (bss, entries) = write_segment(&seg_path, entries, signer.as_ref()).unwrap();
@@ -1913,7 +1907,7 @@ mod tests {
     /// A segment with a flipped body byte fails signature verification.
     #[test]
     fn verify_rejects_tampered_bytes() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1923,7 +1917,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -1942,7 +1936,7 @@ mod tests {
     /// A segment signed with key A is rejected when verified with key B.
     #[test]
     fn verify_rejects_wrong_key() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1952,7 +1946,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         let (signer_a, _vk_a) = elide_core::signing::generate_ephemeral_signer();
@@ -1968,7 +1962,7 @@ mod tests {
     /// A segment with a zeroed signature field is rejected as unsigned.
     #[test]
     fn verify_rejects_unsigned_segment() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -1978,7 +1972,7 @@ mod tests {
             blake3::hash(&data),
             0,
             1,
-            SegmentFlags::empty(),
+            Codec::None,
             data,
         )];
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -2149,7 +2143,7 @@ mod tests {
     /// inner range-fetcher is invoked.
     #[test]
     fn fetch_extent_coalesces_concurrent_demand_fetches_for_same_segment() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use std::sync::Mutex as StdMutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
@@ -2191,9 +2185,7 @@ mod tests {
             .iter()
             .zip(hashes.iter())
             .enumerate()
-            .map(|(i, (d, h))| {
-                SegmentEntry::new_data(*h, i as u64, 1, SegmentFlags::empty(), d.clone())
-            })
+            .map(|(i, (d, h))| SegmentEntry::new_data(*h, i as u64, 1, Codec::None, d.clone()))
             .collect();
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -2315,7 +2307,7 @@ mod tests {
     /// the run set is durable.
     #[test]
     fn fetch_extent_disjoint_concurrent_batches_preserve_present_bits() {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use std::sync::Barrier;
         use std::sync::Mutex as StdMutex;
         use std::thread;
@@ -2365,9 +2357,7 @@ mod tests {
             .iter()
             .zip(hashes.iter())
             .enumerate()
-            .map(|(i, (d, h))| {
-                SegmentEntry::new_data(*h, i as u64, 1, SegmentFlags::empty(), d.clone())
-            })
+            .map(|(i, (d, h))| SegmentEntry::new_data(*h, i as u64, 1, Codec::None, d.clone()))
             .collect();
         let seg_path = tmp.path().join(&seg_id);
         let (signer, vk) = elide_core::signing::generate_ephemeral_signer();
@@ -2482,7 +2472,7 @@ mod tests {
         PathBuf,
         PathBuf,
     ) {
-        use elide_core::segment::{SegmentEntry, SegmentFlags, write_segment};
+        use elide_core::segment::{Codec, SegmentEntry, write_segment};
 
         let index_dir = tmp.join("index");
         let cache_dir = tmp.join("cache");
@@ -2501,13 +2491,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, data)| {
-                SegmentEntry::new_data(
-                    blake3::hash(data),
-                    i as u64,
-                    1,
-                    SegmentFlags::empty(),
-                    data.clone(),
-                )
+                SegmentEntry::new_data(blake3::hash(data), i as u64, 1, Codec::None, data.clone())
             })
             .collect();
         let seg_path = tmp.join(&seg_id);
@@ -2776,7 +2760,7 @@ mod tests {
     #[test]
     fn warm_segment_skips_non_data_entries_inside_batch() {
         use elide_core::segment::{
-            PendingEntry, SegmentEntry, SegmentFlags, check_present_bit, write_segment,
+            Codec, PendingEntry, SegmentEntry, check_present_bit, write_segment,
         };
         use tempfile::TempDir;
 
@@ -2808,14 +2792,14 @@ mod tests {
                 blake3::hash(&payload_pad),
                 0,
                 1,
-                SegmentFlags::empty(),
+                Codec::None,
                 payload_pad.clone(),
             ),
             SegmentEntry::new_data(
                 blake3::hash(&payload_a),
                 1,
                 1,
-                SegmentFlags::empty(),
+                Codec::None,
                 payload_a.clone(),
             ),
             PendingEntry::from_entry(SegmentEntry::new_dedup_ref(dedup_target_hash, 2, 1)),
@@ -2824,7 +2808,7 @@ mod tests {
                 blake3::hash(&payload_b),
                 4,
                 1,
-                SegmentFlags::empty(),
+                Codec::None,
                 payload_b.clone(),
             ),
         ];
