@@ -547,10 +547,14 @@ fn emit_run(
     let slice = &composite[start..end];
     let run_hash = blake3::hash(slice);
     // A run is fresh plaintext sliced out of a materialised composite, so it
-    // carries no stored form to inherit the way `compression_flags` copy-through
-    // does. It takes the same gate every other producer of plaintext takes.
-    let (codec, body) = match crate::volume::maybe_compress(slice) {
-        Some(compressed) => (Codec::Lz4, compressed),
+    // carries no stored form to inherit the way codec copy-through does. It
+    // takes the same gate every other producer of body plaintext takes.
+    // `allow_journal` marks a journal-to-journal rewrite, which is the only
+    // way a run here covers journal-tier bytes.
+    let (codec, body) = match crate::volume::compress_body(slice, ctx.allow_journal)
+        .map_err(MaterialiseOutcome::from)?
+    {
+        Some(pair) => pair,
         None => (Codec::None, slice.to_vec()),
     };
     out_entries.push(SegmentEntry::new_data(
@@ -952,11 +956,11 @@ mod tests {
             (None, Some(i)) => i,
             (None, None) => panic!("entry carries no bytes"),
         };
-        if e.entry.codec == Codec::Lz4 {
-            lz4_flex::decompress_size_prepended(stored).expect("run body decompresses")
-        } else {
-            stored.to_vec()
-        }
+        e.entry
+            .codec
+            .decode(Cow::Borrowed(stored))
+            .expect("run body decodes")
+            .into_owned()
     }
 
     fn entropy_bytes(seed: u64, n: usize) -> Vec<u8> {
@@ -1224,10 +1228,10 @@ mod tests {
 
     #[test]
     fn run_bodies_take_the_compression_gate() {
-        // One input holding three two-block regions: a mixed region lz4 shrinks
-        // to a `Data`-sized payload, a constant region whose compressed form
-        // falls under `INLINE_THRESHOLD`, and a high-entropy region lz4 cannot
-        // shrink past the 1.5x bar. The plan emits one run over each.
+        // One input holding three two-block regions: a mixed region that
+        // shrinks to a `Data`-sized payload, a constant region whose stored
+        // form falls under `INLINE_THRESHOLD`, and a high-entropy region no
+        // codec shrinks at all. The plan emits one run over each.
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path().join("vol");
         fs::create_dir_all(base.join("index")).unwrap();
@@ -1275,16 +1279,21 @@ mod tests {
         assert_eq!(out.entries.len(), 3);
 
         let m = &out.entries[0];
-        assert!(
-            m.entry.codec == Codec::Lz4,
-            "a run lz4 shrinks past the ratio must be stored compressed"
+        assert_eq!(
+            m.entry.codec,
+            Codec::Zstd,
+            "a body-section run takes the body codec"
         );
         assert_eq!(m.entry.kind, EntryKind::Data);
         assert!((m.entry.stored_length as usize) < mixed.len());
         assert_eq!(plain_body(m), mixed);
 
         let c = &out.entries[1];
-        assert_eq!(c.entry.codec, Codec::Lz4);
+        assert_eq!(
+            c.entry.codec,
+            Codec::Lz4,
+            "a run small enough to land in the inline section takes lz4"
+        );
         assert_eq!(
             c.entry.kind,
             EntryKind::Inline,
@@ -1293,9 +1302,10 @@ mod tests {
         assert_eq!(plain_body(c), constant);
 
         let e = &out.entries[2];
-        assert!(
-            e.entry.codec == Codec::None,
-            "a run lz4 cannot shrink past the ratio stays raw"
+        assert_eq!(
+            e.entry.codec,
+            Codec::None,
+            "a run no codec shrinks stays raw"
         );
         assert_eq!(e.entry.kind, EntryKind::Data);
         assert_eq!(e.entry.stored_length as usize, entropy.len());

@@ -378,7 +378,20 @@ pub enum Codec {
     /// lz4 with a `u32` le uncompressed-length prefix, as
     /// `lz4_flex::compress_prepend_size` produces.
     Lz4 = 1,
+    /// A single zstd frame. The frame header carries the plaintext length,
+    /// so the stored bytes describe their own decoded size the way the lz4
+    /// prefix does.
+    Zstd = 2,
 }
+
+/// Upper bound on the plaintext a stored payload may claim to decode to.
+///
+/// The claimed length comes from the stored bytes, which the body section
+/// does not sign, so a decoder sizes its output buffer from a number an
+/// attacker can choose. An extent is one guest write, capped at 1 MiB by
+/// `src/ublk.rs`'s `IO_BUF_BYTES`, or one imported file fragment, the
+/// largest measured at 24 MiB over the Ubuntu cloud-image corpus.
+pub const MAX_EXTENT_PLAINTEXT: usize = 64 * 1024 * 1024;
 
 impl Codec {
     /// The byte written to the index entry.
@@ -391,8 +404,35 @@ impl Codec {
         match b {
             0 => Ok(Codec::None),
             1 => Ok(Codec::Lz4),
+            2 => Ok(Codec::Zstd),
             other => Err(io::Error::other(format!("unknown entry codec {other}"))),
         }
+    }
+
+    /// Plaintext length `stored` declares, refused above
+    /// [`MAX_EXTENT_PLAINTEXT`].
+    ///
+    /// `Codec::None` declares its own length by being the plaintext.
+    pub fn plain_len(self, stored: &[u8]) -> io::Result<usize> {
+        let declared = match self {
+            Codec::None => stored.len() as u64,
+            Codec::Lz4 => {
+                let prefix: [u8; 4] = stored
+                    .get(..4)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| io::Error::other("lz4 payload missing size prefix"))?;
+                u32::from_le_bytes(prefix) as u64
+            }
+            Codec::Zstd => zstd::zstd_safe::get_frame_content_size(stored)
+                .map_err(|e| io::Error::other(format!("zstd frame header: {e}")))?
+                .ok_or_else(|| io::Error::other("zstd frame declares no content size"))?,
+        };
+        if declared > MAX_EXTENT_PLAINTEXT as u64 {
+            return Err(io::Error::other(format!(
+                "stored payload declares {declared} bytes of plaintext, over the {MAX_EXTENT_PLAINTEXT} cap"
+            )));
+        }
+        Ok(declared as usize)
     }
 
     /// The codec `flags` names. `WalFlags` is its own bit namespace, so a
@@ -408,13 +448,72 @@ impl Codec {
     /// Plaintext of `stored`, passed straight through when the stored bytes
     /// are already plain.
     pub fn decode<'a>(self, stored: Cow<'a, [u8]>) -> io::Result<Cow<'a, [u8]>> {
+        if self == Codec::None {
+            return Ok(stored);
+        }
+        let mut out = vec![0u8; self.plain_len(&stored)?];
+        self.decode_into(&stored, &mut out)?;
+        Ok(Cow::Owned(out))
+    }
+
+    /// Decode `stored` into `out`, which must be exactly [`Self::plain_len`]
+    /// bytes long.
+    ///
+    /// Lets a caller that already owns the destination — the read path's
+    /// output buffer or its scratch — decode without an intermediate.
+    pub fn decode_into(self, stored: &[u8], out: &mut [u8]) -> io::Result<()> {
         match self {
-            Codec::None => Ok(stored),
-            Codec::Lz4 => lz4_flex::decompress_size_prepended(&stored)
-                .map(Cow::Owned)
-                .map_err(|e| io::Error::other(format!("lz4 decompress failed: {e}"))),
+            Codec::None => {
+                if stored.len() != out.len() {
+                    return Err(io::Error::other(format!(
+                        "raw payload is {} bytes for a {} byte destination",
+                        stored.len(),
+                        out.len()
+                    )));
+                }
+                out.copy_from_slice(stored);
+                Ok(())
+            }
+            Codec::Lz4 => {
+                let payload = stored
+                    .get(4..)
+                    .ok_or_else(|| io::Error::other("lz4 payload missing size prefix"))?;
+                lz4_flex::decompress_into(payload, out)
+                    .map_err(|e| io::Error::other(format!("lz4 decompress failed: {e}")))?;
+                Ok(())
+            }
+            Codec::Zstd => ZSTD_DECODER.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let decoder = match slot.as_mut() {
+                    Some(d) => d,
+                    None => slot.insert(
+                        zstd::bulk::Decompressor::new()
+                            .map_err(|e| io::Error::other(format!("zstd decoder init: {e}")))?,
+                    ),
+                };
+                let written = decoder
+                    .decompress_to_buffer(stored, out)
+                    .map_err(|e| io::Error::other(format!("zstd decompress failed: {e}")))?;
+                if written != out.len() {
+                    return Err(io::Error::other(format!(
+                        "zstd frame decoded {written} bytes into a {} byte destination",
+                        out.len()
+                    )));
+                }
+                Ok(())
+            }),
         }
     }
+}
+
+thread_local! {
+    /// Pooled zstd decompression context.
+    ///
+    /// A context per call is the allocation shape that ratcheted RSS into the
+    /// OOMs behind `malloc_policy.rs`, and a body decode runs on every cold
+    /// extent read, so every decode borrows this one.
+    static ZSTD_DECODER: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl std::fmt::Display for Codec {
@@ -422,6 +521,7 @@ impl std::fmt::Display for Codec {
         f.write_str(match self {
             Codec::None => "raw",
             Codec::Lz4 => "lz4",
+            Codec::Zstd => "zstd",
         })
     }
 }
@@ -3292,6 +3392,57 @@ mod tests {
         assert_eq!(read_back[0].stored_length, 2048);
 
         fs::remove_file(&path).unwrap();
+    }
+
+    /// Every codec decodes to the plaintext it was given, and declares that
+    /// plaintext's length before decoding it.
+    #[test]
+    fn each_codec_round_trips_and_declares_its_plaintext_length() {
+        let plain: Vec<u8> = (0..64 * 1024u32).map(|i| (i / 97 % 251) as u8).collect();
+        let forms = [
+            (Codec::None, plain.clone()),
+            (Codec::Lz4, lz4_flex::compress_prepend_size(&plain)),
+            (Codec::Zstd, zstd::bulk::compress(&plain, 9).expect("zstd")),
+        ];
+        for (codec, stored) in forms {
+            assert_eq!(
+                codec.plain_len(&stored).expect("len"),
+                plain.len(),
+                "{codec}"
+            );
+            assert_eq!(
+                codec
+                    .decode(Cow::Borrowed(&stored))
+                    .expect("decode")
+                    .as_ref(),
+                &plain[..],
+                "{codec}"
+            );
+            let mut out = vec![0u8; plain.len()];
+            codec.decode_into(&stored, &mut out).expect("decode_into");
+            assert_eq!(out, plain, "{codec}");
+        }
+    }
+
+    /// The declared plaintext length comes from the body section, which is not
+    /// signed, so a decoder must not size a buffer from it unbounded.
+    #[test]
+    fn a_declared_plaintext_length_over_the_cap_is_refused() {
+        let mut lz4 = lz4_flex::compress_prepend_size(b"short");
+        lz4[..4].copy_from_slice(&(MAX_EXTENT_PLAINTEXT as u32 + 1).to_le_bytes());
+        let err = Codec::Lz4.plain_len(&lz4).expect_err("over the cap");
+        assert!(
+            err.to_string().contains("over the"),
+            "expected a cap error, got: {err}"
+        );
+
+        // zstd writes the content size into the frame header, so a claim over
+        // the cap is built by compressing that much.
+        assert!(
+            Codec::Zstd
+                .plain_len(&zstd::bulk::compress(&vec![0u8; 4096], 1).expect("zstd"))
+                .is_ok()
+        );
     }
 
     /// A codec byte this build does not know names bytes it cannot decode, so

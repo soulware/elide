@@ -47,13 +47,14 @@ fn lock_dmat_cache(cache: &DmatCache) -> std::sync::MutexGuard<'_, HashMap<Ulid,
 
 /// Per-thread scratch buffers for compressed-extent reads.
 ///
-/// `compressed` holds the raw compressed bytes pread'd from the segment file;
+/// `compressed` holds the stored bytes pread'd from the segment file;
 /// `decompressed` holds the full extent plaintext when the caller wants a
-/// sub-range of the extent (lz4 output for compressed extents, the pread
-/// payload for raw ones — the whole-extent path targets the caller buffer
+/// sub-range of the extent (decoder output for a coded extent, the pread
+/// payload for a raw one — the whole-extent path targets the caller buffer
 /// and never touches `decompressed`). Both Vecs grow to the high-water-mark
-/// of any read served by this thread and stay there — extent sizes are
-/// bounded by the 16 MiB segment cap, so total per-thread overhead is small.
+/// of any read served by this thread and stay there — a declared plaintext
+/// length is capped at `segment::MAX_EXTENT_PLAINTEXT`, so total per-thread
+/// overhead is bounded.
 struct ReadScratch {
     compressed: Vec<u8>,
     decompressed: Vec<u8>,
@@ -493,7 +494,7 @@ pub(crate) fn read_extents(
                     })?;
                 }
             }
-            segment::Codec::Lz4 => {
+            codec @ (segment::Codec::Lz4 | segment::Codec::Zstd) => {
                 READ_SCRATCH.with(|s| -> io::Result<()> {
                     let mut s = s.borrow_mut();
                     let s = &mut *s;
@@ -503,29 +504,19 @@ pub(crate) fn read_extents(
                         log_err("read", loc.body_length as usize, &e);
                         return Err(e);
                     }
-
-                    // The 4-byte LE size prefix `compress_prepend_size` emits.
-                    if s.compressed.len() < 4 {
-                        return Err(io::Error::other("compressed payload missing size prefix"));
-                    }
-                    let plain_len =
-                        u32::from_le_bytes(s.compressed[..4].try_into().expect("4-byte slice"))
-                            as usize;
-                    let payload = &s.compressed[4..];
+                    let plain_len = codec.plain_len(&s.compressed)?;
 
                     if src_start == 0 && src_end == plain_len && out_slice.len() == plain_len {
-                        lz4_flex::decompress_into(payload, out_slice).map_err(|e| {
-                            log_err("lz4 decompress", plain_len, &e);
-                            io::Error::other(e)
-                        })?;
+                        codec
+                            .decode_into(&s.compressed, out_slice)
+                            .inspect_err(|e| log_err("decode", plain_len, e))?;
                         return verify_extent_content(&er.hash, out_slice, lba, loc.segment_id);
                     }
 
                     s.decompressed.resize(plain_len, 0);
-                    lz4_flex::decompress_into(payload, &mut s.decompressed).map_err(|e| {
-                        log_err("lz4 decompress", plain_len, &e);
-                        io::Error::other(e)
-                    })?;
+                    codec
+                        .decode_into(&s.compressed, &mut s.decompressed)
+                        .inspect_err(|e| log_err("decode", plain_len, e))?;
                     verify_and_slice(
                         &s.decompressed,
                         &er.hash,

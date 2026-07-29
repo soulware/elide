@@ -25,6 +25,7 @@
 //   replays entries into the LBA map, extent index, and pending writes.
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
@@ -59,9 +60,9 @@ pub use ancestry::{
     latest_snapshot, lineage_ulids, parse_lineage_pair, resolve_ancestor_dir,
     verify_ancestor_manifests, walk_ancestors, walk_extent_ancestors,
 };
-pub(crate) use compress::maybe_compress;
 #[cfg(test)]
 pub(in crate::volume) use compress::{MIN_COMPRESSION_RATIO_DEN, MIN_COMPRESSION_RATIO_NUM};
+pub(crate) use compress::{compress_body, maybe_compress};
 pub use fork::{fork_volume, fork_volume_at};
 use jobs::GcCheckpointUlids;
 pub use jobs::{
@@ -145,6 +146,12 @@ pub struct PendingWrite {
 /// producing the build-form [`segment::PendingEntry`]s a segment write
 /// consumes. Inline-kind bytes land on `entry.inline`; Data bytes ride
 /// as the pending body.
+///
+/// Formation is where a body changes codec. The WAL holds lz4 because its
+/// cost is guest write latency; a segment body holds what
+/// [`compress_body`] chooses because its cost is upload bytes. Inline bytes
+/// keep the WAL's form: under roughly a kilobyte a zstd frame header costs
+/// more than its coding saves.
 pub(crate) fn materialise_pending_bodies(
     wal_path: &Path,
     writes: &[PendingWrite],
@@ -165,7 +172,14 @@ pub(crate) fn materialise_pending_bodies(
             if entry.kind.is_inline() {
                 entry.inline = Some(buf.into_boxed_slice());
             } else {
-                body = Some(buf);
+                let plain = entry.codec.decode(Cow::Owned(buf))?.into_owned();
+                let (codec, stored) = match compress_body(&plain, entry.journal)? {
+                    Some(pair) => pair,
+                    None => (segment::Codec::None, plain),
+                };
+                entry.codec = codec;
+                entry.stored_length = stored.len() as u32;
+                body = Some(stored);
             }
         }
         out.push(segment::PendingEntry { entry, body });

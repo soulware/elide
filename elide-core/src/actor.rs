@@ -3618,15 +3618,15 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     // delta_blob wasn't smaller — fall through to Data.
                 }
 
-                let (stored_body, flags) = match crate::volume::maybe_compress(bytes) {
-                    Some(c) => (c, segment::Codec::Lz4),
-                    None => (bytes.to_vec(), segment::Codec::None),
+                let (codec, stored_body) = match crate::volume::compress_body(bytes, false)? {
+                    Some(pair) => pair,
+                    None => (segment::Codec::None, bytes.to_vec()),
                 };
                 entries.push(segment::SegmentEntry::new_data(
                     new_hash,
                     er.range_start,
                     length_blocks,
-                    flags,
+                    codec,
                     stored_body,
                 ));
                 uncompressed_bytes.push(bytes.len() as u64);

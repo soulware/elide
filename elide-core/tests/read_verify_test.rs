@@ -304,3 +304,43 @@ fn the_live_path_serves_a_correct_inline_extent() {
 
     assert_eq!(&read[..], &bytes[..]);
 }
+
+#[test]
+fn the_live_path_serves_a_whole_zstd_extent() {
+    let bytes = multiblock_plaintext();
+    let hash = blake3::hash(&bytes);
+    let stored = zstd::bulk::compress(&bytes, 9).expect("compress");
+
+    let read = write_then_read_live(stored, 4, Codec::Zstd, hash, 0, 4)
+        .expect("a correct zstd extent must still read");
+
+    assert_eq!(&read[..], &bytes[..]);
+}
+
+#[test]
+fn the_live_path_serves_a_sub_range_of_a_zstd_extent() {
+    let bytes = multiblock_plaintext();
+    let hash = blake3::hash(&bytes);
+    let stored = zstd::bulk::compress(&bytes, 9).expect("compress");
+
+    for block in 0..4u64 {
+        let read = write_then_read_live(stored.clone(), 4, Codec::Zstd, hash, block, 1)
+            .expect("a correct zstd extent must still read");
+        let want = &bytes[block as usize * 4096..(block as usize + 1) * 4096];
+        assert_eq!(&read[..], want, "block {block}");
+    }
+}
+
+#[test]
+fn the_live_path_refuses_a_zstd_extent_that_decodes_cleanly_but_hashes_wrong() {
+    let stored = zstd::bulk::compress(&plaintext(), 9).expect("compress");
+    let wrong = blake3::hash(b"a hash no stored extent holds");
+
+    let err = write_then_read_live(stored, 1, Codec::Zstd, wrong, 0, 1)
+        .expect_err("the live path must not serve a zstd extent that fails its content hash");
+
+    assert!(
+        err.to_string().contains("hashed"),
+        "error should report the hash mismatch, got: {err}"
+    );
+}
