@@ -3263,12 +3263,6 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
 // Reclaim worker execution
 // ---------------------------------------------------------------------------
 
-/// zstd level for re-delta'd reclaim outputs. Mirrors the import-time
-/// `delta_compute::ZSTD_LEVEL`; reclaim runs off-actor and the blob is
-/// fetched infrequently, so a middling level keeps compression time
-/// bounded without sacrificing ratio.
-const RECLAIM_ZSTD_LEVEL: i32 = 3;
-
 /// What the reclaim worker has to work with for a single hash sitting
 /// inside the target range.
 enum ReclaimBody {
@@ -3599,13 +3593,13 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 let source_pinned =
                     pre_snapshot_h || job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0;
                 if source_pinned {
-                    let delta_blob =
-                        zstd::bulk::Compressor::with_dictionary(RECLAIM_ZSTD_LEVEL, body)
-                            .map_err(|e| {
-                                io::Error::other(format!("reclaim zstd compressor init: {e}"))
-                            })?
-                            .compress(bytes)
-                            .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
+                    let delta_blob = zstd::bulk::Compressor::with_dictionary(
+                        crate::delta_compute::ZSTD_LEVEL,
+                        body,
+                    )
+                    .map_err(|e| io::Error::other(format!("reclaim zstd compressor init: {e}")))?
+                    .compress(bytes)
+                    .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
                     if delta_blob.len() < bytes.len() {
                         let delta_offset = delta_body.len() as u64;
                         let delta_length = delta_blob.len() as u32;
@@ -3679,13 +3673,13 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 // isn't smaller than the raw sub-range bytes, skip — a
                 // bigger-delta entry would be a net loss on every read
                 // path.
-                let delta_blob =
-                    zstd::bulk::Compressor::with_dictionary(RECLAIM_ZSTD_LEVEL, source_plain)
-                        .map_err(|e| {
-                            io::Error::other(format!("reclaim zstd compressor init: {e}"))
-                        })?
-                        .compress(bytes)
-                        .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
+                let delta_blob = zstd::bulk::Compressor::with_dictionary(
+                    crate::delta_compute::ZSTD_LEVEL,
+                    source_plain,
+                )
+                .map_err(|e| io::Error::other(format!("reclaim zstd compressor init: {e}")))?
+                .compress(bytes)
+                .map_err(|e| io::Error::other(format!("reclaim zstd compress: {e}")))?;
                 if delta_blob.len() >= bytes.len() {
                     continue;
                 }
