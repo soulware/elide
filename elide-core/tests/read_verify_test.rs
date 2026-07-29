@@ -240,6 +240,59 @@ fn the_live_path_serves_a_whole_compressed_extent() {
 }
 
 #[test]
+fn the_live_path_serves_a_whole_raw_extent() {
+    let bytes = multiblock_plaintext();
+    let hash = blake3::hash(&bytes);
+
+    let read = write_then_read_live(bytes.clone(), 4, Codec::None, hash, 0, 4)
+        .expect("a correct raw extent must still read");
+
+    assert_eq!(&read[..], &bytes[..]);
+}
+
+/// A sub-range of a compressed extent decodes through the scratch buffer
+/// rather than straight into the caller's, so it agrees with the whole-extent
+/// read only if both spell the slice the same way.
+#[test]
+fn the_live_path_serves_a_sub_range_of_a_compressed_extent() {
+    let bytes = multiblock_plaintext();
+    let hash = blake3::hash(&bytes);
+    let stored = lz4_flex::compress_prepend_size(&bytes);
+
+    for block in 0..4u64 {
+        let read = write_then_read_live(stored.clone(), 4, Codec::Lz4, hash, block, 1)
+            .expect("a correct compressed extent must still read");
+        let want = &bytes[block as usize * 4096..(block as usize + 1) * 4096];
+        assert_eq!(&read[..], want, "block {block}");
+    }
+}
+
+/// Four distinct constant blocks: distinguishable per block, and small enough
+/// compressed to land in the inline section.
+fn inline_sized_multiblock() -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 * 4096);
+    for block in 0u8..4 {
+        v.extend(std::iter::repeat_n(0x30 | block, 4096));
+    }
+    v
+}
+
+#[test]
+fn the_live_path_serves_a_sub_range_of_an_inline_extent() {
+    let bytes = inline_sized_multiblock();
+    let hash = blake3::hash(&bytes);
+    let stored = lz4_flex::compress_prepend_size(&bytes);
+    assert!(stored.len() < 256, "stored form must be inline-sized");
+
+    for block in 0..4u64 {
+        let read = write_then_read_live(stored.clone(), 4, Codec::Lz4, hash, block, 1)
+            .expect("a correct inline extent must still read");
+        let want = &bytes[block as usize * 4096..(block as usize + 1) * 4096];
+        assert_eq!(&read[..], want, "block {block}");
+    }
+}
+
+#[test]
 fn the_live_path_serves_a_correct_inline_extent() {
     let bytes = vec![0x55u8; 4096];
     let hash = blake3::hash(&bytes);

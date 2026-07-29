@@ -67,6 +67,11 @@ pub struct ExtentLocation {
     /// Byte length of the stored payload, in the form `codec` names.
     pub body_length: u32,
     /// Codec of the stored payload at this location.
+    ///
+    /// A read takes its codec from the source it resolved rather than from
+    /// the entry alone. `body_source`'s files hold the segment's stored bytes,
+    /// so this answers for them; a source that re-encodes locally answers for
+    /// itself. See `docs/design/body-materialisation.md`.
     pub codec: segment::Codec,
     /// How this extent's body is stored locally.
     pub body_source: BodySource,
