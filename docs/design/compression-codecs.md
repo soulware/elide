@@ -34,9 +34,7 @@ Formation is the seam. It is asynchronous, off the ack path, and already visits 
 
 **`.dmat` — lz4.** A local read cache whose whole purpose is to be faster to read than re-materialising a delta.
 
-**Bodies take level 9,** on the same asymmetry as the delta tier below: a body compresses once at formation, off the ack path, and decompresses faster as the level rises, so the level is paid for in formation CPU alone.
-
-What it buys on whole extents is far less than on delta residuals. Measured over three corpora, stored bytes as a share of plaintext:
+**Bodies take level 3.** Measured over three corpora, stored bytes as a share of plaintext:
 
 | corpus | lz4 | zstd-3 | zstd-9 | 9 under 3 |
 |---|---|---|---|---|
@@ -44,7 +42,9 @@ What it buys on whole extents is far less than on delta residuals. Measured over
 | pg6, churn, 8 KiB extents | 18.0% | 9.8% | 9.3% | 5.7% |
 | Ubuntu cloud image, import | 41.6% | 29.3% | 27.6% | 6.1% |
 
-So 6 to 14% for roughly 3.4 times the compression CPU, against the 34 to 36% the same step buys on deltas. A residual against a dictionary has redundancy a longer search finds; a whole extent, often 8 KiB of it, does not.
+Level 9 buys 6 to 14% for roughly 3.4 times the compression CPU, on every entry formation touches. The delta tier takes 9 on the same trade because it buys 34 to 36% there, over the fraction of a percent of entries that carry a delta. A residual against a dictionary holds redundancy a longer search finds; a whole extent, often 8 KiB of one, does not. The asymmetry that makes a level cheap — compress once, off the ack path, decompress faster as it rises — applies to both, and is not what separates them.
+
+The step from lz4 is where the ratio is: 30 to 58% fewer stored bytes, which is the change this document exists for.
 
 **Delta blobs take level 9.** Measured over two Ubuntu cloud-image pairs, 429 and 1,652 fragments, deltas against the same-path parent fragment:
 
@@ -159,18 +159,18 @@ The chaining values also serve delta source selection, where a shared value betw
 
 An extent over one chunk is chunked whether or not the frames shrink it. On content no codec shrinks, the chunked form runs about 0.04% over the plaintext — one frame header and one table entry per chunk — and that buys a read that decodes and hashes one chunk where a raw extent makes it decode and hash all of them. Never producing a large raw extent is what keeps the read bound a property of the format rather than of the content, and it is the shape #800 made expensive on import fragments, which `IO_BUF_BYTES` does not bound.
 
-The lost cross-chunk matches are what chunking costs, and they are larger than codec reach suggests. Measured at zstd-9 over the entries above 64 KiB in each corpus, against storing the same extent as one frame:
+The lost cross-chunk matches are what chunking costs, and they run larger than codec reach suggests. Measured at the body level over the entries above 64 KiB in each corpus, against storing the same extent as one frame:
 
 | chunk | pg5 | pg6 | import |
 |---|---|---|---|
-| 64 KiB | +13.07% | +10.34% | +8.12% |
-| 128 KiB | +6.59% | +5.46% | +5.88% |
-| 256 KiB | +2.60% | +2.48% | +3.55% |
-| 512 KiB | +1.65% | +1.64% | +3.19% |
+| 64 KiB | +9.77% | +6.67% | +7.84% |
+| 128 KiB | +6.53% | +4.83% | +6.00% |
+| 256 KiB | +1.95% | +1.25% | +2.65% |
+| 512 KiB | +1.00% | +1.66% | +2.04% |
 
-The cost roughly halves per doubling, so zstd does keep finding matches past 128 KiB — the dictionary table's ~128 KiB plateau is about what a *trained* dictionary adds, not about a frame's own history. Chunking is not free the way "bounded by codec reach" implies.
+zstd keeps finding matches past 128 KiB, so the ~128 KiB plateau in the dictionary table above is about what a *trained* dictionary adds and not about a frame's own history.
 
-128 KiB costs 5.5 to 6.6% of the stored bytes of the extents it chunks, which on the import corpus, where 70% of plaintext sits in those extents, is 1.16% of everything stored. It bounds a 4 KiB read at 128 KiB of decode and hash where the corpus holds a 62.2 MiB extent. 256 KiB halves the cost for twice the read bound, and is the open question the table poses.
+**Chunks are 256 KiB,** where the curve flattens: it costs 1.3 to 2.7% of the stored bytes of the extents it chunks, a third of what 128 KiB costs, and 512 KiB buys little more and is worse on one corpus. On the import corpus, where 72% of plaintext sits in chunked extents, 256 KiB is 0.58% of everything stored. It bounds a 4 KiB read at 256 KiB of decode and hash against a corpus holding a 62.2 MiB extent.
 
 Chunked frames are a second body-format break beside the codec tag (§ Format). Existing volumes are already unreadable across the codec change, so both belong in one format revision — one break, not two.
 

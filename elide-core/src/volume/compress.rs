@@ -17,11 +17,12 @@ pub(in crate::volume) const MIN_COMPRESSION_RATIO_DEN: usize = 2;
 
 /// zstd level for segment bodies.
 ///
-/// A body compresses once at formation, off the ack path, and decompresses
-/// faster as the level rises, so the level is paid for in formation CPU
-/// alone. Body bytes are what a segment uploads and what S3 charges for,
-/// which is the cost this buys down.
-pub(crate) const BODY_ZSTD_LEVEL: i32 = 9;
+/// Level 9 measures 6 to 14% smaller than this over three corpora, for
+/// roughly 3.4 times the compression CPU on every entry formation touches.
+/// A whole extent, often 8 KiB of one, holds much less for a longer search
+/// to find than the delta residuals that make level 9 pay in
+/// `delta_compute::ZSTD_LEVEL`.
+pub(crate) const BODY_ZSTD_LEVEL: i32 = 3;
 
 /// Attempt lz4 compression on `data`.
 ///

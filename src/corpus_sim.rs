@@ -24,7 +24,11 @@ use elide_core::sketch::MIN_SKETCH_BYTES;
 const ZSTD_LEVEL: i32 = 3;
 
 /// The level `volume::compress_body` takes for segment bodies.
-const BODY_LEVEL: i32 = 9;
+const BODY_LEVEL: i32 = 3;
+
+/// A level above [`BODY_LEVEL`], reported so the study prices what raising it
+/// would buy rather than only what the current one achieves.
+const HIGH_LEVEL: i32 = 9;
 
 /// Sample bytes to train on per byte of dictionary produced. Below roughly
 /// this ratio zstd's trainer warns and the dictionary overfits its samples.
@@ -308,14 +312,14 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     // below one chunk are stored as a single frame either way.
     let mut big_entries = 0u64;
     let mut big_plain = 0u64;
-    let mut big_whole9 = 0u64;
-    let mut big_chunked9 = [0u64; CHUNK_SIZES.len()];
+    let mut big_whole = 0u64;
+    let mut big_chunked = [0u64; CHUNK_SIZES.len()];
     let mut zstd9_total = 0u64;
 
     for v in versions {
         let lz4 = lz4_flex::compress_prepend_size(&v.plain).len() as u64;
         let zst = zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
-        let zst9 = zstd_len(BODY_LEVEL, &v.plain)? as u64;
+        let zst9 = zstd_len(HIGH_LEVEL, &v.plain)? as u64;
         plain += v.plain.len() as u64;
         lz4_total += lz4;
         zstd_total += zst;
@@ -330,8 +334,8 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         if v.plain.len() > CHUNK_SIZES[0] {
             big_entries += 1;
             big_plain += v.plain.len() as u64;
-            big_whole9 += zst9;
-            for (slot, chunk_bytes) in big_chunked9.iter_mut().zip(CHUNK_SIZES) {
+            big_whole += zstd_len(BODY_LEVEL, &v.plain)? as u64;
+            for (slot, chunk_bytes) in big_chunked.iter_mut().zip(CHUNK_SIZES) {
                 *slot += chunked_len(BODY_LEVEL, &v.plain, chunk_bytes)? as u64;
             }
         }
@@ -351,7 +355,7 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     );
     println!(
         "zstd-{}             {:.1} MiB ({:.1}% of plain), {:.1}% under zstd-{}",
-        BODY_LEVEL,
+        HIGH_LEVEL,
         mib(zstd9_total),
         pct(zstd9_total, plain),
         pct(zstd_total.saturating_sub(zstd9_total), zstd_total),
@@ -384,18 +388,18 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     }
     println!(
         "  one frame        {:.1} MiB ({:.1}% of that plaintext)",
-        mib(big_whole9),
-        pct(big_whole9, big_plain),
+        mib(big_whole),
+        pct(big_whole, big_plain),
     );
-    for (chunked, chunk_bytes) in big_chunked9.iter().zip(CHUNK_SIZES) {
+    for (chunked, chunk_bytes) in big_chunked.iter().zip(CHUNK_SIZES) {
         println!(
             "  {:>4} KiB chunks  {:.1} MiB ({:.1}% of it)  costs {:+.2}% against one frame, \
              {:+.3}% of all plaintext",
             chunk_bytes / 1024,
             mib(*chunked),
             pct(*chunked, big_plain),
-            100.0 * (*chunked as f64 - big_whole9 as f64) / big_whole9 as f64,
-            100.0 * (*chunked as f64 - big_whole9 as f64) / plain as f64,
+            100.0 * (*chunked as f64 - big_whole as f64) / big_whole as f64,
+            100.0 * (*chunked as f64 - big_whole as f64) / plain as f64,
         );
     }
     Ok(())
