@@ -18,10 +18,14 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::sim_util::{mib, pct, zstd_len};
+use elide_core::chunk_tree;
 use elide_core::segment;
 use elide_core::sketch::MIN_SKETCH_BYTES;
 
 const ZSTD_LEVEL: i32 = 3;
+
+/// The level `volume::compress_body` takes for segment bodies.
+const BODY_LEVEL: i32 = 9;
 
 /// Sample bytes to train on per byte of dictionary produced. Below roughly
 /// this ratio zstd's trainer warns and the dictionary overfits its samples.
@@ -227,6 +231,18 @@ fn training_samples(entries: &[&Version], dict_bytes: usize) -> Vec<Vec<u8>> {
 /// Per-entry lz4 against zstd, both recomputed from plaintext so the
 /// comparison is between codecs rather than against whatever the write path
 /// happened to store.
+/// Stored size of `plain` as a chunked body: the table plus one frame per
+/// chunk. Mirrors `volume::compress_body`'s layout, including the 4-byte
+/// header and the 36 bytes each chunk costs in the table.
+fn chunked_len(level: i32, plain: &[u8]) -> io::Result<usize> {
+    let count = chunk_tree::chunk_count(plain.len());
+    let mut total = 4 + count * 36;
+    for index in 0..count {
+        total += zstd_len(level, &plain[chunk_tree::chunk_range(index, plain.len())])?;
+    }
+    Ok(total)
+}
+
 fn codec_study(versions: &[Version]) -> io::Result<()> {
     let mut plain = 0u64;
     let mut lz4_total = 0u64;
@@ -235,16 +251,32 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     let mut lz4_win_margin = 0u64;
     let mut win_sizes: BTreeMap<u32, u64> = BTreeMap::new();
 
+    // The population chunking touches, and what it costs there. Extents at or
+    // below one chunk are stored as a single frame either way.
+    let mut big_entries = 0u64;
+    let mut big_plain = 0u64;
+    let mut big_whole9 = 0u64;
+    let mut big_chunked9 = 0u64;
+    let mut zstd9_total = 0u64;
+
     for v in versions {
         let lz4 = lz4_flex::compress_prepend_size(&v.plain).len() as u64;
         let zst = zstd_len(ZSTD_LEVEL, &v.plain)? as u64;
+        let zst9 = zstd_len(BODY_LEVEL, &v.plain)? as u64;
         plain += v.plain.len() as u64;
         lz4_total += lz4;
         zstd_total += zst;
+        zstd9_total += zst9;
         if lz4 < zst {
             lz4_wins += 1;
             lz4_win_margin += zst - lz4;
             *win_sizes.entry(size_bucket(v.plain.len())).or_default() += 1;
+        }
+        if v.plain.len() > chunk_tree::CHUNK_BYTES {
+            big_entries += 1;
+            big_plain += v.plain.len() as u64;
+            big_whole9 += zst9;
+            big_chunked9 += chunked_len(BODY_LEVEL, &v.plain)? as u64;
         }
     }
 
@@ -261,6 +293,14 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         pct(lz4_total.saturating_sub(zstd_total), lz4_total),
     );
     println!(
+        "zstd-{}             {:.1} MiB ({:.1}% of plain), {:.1}% under zstd-{}",
+        BODY_LEVEL,
+        mib(zstd9_total),
+        pct(zstd9_total, plain),
+        pct(zstd_total.saturating_sub(zstd9_total), zstd_total),
+        ZSTD_LEVEL,
+    );
+    println!(
         "entries lz4 smaller {} of {} ({:.1}%), {} bytes total margin",
         lz4_wins,
         versions.len(),
@@ -270,6 +310,32 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     for (log2, count) in &win_sizes {
         println!("  <= {:>7}  {:>6} entries", fmt_pow2(*log2), count);
     }
+
+    println!(
+        "\nchunking ({} KiB chunks), over the {} of {} entries above one chunk",
+        chunk_tree::CHUNK_BYTES / 1024,
+        big_entries,
+        versions.len(),
+    );
+    if big_entries == 0 {
+        println!("  no entry exceeds one chunk; chunking changes nothing here");
+        return Ok(());
+    }
+    println!(
+        "  plaintext        {:.1} MiB ({:.1}% of all plaintext)\n  \
+         one frame        {:.1} MiB ({:.1}% of it)\n  \
+         chunked          {:.1} MiB ({:.1}% of it)\n  \
+         chunking costs   {:.1} MiB ({:+.2}% against one frame, {:+.2}% of all plaintext)",
+        mib(big_plain),
+        pct(big_plain, plain),
+        mib(big_whole9),
+        pct(big_whole9, big_plain),
+        mib(big_chunked9),
+        pct(big_chunked9, big_plain),
+        mib(big_chunked9.saturating_sub(big_whole9)),
+        100.0 * (big_chunked9 as f64 - big_whole9 as f64) / big_whole9 as f64,
+        100.0 * (big_chunked9 as f64 - big_whole9 as f64) / plain as f64,
+    );
     Ok(())
 }
 

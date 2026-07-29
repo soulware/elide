@@ -230,7 +230,7 @@ pub fn scan_reclaim_candidates(
                     segment::Codec::None => {
                         (loc.body_length as u64 / 4096, false, loc.body_length as u64)
                     }
-                    segment::Codec::Lz4 | segment::Codec::Zstd => {
+                    segment::Codec::Lz4 | segment::Codec::Zstd | segment::Codec::ZstdChunked => {
                         (agg.max_offset_end, true, loc.body_length as u64)
                     }
                 }

@@ -5,6 +5,7 @@
 
 use std::io;
 
+use crate::chunk_tree::{self, ChunkTable};
 use crate::segment::Codec;
 
 /// Minimum compression ratio required to store compressed data (1.5×).
@@ -55,20 +56,88 @@ pub(crate) fn compress_body(plain: &[u8], journal: bool) -> io::Result<Option<(C
     if journal {
         return Ok(maybe_compress(plain).map(|c| (Codec::Lz4, c)));
     }
-    let zstd_form = zstd::bulk::compress(plain, BODY_ZSTD_LEVEL)
-        .map_err(|e| io::Error::other(format!("zstd body compress failed: {e}")))?;
-    if zstd_form.len() >= plain.len() {
+
+    // An extent over one chunk is always chunked, whether or not the frames
+    // shrink it. On content no codec shrinks the chunked form runs about
+    // 0.04% over the plaintext — a frame header and a table entry per chunk —
+    // and that buys a read that decodes and hashes one chunk where a raw
+    // extent makes it decode and hash all of them. Never producing a large
+    // raw extent is what keeps the read bound a property of the format rather
+    // than of the content.
+    if plain.len() > chunk_tree::CHUNK_BYTES {
+        return Ok(Some((Codec::ZstdChunked, compress_chunked(plain)?)));
+    }
+
+    let form = zstd_frame(plain)?;
+    if form.len() >= plain.len() {
         return Ok(None);
     }
     // A stored form this small rides in the `.idx` rather than the body
     // section, and the inline section is lz4: it is fetched eagerly by every
     // host and decoded from memory, which is what the ratio threshold prices.
     // Only entries small enough to land there pay for the second encode.
-    if crate::segment::would_be_inline(zstd_form.len())
+    if crate::segment::would_be_inline(form.len())
         && let Some(lz4_form) = maybe_compress(plain)
         && crate::segment::would_be_inline(lz4_form.len())
     {
         return Ok(Some((Codec::Lz4, lz4_form)));
     }
-    Ok(Some((Codec::Zstd, zstd_form)))
+    Ok(Some((Codec::Zstd, form)))
+}
+
+thread_local! {
+    /// Pooled zstd compression context. Chunking turns one compress per
+    /// extent into one per 128 KiB, so a context per call would be the
+    /// allocation shape behind `malloc_policy.rs` at chunk frequency.
+    static ZSTD_ENCODER: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One zstd frame over `plain`, at [`BODY_ZSTD_LEVEL`].
+fn zstd_frame(plain: &[u8]) -> io::Result<Vec<u8>> {
+    ZSTD_ENCODER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let encoder = match slot.as_mut() {
+            Some(e) => e,
+            None => slot.insert(
+                zstd::bulk::Compressor::new(BODY_ZSTD_LEVEL)
+                    .map_err(|e| io::Error::other(format!("zstd encoder init: {e}")))?,
+            ),
+        };
+        encoder
+            .compress(plain)
+            .map_err(|e| io::Error::other(format!("zstd body compress failed: {e}")))
+    })
+}
+
+/// A chunk table followed by one independently decodable frame per
+/// [`chunk_tree::CHUNK_BYTES`] of `plain`.
+///
+/// The cost is the frames the compressor no longer sees across a chunk
+/// boundary. lz4 matches within 64 KiB and zstd gains little from history
+/// beyond about this size, because inputs this large supply their own, so a
+/// 128 KiB chunk gives up little of either.
+fn compress_chunked(plain: &[u8]) -> io::Result<Vec<u8>> {
+    let count = chunk_tree::chunk_count(plain.len());
+    let mut frames = Vec::with_capacity(count);
+    let mut table = ChunkTable {
+        plain_len: plain.len(),
+        stored_lengths: Vec::with_capacity(count),
+        cvs: Vec::with_capacity(count),
+    };
+    for index in 0..count {
+        let chunk = &plain[chunk_tree::chunk_range(index, plain.len())];
+        let frame = zstd_frame(chunk)?;
+        table.cvs.push(chunk_tree::chunk_cv(index, chunk));
+        table.stored_lengths.push(frame.len() as u32);
+        frames.push(frame);
+    }
+    let mut out = Vec::with_capacity(
+        ChunkTable::encoded_len(plain.len()) + frames.iter().map(Vec::len).sum::<usize>(),
+    );
+    table.encode(&mut out);
+    for frame in frames {
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
 }

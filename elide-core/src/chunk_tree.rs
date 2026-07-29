@@ -145,6 +145,95 @@ pub fn verify_chunk(
     Ok(())
 }
 
+/// Bytes each chunk takes in the table: its stored length and its chaining
+/// value. Offsets are the prefix sum of the lengths, so they are not stored.
+const TABLE_ENTRY_LEN: usize = 4 + 32;
+
+/// Bytes the table header takes: the extent's plaintext length, from which
+/// the chunk count follows.
+const TABLE_HEADER_LEN: usize = 4;
+
+/// The table at the head of a chunked stored payload.
+///
+/// It sits in the body section rather than the index because `.idx` is
+/// fetched eagerly for every ancestor at open, and a volume that never reads
+/// a body should not carry its chaining values.
+pub struct ChunkTable {
+    /// Plaintext bytes the whole extent decodes to.
+    pub plain_len: usize,
+    /// Stored bytes of each chunk, in order.
+    pub stored_lengths: Vec<u32>,
+    /// Chaining value of each chunk, in order.
+    pub cvs: Vec<ChainingValue>,
+}
+
+impl ChunkTable {
+    /// Bytes a table for `plain_len` bytes of plaintext occupies.
+    pub fn encoded_len(plain_len: usize) -> usize {
+        TABLE_HEADER_LEN + chunk_count(plain_len) * TABLE_ENTRY_LEN
+    }
+
+    /// The plaintext length at the head of `stored`, before the rest of the
+    /// table has been read.
+    ///
+    /// Lets a reader size its table read from a first byte range that may be
+    /// shorter than the table.
+    pub fn peek_plain_len(stored: &[u8]) -> io::Result<usize> {
+        let bytes: [u8; 4] = stored
+            .get(..TABLE_HEADER_LEN)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| io::Error::other("chunked payload missing its table header"))?;
+        Ok(u32::from_le_bytes(bytes) as usize)
+    }
+
+    pub fn parse(stored: &[u8]) -> io::Result<Self> {
+        let plain_len = Self::peek_plain_len(stored)?;
+        let count = chunk_count(plain_len);
+        let table = stored
+            .get(..Self::encoded_len(plain_len))
+            .ok_or_else(|| io::Error::other("chunked payload shorter than its table"))?;
+        let mut stored_lengths = Vec::with_capacity(count);
+        let mut cvs = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = TABLE_HEADER_LEN + i * TABLE_ENTRY_LEN;
+            let len: [u8; 4] = table[at..at + 4].try_into().map_err(io::Error::other)?;
+            let cv: ChainingValue = table[at + 4..at + TABLE_ENTRY_LEN]
+                .try_into()
+                .map_err(io::Error::other)?;
+            stored_lengths.push(u32::from_le_bytes(len));
+            cvs.push(cv);
+        }
+        Ok(Self {
+            plain_len,
+            stored_lengths,
+            cvs,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.plain_len as u32).to_le_bytes());
+        for (len, cv) in self.stored_lengths.iter().zip(&self.cvs) {
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(cv);
+        }
+    }
+
+    /// Byte range of chunk `index` within the whole stored payload.
+    pub fn chunk_span(&self, index: usize) -> io::Result<std::ops::Range<usize>> {
+        if index >= self.stored_lengths.len() {
+            return Err(io::Error::other(format!(
+                "chunk {index} is past the chunk table"
+            )));
+        }
+        let start = Self::encoded_len(self.plain_len)
+            + self.stored_lengths[..index]
+                .iter()
+                .map(|l| *l as usize)
+                .sum::<usize>();
+        Ok(start..start + self.stored_lengths[index] as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
