@@ -1,6 +1,6 @@
 # Design: compression codecs
 
-Status: Proposed, not started. Measurements in § Measurement come from one bulk-load-dominated postgres corpus; § Open questions lists what a churned corpus has to confirm before the codec change is taken.
+Status: Proposed, not started. § Measurement covers a bulk-load-dominated and a churned postgres corpus. Guest read latency, in § Open questions, is what still gates the codec change.
 
 Date: 2026-07-25
 
@@ -48,7 +48,7 @@ The threshold prices decompression CPU on read. Under the asymmetry above that i
 
 It is also a weaker safety net under zstd than under lz4. On incompressible input lz4 expands by about 0.4% (65,536 bytes of random data becomes 65,798) while zstd emits a raw block and adds a flat ~13 bytes (65,546). The expansion the threshold guards against is an lz4 property.
 
-Two knobs to settle with the churned-corpus rerun: the ratio itself, and whether segment bodies and `.dmat` share one.
+The churned corpus prices the bar. Stored bytes there run 18.0% of plaintext against a per-entry lz4 recompute of 18.0%, so the ratio turns away too little to be the lever. What stays open is whether segment bodies and `.dmat` share one.
 
 ## zstd and dictionaries
 
@@ -72,14 +72,14 @@ The economics follow the same shape. The gain totals ~109 KiB across 382.6 MiB o
 
 ## Measurement
 
-`elide corpus-sim` over 34 segments of a pgbench volume, 1,677 entries, 993.3 MiB of plaintext, both codecs recomputed from plaintext:
+`elide corpus-sim` over two pgbench corpora, both codecs recomputed from plaintext. The bulk corpus is 34 segments, 1,677 entries, 993.3 MiB of plaintext at a mean entry of 592 KiB. The churned corpus is a fresh volume driven through eight 300-second rounds, 65,012 entries, 753.7 MiB at a mean entry of 11.9 KiB.
 
-| | bytes | of plain |
-|---|---|---|
-| lz4 | 147.2 MiB | 14.8% |
-| zstd-3 | 61.5 MiB | 6.2% |
+| | bulk | of plain | churn | of plain |
+|---|---|---|---|---|
+| lz4 | 147.2 MiB | 14.8% | 135.7 MiB | 18.0% |
+| zstd-3 | 61.5 MiB | 6.2% | 74.0 MiB | 9.8% |
 
-zstd-3 is 85.7 MiB smaller, 58.2% fewer bytes uploaded for the same data. lz4 produced the smaller output on 0 of 1,677 entries.
+zstd-3 is 58.2% smaller on the bulk corpus and 45.5% smaller on the churned one, and produced the smaller output on every entry of both, 1,677 and 65,012. Over the churned corpus's newest twenty segments alone it is 42.0% smaller.
 
 lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern — its four-byte size prefix against zstd's frame header. The crossover is a framing constant, not a content property, and it sits below the 256-byte threshold at which extents become `Inline`.
 
@@ -101,9 +101,7 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 
 ## Open questions
 
-The measured corpus is dominated by an initial bulk load. A churned corpus — many small overwrites, a large canonical-only population from GC output — gave a very different picture on the same workload, with stored bytes within 1% of plaintext because almost every entry failed the 1.5× bar. The codec gap, the funnel, and the threshold all need re-measuring there before the change is taken.
-
-A trained dictionary reopens on that corpus too. Its mean entry ran to 8.8 KiB against 592 KiB here, and 8 KiB is the size at which the dictionary earns 17.4%. A volume that churns into small extents is the shape the per-size table says a dictionary is for, so the question is which distribution real volumes settle into rather than whether dictionaries work.
+A trained dictionary pays on the churned corpus, on the shape the per-size table predicts. Its 8 KiB entries, 26,117 of them and the population that carries the corpus, gain 32.8%; 16 KiB gains 17.7% and 32 to 64 KiB around 10%. The held-out aggregate runs 29.6 MiB down to 22.4 MiB, 24% under dictionaryless zstd, with 0.1 points of drift against a dictionary trained on the test set. What stays open is which distribution real volumes settle into, since the bulk corpus above wants no dictionary at all.
 
 Guest read latency under zstd is unmeasured, and under the aim above it gates the change rather than costing against it. Decompression is roughly three to four times slower than lz4. What decides whether that is visible is extent-level read locality under the guest, which nothing measures today.
 
@@ -127,4 +125,6 @@ Chunked frames are a second body-format break beside the codec tag (§ Format). 
 
 `IO_BUF_BYTES` reaches the same variable with no format change, since it is what bounds an extent. Lowering it shrinks extents directly, at the cost of more I/Os per large sequential write and more entries in the eagerly-fetched `.idx`. It is the cheap way to find out whether read amplification is worth a format change before making one, and it reaches guest-write extents alone. Import fragments take their size from the ext4 extent tree instead. Over three Ubuntu cloud-image pairs the fragments above 128 KiB are a small minority by count after whole-extent dedup (199 of 2600, 453 of 7574, 1331 of 39793) and hold 66 to 84% of the bytes, so on boot-image volumes most bytes sit in extents large enough for chunking to bound a read.
 
-Delta compression and a stronger body codec are substitutes at the margin. The first keep bar is "beat the stored body", which becomes a smaller number under zstd. Against zstd-3 in 128 KiB chunked frames the bar still clears on import corpora, keeping 423 of 429, 1646 of 1652 and 2469 of 2481 eligible conversions across three Ubuntu cloud-image pairs and saving 13.9%, 24.7% and 7.5% of the stored bytes that survive whole-extent dedup. The same re-baseline on a churned corpus stays open.
+Which volumes chunking reaches follows the same distribution. The bulk corpus puts 98.5% of its bytes in extents above 128 KiB, and the churned one puts 89.3% at or under it, 99.5% over its newest twenty segments. So chunking bounds reads on imported and bulk-loaded volumes, and a volume that has churned into small extents is already below the chunk size.
+
+Delta compression and a stronger body codec are substitutes at the margin. The first keep bar is "beat the stored body", which becomes a smaller number under zstd. Against zstd-3 in 128 KiB chunked frames the bar still clears on import corpora, keeping 423 of 429, 1646 of 1652 and 2469 of 2481 eligible conversions across three Ubuntu cloud-image pairs and saving 13.9%, 24.7% and 7.5% of the stored bytes that survive whole-extent dedup. On the churned corpus delta is weak from the other direction: 133 chains, and a delta against a fixed anchor lands at 79.2% of dictionaryless zstd one version out, decaying to 93.5% by four, with anchor retention costing 0.8 MiB more than it saves.
