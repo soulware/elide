@@ -18,7 +18,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::{
-    delta_compute, dmat,
+    chunk_tree, delta_compute, dmat,
     extentindex::{self, BodySource, SegmentPresence},
     lbamap,
     segment::{self},
@@ -58,6 +58,10 @@ fn lock_dmat_cache(cache: &DmatCache) -> std::sync::MutexGuard<'_, HashMap<Ulid,
 struct ReadScratch {
     compressed: Vec<u8>,
     decompressed: Vec<u8>,
+    /// A chunked extent's table, and the chaining values reconstructed from
+    /// it with the decoded chunks' values substituted in.
+    table: Vec<u8>,
+    cvs: Vec<blake3::hazmat::ChainingValue>,
 }
 
 thread_local! {
@@ -65,6 +69,8 @@ thread_local! {
         RefCell::new(ReadScratch {
             compressed: Vec::new(),
             decompressed: Vec::new(),
+            table: Vec::new(),
+            cvs: Vec::new(),
         })
     };
 }
@@ -122,6 +128,116 @@ fn verify_and_slice(
     out_slice.copy_from_slice(src);
     Ok(())
 }
+
+/// Serve `src_start..src_end` of a chunked extent, reading and decoding only
+/// the chunks that range lands in.
+///
+/// The chunk table's chaining values are subtree values of the extent's own
+/// hash tree, so substituting the values computed from the decoded chunks and
+/// reconstructing the root checks the decoded bytes and the unsigned table
+/// together, against the hash the signed index carries. That is one
+/// reconstruction per read whatever the read's shape.
+#[allow(clippy::too_many_arguments)]
+fn serve_chunked(
+    f: &fs::File,
+    file_body_offset: u64,
+    body_length: usize,
+    expected: &blake3::Hash,
+    lba: u64,
+    segment_id: Ulid,
+    src_start: usize,
+    src_end: usize,
+    out_slice: &mut [u8],
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    READ_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        let s = &mut *s;
+
+        // The table's own length follows from the plaintext length in its
+        // first four bytes, so read a prefix that covers most tables outright
+        // and extend it only when one runs longer.
+        let prefix = TABLE_READ_PREFIX.min(body_length);
+        s.table.resize(prefix, 0);
+        f.read_exact_at(&mut s.table, file_body_offset)?;
+        let plain_len = chunk_tree::ChunkTable::peek_plain_len(&s.table)?;
+        if plain_len > segment::MAX_EXTENT_PLAINTEXT {
+            return Err(io::Error::other(format!(
+                "chunked payload declares {plain_len} bytes of plaintext, over the {} cap",
+                segment::MAX_EXTENT_PLAINTEXT
+            )));
+        }
+        let table_len = chunk_tree::ChunkTable::encoded_len(plain_len);
+        if table_len > s.table.len() {
+            s.table.resize(table_len, 0);
+            f.read_exact_at(&mut s.table, file_body_offset)?;
+        }
+        let table = chunk_tree::ChunkTable::parse(&s.table)?;
+
+        let wanted = chunk_tree::chunks_covering(src_start, src_end);
+        let first = table.chunk_span(wanted.start)?;
+        let last = table.chunk_span(wanted.end - 1)?;
+        if last.end > body_length {
+            return Err(io::Error::other(
+                "chunk table spans past the stored payload",
+            ));
+        }
+
+        // One pread for the run: chunks sit in index order, so the wanted
+        // ones are contiguous.
+        s.compressed.resize(last.end - first.start, 0);
+        f.read_exact_at(&mut s.compressed, file_body_offset + first.start as u64)?;
+
+        s.cvs.clear();
+        s.cvs.extend_from_slice(&table.cvs);
+        for index in wanted {
+            let span = table.chunk_span(index)?;
+            let frame = &s.compressed[span.start - first.start..span.end - first.start];
+            let plain = chunk_tree::chunk_range(index, plain_len);
+
+            // A chunk wholly inside the caller's range decodes into its
+            // buffer; one that only overlaps decodes into the scratch and
+            // contributes the overlap. Either way the whole chunk is in hand,
+            // which is what its chaining value covers.
+            let cv = if plain.start >= src_start && plain.end <= src_end {
+                let at = plain.start - src_start;
+                let into = &mut out_slice[at..at + plain.len()];
+                segment::Codec::Zstd.decode_into(frame, into)?;
+                chunk_tree::chunk_cv(index, into)
+            } else {
+                s.decompressed.resize(plain.len(), 0);
+                segment::Codec::Zstd.decode_into(frame, &mut s.decompressed)?;
+                let from = src_start.max(plain.start);
+                let to = src_end.min(plain.end);
+                out_slice[from - src_start..to - src_start]
+                    .copy_from_slice(&s.decompressed[from - plain.start..to - plain.start]);
+                chunk_tree::chunk_cv(index, &s.decompressed)
+            };
+            s.cvs[index] = cv;
+        }
+
+        let root = chunk_tree::root_from_cvs(&s.cvs, plain_len)?;
+        if root != *expected {
+            log::error!(
+                "content hash mismatch: lba={lba} segment={segment_id} expected={} got={} \
+                 ({plain_len} bytes over {} chunks)",
+                expected.to_hex(),
+                root.to_hex(),
+                s.cvs.len(),
+            );
+            return Err(io::Error::other(format!(
+                "extent body hashed {} instead of {} ({plain_len} bytes)",
+                root.to_hex(),
+                expected.to_hex()
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// First read of a chunk table. Covers a table for an extent up to about
+/// 14 MiB, so a second read is the tail of the size distribution.
+const TABLE_READ_PREFIX: usize = 4096;
 
 /// Default capacity for the segment file handle LRU cache.
 const FILE_CACHE_CAPACITY: usize = 16;
@@ -461,11 +577,27 @@ pub(crate) fn read_extents(
             );
         };
 
-        // Each arm produces the extent's plaintext, either straight into
-        // `out_slice` when the caller wants the whole extent or into the TLS
-        // scratch when it wants a sub-range of it. The content hash covers
-        // the extent, so even a one-block read materialises all of it.
+        // An unchunked arm produces the extent's whole plaintext, either
+        // straight into `out_slice` when the caller wants all of it or into
+        // the TLS scratch when it wants a sub-range, because the content hash
+        // can only be checked against the whole extent. The chunked arm
+        // checks per chunk against the same hash, so it reads and decodes
+        // only the chunks the caller's range lands in.
         match loc.codec {
+            segment::Codec::ZstdChunked => {
+                serve_chunked(
+                    f,
+                    file_body_offset,
+                    loc.body_length as usize,
+                    &er.hash,
+                    lba,
+                    loc.segment_id,
+                    src_start,
+                    src_end,
+                    out_slice,
+                )
+                .inspect_err(|e| log_err("chunked decode", src_end - src_start, e))?;
+            }
             segment::Codec::None => {
                 let body_len = loc.body_length as usize;
                 if src_start == 0 && out_slice.len() == body_len {

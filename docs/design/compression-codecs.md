@@ -1,6 +1,6 @@
 # Design: compression codecs
 
-Status: Built. § Measurement covers a bulk-load-dominated and a churned postgres corpus. The read-side answers in § Open questions follow this change rather than gating it, and § Format carries what it preserves for them to stay available.
+Status: Built, including the chunked granularity in § Open questions. § Measurement covers a bulk-load-dominated and a churned postgres corpus. The read-side answers in § Open questions follow this change rather than gating it, and § Format carries what it preserves for them to stay available.
 
 Date: 2026-07-25
 
@@ -147,7 +147,7 @@ Two things this asks of the layout. Chunk size is a power-of-two multiple of BLA
 
 The chaining values also serve delta source selection, where a shared value between two extents is an exact resemblance signal against the sampling `sketch.rs` does.
 
-Raw extents carry the table too. They hold no frame to chunk, so their entries are chaining values alone with offsets implied by the chunk size, and the read path verifies the chunk it touched instead of the whole payload. This is the shape #800 made expensive, and import fragments, which `IO_BUF_BYTES` does not bound, are where it costs most.
+An extent over one chunk is chunked whether or not the frames shrink it. On content no codec shrinks, the chunked form runs about 0.04% over the plaintext — one frame header and one table entry per chunk — and that buys a read that decodes and hashes one chunk where a raw extent makes it decode and hash all of them. Never producing a large raw extent is what keeps the read bound a property of the format rather than of the content, and it is the shape #800 made expensive on import fragments, which `IO_BUF_BYTES` does not bound.
 
 The lost cross-chunk matches are bounded by codec reach. lz4 matches within a 64 KiB window, so chunks at or above that size cost it nothing, and the dictionary table above shows zstd gaining little from history beyond ~128 KiB, because inputs that size supply their own. At 128 KiB the chunk table falls to ~0.4% of body bytes and a 4 KiB read decompresses at most 128 KiB.
 

@@ -344,3 +344,198 @@ fn the_live_path_refuses_a_zstd_extent_that_decodes_cleanly_but_hashes_wrong() {
         "error should report the hash mismatch, got: {err}"
     );
 }
+
+// --- chunked extents ---
+
+use elide_core::chunk_tree::{self, CHUNK_BYTES, ChunkTable};
+
+/// Build the `ZstdChunked` stored form of `plain` the way `compress_body`
+/// does, so these tests exercise the reader against the real layout.
+fn chunked_form(plain: &[u8]) -> Vec<u8> {
+    let count = chunk_tree::chunk_count(plain.len());
+    let mut frames = Vec::new();
+    let mut table = ChunkTable {
+        plain_len: plain.len(),
+        stored_lengths: Vec::new(),
+        cvs: Vec::new(),
+    };
+    for index in 0..count {
+        let chunk = &plain[chunk_tree::chunk_range(index, plain.len())];
+        let frame = zstd::bulk::compress(chunk, 9).expect("compress");
+        table.cvs.push(chunk_tree::chunk_cv(index, chunk));
+        table.stored_lengths.push(frame.len() as u32);
+        frames.push(frame);
+    }
+    let mut out = Vec::new();
+    table.encode(&mut out);
+    for frame in frames {
+        out.extend_from_slice(&frame);
+    }
+    out
+}
+
+/// Distinguishable per 4 KiB block and compressible, spanning several chunks.
+fn multichunk_plaintext(blocks: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(blocks * 4096);
+    for block in 0..blocks {
+        v.extend(std::iter::repeat_n((block % 251) as u8, 4096));
+        let tag = (block as u32).to_le_bytes();
+        let at = v.len() - 4096;
+        v[at..at + 4].copy_from_slice(&tag);
+    }
+    v
+}
+
+#[test]
+fn the_live_path_serves_a_whole_chunked_extent() {
+    let blocks = 100; // ~410 KiB, four chunks
+    let bytes = multichunk_plaintext(blocks);
+    assert!(bytes.len() > 3 * CHUNK_BYTES);
+    let hash = blake3::hash(&bytes);
+
+    let read = write_then_read_live(
+        chunked_form(&bytes),
+        blocks as u32,
+        Codec::ZstdChunked,
+        hash,
+        0,
+        blocks as u32,
+    )
+    .expect("a correct chunked extent must read");
+
+    assert_eq!(&read[..], &bytes[..]);
+}
+
+/// Every single-block read across a multi-chunk extent, including the blocks
+/// either side of each chunk boundary.
+#[test]
+fn the_live_path_serves_every_block_of_a_chunked_extent() {
+    let blocks = 100;
+    let bytes = multichunk_plaintext(blocks);
+    let hash = blake3::hash(&bytes);
+    let stored = chunked_form(&bytes);
+
+    for block in 0..blocks as u64 {
+        let read = write_then_read_live(
+            stored.clone(),
+            blocks as u32,
+            Codec::ZstdChunked,
+            hash,
+            block,
+            1,
+        )
+        .expect("a correct chunked extent must read");
+        let at = block as usize * 4096;
+        assert_eq!(&read[..], &bytes[at..at + 4096], "block {block}");
+    }
+}
+
+/// A range straddling a chunk boundary needs both chunks, and the halves have
+/// to line up in the caller's buffer.
+#[test]
+fn the_live_path_serves_a_range_straddling_a_chunk_boundary() {
+    let blocks = 100;
+    let bytes = multichunk_plaintext(blocks);
+    let hash = blake3::hash(&bytes);
+    let stored = chunked_form(&bytes);
+
+    let boundary = (CHUNK_BYTES / 4096) as u64;
+    for (start, count) in [
+        (boundary - 1, 2),
+        (boundary - 2, 4),
+        (boundary * 2 - 1, 3),
+        (0, blocks as u32 - 1),
+        (1, blocks as u32 - 1),
+    ] {
+        let read = write_then_read_live(
+            stored.clone(),
+            blocks as u32,
+            Codec::ZstdChunked,
+            hash,
+            start,
+            count,
+        )
+        .expect("a correct chunked extent must read");
+        let at = start as usize * 4096;
+        assert_eq!(
+            &read[..],
+            &bytes[at..at + count as usize * 4096],
+            "{count} blocks at {start}"
+        );
+    }
+}
+
+#[test]
+fn the_live_path_refuses_a_chunked_extent_that_hashes_wrong() {
+    let blocks = 100;
+    let bytes = multichunk_plaintext(blocks);
+    let wrong = blake3::hash(b"a hash no stored extent holds");
+
+    let err = write_then_read_live(
+        chunked_form(&bytes),
+        blocks as u32,
+        Codec::ZstdChunked,
+        wrong,
+        0,
+        1,
+    )
+    .expect_err("the live path must not serve a chunked extent that fails its content hash");
+
+    assert!(
+        err.to_string().contains("hashed"),
+        "error should report the hash mismatch, got: {err}"
+    );
+}
+
+/// A read verifies what it serves, and only that. Corrupting a chunk the read
+/// does not touch leaves it unaffected, because the reader takes that chunk's
+/// chaining value from the table rather than recomputing it; reading the
+/// corrupt chunk is refused. That is the granularity of the check.
+#[test]
+fn a_chunked_read_verifies_the_chunks_it_serves() {
+    let blocks = 100;
+    let bytes = multichunk_plaintext(blocks);
+    let hash = blake3::hash(&bytes);
+
+    let mut stored = chunked_form(&bytes);
+    // Land inside the last chunk's frame, past every earlier chunk.
+    let at = stored.len() - 8;
+    stored[at] ^= 0xFF;
+
+    let read = write_then_read_live(
+        stored.clone(),
+        blocks as u32,
+        Codec::ZstdChunked,
+        hash,
+        0,
+        1,
+    )
+    .expect("a chunk the read does not touch does not affect it");
+    assert_eq!(&read[..], &bytes[..4096]);
+
+    let last = blocks as u64 - 1;
+    write_then_read_live(stored, blocks as u32, Codec::ZstdChunked, hash, last, 1)
+        .expect_err("the corrupt chunk itself must be refused");
+}
+
+/// The table is unsigned, so a chaining value for a chunk the read does not
+/// decode still has to be covered — every one of them feeds the root.
+#[test]
+fn a_chunked_read_refuses_a_tampered_chunk_table() {
+    let blocks = 100;
+    let bytes = multichunk_plaintext(blocks);
+    let hash = blake3::hash(&bytes);
+
+    let mut stored = chunked_form(&bytes);
+    // The last chaining value in the table, well away from chunk 0.
+    let count = chunk_tree::chunk_count(bytes.len());
+    let at = 4 + (count - 1) * 36 + 4;
+    stored[at] ^= 0xFF;
+
+    let err = write_then_read_live(stored, blocks as u32, Codec::ZstdChunked, hash, 0, 1)
+        .expect_err("a tampered chaining value must be refused");
+    assert!(
+        err.to_string().contains("hashed"),
+        "error should report the hash mismatch, got: {err}"
+    );
+}

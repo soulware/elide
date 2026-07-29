@@ -81,6 +81,8 @@ use bitflags::bitflags;
 use ed25519_dalek::{Signature, VerifyingKey};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as LE};
 
+use crate::chunk_tree;
+
 // --- constants ---
 
 pub const MAGIC: &[u8; 8] = b"ELIDSEG\x08";
@@ -382,6 +384,10 @@ pub enum Codec {
     /// so the stored bytes describe their own decoded size the way the lz4
     /// prefix does.
     Zstd = 2,
+    /// A [`chunk_tree::ChunkTable`] followed by one independently decodable
+    /// zstd frame per [`chunk_tree::CHUNK_BYTES`] of plaintext, so a read of
+    /// part of an extent decodes only the chunks holding it.
+    ZstdChunked = 3,
 }
 
 /// Upper bound on the plaintext a stored payload may claim to decode to.
@@ -405,6 +411,7 @@ impl Codec {
             0 => Ok(Codec::None),
             1 => Ok(Codec::Lz4),
             2 => Ok(Codec::Zstd),
+            3 => Ok(Codec::ZstdChunked),
             other => Err(io::Error::other(format!("unknown entry codec {other}"))),
         }
     }
@@ -426,6 +433,7 @@ impl Codec {
             Codec::Zstd => zstd::zstd_safe::get_frame_content_size(stored)
                 .map_err(|e| io::Error::other(format!("zstd frame header: {e}")))?
                 .ok_or_else(|| io::Error::other("zstd frame declares no content size"))?,
+            Codec::ZstdChunked => chunk_tree::ChunkTable::peek_plain_len(stored)? as u64,
         };
         if declared > MAX_EXTENT_PLAINTEXT as u64 {
             return Err(io::Error::other(format!(
@@ -482,6 +490,25 @@ impl Codec {
                     .map_err(|e| io::Error::other(format!("lz4 decompress failed: {e}")))?;
                 Ok(())
             }
+            Codec::ZstdChunked => {
+                let table = chunk_tree::ChunkTable::parse(stored)?;
+                if out.len() != table.plain_len {
+                    return Err(io::Error::other(format!(
+                        "chunked payload decodes to {} bytes into a {} byte destination",
+                        table.plain_len,
+                        out.len()
+                    )));
+                }
+                for index in 0..table.cvs.len() {
+                    let span = table.chunk_span(index)?;
+                    let frame = stored
+                        .get(span)
+                        .ok_or_else(|| io::Error::other("chunk runs past the stored payload"))?;
+                    let plain = chunk_tree::chunk_range(index, table.plain_len);
+                    Codec::Zstd.decode_into(frame, &mut out[plain])?;
+                }
+                Ok(())
+            }
             Codec::Zstd => ZSTD_DECODER.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 let decoder = match slot.as_mut() {
@@ -522,6 +549,7 @@ impl std::fmt::Display for Codec {
             Codec::None => "raw",
             Codec::Lz4 => "lz4",
             Codec::Zstd => "zstd",
+            Codec::ZstdChunked => "zstd-chunked",
         })
     }
 }
@@ -3399,12 +3427,32 @@ mod tests {
     #[test]
     fn each_codec_round_trips_and_declares_its_plaintext_length() {
         let plain: Vec<u8> = (0..64 * 1024u32).map(|i| (i / 97 % 251) as u8).collect();
+        // Over one chunk, so `compress_body` produces the chunked form.
+        let big: Vec<u8> = (0..5 * crate::chunk_tree::CHUNK_BYTES + 77)
+            .map(|i| (i / 97 % 251) as u8)
+            .collect();
         let forms = [
-            (Codec::None, plain.clone()),
-            (Codec::Lz4, lz4_flex::compress_prepend_size(&plain)),
-            (Codec::Zstd, zstd::bulk::compress(&plain, 9).expect("zstd")),
+            (Codec::None, plain.clone(), plain.clone()),
+            (
+                Codec::Lz4,
+                lz4_flex::compress_prepend_size(&plain),
+                plain.clone(),
+            ),
+            (
+                Codec::Zstd,
+                zstd::bulk::compress(&plain, 9).expect("zstd"),
+                plain.clone(),
+            ),
+            (
+                Codec::ZstdChunked,
+                crate::volume::compress_body(&big, false)
+                    .expect("compress")
+                    .expect("compresses")
+                    .1,
+                big.clone(),
+            ),
         ];
-        for (codec, stored) in forms {
+        for (codec, stored, plain) in forms {
             assert_eq!(
                 codec.plain_len(&stored).expect("len"),
                 plain.len(),

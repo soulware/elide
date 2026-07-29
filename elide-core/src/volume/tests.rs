@@ -1333,6 +1333,47 @@ fn formation_re_encodes_a_body_from_the_wal_codec_to_the_body_codec() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// An extent over one chunk is stored as independently decodable frames, so a
+/// read of part of it decodes part of it. Below that size there is one chunk,
+/// no root to reconstruct from it, and nothing to gain.
+#[test]
+fn formation_chunks_a_body_larger_than_one_chunk() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let small: Vec<u8> = (0..64 * 1024).map(|i| (i / 97 % 251) as u8).collect();
+    let large: Vec<u8> = (0..crate::chunk_tree::CHUNK_BYTES * 3 + 8192)
+        .map(|i| (i / 97 % 251) as u8)
+        .collect();
+    vol.write(0, &small).unwrap();
+    vol.write(64, &large).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let ulids = pending_ulids(&base);
+    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let (_, entries, _) =
+        segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+    let by_lba = |lba: u64| entries.iter().find(|e| e.start_lba == lba).expect("entry");
+    assert_eq!(
+        by_lba(0).codec,
+        segment::Codec::Zstd,
+        "one chunk, one frame"
+    );
+    assert_eq!(by_lba(64).codec, segment::Codec::ZstdChunked);
+
+    assert_eq!(vol.read(0, 16).unwrap(), small);
+    assert_eq!(vol.read(64, large.len() as u32 / 4096).unwrap(), large);
+    // A single block out of the middle of the chunked extent.
+    let block = (crate::chunk_tree::CHUNK_BYTES / 4096) as u64 + 3;
+    let at = block as usize * 4096;
+    assert_eq!(
+        vol.read(64 + block, 1).unwrap(),
+        large[at..at + 4096].to_vec()
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// Journal bytes reap whole with their segment and are never a dedup or
 /// delta source, so they keep lz4 where durable bodies take zstd.
 #[test]
