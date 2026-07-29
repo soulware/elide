@@ -548,12 +548,15 @@ fn emit_run(
     }
     let slice = &composite[start..end];
     let run_hash = blake3::hash(slice);
+    // A run is fresh plaintext sliced out of a materialised composite, so it
+    // carries no stored form to inherit the way `compression_flags` copy-through
+    // does. It takes the same gate every other producer of plaintext takes.
+    let (flags, body) = match crate::volume::maybe_compress(slice) {
+        Some(compressed) => (SegmentFlags::COMPRESSED, compressed),
+        None => (SegmentFlags::empty(), slice.to_vec()),
+    };
     out_entries.push(SegmentEntry::new_data(
-        run_hash,
-        start_lba,
-        lba_length,
-        SegmentFlags::empty(),
-        slice.to_vec(),
+        run_hash, start_lba, lba_length, flags, body,
     ));
     Ok(())
 }
@@ -957,6 +960,36 @@ mod tests {
         (ulid, path, bss, hash)
     }
 
+    /// Plaintext of an emitted entry, whichever stored form it took. A run
+    /// that clears the compression ratio lands compressed, and one whose
+    /// compressed size drops under `INLINE_THRESHOLD` lands `Inline`, so the
+    /// bytes arrive on `entry.inline` rather than `body`.
+    fn plain_body(e: &PendingEntry) -> Vec<u8> {
+        let stored: &[u8] = match (&e.body, &e.entry.inline) {
+            (Some(b), _) => b,
+            (None, Some(i)) => i,
+            (None, None) => panic!("entry carries no bytes"),
+        };
+        if e.entry.compressed {
+            lz4_flex::decompress_size_prepended(stored).expect("run body decompresses")
+        } else {
+            stored.to_vec()
+        }
+    }
+
+    fn entropy_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n + 8);
+        let mut x = seed | 1;
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
     #[test]
     fn materialise_keep_passes_data_through() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1203,10 +1236,93 @@ mod tests {
         let expect = [(100u64, 1u8), (203, 8), (102, 3)];
         for (e, (start_lba, fill)) in out.entries.iter().zip(expect) {
             assert_eq!(e.entry.start_lba, start_lba);
-            assert_eq!(
-                e.body.as_deref(),
-                Some(vec![fill; BLOCK_BYTES as usize].as_slice())
-            );
+            assert_eq!(plain_body(e), vec![fill; BLOCK_BYTES as usize]);
+        }
+    }
+
+    #[test]
+    fn run_bodies_take_the_compression_gate() {
+        // One input holding three two-block regions: a mixed region lz4 shrinks
+        // to a `Data`-sized payload, a constant region whose compressed form
+        // falls under `INLINE_THRESHOLD`, and a high-entropy region lz4 cannot
+        // shrink past the 1.5x bar. The plan emits one run over each.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("vol");
+        fs::create_dir_all(base.join("index")).unwrap();
+
+        let block = BLOCK_BYTES as usize;
+        let mut mixed = Vec::new();
+        for b in 0..2 {
+            mixed.extend(entropy_bytes(0x51ce + b, block / 4));
+            mixed.extend(std::iter::repeat_n(0u8, block - block / 4));
+        }
+        let constant = vec![0x5Au8; 2 * block];
+        let entropy = entropy_bytes(0xf00d, 2 * block);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&mixed);
+        body.extend_from_slice(&constant);
+        body.extend_from_slice(&entropy);
+        let (ulid, path, _, _) = write_simple_input(dir.path(), &body);
+        fs::copy(&path, base.join("index").join(format!("{ulid}.idx"))).unwrap();
+
+        let mut resolver = MockResolver {
+            files: HashMap::new(),
+            delta_files: HashMap::new(),
+        };
+        resolver
+            .files
+            .insert(ulid, (path, SegmentBodyLayout::FullSegment));
+
+        let run = |payload_block_offset, start_lba| PlanOutput::Run {
+            input: ulid,
+            entry_idx: 0,
+            payload_block_offset,
+            start_lba,
+            lba_length: 2,
+        };
+        let plan = RewritePlan {
+            new_ulid: Ulid::new(),
+            outputs: vec![run(0, 100), run(2, 102), run(4, 104)],
+        };
+
+        let index = ExtentIndex::default();
+        let inputs = plan.inputs();
+        let ctx = MaterialiseCtx::new(&base, &inputs, &index, &resolver).unwrap();
+        let out = materialise_plan(&plan, &ctx).unwrap();
+        assert_eq!(out.entries.len(), 3);
+
+        let m = &out.entries[0];
+        assert!(
+            m.entry.compressed,
+            "a run lz4 shrinks past the ratio must be stored compressed"
+        );
+        assert_eq!(m.entry.kind, EntryKind::Data);
+        assert!((m.entry.stored_length as usize) < mixed.len());
+        assert_eq!(plain_body(m), mixed);
+
+        let c = &out.entries[1];
+        assert!(c.entry.compressed);
+        assert_eq!(
+            c.entry.kind,
+            EntryKind::Inline,
+            "a compressed run under the inline threshold lands Inline"
+        );
+        assert_eq!(plain_body(c), constant);
+
+        let e = &out.entries[2];
+        assert!(
+            !e.entry.compressed,
+            "a run lz4 cannot shrink past the ratio stays raw"
+        );
+        assert_eq!(e.entry.kind, EntryKind::Data);
+        assert_eq!(e.entry.stored_length as usize, entropy.len());
+        assert_eq!(plain_body(e), entropy);
+
+        // The entry hash covers plaintext, so it is the same whichever stored
+        // form the run took.
+        for (entry, plain) in out.entries.iter().zip([&mixed, &constant, &entropy]) {
+            assert_eq!(entry.entry.hash, blake3::hash(plain));
         }
     }
 
