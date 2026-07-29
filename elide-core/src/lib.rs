@@ -4,6 +4,7 @@ pub const VERSION: &str = env!("ELIDE_VERSION");
 pub mod actor;
 pub mod blake3_id_hasher;
 pub mod block_reader;
+pub mod chunk_tree;
 pub mod config;
 pub mod delta_compute;
 pub mod dmat;
