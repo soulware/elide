@@ -32,11 +32,27 @@ Formation is the seam. It is asynchronous, off the ack path, and already visits 
 
 **`.dmat` — lz4.** A local read cache whose whole purpose is to be faster to read than re-materialising a delta.
 
-Level 3. Level 19 measured 11% smaller on a 64 KiB entry (1,640 bytes against 1,835) for roughly twenty times the compression CPU. zstd decompression speed is close to independent of compression level, so the level can be raised later against formation CPU headroom without touching the read path.
+Bodies take level 3. Level 19 measured 11% smaller on a 64 KiB entry (1,640 bytes against 1,835) for roughly twenty times the compression CPU.
+
+**Delta blobs take level 9.** Measured over two Ubuntu cloud-image pairs, 429 and 1,652 fragments, deltas against the same-path parent fragment:
+
+| level | pair A stored | pair B stored | compress | decompress |
+|---|---|---|---|---|
+| 3 | 26.1% of plain | 20.0% | 300 to 371 MB/s | 1150 to 1846 MB/s |
+| 9 | 16.6% | 13.2% | 90 to 106 MB/s | 1583 to 1932 MB/s |
+| 19 | 9.1% | 8.3% | 3.7 MB/s | 1869 to 2200 MB/s |
+
+Level 9 is 34 to 36% smaller than level 3 for about 3.4 times the compression CPU. Level 19 is smaller again, at 80 to 100 times level 3, and 3.7 MB/s puts a GiB of delta targets at several minutes of CPU on hosts already short of it.
+
+The tier's own source selection reaches those ratios and beats them. Probing the resemblance index with each target's sketch returns a candidate for 653 of 821 and 2,297 of 2,551 sketchable residual fragments, and the deltas against those candidates run 15.2% and 11.8% of plaintext at level 9, over a population a fifth larger than the same-path pairing gives. About 62% of the picks are the same-path fragment, so the rest are sources same-path pairing reaches for nothing.
+
+Decompression rises with the level rather than holding flat, because a denser blob carries fewer literals and longer matches, so the decoder does less work per output byte. A level is therefore bought with compression CPU alone. Dictionary loading is not part of that price on the read path either: timing `apply_delta`'s whole load-plus-decompress against decompress alone leaves the two within noise of each other, since a decompression dictionary needs little preprocessing.
+
+The level is a write-time choice with no read-time dependency. A zstd frame declares its window, its content size and optionally a dictionary id, never the level that produced it, so a segment written at any level decodes under any configuration. Changing the level needs no tag, no migration and no compatibility path, which is what separates it from the codec choice in § Format.
 
 Formation gains an lz4-decompress plus a zstd-compress per entry, asynchronous, roughly eight seconds of CPU per GiB of plaintext at level 3.
 
-Codec contexts are pooled per formation worker and per queue thread. At body scope every entry compresses once and every cold extent read decompresses, so a context constructed per call runs at the rate of the whole workload rather than the 0.2% of entries that carry deltas. Per-call construction is the allocation shape that ratcheted RSS into the OOMs behind `malloc_policy.rs`, which makes pooling a constraint on the design rather than a tuning step. `delta_compute::apply_delta` builds a decompression context per call today and is the pattern not to extend.
+Codec contexts are pooled for the allocation rather than the CPU, which the timing above prices at nothing on the read path. Pooling is per formation worker and per queue thread. At body scope every entry compresses once and every cold extent read decompresses, so a context constructed per call runs at the rate of the whole workload rather than the 0.2% of entries that carry deltas. Per-call construction is the allocation shape that ratcheted RSS into the OOMs behind `malloc_policy.rs`, which makes pooling a constraint on the design rather than a tuning step. `delta_compute::apply_delta` builds a decompression context per call today and is the pattern not to extend.
 
 ## The ratio threshold
 
@@ -102,6 +118,8 @@ lz4 does win below roughly 1 KiB, by one to four bytes, on every content pattern
 The tag names the codec of the uploaded body, and the read path takes its codec from the location it resolved rather than from the tag alone. Written that way a second local source in a different codec is one more arm on a choice the read path already makes. Written as one decompress keyed off `entry.compressed`, adding one means reworking the path. The local read cache in [body-materialisation.md](body-materialisation.md) is that second source, and it holds lz4 whatever the tag says.
 
 ## Open questions
+
+Whether the levels are configurable is open, and the answer costs nothing on-disk because a level leaves no trace a reader consults. Three parts to it. Where the setting lives, with `volume.toml` the existing shape for per-volume config and formation CPU headroom a property of the host and the workload rather than of the format. Whether the level a segment was produced at is recorded, which correctness never needs and only diagnostics would read, so it would be a field written for people. And whether bodies and delta blobs share one setting or take two, since a body compresses once per entry and a delta only on the fraction of entries that convert, which is the same asymmetry that gives them different levels here.
 
 A trained dictionary pays on the churned corpus, on the shape the per-size table predicts. Its 8 KiB entries, 26,117 of them and the population that carries the corpus, gain 32.8%; 16 KiB gains 17.7% and 32 to 64 KiB around 10%. The held-out aggregate runs 29.6 MiB down to 22.4 MiB, 24% under dictionaryless zstd, with 0.1 points of drift against a dictionary trained on the test set. What stays open is which distribution real volumes settle into, since the bulk corpus above wants no dictionary at all.
 
