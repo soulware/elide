@@ -14,8 +14,6 @@ The WAL is never uploaded. It absorbs guest writes and is consumed at formation.
 
 `cache/<ULID>.dmat` is a local-only read cache. Its compression is paid on write-back and its decompression on every subsequent cold delta read, so its cost is read latency.
 
-Local reads are held to a standard rather than a budget: the aim is to serve them as close to raw-disk performance as the format allows. Decompression cost on the read path is therefore a constraint on the design, not one term to trade off against uploaded bytes, and it is what the local cache in § Open questions exists to serve.
-
 ## Where compression happens today
 
 There is one compression, and it is on the write path. `Volume::write` calls `maybe_compress` before handing bytes to the WAL. Formation then carries the result through unchanged: `volume/wal.rs:72-79` translates `WalFlags::COMPRESSED` into `SegmentFlags::COMPRESSED` and reuses the same buffer and length.
