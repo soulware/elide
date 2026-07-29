@@ -236,7 +236,7 @@ fn serve_chunked(
 }
 
 /// First read of a chunk table. Covers a table for an extent up to about
-/// 14 MiB, so a second read is the tail of the size distribution.
+/// 28 MiB, so a second read is the tail of the size distribution.
 const TABLE_READ_PREFIX: usize = 4096;
 
 /// Default capacity for the segment file handle LRU cache.
