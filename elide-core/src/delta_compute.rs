@@ -128,10 +128,12 @@ fn delta_is_worth_storing(delta_len: usize, stored_length: u32, plain: &[u8]) ->
 }
 
 /// Upper bound on the uncompressed size of a delta-dict decompression.
-/// Matches the 16 MiB segment-size cap — a single extent cannot be
-/// larger, and the decoder needs a capacity bound to protect against
-/// corrupt / adversarial delta blobs.
-pub const DELTA_DECOMPRESS_CAP: usize = 16 * 1024 * 1024;
+///
+/// A delta blob decodes to one extent, so this is the bound every decoder
+/// applies to extent plaintext. Importing one Ubuntu cloud image produces a
+/// 62.2 MiB extent, so a bound below that turns a delta over a large import
+/// fragment into a read error.
+pub const DELTA_DECOMPRESS_CAP: usize = segment::MAX_EXTENT_PLAINTEXT;
 
 /// Apply a delta blob to its base body, reconstructing the composite
 /// body bytes. Uses the base as a zstd dictionary.
@@ -905,6 +907,28 @@ mod tests {
         assert!(!delta_is_worth_storing(between, stored, &plain).expect("gate"));
 
         assert!(delta_is_worth_storing(plain_zstd - 1, stored, &plain).expect("gate"));
+    }
+
+    /// An import fragment can be far larger than a guest write, and a delta
+    /// over one decodes to the whole extent. Measured: importing one Ubuntu
+    /// cloud image produces a 62.2 MiB extent, which the previous 16 MiB
+    /// bound turned into a read error.
+    #[test]
+    fn a_delta_over_an_extent_larger_than_a_guest_write_applies() {
+        let base: Vec<u8> = (0..24 << 20).map(|i| (i / 97 % 251) as u8).collect();
+        let mut target = base.clone();
+        target[1 << 20..2 << 20].fill(0x5A);
+
+        let blob = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &base)
+            .expect("compressor")
+            .compress(&target)
+            .expect("compress");
+
+        assert!(
+            base.len() > 16 * 1024 * 1024,
+            "the fixture has to exceed the bound this covers"
+        );
+        assert_eq!(apply_delta(&base, &blob).expect("apply"), target);
     }
 
     /// A zstd frame declares its window, its content size and optionally a

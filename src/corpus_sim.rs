@@ -18,7 +18,6 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::sim_util::{mib, pct, zstd_len};
-use elide_core::chunk_tree;
 use elide_core::segment;
 use elide_core::sketch::MIN_SKETCH_BYTES;
 

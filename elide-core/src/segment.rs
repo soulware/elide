@@ -394,10 +394,11 @@ pub enum Codec {
 ///
 /// The claimed length comes from the stored bytes, which the body section
 /// does not sign, so a decoder sizes its output buffer from a number an
-/// attacker can choose. An extent is one guest write, capped at 1 MiB by
-/// `src/ublk.rs`'s `IO_BUF_BYTES`, or one imported file fragment, the
-/// largest measured at 24 MiB over the Ubuntu cloud-image corpus.
-pub const MAX_EXTENT_PLAINTEXT: usize = 64 * 1024 * 1024;
+/// attacker can choose. A guest write is capped at 1 MiB by `src/ublk.rs`'s
+/// `IO_BUF_BYTES`, but an imported file fragment is bounded only by the file:
+/// importing one Ubuntu cloud image produces a 62.2 MiB extent. This is set
+/// well clear of that, since the only thing it buys is a bound.
+pub const MAX_EXTENT_PLAINTEXT: usize = 256 * 1024 * 1024;
 
 impl Codec {
     /// The byte written to the index entry.
