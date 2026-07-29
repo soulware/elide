@@ -44,6 +44,8 @@ Bodies take level 3. Level 19 measured 11% smaller on a 64 KiB entry (1,640 byte
 
 Level 9 is 34 to 36% smaller than level 3 for about 3.4 times the compression CPU. Level 19 is smaller again, at 80 to 100 times level 3, and 3.7 MB/s puts a GiB of delta targets at several minutes of CPU on hosts already short of it.
 
+The tier's own source selection reaches those ratios and beats them. Probing the resemblance index with each target's sketch returns a candidate for 653 of 821 and 2,297 of 2,551 sketchable residual fragments, and the deltas against those candidates run 15.2% and 11.8% of plaintext at level 9, over a population a fifth larger than the same-path pairing gives. About 62% of the picks are the same-path fragment, so the rest are sources same-path pairing reaches for nothing.
+
 Decompression rises with the level rather than holding flat, because a denser blob carries fewer literals and longer matches, so the decoder does less work per output byte. A level is therefore bought with compression CPU alone. Dictionary loading is not part of that price on the read path either: timing `apply_delta`'s whole load-plus-decompress against decompress alone leaves the two within noise of each other, since a decompression dictionary needs little preprocessing.
 
 The level is a write-time choice with no read-time dependency. A zstd frame declares its window, its content size and optionally a dictionary id, never the level that produced it, so a segment written at any level decodes under any configuration. Changing the level needs no tag, no migration and no compatibility path, which is what separates it from the codec choice in § Format.
