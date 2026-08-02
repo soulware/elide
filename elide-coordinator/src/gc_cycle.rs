@@ -535,6 +535,28 @@ impl GcCycleOrchestrator {
     /// its failure paths). A lost HEAD self-heals on the next active
     /// tick's seed: `read` treats a 404 or unparseable body as empty,
     /// and we rewrite from the current truth.
+    /// `true` when every confirmed segment (`index/<ulid>.idx`) above
+    /// `anchor` is in this tick's scratch — the shape a legitimately
+    /// empty HEAD has on a fresh volume or right after a seal. A
+    /// confirmed segment beyond the scratch means the empty body lost
+    /// committed entries. A listing error returns `false`, routing the
+    /// caller to `segment_head::regenerate`, which reports it.
+    fn empty_head_is_legitimate(&self, anchor: Option<Ulid>) -> bool {
+        let idx = match elide_core::segment::collect_idx_files(&self.fork_dir.join("index")) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let scratch: std::collections::HashSet<Ulid> = self.tick_added.iter().copied().collect();
+        idx.iter()
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| Ulid::from_string(s).ok())
+            })
+            .filter(|u| anchor.is_none_or(|a| *u > a))
+            .all(|u| scratch.contains(&u))
+    }
+
     async fn publish_head_delta(&mut self) {
         let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
         let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
@@ -547,25 +569,51 @@ impl GcCycleOrchestrator {
         // doesn't conflict with the live guard.
         let cell = Arc::clone(&self.head_cache);
         let mut cache = cell.lock().await;
-        // `trusted` is false only when the seed GET failed: the merge
-        // proceeds against an assumed-empty HEAD (self-heal
-        // semantics), but that fabricated value must not populate the
-        // cache unless the PUT lands it in S3.
-        let (mut head, trusted) = match cache.take() {
-            Some(h) => (h, true),
-            None => match self.volume_data.head().read().await {
-                Ok(h) => (h, true),
-                Err(e) => {
-                    warn!(
-                        "[head {}] read failed: {e}; treating as empty",
-                        self.vol_ulid
-                    );
-                    (segment_head::SegmentHead::empty(None), false)
+        // The cache holds the last successfully read or PUT body, so a
+        // cached value — including the empty-at-anchor form the seal
+        // writes — is trusted as-is. A body from S3 is trusted when it
+        // has entries, or when its emptiness is the legitimate shape
+        // (every confirmed segment beyond its anchor is in this tick's
+        // scratch). Anything else — a failed GET, or an empty body
+        // that lost committed entries — is repaired by regenerating
+        // the full delta from the fork directory, the authority HEAD
+        // derives from. Merging the tick's scratch into an
+        // assumed-empty HEAD would instead overwrite the object with
+        // one tick's delta.
+        let (mut head, repaired) = match cache.take() {
+            Some(h) => (h, false),
+            None => {
+                let seed = match self.volume_data.head().read().await {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        warn!(
+                            "[head {}] read failed: {e}; regenerating from local state",
+                            self.vol_ulid
+                        );
+                        None
+                    }
+                };
+                match seed {
+                    Some(h) if !h.is_empty() => (h, false),
+                    Some(h) if self.empty_head_is_legitimate(h.anchor) => (h, false),
+                    _ => match segment_head::regenerate(&self.fork_dir) {
+                        Ok(r) => {
+                            let repaired = !r.is_empty();
+                            (r, repaired)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[head {}] regenerate failed: {e}; retrying next tick",
+                                self.vol_ulid
+                            );
+                            return;
+                        }
+                    },
                 }
-            },
+            }
         };
 
-        let mut mutated = has_scratch;
+        let mut mutated = has_scratch || repaired;
         if reap_due {
             if self.reap_expired(&mut head).await {
                 mutated = true;
@@ -582,9 +630,7 @@ impl GcCycleOrchestrator {
         }
 
         if !mutated {
-            if trusted {
-                *cache = Some(head);
-            }
+            *cache = Some(head);
             return;
         }
         match self.volume_data.head().put(&head).await {
@@ -1053,6 +1099,67 @@ mod tests {
             head.superseded.get(&input_b),
             Some(&Supersession { output, since })
         );
+    }
+
+    /// Plant `volume.pub` plus a signed, extracted `index/<seg>.idx`
+    /// (with `inputs`) in the fork dir.
+    fn plant_confirmed_segment(fork_dir: &Path, seg: Ulid, inputs: &[Ulid]) {
+        use elide_core::signing;
+        let key = match std::fs::read(fork_dir.join(signing::VOLUME_KEY_FILE)) {
+            Ok(bytes) => {
+                let arr: [u8; 32] = bytes.as_slice().try_into().unwrap();
+                ed25519_dalek::SigningKey::from_bytes(&arr)
+            }
+            Err(_) => signing::generate_keypair(
+                fork_dir,
+                signing::VOLUME_KEY_FILE,
+                signing::VOLUME_PUB_FILE,
+            )
+            .unwrap(),
+        };
+        let (signer, _) = signing::signer_from_bytes(&key.to_bytes()).unwrap();
+        let index_dir = fork_dir.join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let scratch = fork_dir.join(format!("{seg}.seg"));
+        let body = vec![0xCD; 4096];
+        let entries = vec![elide_core::segment::SegmentEntry::new_data(
+            blake3::hash(&body),
+            0,
+            1,
+            elide_core::segment::Codec::None,
+            body,
+        )];
+        elide_core::segment::write_segment_full(&scratch, entries, &[], inputs, signer.as_ref())
+            .unwrap();
+        elide_core::segment::extract_idx(&scratch, &index_dir.join(format!("{seg}.idx"))).unwrap();
+        std::fs::remove_file(&scratch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_head_regenerates_prior_ticks_from_local_state() {
+        // Regression: HEAD object gone (lost, or never readable) while
+        // index/ records prior confirmed segments. The publish must
+        // carry those segments, never overwrite HEAD with only the
+        // current tick's scratch.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let prior = m.next();
+        let gc_input = m.next();
+        let gc_out = m.next();
+        let fresh = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, prior, &[]);
+            plant_confirmed_segment(fork, gc_out, &[gc_input]);
+        });
+        orch.tick_added.push(fresh);
+
+        orch.publish_head_delta().await;
+
+        let head = read_head_via(&store).await;
+        assert!(head.added.contains(&prior), "lost prior tick's segment");
+        assert!(head.added.contains(&gc_out));
+        assert!(head.added.contains(&fresh));
+        assert_eq!(head.superseded[&gc_input].output, gc_out);
     }
 
     #[tokio::test]
