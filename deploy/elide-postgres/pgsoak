@@ -25,6 +25,15 @@
 #   check            start, then verify (one ssh round-trip after a host crash)
 #   cycle pg|vol     bench-bg, crash at a random point mid-run, check
 #   status           volume + postgres + mount state at a glance
+#   tps              print every recorded bench result, oldest first
+#
+# `bench` appends a row to $OUT_ROOT/tps.tsv tagged with the elide version, the
+# pgbench settings, and which bench this is against that volume. Compare rows at
+# the same ordinal: throughput falls steeply run over run against one volume
+# (measured 179, 71, 27, 31, 21, 21 tps over six consecutive runs), so a first
+# bench on a fresh volume and a sixth on an aged one say nothing about each
+# other. Crashed runs record nothing, which is why `cycle` and `bench-bg` leave
+# the table alone.
 #
 # Env overrides (all optional):
 #   VOL       volume name (default pg0)
@@ -35,6 +44,7 @@
 #   RUN_SECS  pgbench duration per cycle in seconds (default 120, min 30)
 #   OUT_ROOT  evidence directory (default /data/pgsoak, on the Fly volume so
 #             logs survive a machine crash)
+#   TPS_TSV   throughput table (default $OUT_ROOT/tps.tsv)
 set -euo pipefail
 
 VOL="${VOL:-pg0}"
@@ -44,6 +54,7 @@ CLIENTS="${CLIENTS:-8}"
 JOBS="${JOBS:-2}"
 RUN_SECS="${RUN_SECS:-120}"
 OUT_ROOT="${OUT_ROOT:-/data/pgsoak}"
+TPS_TSV="${TPS_TSV:-$OUT_ROOT/tps.tsv}"
 
 PGBIN=/usr/lib/postgresql/16/bin
 DEV="/dev/elide/${VOL}"
@@ -118,9 +129,39 @@ do_verify() {
     log "amcheck OK"
 }
 
+# One row per completed bench, so throughput has something to be compared
+# against. Without it a release's numbers stand alone and say nothing.
+record_tps() {
+    local out="$1" secs="$2" tps lat_avg lat_sd txns version run
+    tps=$(sed -n 's/^tps = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    [ -n "$tps" ] || { log "no tps line in $out; nothing recorded"; return 0; }
+    lat_avg=$(sed -n 's/^latency average = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    lat_sd=$(sed -n 's/^latency stddev = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    txns=$(sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' "$out" | tail -1)
+    version=$(elide --version 2>/dev/null | awk '{print $NF}')
+    # Throughput falls steeply with each bench against the same volume, so a
+    # row is only comparable to one at the same ordinal. `-n` skips pgbench's
+    # startup vacuum to protect the balance invariant, which leaves the dead
+    # tuples autovacuum then has to chase.
+    run=1
+    if [ -s "$TPS_TSV" ]; then
+        run=$(awk -F'\t' -v v="$VOL" 'NR>1 && $3==v {n++} END{print n+1}' "$TPS_TSV")
+    else
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            utc version vol run scale clients jobs secs txns tps lat_avg_ms lat_stddev_ms > "$TPS_TSV"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${version:-unknown}" "$VOL" "${run:-1}" "$SCALE" \
+        "$CLIENTS" "$JOBS" "$secs" "${txns:-}" "$tps" "${lat_avg:-}" "${lat_sd:-}" \
+        >> "$TPS_TSV"
+    log "bench: $tps tps, ${lat_avg}ms avg over ${secs}s, run ${run:-1} on $VOL (elide ${version:-unknown})"
+}
+
 do_bench() {
     local secs="${1:-$RUN_SECS}"
-    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
+    local out="$OUT_ROOT/pgbench-$(date -u +%Y%m%dT%H%M%SZ).log"
+    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB" 2>&1 | tee "$out"
+    record_tps "$out" "$secs"
 }
 
 # -n on every run: pgbench's default startup vacuum truncates pgbench_history,
@@ -225,13 +266,20 @@ EOF
     verify)    do_verify ;;
     check)     do_start; do_verify ;;
     cycle)     do_cycle "${2:?usage: pgsoak cycle pg|vol}" ;;
+    tps)
+        if [ -s "$TPS_TSV" ]; then
+            cat "$TPS_TSV"
+        else
+            echo "no bench recorded yet ($TPS_TSV)"
+        fi
+        ;;
     status)
         elide volume list || true
         mountpoint -q "$MNT" && echo "mounted: $MNT" || echo "not mounted: $MNT"
         pg_running && echo "postgres: running" || echo "postgres: down"
         ;;
     *)
-        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac
