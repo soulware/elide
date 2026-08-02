@@ -319,12 +319,19 @@ pub async fn wait_for_pid_exit(pid: u32) {
 /// queue io_uring fds are released. `kill_dev` itself is safe-from-
 /// anywhere, but `del_dev` blocks until refcounts drop.
 pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
-    info!(
-        "[ublk-teardown] removing kernel device ublk{bound_id} bound to {}",
-        vol_dir.display()
-    );
-    if let Err(e) = delete_device(bound_id).await {
-        warn!("[ublk-teardown] del_dev ublk{bound_id}: {e}");
+    if owns_device(vol_dir, bound_id, &live_devices(), read_owner_volume_dir) {
+        info!(
+            "[ublk-teardown] removing kernel device ublk{bound_id} bound to {}",
+            vol_dir.display()
+        );
+        if let Err(e) = delete_device(bound_id).await {
+            warn!("[ublk-teardown] del_dev ublk{bound_id}: {e}");
+        }
+    } else {
+        info!(
+            "[ublk-teardown] ublk{bound_id} carries another owner's stamp; {} drops its binding and leaves the device running",
+            vol_dir.display()
+        );
     }
     if let Err(e) = elide_core::config::VolumeConfig::clear_ublk_transport(vol_dir) {
         warn!(
@@ -333,6 +340,39 @@ pub async fn teardown_bound_device(vol_dir: &Path, bound_id: i32) {
         );
     }
     crate::dev_link::retract_for_volume(&crate::dev_link::LinkPaths::system(), vol_dir, bound_id);
+}
+
+/// True iff `id` is a live kernel device whose owner stamp names `vol_dir`.
+///
+/// Kernel ids are recycled, so the `dev_id` a volume recorded in its config
+/// can name a device another volume now serves. The serve path already holds
+/// the stamp above the recorded binding — a stale id routes to
+/// `Route::Relocate` and the foreign device is left untouched — and teardown
+/// holds the same line, so retiring one volume leaves every other volume's
+/// device serving its filesystem.
+///
+/// `read_stamp` is injected so the decision is exercisable without a kernel.
+fn owns_device(
+    vol_dir: &Path,
+    id: i32,
+    live: &HashSet<i32>,
+    read_stamp: impl Fn(i32) -> Option<PathBuf>,
+) -> bool {
+    live.contains(&id) && read_stamp(id).as_deref() == Some(vol_dir)
+}
+
+/// Live kernel device ids. A host with no `ublk_drv` has none to enumerate;
+/// an unreadable sysfs leaves ownership unprovable, and teardown deletes only
+/// what it can prove it owns.
+fn live_devices() -> HashSet<i32> {
+    match scan_sysfs() {
+        Ok(live) => live,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(e) => {
+            warn!("[ublk-teardown] enumerating {SYSFS_UBLK_CHAR}: {e}");
+            HashSet::new()
+        }
+    }
 }
 
 /// Rewrite `vol_dir/volume.toml`'s `[ublk]` section to the host-capability
@@ -590,6 +630,42 @@ mod tests {
             cfg.ublk.is_none(),
             "teardown must drop the [ublk] section, not just the dev_id"
         );
+    }
+
+    /// The shape that took a mounted filesystem to EIO: pg5 recorded
+    /// `dev_id = 1`, its daemon exited, the kernel handed id 1 to pg8, and
+    /// removing pg5 issued kill_dev + del_dev against pg8's live device.
+    #[test]
+    fn a_recycled_id_now_serving_another_volume_is_not_ours() {
+        let live = HashSet::from([1]);
+        let retiring = PathBuf::from("/data/by_id/01PG5");
+        let serving = PathBuf::from("/data/by_id/01PG8");
+        assert!(!owns_device(&retiring, 1, &live, |_| Some(serving.clone())));
+        assert!(owns_device(&serving, 1, &live, |_| Some(serving.clone())));
+    }
+
+    #[test]
+    fn a_device_stamped_for_this_volume_is_ours() {
+        let vol = PathBuf::from("/data/by_id/01ALPHA");
+        let live = HashSet::from([3]);
+        assert!(owns_device(&vol, 3, &live, |_| Some(vol.clone())));
+    }
+
+    #[test]
+    fn an_id_with_no_live_device_is_not_ours() {
+        let vol = PathBuf::from("/data/by_id/01ALPHA");
+        assert!(!owns_device(&vol, 3, &HashSet::new(), |_| Some(
+            vol.clone()
+        )));
+    }
+
+    /// An unstamped device is one this codebase did not create, which is the
+    /// same reading `reconcile` takes of it.
+    #[test]
+    fn an_unstamped_device_is_not_ours() {
+        let vol = PathBuf::from("/data/by_id/01ALPHA");
+        let live = HashSet::from([3]);
+        assert!(!owns_device(&vol, 3, &live, |_| None));
     }
 
     #[test]
