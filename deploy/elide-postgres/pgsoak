@@ -25,9 +25,35 @@
 #   check            start, then verify (one ssh round-trip after a host crash)
 #   cycle pg|vol     bench-bg, crash at a random point mid-run, check
 #   status           volume + postgres + mount state at a glance
+#   tps              print every recorded bench result, oldest first
+#
+# `bench` appends a row to $OUT_ROOT/tps.tsv tagged with the elide version, the
+# backend, the pgbench settings, and which bench this is against that volume.
+# Compare rows at the same ordinal on volumes of the same age: throughput falls
+# run over run against one elide volume, and how steeply depends on how much
+# history that volume already carries (an aged volume ran 179, 71, 27, 31, 21,
+# 21 tps over six benches; a fresh one ran 353 then 206). Crashed runs record
+# nothing, which is why `cycle` and `bench-bg` leave the table alone.
+#
+# BACKEND picks what postgres sits on, so a number has something to be measured
+# against. `loop` is the comparison that isolates elide — same ext4, same mkfs
+# flags, same mount options, differing only in ublk+elide versus a direct-io
+# loop device over a sparse file. `raw` puts PGDATA straight on a host directory
+# for the ceiling. Both baselines still differ from elide in durability: ublk
+# runs write-through because FUA is ignored (#728), so elide does more work per
+# fsync than either. `crash-vol` needs BACKEND=elide; `crash-pg` works anywhere.
+#
+# Measured 2026-08-02, scale 50 / 8 clients, run 1 and run 2 of each:
+#   elide 353 -> 206 tps, latency stddev 266 and 486 ms
+#   loop  601 -> 593 tps, latency stddev  31 and  32 ms
+#   raw   557 -> 580 tps, latency stddev  38 and  32 ms
+# loop and raw agree, so the gap is elide rather than the filesystem stack, and
+# the run-over-run decay belongs to elide alone. Mean latency separates the
+# three by 1.7x where the stddev separates them by 10x.
 #
 # Env overrides (all optional):
 #   VOL       volume name (default pg0)
+#   BACKEND   elide | loop | raw (default elide)
 #   VOL_SIZE  size for `volume create` (default 8G)
 #   SCALE     pgbench scale factor (default 50)
 #   CLIENTS   pgbench clients (default 8)
@@ -35,22 +61,34 @@
 #   RUN_SECS  pgbench duration per cycle in seconds (default 120, min 30)
 #   OUT_ROOT  evidence directory (default /data/pgsoak, on the Fly volume so
 #             logs survive a machine crash)
+#   TPS_TSV   throughput table (default $OUT_ROOT/tps.tsv)
 set -euo pipefail
 
 VOL="${VOL:-pg0}"
+BACKEND="${BACKEND:-elide}"
 VOL_SIZE="${VOL_SIZE:-8G}"
 SCALE="${SCALE:-50}"
 CLIENTS="${CLIENTS:-8}"
 JOBS="${JOBS:-2}"
 RUN_SECS="${RUN_SECS:-120}"
 OUT_ROOT="${OUT_ROOT:-/data/pgsoak}"
+TPS_TSV="${TPS_TSV:-$OUT_ROOT/tps.tsv}"
 
 PGBIN=/usr/lib/postgresql/16/bin
-DEV="/dev/elide/${VOL}"
-MNT="/mnt/${VOL}"
-PGDATA="${MNT}/pgdata"
 DB=bench
 DATA_DIR="${ELIDE_DATA_DIR:-/data/elide_data}"
+LOOP_IMG="$OUT_ROOT/loop/${VOL}.img"
+
+# `loop` exists to be measured against `elide`: everything above the block
+# device is identical, so the difference between them is elide. `raw` gives
+# the ceiling the hardware allows with no filesystem of our own in the way.
+case "$BACKEND" in
+    elide) DEV="/dev/elide/${VOL}"; MNT="/mnt/${VOL}" ;;
+    loop)  DEV=""; MNT="/mnt/${VOL}" ;;
+    raw)   DEV=""; MNT="$OUT_ROOT/raw/${VOL}" ;;
+    *)     echo "unknown BACKEND '$BACKEND' (elide|loop|raw)" >&2; exit 1 ;;
+esac
+PGDATA="${MNT}/pgdata"
 
 log() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$OUT_ROOT/pgsoak.log"; }
 die() { log "FAIL: $*"; exit 1; }
@@ -60,7 +98,21 @@ sql() { as_pg "$PGBIN/psql" -X -At -d "$DB" -c "$1"; }
 
 pg_running() { as_pg "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; }
 
+# --direct-io=on so writes reach the backing file rather than resting in the
+# page cache: a buffered loop device would report throughput no durable
+# configuration can deliver, which is the opposite of a baseline.
+loop_dev() {
+    local dev
+    dev="$(losetup -j "$LOOP_IMG" -O NAME --noheadings 2>/dev/null | head -1)"
+    [ -n "$dev" ] || dev="$(losetup --find --show --direct-io=on "$LOOP_IMG")"
+    echo "$dev"
+}
+
 wait_device() {
+    case "$BACKEND" in
+        raw)  return 0 ;;
+        loop) DEV="$(loop_dev)"; return 0 ;;
+    esac
     local deadline=$((SECONDS + 120))
     until [ -b "$(readlink -f "$DEV" 2>/dev/null || true)" ]; do
         ((SECONDS < deadline)) || die "device $DEV did not appear within 120s"
@@ -77,8 +129,14 @@ fsck_device() {
     ((rc <= 1)) || die "e2fsck exit $rc on $DEV (see $OUT_ROOT/fsck.log)"
 }
 
+# `raw` puts PGDATA on a directory of the host filesystem, whose recovery is
+# the host's business.
 do_mount() {
     wait_device
+    if [ "$BACKEND" = raw ]; then
+        mkdir -p "$MNT"
+        return 0
+    fi
     if ! mountpoint -q "$MNT"; then
         fsck_device
         mkdir -p "$MNT"
@@ -118,9 +176,42 @@ do_verify() {
     log "amcheck OK"
 }
 
+# One row per completed bench, so throughput has something to be compared
+# against. Without it a release's numbers stand alone and say nothing.
+record_tps() {
+    local out="$1" secs="$2" tps lat_avg lat_sd txns version run
+    tps=$(sed -n 's/^tps = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    [ -n "$tps" ] || { log "no tps line in $out; nothing recorded"; return 0; }
+    lat_avg=$(sed -n 's/^latency average = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    lat_sd=$(sed -n 's/^latency stddev = \([0-9.]*\).*/\1/p' "$out" | tail -1)
+    txns=$(sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' "$out" | tail -1)
+    version=$(elide --version 2>/dev/null | awk '{print $NF}')
+    # Throughput falls steeply with each bench against the same elide volume,
+    # so a row is only comparable to one at the same ordinal. The loop and raw
+    # backends run the same workload flat, which is what the ordinal exists to
+    # expose.
+    run=1
+    if [ -s "$TPS_TSV" ]; then
+        run=$(awk -F'\t' -v b="$BACKEND" -v v="$VOL" \
+            'NR>1 && $3==b && $4==v {n++} END{print n+1}' "$TPS_TSV")
+    else
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            utc version backend vol run scale clients jobs secs txns tps \
+            lat_avg_ms lat_stddev_ms > "$TPS_TSV"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${version:-unknown}" "$BACKEND" "$VOL" \
+        "${run:-1}" "$SCALE" "$CLIENTS" "$JOBS" "$secs" "${txns:-}" "$tps" \
+        "${lat_avg:-}" "${lat_sd:-}" \
+        >> "$TPS_TSV"
+    log "bench: $tps tps, ${lat_avg}ms avg over ${secs}s, $BACKEND run ${run:-1} on $VOL (elide ${version:-unknown})"
+}
+
 do_bench() {
     local secs="${1:-$RUN_SECS}"
-    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB"
+    local out="$OUT_ROOT/pgbench-$(date -u +%Y%m%dT%H%M%SZ).log"
+    as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB" 2>&1 | tee "$out"
+    record_tps "$out" "$secs"
 }
 
 # -n on every run: pgbench's default startup vacuum truncates pgbench_history,
@@ -151,6 +242,7 @@ crash_pg() {
 
 crash_vol() {
     local fork_dir pid
+    [ "$BACKEND" = elide ] || die "crash-vol needs BACKEND=elide (have $BACKEND)"
     fork_dir="$(readlink -f "$DATA_DIR/by_name/$VOL")"
     pid="$(cat "$fork_dir/volume.pid")"
     log "crash-vol: kill -9 volume server pid $pid"
@@ -186,11 +278,19 @@ case "${1:-}" in
     setup)
         # Every step is guarded on its own effect, so a rerun resumes an
         # interrupted setup instead of failing or redoing work.
-        [ -e "$DATA_DIR/by_name/$VOL" ] || elide volume create --size "$VOL_SIZE" "$VOL"
+        case "$BACKEND" in
+            elide) [ -e "$DATA_DIR/by_name/$VOL" ] \
+                       || elide volume create --size "$VOL_SIZE" "$VOL" ;;
+            loop)  mkdir -p "$(dirname "$LOOP_IMG")"
+                   [ -e "$LOOP_IMG" ] || truncate -s "$VOL_SIZE" "$LOOP_IMG" ;;
+            raw)   mkdir -p "$MNT" ;;
+        esac
         wait_device
-        blkid "$(readlink -f "$DEV")" >/dev/null 2>&1 \
-            || mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
-                "$(readlink -f "$DEV")"
+        if [ "$BACKEND" != raw ]; then
+            blkid "$(readlink -f "$DEV")" >/dev/null 2>&1 \
+                || mkfs.ext4 -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+                    "$(readlink -f "$DEV")"
+        fi
         do_mount
         if [ ! -e "$PGDATA/PG_VERSION" ]; then
             install -d -o postgres -g postgres "$PGDATA"
@@ -212,7 +312,7 @@ EOF
             as_pg "$PGBIN/createdb" "$DB"
             as_pg "$PGBIN/pgbench" -i -s "$SCALE" "$DB"
         fi
-        log "setup complete: volume $VOL, scale $SCALE"
+        log "setup complete: $BACKEND volume $VOL, scale $SCALE"
         ;;
     start)     do_start ;;
     bench)     do_bench "${2:-}" ;;
@@ -225,13 +325,30 @@ EOF
     verify)    do_verify ;;
     check)     do_start; do_verify ;;
     cycle)     do_cycle "${2:?usage: pgsoak cycle pg|vol}" ;;
+    tps)
+        if [ -s "$TPS_TSV" ]; then
+            cat "$TPS_TSV"
+        else
+            echo "no bench recorded yet ($TPS_TSV)"
+        fi
+        ;;
     status)
-        elide volume list || true
-        mountpoint -q "$MNT" && echo "mounted: $MNT" || echo "not mounted: $MNT"
+        if [ "$BACKEND" = loop ]; then
+            DEV="$(losetup -j "$LOOP_IMG" -O NAME --noheadings 2>/dev/null | head -1)"
+        fi
+        echo "backend: $BACKEND${DEV:+ ($DEV)}"
+        if [ "$BACKEND" = elide ]; then
+            elide volume list || true
+        fi
+        if [ "$BACKEND" = raw ]; then
+            echo "pgdata: $PGDATA"
+        else
+            mountpoint -q "$MNT" && echo "mounted: $MNT" || echo "not mounted: $MNT"
+        fi
         pg_running && echo "postgres: running" || echo "postgres: down"
         ;;
     *)
-        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac
