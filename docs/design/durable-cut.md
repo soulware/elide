@@ -2,9 +2,10 @@
 
 **Status: Proposed.** Builds on [segment-index.md](segment-index.md)
 (per-volume HEAD, the manifest ∪ HEAD live set, seal-time truncation)
-and the drain/GC tick in `elide-coordinator/src/gc_cycle.rs`. Fixes a
-live consistency hole in today's publish rules and provides the commit
-mechanism the loss-window work needs.
+and the drain/GC tick in `elide-coordinator/src/gc_cycle.rs`. Fixes
+live consistency holes in today's publish rules and provides the
+commit mechanism the loss-window work needs. Introduces no new bucket
+artefact: the cut is a semantics for the objects that already exist.
 
 ## The problem
 
@@ -13,7 +14,7 @@ Force-claim recovers a lost host's volume from S3 by materialising
 (`force_claim.rs`, `segment_head::live_set`). For that image to be
 usable, it must be **crash-consistent**: a state the guest's block
 device could actually have been in at some past instant, respecting
-write ordering. Three paths in today's code can publish a set that
+write ordering. Four paths in today's code can publish a set that
 violates this.
 
 **Partial-drain publish.** Repack rewrites pending segments against
@@ -30,6 +31,14 @@ Host loss before the retry drains the rest turns either into a durable
 image that interleaves and drops acked writes in an order no crash
 could produce. The whole sequence fits in one tick; the exposure
 window stays open for as long as the S3 failure persists.
+
+**Assumed-empty merge.** When the publish step's seed GET of HEAD
+fails, it merges the tick's delta into an assumed-empty HEAD and PUTs
+the result (`gc_cycle.rs::publish_head_delta`). A transient read
+failure thereby truncates HEAD to the current tick's delta: the live
+set keeps this tick's segments and loses every previously published
+one — newer writes visible, older committed writes gone, the same
+inconsistency class triggered by nothing more than one failed GET.
 
 **Superset rebuild.** HEAD-loss recovery LISTs `by_id/<vol>/segments/`
 and includes every object found, on the stated ground that an
@@ -50,7 +59,7 @@ committing. Force-claim in that window resolves the LBA to a version
 *older* than the one the removed input held, alongside neighbouring
 writes of the same era.
 
-All three are one defect seen from three sides: **HEAD can come to
+All four are one defect seen from different sides: **HEAD can come to
 describe a set that is not a consistent cut of any volume state.**
 The segments-before-HEAD crash ordering already protects the common
 case (host loss mid-drain leaves the new segments invisible); these
@@ -63,7 +72,7 @@ full committed state as of one frontier: every segment the local
 directory records as confirmed-in-S3, published together, or nothing.
 Between cuts, S3 may hold any partial residue of uploads — invisible
 to every reader, because HEAD (∪ anchor manifest) names only whole
-cuts, and the rebuild path reconstructs only whole cuts.
+cuts, and every recovery path reconstructs only whole cuts.
 
 Under this rule the volume side needs no ordering discipline at all.
 Repack may elide against any pending peer, reshuffle outputs freely,
@@ -73,6 +82,20 @@ before it. Intra-batch upload order stops mattering. The consistency
 argument moves from "every uploaded object is individually harmless"
 (false today) to "the published set is a state the volume actually
 had" (enforced at one choke point).
+
+Two facts make HEAD itself sufficient to carry this, with no further
+artefact:
+
+- **HEAD survives every crash.** It is a whole-object atomic PUT; a
+  host dying at any moment leaves a readable HEAD holding either the
+  pre-tick or the post-tick body — both complete cuts under the
+  publish rule below. Crash and host loss can never make HEAD
+  unreadable or partial.
+- **The owner never depends on HEAD.** HEAD is cross-coordinator
+  derived state; the owner's authority is its local directory
+  (`index/`, the GC outputs' signed `inputs` tables). The owner can
+  therefore regenerate the entire HEAD body from local state at any
+  time.
 
 ## Design
 
@@ -96,41 +119,39 @@ next tick retries from the oldest un-drained ULID as it does today
 No new bookkeeping is needed for the carryover. The local directory
 already encodes confirmation — `index/<ulid>.idx` exists exactly when
 the segment is confirmed in S3 — so the cut's `added` set is derivable
-at publish time: every confirmed segment not named by the anchor
-manifest or the previous cut. A crash between upload and publish
-self-heals the same way; the segments simply join the next complete
-cut.
+at publish time: every confirmed segment beyond the anchor manifest.
+A crash between upload and publish self-heals the same way; the
+segments simply join the next complete cut.
 
-### A cut record precedes the HEAD overwrite
+### The owner regenerates HEAD; it never merges into an assumption
 
-HEAD stays the single-GET read path, whole-object overwrite, exactly
-as designed. What changes is durability of the *committed* delta: each
-publishing tick first PUTs the identical body to an immutable key,
+When the publish step cannot read HEAD — missing object or transient
+failure alike — it regenerates the full body from local state: `added`
+from `index/` beyond the anchor, `superseded` from local GC outputs'
+signed `inputs` tables, then PUTs the whole cut. The owner's disk is
+the authority and the regenerated body is complete by construction,
+so the one PUT repairs a lost, corrupt, or stale HEAD identically.
+This replaces the assumed-empty merge and closes the truncation leak
+above. Regeneration is also the natural publish path after claim and
+restart, where no cached HEAD exists.
 
-```
-by_id/<vol_ulid>/cuts/<tick_ulid>
-```
+### Recovery is two-tier, on existing artefacts
 
-then overwrites HEAD, then DELETEs the predecessor cut record. Steady
-state is one cut record plus HEAD; an ill-timed crash leaves two, and
-`max(cuts/)` is always the newest committed cut. The write order makes
-the record trustworthy by construction: every segment it names is
-durable before the record exists, and the record exists before HEAD
-asserts it.
+- **Primary — HEAD.** Every crash and host-loss case leaves it
+  readable and whole; force-claim recovers the last committed cut,
+  exactly as it reads today.
+- **Defense in depth — the newest seal.** If HEAD is unreadable, the
+  failure is bucket-level (deletion, corruption, operator error) —
+  a class in which segment objects are equally at risk. Force-claim
+  then anchors at the newest snapshot manifest, which is already a
+  signed, exhaustive, reaper-stable cut. The loss bound is the seal
+  cadence, which replica-model.md already frames as an operator
+  retention SLA.
 
-Rebuild after HEAD loss becomes: LIST `cuts/` (one or two keys), GET
-the newest, and that *is* HEAD — each record carries its anchor, so a
-record raced by a seal still computes the correct live set, the same
-argument the seal already makes for HEAD readers. The elevated LIST of
-`segments/` is demoted from "reconstructs the live set" to what it can
-soundly do: reconcile-and-reap, deleting objects that no committed cut
-or manifest reaches once retention passes.
-
-Seal-time truncation extends naturally: the sealer writes the
-manifest, overwrites HEAD to empty-at-anchor, writes the matching
-empty cut record, and deletes prior cut records. Cost per publishing
-tick is one extra small PUT and one DELETE; idle ticks continue to
-publish nothing.
+The elevated LIST of `segments/` is demoted from "reconstructs the
+live set" to what it can soundly do: reconcile-and-reap, deleting
+objects that no committed cut or manifest reaches once retention
+passes.
 
 ### GC supersession waits for its killers
 
@@ -151,7 +172,7 @@ volume rejects. The fix is to split what the pass publishes:
 The barrier costs the inputs' storage for the ticks between output
 commit and edge commit, which the reaper's retention delay already
 dwarfs. After a coordinator crash the held edges are re-derived from
-the output's signed `inputs` table — the same authority the rebuild
+the output's signed `inputs` table — the same authority regeneration
 uses — and published once a post-restart cut satisfies the barrier.
 
 ## Crash ordering summary
@@ -159,25 +180,22 @@ uses — and published once a post-restart cut satisfies the barrier.
 Per publishing tick, strictly ordered:
 
 1. PUT every segment object of the batch (ULID-ascending, as today)
-2. PUT `cuts/<tick>` naming the full delta
-3. PUT HEAD (same body)
-4. DELETE predecessor cut record; reap per retention
+2. PUT HEAD naming the whole cut; reap per retention
 
-A crash after 1 leaves invisible objects (reconciled later). A crash
-after 2 leaves the cut committed with a stale HEAD; rebuild-from-cuts
-and the next tick's fold both converge on it. A crash after 3 leaves
-an extra cut record that `max()` ignores. Every prefix of the sequence
-is a state the protocol already handles.
+A crash after 1 leaves invisible objects, reconciled later or joined
+to the next cut. A crash during 2 leaves the previous HEAD body — the
+previous cut — intact. Both states are ones the protocol already
+serves.
 
 ## What stays unchanged
 
 Force-claim's read path (`live_set` over manifest ∪ HEAD), the drain's
 ULID-ascending halt-on-failure, repack/reclaim/sweep semantics and
-their local crash recovery, snapshot manifests, the handoff protocol,
-and the volume's directory invariants all keep their current shape.
-Repack sheds a burden: its outputs no longer carry any remote-ordering
-obligation, which is what licenses the cross-segment elision the
-loss-window work wants to widen.
+their local crash recovery, snapshot manifests, seal-time truncation,
+the handoff protocol, and the volume's directory invariants all keep
+their current shape. Repack sheds a burden: its outputs no longer
+carry any remote-ordering obligation, which is what licenses the
+cross-segment elision the loss-window work wants to widen.
 
 ## Tradeoffs
 
@@ -187,13 +205,11 @@ loss-window work wants to widen.
   completes. The recoverable image is older and correct. This is the
   same degradation contract as window coalescing in the loss-window
   design.
-- **The rebuild invariant changes character.** "Safe superset from a
-  bucket scan" becomes "newest cut record, anchored at a manifest".
-  One sentence becomes a small protocol, and the reconcile pass takes
-  over orphan deletion. The proptest model must assert record-fold ≡
-  HEAD ≡ rebuild.
-- **Two extra S3 ops per publishing tick** (one small PUT, one
-  DELETE).
+- **Bucket-damage recovery is bounded by seal cadence.** The superset
+  LIST recovered more segments after HEAD loss (inconsistently, and
+  only when those objects themselves survived whatever ate HEAD);
+  anchoring at the newest seal recovers less but always a real state.
+  Operators who care about the bound tighten it with seal cadence.
 
 ## Relation to the loss-window work
 
@@ -208,16 +224,19 @@ does.
 ## Testing
 
 - **Cut consistency oracle.** Extend the crash-recovery proptest: at
-  arbitrary points in a simulated tick (between PUTs, before/after the
-  cut record, before/after HEAD), materialise the remote image exactly
-  as force-claim would and assert it equals a state the write history
-  could have produced — every visible write preceded by all writes
-  acked before it. This is the invariant all three holes violate
-  today, so the test should fail against current publish rules and
-  pass under cuts.
-- **Record-fold equivalence.** Property test that the incremental
-  HEAD fold, the newest cut record, and a from-scratch fold of cut
-  records over the anchor compute identical live sets.
+  arbitrary points in a simulated tick (between PUTs, before/after
+  the HEAD overwrite, with and without a failed seed GET),
+  materialise the remote image exactly as force-claim would and
+  assert it equals a state the write history could have produced —
+  every visible write preceded by all writes acked before it. This is
+  the invariant all four holes violate today, so the test should fail
+  against current publish rules and pass under cuts.
+- **Regeneration equivalence.** Property test that the incrementally
+  maintained HEAD and a from-scratch regeneration from local state
+  compute identical bodies at every publish point — the
+  rebuild-defines-correctness pattern applied to HEAD itself.
+- **Fallback test.** With HEAD deleted, force-claim anchors at the
+  newest seal and materialises exactly the manifest set.
 - **Barrier test.** A GC pass whose inputs die only via pending/WAL
   writes publishes `Added` in the current cut and `Superseded` only
   after a cut containing a post-pass flush; force-claim between the
@@ -231,5 +250,7 @@ does.
 - Whether `snapshot` and `stop` seals should force a cut boundary
   synchronously (they already sweep-and-upload; expressing them as
   cuts makes the seal the cut) or remain a separate publish path.
+- Whether regeneration should run only on a failed seed GET or
+  periodically as a divergence check against the incremental fold.
 - Whether the reconcile pass needs rate limiting on Tigris, where
   LIST is priced ~10× GET.
