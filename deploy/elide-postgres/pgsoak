@@ -30,11 +30,10 @@
 # `bench` appends a row to $OUT_ROOT/tps.tsv tagged with the elide version, the
 # backend, the pgbench settings, and which bench this is against that volume.
 # Compare rows at the same ordinal on volumes of the same age: throughput falls
-# run over run against one volume, and how steeply depends on how much history
-# that volume already carries (an aged volume ran 179, 71, 27, 31, 21, 21 tps
-# over six benches; a fresh one opened at 298 and lost 11% on its second).
-# Crashed runs record nothing, which is why `cycle` and `bench-bg` leave the
-# table alone.
+# run over run against one elide volume, and how steeply depends on how much
+# history that volume already carries (an aged volume ran 179, 71, 27, 31, 21,
+# 21 tps over six benches; a fresh one ran 353 then 206). Crashed runs record
+# nothing, which is why `cycle` and `bench-bg` leave the table alone.
 #
 # BACKEND picks what postgres sits on, so a number has something to be measured
 # against. `loop` is the comparison that isolates elide — same ext4, same mkfs
@@ -43,6 +42,14 @@
 # for the ceiling. Both baselines still differ from elide in durability: ublk
 # runs write-through because FUA is ignored (#728), so elide does more work per
 # fsync than either. `crash-vol` needs BACKEND=elide; `crash-pg` works anywhere.
+#
+# Measured 2026-08-02, scale 50 / 8 clients, run 1 and run 2 of each:
+#   elide 353 -> 206 tps, latency stddev 266 and 486 ms
+#   loop  601 -> 593 tps, latency stddev  31 and  32 ms
+#   raw   557 -> 580 tps, latency stddev  38 and  32 ms
+# loop and raw agree, so the gap is elide rather than the filesystem stack, and
+# the run-over-run decay belongs to elide alone. Mean latency separates the
+# three by 1.7x where the stddev separates them by 10x.
 #
 # Env overrides (all optional):
 #   VOL       volume name (default pg0)
@@ -179,10 +186,10 @@ record_tps() {
     lat_sd=$(sed -n 's/^latency stddev = \([0-9.]*\).*/\1/p' "$out" | tail -1)
     txns=$(sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' "$out" | tail -1)
     version=$(elide --version 2>/dev/null | awk '{print $NF}')
-    # Throughput falls steeply with each bench against the same volume, so a
-    # row is only comparable to one at the same ordinal. `-n` skips pgbench's
-    # startup vacuum to protect the balance invariant, which leaves the dead
-    # tuples autovacuum then has to chase.
+    # Throughput falls steeply with each bench against the same elide volume,
+    # so a row is only comparable to one at the same ordinal. The loop and raw
+    # backends run the same workload flat, which is what the ordinal exists to
+    # expose.
     run=1
     if [ -s "$TPS_TSV" ]; then
         run=$(awk -F'\t' -v b="$BACKEND" -v v="$VOL" \
@@ -341,7 +348,7 @@ EOF
         pg_running && echo "postgres: running" || echo "postgres: down"
         ;;
     *)
-        sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac
