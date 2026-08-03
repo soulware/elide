@@ -29,8 +29,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use elide_core::signing;
 use object_store::path::Path as StorePath;
 use ulid::Ulid;
 
@@ -309,6 +312,47 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
         .collect()
 }
 
+/// Regenerate the full HEAD body from the owner's local directory.
+///
+/// `anchor` is the latest local user snapshot; `added` is every
+/// confirmed segment (`index/<ulid>.idx`) above it; `superseded`
+/// carries one edge per entry of each such segment's signed `inputs`
+/// table, stamped `since = now`, which restarts that edge's reap
+/// retention clock. Each `.idx` is signature-verified against
+/// `volume.pub` before its inputs are trusted.
+pub fn regenerate(fork_dir: &Path) -> io::Result<SegmentHead> {
+    let anchor = elide_core::volume::latest_snapshot(fork_dir)?;
+    let mut head = SegmentHead::empty(anchor);
+    let idx_files = elide_core::segment::collect_idx_files(&fork_dir.join("index"))?;
+    if idx_files.is_empty() {
+        return Ok(head);
+    }
+    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+    let now = Utc::now();
+    for path in idx_files {
+        let ulid = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| Ulid::from_string(s).ok())
+            .ok_or_else(|| io::Error::other(format!("bad idx filename {}", path.display())))?;
+        if anchor.is_some_and(|a| ulid <= a) {
+            continue;
+        }
+        head.added.insert(ulid);
+        let (_, _, inputs) = elide_core::segment::read_and_verify_segment_index(&path, &vk)?;
+        for input in inputs {
+            head.superseded.insert(
+                input,
+                Supersession {
+                    output: ulid,
+                    since: now,
+                },
+            );
+        }
+    }
+    Ok(head)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseHeadError {
     MissingSection { name: &'static str },
@@ -565,5 +609,89 @@ mod tests {
         let h = SegmentHead::empty(Some(a));
         let parsed = parse(&render(&h)).unwrap();
         assert_eq!(parsed.anchor, Some(a));
+    }
+
+    // --- regenerate ---
+
+    fn keyed_fork() -> (
+        tempfile::TempDir,
+        std::sync::Arc<dyn elide_core::segment::SegmentSigner>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = signing::generate_keypair(
+            tmp.path(),
+            signing::VOLUME_KEY_FILE,
+            signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let (signer, _) = signing::signer_from_bytes(&key.to_bytes()).unwrap();
+        (tmp, signer)
+    }
+
+    fn write_idx(
+        fork_dir: &Path,
+        signer: &dyn elide_core::segment::SegmentSigner,
+        seg: Ulid,
+        inputs: &[Ulid],
+    ) {
+        let index_dir = fork_dir.join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let scratch = fork_dir.join(format!("{seg}.seg"));
+        let body = vec![0xAB; 4096];
+        let entries = vec![elide_core::segment::SegmentEntry::new_data(
+            blake3::hash(&body),
+            0,
+            1,
+            elide_core::segment::Codec::None,
+            body,
+        )];
+        elide_core::segment::write_segment_full(&scratch, entries, &[], inputs, signer).unwrap();
+        elide_core::segment::extract_idx(&scratch, &index_dir.join(format!("{seg}.idx"))).unwrap();
+        std::fs::remove_file(&scratch).unwrap();
+    }
+
+    #[test]
+    fn regenerate_fresh_dir_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = regenerate(tmp.path()).unwrap();
+        assert!(head.is_empty());
+        assert_eq!(head.anchor, None);
+    }
+
+    #[test]
+    fn regenerate_rebuilds_added_and_superseded_beyond_anchor() {
+        let (tmp, signer) = keyed_fork();
+        let mut m = mint();
+        let pre_anchor = m.next();
+        let anchor = m.next();
+        let input_x = m.next();
+        let input_y = m.next();
+        let plain = m.next();
+        let gc_out = m.next();
+
+        write_idx(tmp.path(), signer.as_ref(), pre_anchor, &[]);
+        write_idx(tmp.path(), signer.as_ref(), plain, &[]);
+        write_idx(tmp.path(), signer.as_ref(), gc_out, &[input_x, input_y]);
+        let snapshots = tmp.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join(format!("{anchor}.manifest")), b"").unwrap();
+
+        let head = regenerate(tmp.path()).unwrap();
+        assert_eq!(head.anchor, Some(anchor));
+        assert_eq!(
+            head.added.iter().copied().collect::<Vec<_>>(),
+            vec![plain, gc_out]
+        );
+        assert_eq!(head.superseded[&input_x].output, gc_out);
+        assert_eq!(head.superseded[&input_y].output, gc_out);
+        assert!(head.tombstoned.is_empty());
+    }
+
+    #[test]
+    fn regenerate_fails_closed_without_pubkey() {
+        let (_signer_dir, signer) = keyed_fork();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_idx(tmp.path(), signer.as_ref(), mint().next(), &[]);
+        assert!(regenerate(tmp.path()).is_err());
     }
 }
