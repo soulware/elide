@@ -1849,7 +1849,7 @@ mod tests {
     #[test]
     fn rebuild_from_pending() {
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
@@ -1886,7 +1886,7 @@ mod tests {
         // extent index for that hash points to the canonical Data segment.
         // Only Data entries are indexed.
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
@@ -1919,7 +1919,7 @@ mod tests {
     #[test]
     fn oldest_segment_wins_for_same_hash() {
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
@@ -1984,8 +1984,8 @@ mod tests {
     fn rebuild_indexes_ancestor_segments() {
         let ancestor = temp_dir();
         let live = temp_dir();
-        std::fs::create_dir_all(ancestor.join("pending")).unwrap();
-        std::fs::create_dir_all(live.join("pending")).unwrap();
+        std::fs::create_dir_all(crate::segment::pending_open_dir(&ancestor)).unwrap();
+        std::fs::create_dir_all(crate::segment::pending_open_dir(&live)).unwrap();
         let signer = write_test_pub(&ancestor);
 
         let data = vec![0xabu8; 4096];
@@ -2003,7 +2003,7 @@ mod tests {
                 data,
             )];
             let (b, written) = segment::write_segment(
-                &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &crate::segment::pending_open_dir(&ancestor).join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 entries,
                 signer.as_ref(),
             )
@@ -2026,7 +2026,7 @@ mod tests {
     fn rebuild_indexes_inline_entries_from_pending() {
         // Inline entries should be indexed with their data in inline_data.
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
@@ -2065,7 +2065,7 @@ mod tests {
     fn rebuild_indexes_inline_entries_from_idx() {
         // .idx files include the inline section; rebuild must load inline_data.
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         let index_dir = base.join("index");
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::create_dir_all(&index_dir).unwrap();

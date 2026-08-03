@@ -33,14 +33,17 @@ use proptest::prelude::*;
 /// Mirror the production drain's `Full` mode: repack, then promote in
 /// ULID-ascending order — see `coordinator/src/upload.rs::drain_pending`.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
-    let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
     let _ = vol.repack();
 
-    let pending_after_repack =
-        elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
+    let mut pending_after_repack: Vec<ulid::Ulid> = Vec::new();
+    for gen_dir in elide_core::segment::pending_generation_dirs(dir) {
+        pending_after_repack
+            .extend(elide_core::segment::read_ulid_dir_sorted(&gen_dir).unwrap_or_default());
+    }
+    pending_after_repack.sort();
     for ulid in pending_after_repack {
         let _ = vol.promote_segment(ulid);
     }
@@ -365,7 +368,7 @@ fn delta_ops_mint_a_delta_entry() {
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .unwrap();
-    let minted = fs::read_dir(fork_dir.join("pending"))
+    let minted = fs::read_dir(elide_core::segment::pending_open_dir(fork_dir))
         .unwrap()
         .flatten()
         .map(|e| e.path())

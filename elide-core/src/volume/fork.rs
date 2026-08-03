@@ -70,7 +70,7 @@ pub fn fork_volume_at(
     })?;
 
     fs::create_dir_all(new_fork_dir.join("wal"))?;
-    fs::create_dir_all(new_fork_dir.join("pending"))?;
+    fs::create_dir_all(crate::segment::pending_open_dir(new_fork_dir))?;
 
     // Generate a fresh keypair for the new fork. Every writable volume must have
     // a signing key; the fork gets its own identity independent of its parent.
@@ -132,7 +132,7 @@ mod tests {
         // Create the fork.
         fork_volume(&fork_dir, &default_dir).unwrap();
         assert!(fork_dir.join("wal").is_dir());
-        assert!(fork_dir.join("pending").is_dir());
+        assert!(crate::segment::pending_open_dir(&fork_dir).is_dir());
         assert!(
             !fork_dir.join("volume.parent").exists(),
             "standalone volume.parent file must not exist; parent lives in provenance"

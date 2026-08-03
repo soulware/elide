@@ -45,7 +45,7 @@ fn setup_volume_dir(tmp: &TempDir) -> (std::path::PathBuf, Arc<dyn SegmentSigner
     fs::create_dir_all(&vol_dir).unwrap();
     signing::generate_keypair(&vol_dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE)
         .unwrap();
-    fs::create_dir_all(vol_dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
     fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
     let signer = signing::load_signer(&vol_dir, signing::VOLUME_KEY_FILE).unwrap();
     VolumeConfig {
@@ -83,7 +83,8 @@ fn delta_entry_end_to_end_decompression() {
     // --- Segment 1: holds the parent DATA entry at LBA 0. ---
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
-    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let parent_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -99,7 +100,8 @@ fn delta_entry_end_to_end_decompression() {
     // to LBA 10 anyway, but monotonic ULIDs are required for rebuild
     // ordering to be safe).
     let delta_seg_ulid = mint.next();
-    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -168,7 +170,8 @@ fn delta_entry_roundtrip_from_drained_cache() {
     // ── Parent segment: one DATA entry with the parent bytes.
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
-    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let parent_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -180,7 +183,8 @@ fn delta_entry_roundtrip_from_drained_cache() {
 
     // ── Delta segment: one Delta entry pointing at the parent hash.
     let delta_seg_ulid = mint.next();
-    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -199,7 +203,7 @@ fn delta_entry_roundtrip_from_drained_cache() {
     // ── Drain both segments into the `index/` + `cache/` shape,
     // mirroring what the coordinator does post-upload.
     for ulid in [parent_seg_ulid, delta_seg_ulid] {
-        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let pending = elide_core::segment::pending_open_dir(&vol_dir).join(format!("{ulid}"));
         let idx = vol_dir.join(format!("index/{ulid}.idx"));
         let body = vol_dir.join(format!("cache/{ulid}.body"));
         let present = vol_dir.join(format!("cache/{ulid}.present"));
@@ -270,7 +274,8 @@ fn delta_entry_demand_fetch_from_pull_host() {
 
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
-    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let parent_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -281,7 +286,8 @@ fn delta_entry_demand_fetch_from_pull_host() {
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
 
     let delta_seg_ulid = mint.next();
-    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -301,7 +307,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
     // cache/<delta>.delta so the volume looks like a pull host that
     // hasn't yet materialised the delta body region.
     for ulid in [parent_seg_ulid, delta_seg_ulid] {
-        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let pending = elide_core::segment::pending_open_dir(&vol_dir).join(format!("{ulid}"));
         let idx = vol_dir.join(format!("index/{ulid}.idx"));
         let body = vol_dir.join(format!("cache/{ulid}.body"));
         let present = vol_dir.join(format!("cache/{ulid}.present"));
@@ -428,7 +434,8 @@ fn block_reader_read_block_dispatches_to_delta() {
     // Parent DATA segment at LBA 0.
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
-    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let parent_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -440,7 +447,8 @@ fn block_reader_read_block_dispatches_to_delta() {
 
     // Delta segment with a Delta entry at LBA 10, source = parent_hash.
     let delta_seg_ulid = mint.next();
-    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -516,7 +524,8 @@ fn delta_read_populates_dmat_and_second_read_matches() {
 
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
-    let parent_seg_path = vol_dir.join(format!("pending/{parent_seg_ulid}"));
+    let parent_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -527,7 +536,8 @@ fn delta_read_populates_dmat_and_second_read_matches() {
     write_segment(&parent_seg_path, parent_entries, signer.as_ref()).unwrap();
 
     let delta_seg_ulid = mint.next();
-    let delta_seg_path = vol_dir.join(format!("pending/{delta_seg_ulid}"));
+    let delta_seg_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -544,7 +554,7 @@ fn delta_read_populates_dmat_and_second_read_matches() {
         .unwrap();
 
     for ulid in [parent_seg_ulid, delta_seg_ulid] {
-        let pending = vol_dir.join(format!("pending/{ulid}"));
+        let pending = elide_core::segment::pending_open_dir(&vol_dir).join(format!("{ulid}"));
         let idx = vol_dir.join(format!("index/{ulid}.idx"));
         let body = vol_dir.join(format!("cache/{ulid}.body"));
         let present = vol_dir.join(format!("cache/{ulid}.present"));
@@ -645,7 +655,7 @@ fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
     write_segment(
-        &vol_dir.join(format!("pending/{parent_seg_ulid}")),
+        &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}")),
         vec![SegmentEntry::new_data(
             parent_hash,
             0,
@@ -665,7 +675,7 @@ fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
         delta_hash: blake3::hash(&delta_blob),
     };
     write_segment_with_delta_body(
-        &vol_dir.join(format!("pending/{delta_seg_ulid}")),
+        &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}")),
         vec![PendingEntry::from_entry(SegmentEntry::new_delta(
             child_hash,
             10,
@@ -739,7 +749,7 @@ fn readers_share_one_dmat_instance() {
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_seg_ulid = mint.next();
     write_segment(
-        &vol_dir.join(format!("pending/{parent_seg_ulid}")),
+        &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_seg_ulid}")),
         vec![SegmentEntry::new_data(
             parent_hash,
             0,
@@ -759,7 +769,7 @@ fn readers_share_one_dmat_instance() {
         delta_hash: blake3::hash(&delta_blob),
     };
     write_segment_with_delta_body(
-        &vol_dir.join(format!("pending/{delta_seg_ulid}")),
+        &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}")),
         vec![PendingEntry::from_entry(SegmentEntry::new_delta(
             child_hash,
             10,

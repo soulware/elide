@@ -1421,7 +1421,7 @@ mod tests {
         use crate::segment::SegmentEntry;
 
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         std::fs::create_dir_all(&pending).unwrap();
         let signer = write_test_pub(&base);
 
@@ -1476,7 +1476,7 @@ mod tests {
         use crate::segment::SegmentEntry;
 
         let base = temp_dir();
-        let pending = base.join("pending");
+        let pending = crate::segment::pending_open_dir(&base);
         let index = base.join("index");
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::create_dir_all(&index).unwrap();
@@ -1545,8 +1545,8 @@ mod tests {
 
         let ancestor = temp_dir();
         let live = temp_dir();
-        std::fs::create_dir_all(ancestor.join("pending")).unwrap();
-        std::fs::create_dir_all(live.join("pending")).unwrap();
+        std::fs::create_dir_all(crate::segment::pending_open_dir(&ancestor)).unwrap();
+        std::fs::create_dir_all(crate::segment::pending_open_dir(&live)).unwrap();
         let ancestor_signer = write_test_pub(&ancestor);
         let live_signer = write_test_pub(&live);
 
@@ -1560,7 +1560,7 @@ mod tests {
                 vec![0u8; 40960],
             )];
             segment::write_segment(
-                &ancestor.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                &crate::segment::pending_open_dir(&ancestor).join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
                 entries,
                 ancestor_signer.as_ref(),
             )
@@ -1576,7 +1576,7 @@ mod tests {
                 vec![0u8; 20480],
             )];
             segment::write_segment(
-                &live.join("pending").join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
+                &crate::segment::pending_open_dir(&live).join("01BBBBBBBBBBBBBBBBBBBBBBBB"),
                 entries,
                 live_signer.as_ref(),
             )
@@ -1606,7 +1606,7 @@ mod tests {
         use crate::segment::{DeltaOption, SegmentEntry};
 
         let base = temp_dir();
-        std::fs::create_dir_all(base.join("pending")).unwrap();
+        std::fs::create_dir_all(crate::segment::pending_open_dir(&base)).unwrap();
         let signer = write_test_pub(&base);
 
         let content_hash = h(7);
@@ -1636,7 +1636,7 @@ mod tests {
             options,
         ))];
         segment::write_segment(
-            &base.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            &crate::segment::pending_open_dir(&base).join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
             entries,
             signer.as_ref(),
         )

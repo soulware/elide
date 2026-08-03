@@ -33,7 +33,7 @@ fn make_readonly_volume(
 ) -> (Ulid, PathBuf, std::sync::Arc<dyn SegmentSigner>) {
     let vol_ulid = Ulid::new();
     let vol_dir = by_id_dir.join(vol_ulid.to_string());
-    fs::create_dir_all(vol_dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
     fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
     fs::write(vol_dir.join("volume.readonly"), "").unwrap();
     elide_core::config::VolumeConfig {
@@ -63,7 +63,7 @@ fn write_single_entry_segment(
     body: Vec<u8>,
 ) -> Ulid {
     let seg_ulid = Ulid::new();
-    let seg_path = vol_dir.join("pending").join(seg_ulid.to_string());
+    let seg_path = elide_core::segment::pending_open_dir(vol_dir).join(seg_ulid.to_string());
     let entries = vec![SegmentEntry::new_data(
         hash,
         start_lba,
@@ -182,7 +182,8 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
 
     // ── Re-read the rewritten pending segment and assert the entry is
     // now a thin Delta with source_hash = parent_hash.
-    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let rewritten =
+        elide_core::segment::pending_open_dir(&child_dir).join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries.len(), 1);
     let e = &entries[0];
@@ -200,7 +201,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
 /// index/<ulid>.idx + cache/<ulid>.{body,present}, deleting pending/<ulid>.
 /// Mirrors what the coordinator does after a successful S3 upload.
 fn drain_source_segment(source_dir: &Path, seg_ulid: Ulid) {
-    let pending = source_dir.join("pending").join(seg_ulid.to_string());
+    let pending = elide_core::segment::pending_open_dir(source_dir).join(seg_ulid.to_string());
     let index_dir = source_dir.join("index");
     let cache_dir = source_dir.join("cache");
     fs::create_dir_all(&index_dir).unwrap();
@@ -240,7 +241,8 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
     let (source_ulid, source_dir, source_signer) =
         make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
     let source_seg_ulid = Ulid::new();
-    let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
+    let source_seg_path =
+        elide_core::segment::pending_open_dir(&source_dir).join(source_seg_ulid.to_string());
     let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -296,7 +298,8 @@ fn rewrite_pending_with_deltas_reads_drained_source_body() {
             .expect("rewrite_pending_with_deltas must read drained source body correctly");
     assert_eq!(stats.entries_converted, 1);
 
-    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let rewritten =
+        elide_core::segment::pending_open_dir(&child_dir).join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Delta);
     assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
@@ -329,7 +332,8 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
     let (source_ulid, source_dir, source_signer) =
         make_readonly_volume(&by_id_dir, &ProvenanceLineage::default());
     let source_seg_ulid = Ulid::new();
-    let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
+    let source_seg_path =
+        elide_core::segment::pending_open_dir(&source_dir).join(source_seg_ulid.to_string());
     let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -396,7 +400,8 @@ fn rewrite_pending_with_deltas_reads_gc_applied_source_body() {
         "source segment in bare gc/<id> should still resolve"
     );
 
-    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let rewritten =
+        elide_core::segment::pending_open_dir(&child_dir).join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Delta);
     assert_eq!(entries[0].delta_options[0].source_hash, parent_hash);
@@ -429,7 +434,8 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
     // Build the Inline source entry directly so we control the stored
     // form exactly. `new_data` promotes to Inline when data.len() < 256.
     let source_seg_ulid = Ulid::new();
-    let source_seg_path = source_dir.join("pending").join(source_seg_ulid.to_string());
+    let source_seg_path =
+        elide_core::segment::pending_open_dir(&source_dir).join(source_seg_ulid.to_string());
     let source_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -484,7 +490,8 @@ fn rewrite_pending_with_deltas_handles_inline_source() {
             .expect("rewrite_pending_with_deltas must not fail on inline source");
     assert_eq!(stats.entries_converted, 0);
 
-    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let rewritten =
+        elide_core::segment::pending_open_dir(&child_dir).join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(entries[0].kind, EntryKind::Data);
     assert!(entries[0].delta_options.is_empty());
@@ -543,7 +550,8 @@ fn rewrite_pending_with_deltas_skips_unchanged_hashes() {
             .unwrap();
     assert_eq!(stats.entries_converted, 0);
 
-    let rewritten = child_dir.join("pending").join(child_seg_ulid.to_string());
+    let rewritten =
+        elide_core::segment::pending_open_dir(&child_dir).join(child_seg_ulid.to_string());
     let (_, entries, _) = segment::read_segment_index(&rewritten).unwrap();
     assert_eq!(
         entries[0].kind,

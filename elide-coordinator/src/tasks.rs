@@ -229,8 +229,10 @@ pub async fn run_volume_tasks(
     // and write `index/<ulid>.idx`; running prefetch there would
     // race the drain and fail with 404s on segments that exist only
     // locally so far. Either prefix holding entries is enough to skip.
-    let has_local_segments =
-        dir_has_entries(&fork_dir.join("index")) || dir_has_entries(&fork_dir.join("pending"));
+    let has_local_segments = dir_has_entries(&fork_dir.join("index"))
+        || elide_core::segment::pending_generation_dirs(&fork_dir)
+            .iter()
+            .any(|d| dir_has_entries(d));
     // Pulled ancestors are populated by the descendant writable fork's
     // `prefetch_indexes` chain walk; running their own per-volume prefetch
     // repeats every LIST/range-GET on the chain.
@@ -353,7 +355,9 @@ pub async fn run_volume_tasks(
             }
             _ = tick.tick() => {
                 if fork_dir.join("volume.readonly").exists()
-                    && pending_dir_is_empty(&fork_dir.join("pending"))
+                    && elide_core::segment::pending_generation_dirs(&fork_dir)
+                        .iter()
+                        .all(|d| pending_dir_is_empty(d))
                 {
                     continue;
                 }

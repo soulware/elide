@@ -26,7 +26,7 @@ fn entropy(seed: u64, len: usize) -> Vec<u8> {
 }
 
 fn make_volume(dir: &Path) -> std::sync::Arc<dyn SegmentSigner> {
-    fs::create_dir_all(dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(dir)).unwrap();
     fs::create_dir_all(dir.join("index")).unwrap();
     signing::generate_keypair(dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE).unwrap();
     signing::load_signer(dir, signing::VOLUME_KEY_FILE).unwrap()
@@ -52,7 +52,12 @@ fn write_segment_with(
             e
         })
         .collect();
-    write_segment(&dir.join("pending").join(seg.to_string()), entries, signer).unwrap();
+    write_segment(
+        &elide_core::segment::pending_open_dir(dir).join(seg.to_string()),
+        entries,
+        signer,
+    )
+    .unwrap();
     (seg, hashes)
 }
 
@@ -167,7 +172,7 @@ fn a_journal_entry_contributes_no_source() {
     e.entry.journal = true;
     let seg = Ulid::new();
     write_segment(
-        &dir.join("pending").join(seg.to_string()),
+        &elide_core::segment::pending_open_dir(&dir).join(seg.to_string()),
         vec![e],
         signer.as_ref(),
     )
@@ -178,8 +183,10 @@ fn a_journal_entry_contributes_no_source() {
 
     // Confirm the entry is there at all, so the assertion above is about
     // the journal flag rather than an empty segment.
-    let (_, entries, _) =
-        segment::read_segment_index(&dir.join("pending").join(seg.to_string())).unwrap();
+    let (_, entries, _) = segment::read_segment_index(
+        &elide_core::segment::pending_open_dir(&dir).join(seg.to_string()),
+    )
+    .unwrap();
     assert_eq!(entries.len(), 1);
     assert!(entries[0].journal);
     assert_eq!(entries[0].sketch, None);

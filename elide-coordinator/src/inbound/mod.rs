@@ -761,27 +761,42 @@ pub(crate) async fn drain_volume_for_seal(
     // daemon fails the verb before any credential beyond `volume-rw`
     // is requested.
     let meta_store = stores.writer();
-    // Seals drain everything: journal deferral is a between-cuts tick
-    // policy, and every seal is a synchronous cut boundary.
-    let drained_user_snapshot = match elide_coordinator::upload::drain_pending(
-        fork_dir,
-        vol_ulid,
-        store,
-        &meta_store,
-        head_cache,
-        elide_coordinator::upload::DrainMode::Full,
-    )
-    .await
-    {
-        Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
-            return Err(IpcError::store(format!(
-                "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
-                r.upload_failed, r.promote_failed
-            )));
+    // A seal is a synchronous cut boundary spanning the whole backlog:
+    // drain the upload generation, close the open generation into its
+    // place, and drain again — both generations durable before the
+    // manifest signs.
+    let mut drained_user_snapshot = None;
+    for round in 0..2 {
+        match elide_coordinator::upload::drain_pending(
+            fork_dir,
+            vol_ulid,
+            store,
+            &meta_store,
+            head_cache,
+        )
+        .await
+        {
+            Ok(r) if r.upload_failed > 0 || r.promote_failed > 0 => {
+                return Err(IpcError::store(format!(
+                    "drain reported {} S3-upload failure(s), {} volume-promote failure(s)",
+                    r.upload_failed, r.promote_failed
+                )));
+            }
+            Ok(r) => drained_user_snapshot = r.published_user_snapshot.or(drained_user_snapshot),
+            Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
         }
-        Ok(r) => r.published_user_snapshot,
-        Err(e) => return Err(IpcError::store(format!("drain: {e:#}"))),
-    };
+        if round == 0 {
+            match elide_coordinator::control::close_generation(fork_dir).await {
+                Some(0) => break,
+                Some(_) => {}
+                None => {
+                    return Err(IpcError::internal(
+                        "close_generation failed or volume unreachable",
+                    ));
+                }
+            }
+        }
+    }
 
     let _ = elide_coordinator::control::apply_gc_handoffs(fork_dir).await;
     // Outcomes from handoffs draining during a snapshot seal are folded

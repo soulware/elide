@@ -2551,8 +2551,7 @@ pub fn locate_segment_body(
     if wal.exists() {
         return Some((wal, SegmentBodyLayout::FullSegment));
     }
-    let pending = base_dir.join("pending").join(&sid);
-    if pending.exists() {
+    if let Some(pending) = find_pending_file(base_dir, &sid) {
         return Some((pending, SegmentBodyLayout::FullSegment));
     }
     let gc_body = base_dir.join("gc").join(&sid);
@@ -2638,6 +2637,133 @@ pub fn read_ulid_dir_sorted(dir: &Path) -> io::Result<Vec<ulid::Ulid>> {
         .collect();
     ulids.sort_unstable();
     Ok(ulids)
+}
+
+// --- pending generation layout ---
+//
+// `pending/` holds two generation directories with fixed names
+// (`docs/design/upload-generations.md`): `open/`, where WAL flushes
+// land and every fold reads and writes, and `upload/`, the closed
+// immutable generation the uploader drains. A cut renames open to
+// upload, so a segment's generation is the directory it lives in.
+
+/// The open generation: every pending writer targets this directory.
+pub fn pending_open_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join("pending").join("open")
+}
+
+/// The upload generation: immutable, drained by the uploader.
+/// Absent between a publish and the next close.
+pub fn pending_upload_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join("pending").join("upload")
+}
+
+/// Both generation directories, upload first — every upload-generation
+/// ULID predates every open ULID, so walking in this order visits
+/// pending segments in ULID order.
+pub fn pending_generation_dirs(base_dir: &Path) -> [PathBuf; 2] {
+    [pending_upload_dir(base_dir), pending_open_dir(base_dir)]
+}
+
+/// Locate a pending file by name across both generations.
+pub fn find_pending_file(base_dir: &Path, name: &str) -> Option<PathBuf> {
+    pending_generation_dirs(base_dir)
+        .into_iter()
+        .map(|d| d.join(name))
+        .find(|p| p.exists())
+}
+
+/// Every pending segment file across both generations, upload first,
+/// each directory's files ULID-sorted.
+pub fn collect_pending_segment_files(base_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for dir in pending_generation_dirs(base_dir) {
+        out.extend(collect_segment_files(&dir)?);
+    }
+    Ok(out)
+}
+
+/// Rotate the open generation into `pending/upload/`. The upload
+/// generation must be fully drained (absent or empty). Returns the
+/// rotated segment count, `None` when the open generation was empty
+/// and nothing rotated. The rename is the generation commit point;
+/// the parent fsync makes it durable.
+pub fn rotate_open_generation(base_dir: &Path) -> io::Result<Option<u32>> {
+    let upload = pending_upload_dir(base_dir);
+    match fs::read_dir(&upload) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(io::Error::other(
+                    "rotate_open_generation: upload generation not drained",
+                ));
+            }
+            fs::remove_dir(&upload)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let open = pending_open_dir(base_dir);
+    let mut segments = 0u32;
+    for entry in fs::read_dir(&open)? {
+        let name = entry?.file_name();
+        if name.to_str().is_some_and(|s| !s.contains('.')) {
+            segments += 1;
+        }
+    }
+    if segments == 0 {
+        return Ok(None);
+    }
+
+    fs::rename(&open, &upload)?;
+    fs::create_dir(&open)?;
+    fsync_dir(&open.join("."))?;
+    Ok(Some(segments))
+}
+
+/// Create the generation layout under `pending/` and adopt any flat
+/// pending files (a fork last written by the pre-generation layout)
+/// into `open/`. Removes stray `.tmp` files in every pending
+/// directory. Idempotent; called at volume open.
+pub fn ensure_pending_layout(base_dir: &Path) -> io::Result<()> {
+    let pending = base_dir.join("pending");
+    let open = pending_open_dir(base_dir);
+    fs::create_dir_all(&open)?;
+    let mut moved = false;
+    for entry in fs::read_dir(&pending)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".tmp") {
+            fs::remove_file(&path)?;
+            continue;
+        }
+        fs::rename(&path, open.join(name))?;
+        moved = true;
+    }
+    for dir in pending_generation_dirs(base_dir) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".tmp"))
+            {
+                fs::remove_file(entry.path())?;
+                moved = true;
+            }
+        }
+    }
+    if moved {
+        fsync_dir(&open.join("."))?;
+    }
+    Ok(())
 }
 
 pub fn collect_segment_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -2944,7 +3070,7 @@ pub fn discover_fork_segments(
     branch_ulid: Option<&str>,
 ) -> io::Result<Vec<SegmentRef>> {
     // pending/ first (source of drain-path promote).
-    let pending_paths = collect_segment_files(&fork_dir.join("pending"))?;
+    let pending_paths = collect_pending_segment_files(fork_dir)?;
 
     // gc/ next (source of gc-carried promote).
     let gc_paths = collect_gc_applied_segment_files(fork_dir)?;
@@ -3718,7 +3844,7 @@ mod tests {
 
         let base = temp_dir();
         fs::create_dir_all(base.join("wal")).unwrap();
-        fs::create_dir_all(base.join("pending")).unwrap();
+        fs::create_dir_all(pending_open_dir(&base)).unwrap();
 
         let ulid = ulid::Ulid::from_string("01JQTEST000000000000000001").unwrap();
         let wal_path = base.join("wal").join(ulid.to_string());
@@ -3744,7 +3870,7 @@ mod tests {
         let (bss, entries) = promote(
             &wal_path,
             ulid,
-            &base.join("pending"),
+            &pending_open_dir(&base),
             entries,
             signer.as_ref(),
         )
@@ -3755,7 +3881,7 @@ mod tests {
 
         // Segment must exist (no .tmp).
         let ulid_str = ulid.to_string();
-        let seg_path = base.join("pending").join(&ulid_str);
+        let seg_path = pending_open_dir(&base).join(&ulid_str);
         assert!(seg_path.exists(), "segment missing from pending/");
         assert!(
             !base
@@ -3800,13 +3926,13 @@ mod tests {
     fn make_fork_dir() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let fork_dir = tmp.path().to_path_buf();
-        fs::create_dir_all(fork_dir.join("pending")).unwrap();
+        fs::create_dir_all(pending_open_dir(&fork_dir)).unwrap();
         fs::create_dir_all(fork_dir.join("gc")).unwrap();
         (tmp, fork_dir)
     }
 
     fn seg_path(fork_dir: &Path, ulid: &str) -> PathBuf {
-        fork_dir.join("pending").join(ulid)
+        pending_open_dir(fork_dir).join(ulid)
     }
 
     fn gc_path(fork_dir: &Path, ulid: &str) -> PathBuf {
@@ -4545,7 +4671,7 @@ mod tests {
     #[test]
     fn locate_segment_body_from_starts_at_the_named_home() {
         let dir = temp_dir();
-        for sub in ["wal", "pending", "gc", "cache"] {
+        for sub in ["wal", "pending/open", "gc", "cache"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         let sid = ulid::Ulid::new();
@@ -4561,7 +4687,7 @@ mod tests {
         // A `pending/<id>` alongside it is what the canonical walk would
         // have returned. Both hold the same bytes for the same ULID, and the
         // named home decides which copy the read opens.
-        let pending = dir.join("pending").join(&sid_s);
+        let pending = pending_open_dir(&dir).join(&sid_s);
         fs::write(&pending, b"pending").unwrap();
         assert_eq!(
             locate_segment_body_from(&dir, sid, BodyHome::Cache),
@@ -4582,7 +4708,7 @@ mod tests {
 
         // Absent everywhere, either home reports nothing rather than a path
         // that cannot be opened.
-        fs::remove_file(dir.join("pending").join(&sid_s)).unwrap();
+        fs::remove_file(pending_open_dir(&dir).join(&sid_s)).unwrap();
         assert!(locate_segment_body_from(&dir, sid, BodyHome::Cache).is_none());
         assert!(locate_segment_body_from(&dir, sid, BodyHome::LocalFile).is_none());
 
@@ -4596,7 +4722,7 @@ mod tests {
         // and that `gc/<id>.staged` is naturally excluded (extension
         // filter) while bare `gc/<id>` is accepted without any sidecar.
         let dir = temp_dir();
-        for sub in ["wal", "pending", "gc", "cache"] {
+        for sub in ["wal", "pending/open", "gc", "cache"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         let sid = ulid::Ulid::new();
@@ -4632,7 +4758,7 @@ mod tests {
         );
 
         // pending/ wins over gc/ bare.
-        let pending = dir.join("pending").join(&sid_s);
+        let pending = pending_open_dir(&dir).join(&sid_s);
         fs::write(&pending, b"pending").unwrap();
         assert_eq!(
             locate_segment_body(&dir, sid),

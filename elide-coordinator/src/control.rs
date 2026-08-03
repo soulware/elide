@@ -16,8 +16,8 @@ use std::path::Path;
 use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::CompactionStats;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, GcCheckpointReply, ReclaimReply,
-    VolumeRequest,
+    ApplyGcHandoffsReply, CloseGenerationReply, CompactionReply, ConnectedReply, GcCheckpointReply,
+    ReclaimReply, VolumeRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -45,6 +45,16 @@ pub async fn promote_wal(fork_dir: &Path) -> bool {
 pub async fn repack(fork_dir: &Path) -> Option<CompactionStats> {
     let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::Repack).await?;
     Some(reply.stats)
+}
+
+/// Close the open generation into `pending/upload/`. The upload
+/// generation must already be drained. Returns the closed
+/// generation's segment count (0 when the open generation was empty
+/// and nothing rotated); `None` and a warning if the socket is absent
+/// or the call fails.
+pub async fn close_generation(fork_dir: &Path) -> Option<u32> {
+    let reply: CloseGenerationReply = call_typed(fork_dir, &VolumeRequest::CloseGeneration).await?;
+    Some(reply.segments)
 }
 
 /// Call gc_checkpoint on the volume process for `fork_dir`.
@@ -295,6 +305,7 @@ fn verb_label(request: &VolumeRequest) -> &'static str {
         VolumeRequest::SnapshotManifest { .. } => "snapshot-manifest",
         VolumeRequest::Promote { .. } => "promote",
         VolumeRequest::FinalizeGcHandoff { .. } => "finalize-gc-handoff",
+        VolumeRequest::CloseGeneration => "close-generation",
         VolumeRequest::Reclaim { .. } => "reclaim",
         VolumeRequest::Connected => "connected",
         VolumeRequest::Shutdown => "shutdown",

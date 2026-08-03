@@ -708,22 +708,16 @@ impl Volume {
         by_id_dir: &Path,
     ) -> io::Result<Self> {
         let wal_dir = base_dir.join("wal");
-        let pending_dir = base_dir.join("pending");
-
         fs::create_dir_all(&wal_dir)?;
-        fs::create_dir_all(&pending_dir)?;
 
         // Acquire exclusive lock. Fails immediately if another process has this
         // fork open. The lock is released when Volume is dropped.
         let lock_file = acquire_lock(base_dir)?;
 
-        // Remove any .tmp files in pending/ — incomplete promotions from a crash.
-        for entry in fs::read_dir(&pending_dir)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "tmp") {
-                fs::remove_file(&path)?;
-            }
-        }
+        // Generation layout under pending/ — creates open/, adopts any
+        // flat pre-generation pending files, and sweeps .tmp leftovers
+        // from crashed promotions.
+        segment::ensure_pending_layout(base_dir)?;
 
         // The journal ranges persisted by the previous session. The
         // extent-index rebuild needs them before the filesystem is
@@ -754,7 +748,7 @@ impl Volume {
             let Some(ulid) = path.file_name().and_then(|s| s.to_str()) else {
                 return true; // non-UTF-8 name: leave it alone
             };
-            if pending_dir.join(ulid).exists() {
+            if segment::find_pending_file(base_dir, ulid).is_some() {
                 let _ = fs::remove_file(path);
                 false
             } else {
@@ -771,7 +765,7 @@ impl Volume {
         let latest_snap = latest_snapshot(base_dir)?;
         let mut last_segment_ulid: Option<Ulid> = None;
         // Collect pending/ segment ULIDs (full files, not yet uploaded).
-        for p in segment::collect_segment_files(&base_dir.join("pending"))? {
+        for p in segment::collect_pending_segment_files(base_dir)? {
             if let Some(ulid) = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -855,7 +849,7 @@ impl Volume {
                     old_wal_path: wal_path.clone(),
                     primary,
                     signer: Arc::clone(&signer),
-                    pending_dir: pending_dir.clone(),
+                    pending_dir: segment::pending_open_dir(base_dir),
                     // Recovery promotes of stale WALs write plain Data
                     // entries. Both delta tiers resolve sources through
                     // Arc'd snapshots, and the open path holds the index
@@ -1862,9 +1856,10 @@ impl Volume {
             return Ok(StagedApply::Cancelled);
         }
 
-        let pending_dir = self.base_dir.join("pending");
         for input in &inputs {
-            let _ = fs::remove_file(pending_dir.join(input.to_string()));
+            if let Some(p) = segment::find_pending_file(&self.base_dir, &input.to_string()) {
+                let _ = fs::remove_file(p);
+            }
         }
 
         // Commit point. On a crash above this rename no fold exists on
@@ -2065,22 +2060,28 @@ impl Volume {
     /// to coordinator-layer stress runs.
     #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_pending_above_committed(&self, caller: &'static str) {
-        let pending_dir = self.base_dir.join("pending");
-        let pending_ulids = match segment::read_ulid_dir_sorted(&pending_dir) {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("assert_pending_above_committed[{caller}]: read pending failed: {e}");
-                return;
+        let mut pending_files: Vec<(Ulid, std::path::PathBuf)> = Vec::new();
+        for dir in segment::pending_generation_dirs(&self.base_dir) {
+            match segment::read_ulid_dir_sorted(&dir) {
+                Ok(us) => {
+                    pending_files.extend(us.into_iter().map(|u| (u, dir.join(u.to_string()))))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("assert_pending_above_committed[{caller}]: read pending failed: {e}");
+                    return;
+                }
             }
-        };
+        }
+        let pending_ulids: Vec<Ulid> = pending_files.iter().map(|(u, _)| *u).collect();
         if pending_ulids.is_empty() {
             return; // No pending — invariant vacuously holds.
         }
 
         // Partition pending by tier from each file's own index section.
         // A file whose index cannot be read counts as data, the stricter
-        // side. The listing is ascending, so the first of each tier is
-        // its min.
+        // side. The walk is upload-generation first then open, each
+        // ascending — ULID order — so the first of each tier is its min.
         let is_journal = |path: &std::path::Path| -> bool {
             segment::read_segment_index(path)
                 .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
@@ -2088,8 +2089,8 @@ impl Volume {
         };
         let mut pending_data_min: Option<Ulid> = None;
         let mut pending_journal_min: Option<Ulid> = None;
-        for u in &pending_ulids {
-            let slot = if is_journal(&pending_dir.join(u.to_string())) {
+        for (u, path) in &pending_files {
+            let slot = if is_journal(path) {
                 &mut pending_journal_min
             } else {
                 &mut pending_data_min
@@ -2523,17 +2524,29 @@ impl Volume {
     ///
     /// Ensures `index/` and `cache/` exist so the worker never touches
     /// the directory structure.
+    /// Close the open generation: the upload generation must be fully
+    /// drained (absent or empty). Removes the spent `upload/`, renames
+    /// `open/` into its place, creates a fresh `open/`, and fsyncs
+    /// `pending/` so the boundary survives a crash. Returns the number
+    /// of segments the closed generation carries, `None` when the open
+    /// generation was empty and nothing rotated.
+    pub fn close_generation(&mut self) -> io::Result<Option<u32>> {
+        let rotated = segment::rotate_open_generation(&self.base_dir)?;
+        self.assert_volume_invariants("close_generation");
+        Ok(rotated)
+    }
+
     pub fn prepare_promote_segment(&self, ulid: Ulid) -> io::Result<PromoteSegmentPrep> {
         let ulid_str = ulid.to_string();
         let cache_dir = self.base_dir.join("cache");
         let body_path = cache_dir.join(format!("{ulid_str}.body"));
         let present_path = cache_dir.join(format!("{ulid_str}.present"));
-        let pending_path = self.base_dir.join("pending").join(&ulid_str);
+        let pending_path = segment::find_pending_file(&self.base_dir, &ulid_str);
         let gc_path = self.base_dir.join("gc").join(&ulid_str);
         let index_dir = self.base_dir.join("index");
         let idx_path = index_dir.join(format!("{ulid_str}.idx"));
 
-        let (src_path, is_drain) = if pending_path.try_exists()? {
+        let (src_path, is_drain) = if let Some(pending_path) = pending_path {
             (pending_path, true)
         } else if gc_path.try_exists()? {
             (gc_path, false)
@@ -2679,12 +2692,13 @@ impl Volume {
             }
 
             let ulid_str = ulid.to_string();
-            let delta_path = self
-                .base_dir
-                .join("pending")
-                .join(format!("{ulid_str}.delta"));
-            let _ = fs::remove_file(&delta_path);
-            let pending_path = self.base_dir.join("pending").join(&ulid_str);
+            if let Some(delta_path) =
+                segment::find_pending_file(&self.base_dir, &format!("{ulid_str}.delta"))
+            {
+                let _ = fs::remove_file(&delta_path);
+            }
+            let pending_path = segment::find_pending_file(&self.base_dir, &ulid_str)
+                .ok_or_else(|| io::Error::other(format!("pending segment {ulid_str} missing")))?;
             fs::remove_file(&pending_path)?;
         } else {
             // GC carried path: delete each consumed input's idx.
@@ -3001,12 +3015,17 @@ impl Volume {
             if let Some(open) = self.wal.as_ref() {
                 own_segments.insert(open.ulid);
             }
-            for entry in fs::read_dir(self.base_dir.join("pending"))?.flatten() {
-                if let Some(s) = entry.file_name().to_str()
-                    && !s.contains('.')
-                    && let Ok(u) = Ulid::from_string(s)
-                {
-                    own_segments.insert(u);
+            for dir in segment::pending_generation_dirs(&self.base_dir) {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if let Some(s) = entry.file_name().to_str()
+                        && !s.contains('.')
+                        && let Ok(u) = Ulid::from_string(s)
+                    {
+                        own_segments.insert(u);
+                    }
                 }
             }
             if let Ok(idx_files) = segment::collect_idx_files(&self.base_dir.join("index")) {
@@ -3037,9 +3056,11 @@ impl Volume {
         // can enumerate a complete `index/` rather than a partial view.
         // In production this is driven by the coordinator after confirming
         // S3 upload; the in-process variant skips the upload step.
-        let pending_dir = self.base_dir.join("pending");
         let mut pending_ulids: Vec<Ulid> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&pending_dir) {
+        for dir in segment::pending_generation_dirs(&self.base_dir) {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let Some(s) = name.to_str() else { continue };
@@ -3390,7 +3411,7 @@ impl Volume {
             old_wal_path: open.path,
             primary,
             signer: Arc::clone(&self.signer),
-            pending_dir: self.base_dir.join("pending"),
+            pending_dir: segment::pending_open_dir(&self.base_dir),
             delta,
             journal: jpart,
         })

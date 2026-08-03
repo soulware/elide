@@ -290,6 +290,7 @@ fn reclaim_crash_recovery_seed_3f9275b5_regression() {
 ///     and `incompressible_block(1)`.
 ///   - Second WriteMulti at LBA 46..48: writes `incompressible_block(1)`
 ///     and `incompressible_block(2)`, overwriting LBA 47.
+///
 /// LBA 46 (live, written second) and LBA 48 (live, written first) now
 /// share content `incompressible_block(1)` — same hash, different LBAs,
 /// in the same WAL window.
@@ -902,6 +903,7 @@ fn straddling_write_splits_at_the_window_boundary() {
     vol.flush_wal().unwrap();
 
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 
     // Crash + reopen: every block of both shares survives recovery.
@@ -963,6 +965,7 @@ fn repack_pipeline_crash_states_recover() {
         );
     }
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 
     // Crash partway through input removal after a completed apply.
@@ -980,6 +983,7 @@ fn repack_pipeline_crash_states_recover() {
         );
     }
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 }
 

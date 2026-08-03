@@ -6,6 +6,7 @@ fn open_creates_directories() {
     let base = keyed_temp_dir();
     let _ = Volume::open(&base, &base).unwrap();
     assert!(base.join("wal").is_dir());
+    assert!(segment::pending_open_dir(&base).is_dir());
     assert!(base.join("pending").is_dir());
     fs::remove_dir_all(base).unwrap();
 }
@@ -16,6 +17,41 @@ fn open_is_idempotent() {
     let _ = Volume::open(&base, &base).unwrap();
     // Second open on the same dir should succeed (dirs already exist).
     let _ = Volume::open(&base, &base).unwrap();
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn close_generation_rotates_open_into_upload() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    let open_dir = segment::pending_open_dir(&base);
+    let upload_dir = segment::pending_upload_dir(&base);
+
+    // An empty open generation closes to nothing.
+    assert_eq!(vol.close_generation().unwrap(), None);
+    assert!(!upload_dir.exists());
+
+    vol.write(0, &vec![0x11u8; 4096]).unwrap();
+    vol.promote_for_test().unwrap();
+    assert_eq!(vol.close_generation().unwrap(), Some(1));
+    let uploads: Vec<_> = fs::read_dir(&upload_dir).unwrap().flatten().collect();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(fs::read_dir(&open_dir).unwrap().count(), 0);
+
+    // A part-full upload generation refuses the close.
+    vol.write(1, &vec![0x22u8; 4096]).unwrap();
+    vol.promote_for_test().unwrap();
+    assert!(vol.close_generation().is_err());
+
+    // Drained, the next close rotates the second flush.
+    let ulid = Ulid::from_string(uploads[0].file_name().to_str().unwrap()).unwrap();
+    vol.promote_segment(ulid).unwrap();
+    assert_eq!(vol.close_generation().unwrap(), Some(1));
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap(), vec![0x11u8; 4096]);
+    assert_eq!(vol.read(1, 1).unwrap(), vec![0x22u8; 4096]);
     fs::remove_dir_all(base).unwrap();
 }
 
@@ -189,7 +225,7 @@ fn write_sets_needs_promote_after_threshold() {
     vol.flush_wal().unwrap();
 
     // At least one segment should have been promoted to pending/.
-    let has_pending = fs::read_dir(base.join("pending"))
+    let has_pending = fs::read_dir(segment::pending_open_dir(&base))
         .unwrap()
         .any(|e| e.is_ok());
     assert!(
@@ -310,7 +346,7 @@ fn write_zeroes_no_data_in_segment() {
     vol.write_zeroes(0, 16).unwrap();
     vol.flush_wal().unwrap();
 
-    let seg_path = segment::collect_segment_files(&base.join("pending"))
+    let seg_path = segment::collect_segment_files(&segment::pending_open_dir(&base))
         .unwrap()
         .into_iter()
         .next()
@@ -557,7 +593,7 @@ fn promotion_after_wal_recovery() {
     assert_eq!(vol.lbamap_len(), 2);
 
     // Confirm the promoted segment landed correctly: one file in pending/.
-    let pending_count = fs::read_dir(base.join("pending"))
+    let pending_count = fs::read_dir(segment::pending_open_dir(&base))
         .unwrap()
         .filter(|e| e.is_ok())
         .count();
@@ -581,7 +617,7 @@ fn wal_deleted_when_pending_segment_exists() {
         vol.write(1, &vec![0xbbu8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
         // Grab the segment ULID (there is exactly one file in pending/).
-        let entry = fs::read_dir(base.join("pending"))
+        let entry = fs::read_dir(segment::pending_open_dir(&base))
             .unwrap()
             .next()
             .unwrap()
@@ -592,7 +628,7 @@ fn wal_deleted_when_pending_segment_exists() {
 
     // Simulate the crash: copy the segment back as a WAL file so both exist.
     fs::copy(
-        base.join("pending").join(&ulid),
+        segment::pending_open_dir(&base).join(&ulid),
         base.join("wal").join(&ulid),
     )
     .unwrap();
@@ -682,7 +718,7 @@ fn recovery_replays_all_wals_promoting_non_latest() {
 
     // Exactly one segment in pending/ — the recovery-promoted low
     // WAL, at a freshly-minted ULID strictly above the wal floor.
-    let pending_files: Vec<_> = fs::read_dir(base.join("pending"))
+    let pending_files: Vec<_> = fs::read_dir(segment::pending_open_dir(&base))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
         .filter(|n| !n.ends_with(".tmp"))
@@ -764,7 +800,7 @@ fn recovery_removes_tmp_orphans() {
 
     // Simulate a crash mid-promotion: a .tmp file exists in pending/ but
     // no completed segment (the rename never happened).
-    let orphan = base.join("pending").join("01AAAAAAAAAAAAAAAAAAAAAAAAA.tmp");
+    let orphan = segment::pending_open_dir(&base).join("01AAAAAAAAAAAAAAAAAAAAAAAAA.tmp");
     fs::write(&orphan, b"incomplete segment bytes").unwrap();
 
     // Recovery must succeed, data must be correct, and the orphan removed.
@@ -958,7 +994,7 @@ fn same_epoch_duplicate_minted_as_dedup_ref_at_formation() {
     // same hash, in the same segment.
     let ulids = pending_ulids(&base);
     assert_eq!(ulids.len(), 1);
-    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let seg_path = segment::pending_open_dir(&base).join(ulids[0].to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     let hash = blake3::hash(&data);
@@ -1011,7 +1047,7 @@ fn duplicate_of_promoted_canonical_minted_at_formation() {
     vol.promote_for_test().unwrap();
 
     let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
-    let seg_path = base.join("pending").join(s2.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(s2.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
@@ -1230,7 +1266,7 @@ fn unreadable_device_keeps_stored_window() {
 
     // Drain the pending segment to cache form, then evict its body so
     // reads need a fetcher the reopened volume will not have.
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -1312,7 +1348,7 @@ fn formation_re_encodes_a_body_from_the_wal_codec_to_the_body_codec() {
 
     let ulids = pending_ulids(&base);
     assert_eq!(ulids.len(), 1);
-    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let seg_path = segment::pending_open_dir(&base).join(ulids[0].to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
@@ -1350,7 +1386,7 @@ fn formation_chunks_a_body_larger_than_one_chunk() {
     vol.promote_for_test().unwrap();
 
     let ulids = pending_ulids(&base);
-    let seg_path = base.join("pending").join(ulids[0].to_string());
+    let seg_path = segment::pending_open_dir(&base).join(ulids[0].to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     let by_lba = |lba: u64| entries.iter().find(|e| e.start_lba == lba).expect("entry");
@@ -1390,7 +1426,7 @@ fn formation_keeps_lz4_for_journal_bodies() {
     let ulids = pending_ulids(&base);
     assert_eq!(ulids.len(), 2);
     let read_entries = |seg: Ulid| {
-        let seg_path = base.join("pending").join(seg.to_string());
+        let seg_path = segment::pending_open_dir(&base).join(seg.to_string());
         let (_, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         entries
@@ -1430,7 +1466,7 @@ fn journal_and_home_store_separate_bodies_same_epoch() {
     assert_eq!(ulids.len(), 2);
     let (data_seg, journal_seg) = (ulids[0], ulids[1]);
     let read_entries = |seg: Ulid| {
-        let seg_path = base.join("pending").join(seg.to_string());
+        let seg_path = segment::pending_open_dir(&base).join(seg.to_string());
         let (_, entries, _) =
             segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
         entries
@@ -1508,7 +1544,7 @@ fn journal_and_home_own_separate_tiers_across_epochs() {
     let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
 
     // The epoch-2 segment carries a full Data owner in inner.
-    let seg_path = base.join("pending").join(s2.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(s2.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
@@ -1561,7 +1597,7 @@ fn journal_write_stores_own_body_not_dedup_against_stable() {
     vol.promote_for_test().unwrap();
     let s2 = *pending_ulids(&base).iter().find(|u| **u != s1).unwrap();
 
-    let seg_path = base.join("pending").join(s2.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(s2.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
@@ -1589,7 +1625,7 @@ fn journal_write_stores_own_body_not_dedup_against_stable() {
 }
 
 fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
-    let seg_path = base.join("pending").join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     entries.iter().map(|e| e.start_lba).collect()
@@ -1599,7 +1635,7 @@ fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
 /// flag — the disjoint-tier invariant that a segment is pure journal or
 /// pure data, never mixed.
 fn seg_all_journal(base: &Path, vol: &Volume, seg: Ulid) -> bool {
-    let seg_path = base.join("pending").join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     !entries.is_empty() && entries.iter().all(|e| e.journal)
@@ -2055,7 +2091,7 @@ fn recovery_promote_of_extra_wal_classifies_dedup() {
         .iter()
         .find(|u| **u != canonical_ulid)
         .expect("recovery-promoted segment in pending/");
-    let seg_path = base.join("pending").join(recovery_seg.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(recovery_seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     assert_eq!(entries.len(), 1);
@@ -2112,7 +2148,7 @@ fn delta_variant_extent(seed: u8, tweak: u8) -> Vec<u8> {
 }
 
 fn pending_entry_kinds(base: &Path, vol: &Volume, seg: Ulid) -> Vec<segment::EntryKind> {
-    let seg_path = base.join("pending").join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     entries.iter().map(|e| e.kind).collect()
@@ -2390,7 +2426,7 @@ fn legacy_ref_wal_record_replays_and_promotes() {
 
 /// Helper: collect all pending segment ULIDs (excluding sidecars and tmps).
 fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(base);
     let mut ulids: Vec<ulid::Ulid> = Vec::new();
     for entry in fs::read_dir(&pending_dir).unwrap() {
         let entry = entry.unwrap();
@@ -2459,7 +2495,7 @@ fn repack_drops_hash_dead_data_entry() {
     );
 
     // Old pending file is removed; new ULID's file exists; no .tmp leftover.
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     assert!(
         !pending_dir.join(seg_ulid.to_string()).exists(),
         "pending/<old_ulid> must be removed after redact"
@@ -2618,7 +2654,7 @@ fn repack_idempotent() {
     let new_ulid_again = repack_for_input(&mut vol, &base, new_ulid);
     assert_eq!(new_ulid_again, new_ulid);
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     assert!(
         !pending_dir.join(seg_ulid.to_string()).exists(),
         "input ULID's pending file must be removed after slow-path redact"
@@ -2648,7 +2684,7 @@ fn repack_no_op_when_all_live() {
 
     let ulids = pending_ulids(&base);
     let ulid = ulids[0];
-    let seg_path = base.join("pending").join(ulid.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(ulid.to_string());
     let before = fs::read(&seg_path).unwrap();
 
     repack_for_input(&mut vol, &base, ulid);
@@ -2700,7 +2736,7 @@ fn repack_preserves_body_for_lba_dead_but_hash_alive_entry() {
     // Verify the DATA entry at LBA 0 still has real body bytes (not zeros)
     // in the rewritten output (or the in-place file when repack was a no-op).
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let seg_path = base.join("pending").join(new_ulid.to_string());
+    let seg_path = segment::pending_open_dir(&base).join(new_ulid.to_string());
     let (bss, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     let data_entry = entries
@@ -2749,7 +2785,7 @@ fn repack_drops_entry_when_hash_fully_dead() {
     let new_ulid = repack_for_input(&mut vol, &base, seg_ulid);
     assert_ne!(new_ulid, seg_ulid);
 
-    let new_seg_path = base.join("pending").join(new_ulid.to_string());
+    let new_seg_path = segment::pending_open_dir(&base).join(new_ulid.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&new_seg_path, &vol.verifying_key).unwrap();
     assert!(
@@ -3042,7 +3078,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
 
     // DrainLocal: promote all pending segments to index/ + cache/.
     {
-        let pending = fork_dir.join("pending");
+        let pending = segment::pending_open_dir(&fork_dir);
         let index_dir = fork_dir.join("index");
         let cache_dir = fork_dir.join("cache");
         let _ = fs::create_dir_all(&index_dir);
@@ -3322,7 +3358,9 @@ fn snapshot_empty_wal_no_segment_written() {
     vol.snapshot().unwrap();
 
     // pending/ should be empty (no segment written for empty WAL).
-    let pending: Vec<_> = fs::read_dir(fork_dir.join("pending")).unwrap().collect();
+    let pending: Vec<_> = fs::read_dir(segment::pending_open_dir(&fork_dir))
+        .unwrap()
+        .collect();
     assert!(pending.is_empty());
 
     fs::remove_dir_all(fork_dir).unwrap();
@@ -3567,7 +3605,7 @@ fn gc_handoff_applies_and_renames() {
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let old_ulid = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -3687,7 +3725,7 @@ fn gc_staged_handoff_applies_and_commits_bare() {
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let old_ulid = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -3978,7 +4016,7 @@ fn gc_staged_crash_recovery_bare_wins() {
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let old_ulid = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4114,7 +4152,7 @@ fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
     let h0 = blake3::hash(&d0);
     vol.write(0, &d0).unwrap();
     vol.promote_for_test().unwrap();
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let seg_a_ulid = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4205,7 +4243,7 @@ fn gc_handoff_idempotent_after_crash() {
         vol.write(0, &data).unwrap();
         vol.promote_for_test().unwrap();
 
-        let pending_dir = base.join("pending");
+        let pending_dir = segment::pending_open_dir(&base);
         old_ulid = fs::read_dir(&pending_dir)
             .unwrap()
             .flatten()
@@ -4581,7 +4619,7 @@ fn promote_segment_recovers_mid_apply_crash() {
     vol.write(0, &data).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let ulid_str = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4662,7 +4700,7 @@ fn promote_segment_retry_rebuilds_partial_fetch_created_body() {
     vol.write(1, &block_b).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let ulid_str = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4705,7 +4743,7 @@ fn promote_to_cache_noop_after_source_reaped() {
     vol.write(0, &high_entropy_block(0xC7)).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let ulid_str = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4744,7 +4782,7 @@ fn promote_to_cache_noop_removes_leaked_body_tmp() {
     vol.write(0, &high_entropy_block(0xD3)).unwrap();
     vol.promote_for_test().unwrap();
 
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let ulid_str = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4800,7 +4838,7 @@ fn all_inline_segment_readable() {
     }
 
     // Verify the segment has body_length = 0.
-    let pending_dir = base.join("pending");
+    let pending_dir = segment::pending_open_dir(&base);
     let seg_path = fs::read_dir(&pending_dir)
         .unwrap()
         .flatten()
@@ -4845,7 +4883,7 @@ fn delta_materialisation_hash_mismatch_errors() {
         .compress(&child)
         .unwrap();
     let delta_ulid = ulid::Ulid::new();
-    let pending = base.join("pending").join(delta_ulid.to_string());
+    let pending = segment::pending_open_dir(&base).join(delta_ulid.to_string());
     let entries = vec![segment::PendingEntry::from_entry(
         segment::SegmentEntry::new_delta(
             wrong_hash,

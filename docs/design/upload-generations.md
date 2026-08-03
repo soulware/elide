@@ -1,6 +1,9 @@
 # Design: upload generations — data rides the cut
 
-**Status: Proposed.** Builds on [durable-cut.md](durable-cut.md) (the
+**Status: Implemented** (generation directories, the close-rename cut,
+structural deferral for both tiers). Open: per-volume upload bandwidth
+shaping, the idle-volume early cut. Builds on
+[durable-cut.md](durable-cut.md) (the
 cut as commit primitive, complete-drain publish, HEAD-anchored
 recovery) and
 [journal-pending-consolidation.md](journal-pending-consolidation.md)

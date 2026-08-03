@@ -122,7 +122,10 @@ pub fn import_image(
     parent_extent_index: Option<&ExtentIndex>,
     mut progress: impl FnMut(u64, u64),
 ) -> io::Result<()> {
-    if vol_dir.join("pending").exists() {
+    if !segment::collect_pending_segment_files(vol_dir)
+        .unwrap_or_default()
+        .is_empty()
+    {
         return Err(io::Error::other(format!(
             "volume already has pending segments: {}",
             vol_dir.display()
@@ -136,7 +139,7 @@ pub fn import_image(
 
     // Write to pending/ so the coordinator's normal drain loop picks them up,
     // uploads to the store, and writes index/<ulid>.idx + cache/<ulid>.{body,present}.
-    let segments_dir = vol_dir.join("pending");
+    let segments_dir = segment::pending_open_dir(vol_dir);
     let snapshots_dir = vol_dir.join("snapshots");
     fs::create_dir_all(&segments_dir)?;
     fs::create_dir_all(&snapshots_dir)?;
@@ -266,6 +269,10 @@ pub fn import_image(
     let mut cfg = crate::config::VolumeConfig::read(vol_dir)?;
     cfg.size = Some(image_size);
     cfg.write(vol_dir)?;
+
+    // The finished batch is a closed generation: the serve phase's
+    // drain uploads from `pending/upload/`.
+    segment::rotate_open_generation(vol_dir)?;
 
     Ok(())
 }

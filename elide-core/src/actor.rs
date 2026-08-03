@@ -127,6 +127,9 @@ pub(crate) enum VolumeRequest {
     ApplyGcHandoffs {
         reply: Sender<io::Result<usize>>,
     },
+    CloseGeneration {
+        reply: Sender<io::Result<Option<u32>>>,
+    },
     Repack {
         reply: Sender<io::Result<CompactionStats>>,
     },
@@ -1284,6 +1287,10 @@ impl VolumeActor {
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             self.start_gc_handoffs(Some(reply));
                         }
+                        VolumeRequest::CloseGeneration { reply } => {
+                            let r = self.lock_volume().close_generation();
+                            let _ = reply.send(r);
+                        }
                         VolumeRequest::GcCheckpoint { max_buckets, reply } => {
                             if self.pipeline.parked_gc.is_some() {
                                 // Concurrent GC checkpoint is an error.
@@ -1648,6 +1655,20 @@ impl VolumeClient {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
             .send(VolumeRequest::PromoteWal { reply: reply_tx })
+            .map_err(|_| io::Error::other("volume actor channel closed"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+    }
+
+    /// Close the open generation into `pending/upload/`. Errors if the
+    /// upload generation still holds files. Returns the closed
+    /// generation's segment count, `None` when the open generation was
+    /// empty and nothing rotated.
+    pub fn close_generation(&self) -> io::Result<Option<u32>> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .send(VolumeRequest::CloseGeneration { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
