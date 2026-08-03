@@ -85,17 +85,28 @@ pub struct VolumeConfig {
 /// performs a copy-on-write clone; in practice reads complete in microseconds
 /// so the refcount is almost always 1.
 ///
-/// `flush_gen` is incremented by the actor on every WAL promotion.  Handles
-/// compare it against their cached value; a change means the extent index now
-/// contains post-promote (segment-format) body offsets and any cached WAL file
-/// descriptor must be evicted.  Because `flush_gen` is stored inside the
-/// snapshot, a handle always sees a consistent pair: if it observes a new
-/// generation it also observes the updated extent index in the same atomic
-/// load — there is no window between the two.
+/// `flush_gen` counts publications: every write bumps it. A handle compares
+/// it against the generation it last resolved through and reloads the
+/// snapshot when it differs, which is how a read that raced a repack finds
+/// the segment that replaced the one it was looking for.
+///
+/// `layout_gen` counts the subset of publications that replace or remove
+/// segment files — promotion, drain, repack and GC apply, eviction. A handle
+/// holding an open descriptor may keep using it while `layout_gen` holds
+/// still, because appending WAL bytes grows a file the descriptor already
+/// names rather than putting a different inode in its place. Separating the
+/// two is what lets a descriptor survive a write: on a read-write volume the
+/// publication rate is the write rate, and evicting on it clears the cache
+/// between consecutive reads.
+///
+/// Both generations live inside the snapshot, so a handle always sees a
+/// consistent triple: observing a new generation means observing the extent
+/// index that goes with it, in the same atomic load.
 pub struct ReadSnapshot {
     pub lbamap: Arc<LbaMap>,
     pub extent_index: Arc<ExtentIndex>,
     pub flush_gen: u64,
+    pub layout_gen: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,13 +205,17 @@ pub struct VolumeActor {
     volume: Arc<Mutex<Volume>>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
-    /// Promotion counter.  Bumped under the volume mutex on every snapshot
+    /// Publication counter.  Bumped under the volume mutex on every snapshot
     /// publish (actor-side state changes and direct writes from the ublk
     /// transport) and embedded into the published `ReadSnapshot` so that
     /// handles see a consistent (generation, extent_index) pair from a
     /// single atomic load.  Shared with `VolumeClient` so direct writers
     /// can publish without an actor round-trip.
     flush_gen: Arc<AtomicU64>,
+    /// Counter over the publications that replace or remove segment files.
+    /// Bumped under the same mutex, from the same call, and shared the same
+    /// way; readers evict cached descriptors when it moves.
+    layout_gen: Arc<AtomicU64>,
     /// Sender for dispatching jobs to the worker thread.
     /// `Option` so shutdown can `take()` it, dropping the sender to signal
     /// the worker to exit.
@@ -375,18 +390,45 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
     volume.lock().expect("volume mutex poisoned")
 }
 
-/// Bump `flush_gen` and publish a fresh `ReadSnapshot`.
+/// What a publication did to the files on disk, which decides whether a
+/// reader's open descriptors survive it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Publication {
+    /// Segment files were replaced or removed: WAL promotion, drain, repack
+    /// and GC apply, eviction. A descriptor cached for one of them may now
+    /// name an unlinked inode, so readers drop what they hold.
+    ReplacesFiles,
+    /// Bytes were appended to the WAL. Every file a reader has open still
+    /// names the same inode at the same path, and the appended bytes are
+    /// visible through the descriptor it already holds.
+    AppendsToWal,
+}
+
+/// Bump the generations and publish a fresh `ReadSnapshot`.
 ///
 /// Must be called while holding the volume mutex (the `&Volume` argument
-/// is the live guard) so the (lbamap, extent_index, flush_gen) tuple
+/// is the live guard) so the (lbamap, extent_index, generations) tuple
 /// observed by the next `snapshot.load()` is internally consistent.
-fn publish_snapshot(volume: &Volume, snapshot: &ArcSwap<ReadSnapshot>, flush_gen: &AtomicU64) {
-    let new_gen = flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
+fn publish_snapshot(
+    volume: &Volume,
+    snapshot: &ArcSwap<ReadSnapshot>,
+    flush_gen: &AtomicU64,
+    layout_gen: &AtomicU64,
+    publication: Publication,
+) {
+    let new_flush = flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    // Read `layout_gen` back when this publication leaves the files alone, so
+    // the snapshot carries the generation of the last one that did move them.
+    let new_layout = match publication {
+        Publication::ReplacesFiles => layout_gen.fetch_add(1, Ordering::SeqCst) + 1,
+        Publication::AppendsToWal => layout_gen.load(Ordering::SeqCst),
+    };
     let (lbamap, extent_index) = volume.snapshot_maps();
     snapshot.store(Arc::new(ReadSnapshot {
         lbamap,
         extent_index,
-        flush_gen: new_gen,
+        flush_gen: new_flush,
+        layout_gen: new_layout,
     }));
 }
 
@@ -417,9 +459,18 @@ impl VolumeActor {
         }
     }
 
+    /// Publish after an actor-side operation. Every one of these runs after a
+    /// worker moved, rewrote or unlinked segment files, so they all retire
+    /// readers' descriptors.
     fn publish_snapshot(&mut self) {
         let guard = self.lock_volume();
-        publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+        publish_snapshot(
+            &guard,
+            &self.snapshot,
+            &self.flush_gen,
+            &self.layout_gen,
+            Publication::ReplacesFiles,
+        );
     }
 
     /// Apply a worker's repack result, publish the read snapshot, then
@@ -1379,6 +1430,9 @@ pub struct VolumeClient {
     /// which already pins the actor's strong ref while the actor thread
     /// is alive.
     flush_gen: Arc<AtomicU64>,
+    /// Shared counter over the publications that replace or remove segment
+    /// files, held on the same terms as `flush_gen`.
+    layout_gen: Arc<AtomicU64>,
     /// The volume's single per-process dmat cache, handed to every
     /// reader (see `volume::read::DmatCache`).
     dmat_cache: crate::volume::DmatCache,
@@ -1402,20 +1456,20 @@ pub struct VolumeReader {
     file_cache: RefCell<FileCache>,
     /// The volume's shared cache of opened `cache/<ULID>.dmat` sidecars —
     /// one instance per volume per process (see `volume::read::DmatCache`).
-    /// Cleared alongside `file_cache` whenever the snapshot's `flush_gen`
+    /// Cleared alongside `file_cache` whenever the snapshot's `layout_gen`
     /// changes, so an eviction that drops `.dmat` from disk can't leave a
     /// stale FD pointing at a removed inode.
     dmat_cache: crate::volume::DmatCache,
     /// Telemetry counters for the dmat cache. Per-reader; aggregate by
     /// summing snapshots across readers if needed.
     dmat_stats: Arc<crate::dmat::DmatStats>,
-    /// Generation of the last snapshot whose extent index offsets were used
-    /// to populate `file_cache`. Compared against `ReadSnapshot::flush_gen`
-    /// on every read; if they differ the cache is evicted before proceeding.
-    /// Reading both the generation and the extent index from the same
-    /// snapshot load means the two are always in sync — no separate atomic
-    /// needed.
-    last_flush_gen: Cell<u64>,
+    /// Generation of the last snapshot whose segment files this reader's
+    /// descriptors were opened against. Compared against
+    /// `ReadSnapshot::layout_gen` on every read; if they differ the caches
+    /// are evicted before proceeding. Reading the generation and the extent
+    /// index from the same snapshot load means the two are always in sync —
+    /// no separate atomic needed.
+    last_layout_gen: Cell<u64>,
 }
 
 impl std::ops::Deref for VolumeReader {
@@ -1430,13 +1484,13 @@ impl VolumeClient {
     /// Construct a per-thread reader. Each thread serving reads should call
     /// this once and keep the returned reader for the thread's lifetime.
     pub fn reader(&self) -> VolumeReader {
-        let current_gen = self.snapshot.load().flush_gen;
+        let current_gen = self.snapshot.load().layout_gen;
         VolumeReader {
             dmat_cache: self.dmat_cache.clone(),
             client: self.clone(),
             file_cache: RefCell::new(FileCache::default()),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
-            last_flush_gen: Cell::new(current_gen),
+            last_layout_gen: Cell::new(current_gen),
         }
     }
 }
@@ -1502,7 +1556,13 @@ impl VolumeClient {
         let needs_promote = {
             let mut guard = lock_volume(&volume);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
-            publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            publish_snapshot(
+                &guard,
+                &self.snapshot,
+                &self.flush_gen,
+                &self.layout_gen,
+                Publication::AppendsToWal,
+            );
             if fua {
                 guard.wal_fsync()?;
             }
@@ -1523,7 +1583,13 @@ impl VolumeClient {
         let needs_promote = {
             let mut guard = lock_volume(&volume);
             guard.write_zeroes(start_lba, lba_count)?;
-            publish_snapshot(&guard, &self.snapshot, &self.flush_gen);
+            publish_snapshot(
+                &guard,
+                &self.snapshot,
+                &self.flush_gen,
+                &self.layout_gen,
+                Publication::AppendsToWal,
+            );
             if fua {
                 guard.wal_fsync()?;
             }
@@ -1812,13 +1878,13 @@ impl VolumeReader {
         lba: u64,
         buf: &mut [u8],
     ) -> io::Result<()> {
-        if snap.flush_gen != self.last_flush_gen.get() {
+        if snap.layout_gen != self.last_layout_gen.get() {
             self.file_cache.borrow_mut().clear();
             self.dmat_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            self.last_flush_gen.set(snap.flush_gen);
+            self.last_layout_gen.set(snap.layout_gen);
         }
         let config = &self.client.config;
         let extent_index = &snap.extent_index;
@@ -3208,6 +3274,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         lbamap,
         extent_index,
         flush_gen: 0,
+        layout_gen: 0,
     });
     let snapshot = Arc::new(ArcSwap::new(initial));
 
@@ -3222,6 +3289,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
 
     let volume = Arc::new(Mutex::new(volume));
     let flush_gen = Arc::new(AtomicU64::new(0));
+    let layout_gen = Arc::new(AtomicU64::new(0));
 
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
@@ -3240,6 +3308,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: Arc::clone(&flush_gen),
+        layout_gen: Arc::clone(&layout_gen),
         worker_tx: Some(worker_job_tx),
         worker_rx: worker_result_rx,
         worker_handle: Some(worker_handle),
@@ -3255,6 +3324,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         dmat_cache: lock_volume(&volume).dmat_cache_handle(),
         volume: Arc::downgrade(&volume),
         flush_gen,
+        layout_gen,
     };
 
     (actor, client)
@@ -3793,6 +3863,101 @@ mod tests {
             out.extend_from_slice(&z.to_le_bytes());
         }
         out
+    }
+
+    /// Writes publish a snapshot, so `flush_gen` moves and a reader
+    /// re-resolves through the new extent index. They append to a file every
+    /// open descriptor already names, so `layout_gen` holds and the
+    /// descriptors survive.
+    #[test]
+    fn writes_advance_flush_gen_and_hold_layout_gen() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        let before = client.snapshot.load();
+        for lba in 0..8u64 {
+            client.write(lba, &unique_block(lba as u32), false).unwrap();
+        }
+        let after = client.snapshot.load();
+
+        assert!(
+            after.flush_gen > before.flush_gen,
+            "each write publishes a snapshot"
+        );
+        assert_eq!(
+            after.layout_gen, before.layout_gen,
+            "appending WAL bytes leaves every open descriptor valid"
+        );
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Promotion rewrites the WAL into `pending/` and unlinks it, so a
+    /// descriptor cached for the WAL names an inode that is gone. That
+    /// advances `layout_gen` and retires the descriptor.
+    #[test]
+    fn promotion_advances_layout_gen() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        client.write(0, &unique_block(1), false).unwrap();
+        let before = client.snapshot.load().layout_gen;
+        client.promote_wal().unwrap();
+        let after = client.snapshot.load().layout_gen;
+
+        assert!(
+            after > before,
+            "promotion replaces segment files: {before} -> {after}"
+        );
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The read-your-writes guarantee across the descriptor cache: the first
+    /// read caches an open WAL descriptor, and the second read has to serve
+    /// bytes that were appended to that file afterwards.
+    #[test]
+    fn a_cached_descriptor_serves_bytes_appended_after_it_was_opened() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+        let reader = client.reader();
+
+        let mut buf = vec![0u8; 4096];
+        for seed in 1..=4u32 {
+            let block = unique_block(seed);
+            client.write(0, &block, false).unwrap();
+            reader.read_into(0, &mut buf).unwrap();
+            assert_eq!(
+                buf, block,
+                "read {seed} must see the write that preceded it"
+            );
+        }
+
+        // The same holds across a promotion, which does retire the cached
+        // descriptor.
+        client.promote_wal().unwrap();
+        let block = unique_block(5);
+        client.write(0, &block, false).unwrap();
+        reader.read_into(0, &mut buf).unwrap();
+        assert_eq!(buf, block);
+
+        drop(reader);
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A FUA write fsyncs the WAL in the same critical section as the

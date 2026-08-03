@@ -527,7 +527,7 @@ pub(crate) fn read_extents(
         // The fetcher updates the bitset under its per-segment lock,
         // and `cache/<id>.body` is grown in place (no rename), so a
         // hot FD remains valid across demand-fetch completion. Inode
-        // replacement events (sweep/drain/GC apply) bump `flush_gen`
+        // replacement events (sweep/drain/GC apply) bump `layout_gen`
         // and clear the entire FileCache, so a hot FD here is
         // guaranteed to point at the same inode the bitset describes.
         let presence_known_set = match loc.body_source {
@@ -763,7 +763,7 @@ fn try_read_delta_extent(
         // Same FD-cache + bitset short-circuit as the main read path:
         // skip `find_segment` when the FD is hot and presence is known
         // set, since `cache/<id>.body` is grown in place and inode
-        // replacement bumps `flush_gen` (which clears the FileCache).
+        // replacement bumps `layout_gen` (which clears the FileCache).
         let presence_known_set = match source_loc.body_source {
             BodySource::Local => true,
             BodySource::Cached(idx) => extent_index
