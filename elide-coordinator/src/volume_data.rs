@@ -106,23 +106,39 @@ pub struct HeadView<'a> {
 impl HeadView<'_> {
     /// GET `by_id/<vol>/HEAD`. Returns [`SegmentHead::empty`] when
     /// absent or unparseable — HEAD is derived state that self-heals
-    /// on the next active tick.
+    /// on the next active tick. Recovery paths that must not mistake
+    /// damage for emptiness call [`Self::read_status`] instead.
     pub async fn read(&self) -> Result<SegmentHead, HeadError> {
-        let key = segment_head::head_key(self.vol_ulid);
-        let bytes = match self.store.get(&key).await {
-            Ok(g) => g.bytes().await.map_err(HeadError::Get)?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(SegmentHead::empty(None)),
-            Err(e) => return Err(HeadError::Get(e)),
-        };
-        let text = std::str::from_utf8(&bytes).map_err(HeadError::NotUtf8)?;
-        match segment_head::parse(text) {
+        match self.read_status().await? {
             Ok(h) => Ok(h),
-            Err(e) => {
+            Err(HeadDamage::Missing) => Ok(SegmentHead::empty(None)),
+            Err(damage @ HeadDamage::Unreadable(_)) => {
+                let key = segment_head::head_key(self.vol_ulid);
                 tracing::warn!(
-                    "[volume_data] {key} unparseable ({e}); treating as empty (self-heals on next tick)"
+                    "[volume_data] {key} {damage}; treating as empty (self-heals on next tick)"
                 );
                 Ok(SegmentHead::empty(None))
             }
+        }
+    }
+
+    /// GET `by_id/<vol>/HEAD`, distinguishing the object's state from
+    /// transport failure. The outer error is a failed store operation
+    /// (retryable); the inner error says the object is definitively
+    /// missing or unreadable.
+    pub async fn read_status(&self) -> Result<Result<SegmentHead, HeadDamage>, HeadError> {
+        let key = segment_head::head_key(self.vol_ulid);
+        let bytes = match self.store.get(&key).await {
+            Ok(g) => g.bytes().await.map_err(HeadError::Get)?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(Err(HeadDamage::Missing)),
+            Err(e) => return Err(HeadError::Get(e)),
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(Err(HeadDamage::Unreadable("body is not utf-8".to_owned())));
+        };
+        match segment_head::parse(text) {
+            Ok(h) => Ok(Ok(h)),
+            Err(e) => Ok(Err(HeadDamage::Unreadable(e.to_string()))),
         }
     }
 
@@ -418,6 +434,28 @@ impl SnapshotsView<'_> {
                 Ok(None)
             }
         }
+    }
+
+    /// Newest seal manifest of either kind under the volume's
+    /// `snapshots/` prefix, by one recursive LIST. `LATEST` and
+    /// foreign filenames are skipped. Recovery helper: the newest
+    /// seal is the claim anchor when HEAD is unreadable
+    /// (`docs/design/durable-cut.md` *Recovery is two-tier*).
+    pub async fn newest_seal(&self) -> Result<Option<Ulid>, SnapshotsError> {
+        use futures::TryStreamExt;
+        let prefix = StorePath::from(format!("by_id/{}/snapshots", self.vol_ulid));
+        let mut newest: Option<Ulid> = None;
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(meta) = stream.try_next().await.map_err(SnapshotsError::Get)? {
+            let Some(name) = meta.location.filename() else {
+                continue;
+            };
+            let Some((ulid, _)) = elide_core::signing::parse_snapshot_filename(name) else {
+                continue;
+            };
+            newest = newest.max(Some(ulid));
+        }
+        Ok(newest)
     }
 
     /// CAS the LATEST pointer to `new_snap`. `prev` is the token
@@ -834,6 +872,28 @@ pub enum HeadError {
     Parse(ParseHeadError),
 }
 
+/// Definitive state of the HEAD object when a successful store round
+/// trip found no usable body. For an active volume the whole-object
+/// PUT survives every crash, so either case is bucket-level damage
+/// (`docs/design/durable-cut.md` *Recovery is two-tier*) — or a
+/// volume that has simply never published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadDamage {
+    /// No HEAD object under the volume prefix.
+    Missing,
+    /// The object exists but its body does not parse as a HEAD.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for HeadDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "missing"),
+            Self::Unreadable(e) => write!(f, "unreadable ({e})"),
+        }
+    }
+}
+
 impl std::fmt::Display for HeadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -962,6 +1022,57 @@ mod tests {
         let (_s, vd) = vd();
         let h = vd.head().read().await.unwrap();
         assert_eq!(h, SegmentHead::empty(None));
+    }
+
+    #[tokio::test]
+    async fn head_read_status_distinguishes_damage_from_empty() {
+        let (store, vd) = vd();
+        assert_eq!(
+            vd.head().read_status().await.unwrap(),
+            Err(HeadDamage::Missing)
+        );
+
+        let key = crate::segment_head::head_key(vd.vol_ulid());
+        store
+            .put(&key, object_store::PutPayload::from_static(b"not a head"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            vd.head().read_status().await.unwrap(),
+            Err(HeadDamage::Unreadable(_))
+        ));
+        // `read` keeps folding damage into the self-healing empty form.
+        assert_eq!(vd.head().read().await.unwrap(), SegmentHead::empty(None));
+
+        let head = SegmentHead::empty(Some(mint().next()));
+        vd.head().put(&head).await.unwrap();
+        assert_eq!(vd.head().read_status().await.unwrap(), Ok(head));
+    }
+
+    #[tokio::test]
+    async fn newest_seal_takes_the_max_of_either_kind() {
+        let (_s, vd) = vd();
+        assert_eq!(vd.snapshots().newest_seal().await.unwrap(), None);
+
+        let mut m = mint();
+        let user = m.next();
+        let stop = m.next();
+        vd.snapshots()
+            .put_manifest(user, Bytes::from_static(b"m"))
+            .await
+            .unwrap();
+        vd.snapshots().bump_latest_if_newer(user).await.unwrap();
+        assert_eq!(
+            vd.snapshots().newest_seal().await.unwrap(),
+            Some(user),
+            "LATEST pointer is skipped, the manifest itself is found"
+        );
+
+        vd.snapshots()
+            .put_stop_manifest(stop, Bytes::from_static(b"m"))
+            .await
+            .unwrap();
+        assert_eq!(vd.snapshots().newest_seal().await.unwrap(), Some(stop));
     }
 
     #[tokio::test]
