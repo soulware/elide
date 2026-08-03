@@ -1,9 +1,10 @@
 # Design: consolidating journal segments in pending/
 
 **Status:** Implemented at the single-output default (the split path across
-several journal ULIDs is not built). Builds on the disjoint journal tier
-(`gc-journal-segregation.md`, #774/#776) and claimant-aware journal reap
-(#778), both shipped.
+several journal ULIDs is not built), with journal upload deferred to the
+cut cadence (§ *Journal upload rides the cut*). Builds on the disjoint
+journal tier (`gc-journal-segregation.md`, #774/#776), claimant-aware
+journal reap (#778), and durable cuts (`durable-cut.md`), all shipped.
 
 ## Problem
 
@@ -26,8 +27,9 @@ as an all-Drop bucket but a live one is never merged.
 Merge the pure-journal segments in `pending/` into one pure-journal segment
 before promote (configurable, see below), so a tick's N tiny PUTs become one.
 This replaces the skip branch in `execute_repack` with a journal-consolidation
-pass. It is a local rewrite over `pending/`; nothing about upload ordering or
-durability changes, because every segment still uploads, just merged first.
+pass. It is a local rewrite over `pending/`; every segment's live content
+still uploads, merged first, with journal upload riding the cut cadence
+(§ *Journal upload rides the cut*).
 
 Each output carries only the live journal entries of its inputs (dead ones drop
 as free compaction), and collapses same-hash entries to one shared body. The
@@ -160,6 +162,34 @@ This map lives only in memory and is rebuilt from the on-disk segments and their
 per-entry journal flags, so changing its shape is not an on-disk format change
 and needs no migration.
 
+## Journal upload rides the cut
+
+The tick's drain defers pure-journal segments (`DrainMode::DeferJournal`,
+`elide-coordinator/src/upload.rs`): they stay in `pending/`, where the
+consolidation pass keeps collapsing them — the steady state is the last
+window's ring merging with each new tick's journal — and the tick that
+closes a cut (`gc.cut_interval`) drains everything (`DrainMode::Full`)
+before HEAD publishes. Journal costs one PUT per cut instead of one per
+tick, and every published cut is complete by construction: HEAD only
+ever names a frontier whose journal is confirmed. Data segments keep
+uploading every tick as staging; between cuts they are durable but
+invisible, exactly the partial residue the cut design licenses
+(`durable-cut.md` § *The principle*). The volume's recovery point is
+the last cut for every LBA, so the cut interval is the volume's RPO and
+"journal upload cadence" is the same number.
+
+Deferral is all-or-nothing per drain, and a `Full` drain uploads
+ULID-ascending, so journal commits ascending among themselves: a
+committed journal ULID is always below every pending journal ULID. That
+ordering is what keeps a rebuild's claimant comparison resolving every
+ring position to its newest writer while a deferred segment holds the
+live ring.
+
+Seals drain fully — snapshot, stop, and handoff each close the window
+synchronously (`drain_volume_for_seal`), so the snapshot floor never
+lands above a pending journal segment and a signed manifest always
+carries the live ring.
+
 ## Correctness
 
 - **Reap-whole holds.** The output is a pure journal segment and reaps whole
@@ -196,8 +226,7 @@ and needs no migration.
   leans on). Touching journal only in `pending/`, before its first upload, avoids
   all of that: the ordering is a property of first upload alone, first upload is
   monotonic by the mint, and a committed journal segment is then immutable until
-  it reaps whole. Deferring journal upload between snapshots is a separate
-  question parked for later.
+  it reaps whole.
 - No change to stable packing.
 - No jbd2 transaction parsing; the ring order comes from segment ULIDs and
   in-window LBAs, not from journal internals.

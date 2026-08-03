@@ -335,12 +335,13 @@ fn is_cache_resident(cache_dir: &Path, stats: &SegmentStats) -> bool {
 }
 
 /// Per-pass state loaded from disk — vk, ancestor-walked extent index, lbamap
-/// (with WAL replay), live hashes, and segment stats. Pending segments
-/// created by WAL auto-flush during drain are safe to ignore: collect_stats
-/// only considers index/<ulid>.idx files, so un-promoted segments are never
-/// GC candidates. rebuild_segments includes pending/ with highest priority,
-/// so the LBA map correctly reflects those writes and their LBAs are not
-/// included in older-segment candidates.
+/// (with WAL replay), live hashes, and segment stats. `pending/` is populated
+/// at pass time in the steady state: journal segments defer there between
+/// cuts, and WAL auto-flush during drain lands there too. Both are safe:
+/// collect_stats only considers index/<ulid>.idx files, so un-promoted
+/// segments are never GC candidates, and rebuild_segments folds pending
+/// claims in by claimant ULID, so the LBA map reflects those writes and
+/// their LBAs are excluded from older-segment candidates.
 struct PassState {
     eligible_stats: Vec<SegmentStats>,
     live_hashes: HashSet<blake3::Hash>,
@@ -365,9 +366,6 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_path_buf(), None)))
         .collect();
-    let journal = elide_core::config::VolumeConfig::read(fork_dir)
-        .context("reading volume.toml for journal window")?
-        .journal_ranges();
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
     let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
 
@@ -382,16 +380,8 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     let live_hashes = lbamap.lba_referenced_hashes();
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
-    let all_stats = collect_stats(
-        fork_dir,
-        &vk,
-        &index,
-        &live_hashes,
-        &lbamap,
-        floor,
-        &journal,
-    )
-    .context("collecting segment stats")?;
+    let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
+        .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
     // Segments with a partial-LBA-death Delta entry whose sources don't
@@ -1019,7 +1009,6 @@ fn collect_stats(
     live_hashes: &HashSet<blake3::Hash>,
     lba_map: &LbaMap,
     floor: Option<Ulid>,
-    journal: &elide_core::journal::JournalRanges,
 ) -> io::Result<Vec<SegmentStats>> {
     let index_dir = fork_dir.join("index");
     let mut idx_files = segment::collect_idx_files(&index_dir)?;
@@ -1306,14 +1295,19 @@ fn collect_stats(
         }
 
         // Tombstone is tested first, so the journal arm never sees an
-        // empty entry list and `all` is never vacuously true.
+        // empty entry list and `all` is never vacuously true. Pooling
+        // reads each entry's persisted journal flag — the tier the
+        // segment was written into — so a segment keeps its pool across
+        // journal-window changes (`refresh_journal_ranges`); routing a
+        // journal-tier segment into Stable would trip the rewrite
+        // materialiser's tier guard.
         let pool = if live_entries.is_empty() {
             if removed_hashes.is_empty() {
                 SegmentPool::Tombstone
             } else {
                 SegmentPool::Stable
             }
-        } else if live_entries.iter().all(|e| journal.owns_entry(e)) {
+        } else if live_entries.iter().all(|e| e.journal) {
             SegmentPool::Journal
         } else {
             SegmentPool::Stable
@@ -2431,16 +2425,7 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &elide_core::journal::EMPTY,
-        )
-        .unwrap();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
         // Both segments should have 1 live entry each.
         // S1: DATA(LBA 0→H101) — not extent-canonical (H101→S2), but lba_live.
@@ -2469,7 +2454,7 @@ mod tests {
     /// all of it into a journal output. A mixed segment goes in the stable
     /// pool, where the output split sheds its journal content.
     #[test]
-    fn collect_stats_pools_only_wholly_journal_segments_as_journal() {
+    fn collect_stats_pools_journal_flagged_segments_as_journal() {
         let dir = TempDir::new().unwrap();
         let fork_dir = dir.path();
 
@@ -2483,17 +2468,25 @@ mod tests {
             elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
                 .unwrap();
 
-        let window = elide_core::journal::JournalRanges::new(vec![(96, 8)]);
+        // Stamp the window before first open so formation flags
+        // window writes journal and partitions them into their own
+        // segments. Pooling reads the persisted per-entry flag.
+        let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+        cfg.journal = Some(elide_core::config::JournalConfig {
+            ranges: elide_core::journal::JournalRanges::new(vec![(96, 8)]),
+        });
+        cfg.write(fork_dir).unwrap();
 
         let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
-        // S1: wholly inside the window.
+        // Epoch 1: wholly inside the window — one journal segment.
         vol.write(96, &[1u8; 4096]).unwrap();
         vol.write(97, &[2u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        // S2: wholly outside it.
+        // Epoch 2: wholly outside it — one stable segment.
         vol.write(0, &[3u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
-        // S3: one of each.
+        // Epoch 3: one write of each — formation partitions the epoch
+        // into a stable segment and a journal segment.
         vol.write(98, &[4u8; 4096]).unwrap();
         vol.write(1, &[5u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
@@ -2514,25 +2507,27 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats =
-            collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None, &window).unwrap();
-        assert_eq!(stats.len(), 3);
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        assert_eq!(stats.len(), 4, "epoch 3 partitions into a segment pair");
 
-        let journal: Vec<&SegmentStats> = stats
+        let mut journal_lbas: Vec<u64> = stats
             .iter()
             .filter(|s| s.pool == SegmentPool::Journal)
+            .flat_map(|s| s.live_entries.iter().map(|e| e.start_lba))
             .collect();
+        journal_lbas.sort_unstable();
         assert_eq!(
-            journal.len(),
-            1,
-            "only the wholly-in-window segment pools as journal"
+            journal_lbas,
+            vec![96, 97, 98],
+            "exactly the journal-flagged segments pool as journal"
         );
-        let lbas: Vec<u64> = journal[0]
-            .live_entries
+        let mut stable_lbas: Vec<u64> = stats
             .iter()
-            .map(|e| e.start_lba)
+            .filter(|s| s.pool == SegmentPool::Stable)
+            .flat_map(|s| s.live_entries.iter().map(|e| e.start_lba))
             .collect();
-        assert_eq!(lbas, vec![96, 97]);
+        stable_lbas.sort_unstable();
+        assert_eq!(stable_lbas, vec![0, 1]);
     }
 
     /// A multi-block journal entry that is only partially overwritten
@@ -2598,8 +2593,7 @@ mod tests {
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let live_hashes = lbamap.lba_referenced_hashes();
 
-        let stats =
-            collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None, &window).unwrap();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
         // The segment holding the multi-block journal entry is the one under
         // test — identify it by that entry surviving as a partial-death run.
@@ -2735,16 +2729,7 @@ mod tests {
         assert_eq!(lbamap.hash_at(1), Some(h2), "LBA 1 must be h2");
         assert!(live_hashes.contains(&h2), "h2 must be live (via LBA 1)");
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &elide_core::journal::EMPTY,
-        )
-        .unwrap();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
         // Find S1's stats.
         let s1_stats = stats
@@ -2873,16 +2858,7 @@ mod tests {
             "LBA 3000 must still be zero"
         );
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &elide_core::journal::EMPTY,
-        )
-        .unwrap();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
         let s1_stats = stats
             .iter()
@@ -3161,16 +3137,7 @@ mod tests {
             "[{shape}] test precondition: at least one LBA of S1's range must still resolve to h"
         );
 
-        let stats = collect_stats(
-            fork_dir,
-            &vk,
-            &index,
-            &live_hashes,
-            &lbamap,
-            None,
-            &elide_core::journal::EMPTY,
-        )
-        .unwrap();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
         let s1_stats = stats
             .iter()

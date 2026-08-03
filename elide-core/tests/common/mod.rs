@@ -59,6 +59,72 @@ pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
     }
 }
 
+/// Mirror the production drain's `DeferJournal` mode
+/// (`coordinator/src/upload.rs::drain_pending`): repack, then promote
+/// every pending segment except pure-journal ones, which stay in
+/// `pending/` for a later `Full` drain. Leaves the volume in the
+/// between-cuts steady state — a journal segment pending at a ULID
+/// below committed data.
+pub fn drain_defer_journal(vol: &mut elide_core::volume::Volume) {
+    vol.repack().unwrap();
+    let base = vol.base_dir().to_path_buf();
+    for ulid in pending_ulids(&base) {
+        if pending_is_journal(&base, ulid) {
+            continue;
+        }
+        vol.promote_segment(ulid).unwrap();
+    }
+}
+
+/// `true` when `pending/<ulid>` carries a journal-flagged entry — the
+/// same per-file test the production drain uses to defer.
+fn pending_is_journal(base_dir: &Path, ulid: Ulid) -> bool {
+    segment::read_segment_index(&base_dir.join("pending").join(ulid.to_string()))
+        .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
+        .unwrap_or(false)
+}
+
+/// Verify every on-disk segment is tier-pure: its entries are either all
+/// journal-flagged or all stable. Formation partitions each flush epoch
+/// into a segment pair and the rewriters keep tiers apart, and every
+/// consumer (drain deferral, repack routing, reap-whole) classifies a
+/// whole segment from any one entry — so a mixed segment would be
+/// misrouted wholesale. Walks `pending/` and `index/`.
+///
+/// Returns a description of the first violation found.
+pub fn check_tier_purity(fork_dir: &Path) -> Result<(), String> {
+    let check = |path: &Path, ulid_str: &str| -> Result<(), String> {
+        let Ok((_bss, entries, _inputs)) = segment::read_segment_index(path) else {
+            return Ok(());
+        };
+        let journal_count = entries.iter().filter(|e| e.journal).count();
+        if journal_count != 0 && journal_count != entries.len() {
+            return Err(format!(
+                "segment {ulid_str} is tier-mixed: {journal_count} of {} entries journal-flagged",
+                entries.len(),
+            ));
+        }
+        Ok(())
+    };
+    for ulid in pending_ulids(fork_dir) {
+        let s = ulid.to_string();
+        check(&fork_dir.join("pending").join(&s), &s)?;
+    }
+    let index_dir = fork_dir.join("index");
+    if let Ok(entries) = fs::read_dir(&index_dir) {
+        for dirent in entries.flatten() {
+            let name = dirent.file_name();
+            let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".idx")) else {
+                continue;
+            };
+            if Ulid::from_string(stem).is_ok() {
+                check(&dirent.path(), stem)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Simulate a crash between the worker-phase file I/O of `promote_segment`
 /// and its actor-phase apply, for the lowest-ULID pending segment (if any).
 ///
