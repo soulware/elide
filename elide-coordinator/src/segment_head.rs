@@ -356,9 +356,12 @@ pub fn confirmed_edges(fork_dir: &Path, anchor: Option<Ulid>) -> io::Result<Vec<
 /// Regenerate the full HEAD body from the owner's local directory.
 ///
 /// `anchor` is the latest local user snapshot; `added` is every
-/// confirmed segment (`index/<ulid>.idx`) above it; `superseded`
-/// carries one edge per entry of each such segment's signed `inputs`
-/// table, stamped `since = now`, which restarts that edge's reap
+/// confirmed segment (`index/<ulid>.idx`) above it, plus every input
+/// named by those segments' signed `inputs` tables — a consumed
+/// input's own idx is removed when its output promotes, but the input
+/// was confirmed and its claims stay reachable through it until the
+/// supersession commits. `superseded` carries one edge per inputs
+/// entry, stamped `since = now`, which restarts that edge's reap
 /// retention clock.
 pub fn regenerate(fork_dir: &Path) -> io::Result<SegmentHead> {
     let anchor = elide_core::volume::latest_snapshot(fork_dir)?;
@@ -368,6 +371,7 @@ pub fn regenerate(fork_dir: &Path) -> io::Result<SegmentHead> {
     }
     let now = Utc::now();
     for (input, output) in confirmed_edges(fork_dir, anchor)? {
+        head.added.insert(input);
         head.superseded
             .insert(input, Supersession { output, since: now });
     }
@@ -699,9 +703,12 @@ mod tests {
 
         let head = regenerate(tmp.path()).unwrap();
         assert_eq!(head.anchor, Some(anchor));
+        // Consumed inputs rejoin `added`: their own idx markers are
+        // gone but their claims stay reachable until the supersession
+        // commits.
         assert_eq!(
             head.added.iter().copied().collect::<Vec<_>>(),
-            vec![plain, gc_out]
+            vec![input_x, input_y, plain, gc_out]
         );
         assert_eq!(head.superseded[&input_x].output, gc_out);
         assert_eq!(head.superseded[&input_y].output, gc_out);

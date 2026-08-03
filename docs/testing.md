@@ -30,8 +30,12 @@ elide-coordinator/tests/
   portable_proptest.rs    proptest: two-coordinator names/<name> race + displaced-fork rehome
 
 elide-coordinator/src/ (in-module #[cfg(test)], white-box seams)
-  volume_event_store.rs   proptest: event-log windowed-HEAD spine
-                          (window ≡ chain prefix, crash phantom, force single-chain)
+  gc_cycle.rs             proptest: cut consistency oracle — simulated
+                          guest write history driven through the real
+                          publish_head_delta; every remote mutation is
+                          materialised as force-claim's reader would and
+                          asserted to be a prefix of the write history
+                          (docs/design/durable-cut.md *Testing*)
 ```
 
 The split is enforced by naming. When adding a new test file, pick the right suffix and add it to the inventory above.

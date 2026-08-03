@@ -594,12 +594,20 @@ impl GcCycleOrchestrator {
     }
 
     /// `true` when every confirmed segment (`index/<ulid>.idx`) above
-    /// `anchor` is in the publish scratch — the shape a legitimately
-    /// empty HEAD has on a fresh volume or right after a seal. A
-    /// confirmed segment beyond the scratch means the empty body lost
-    /// committed entries. A listing error returns `false`, routing the
-    /// caller to `segment_head::regenerate`, which reports it.
+    /// `anchor` is in the publish scratch and no supersession edges
+    /// are in hand — the shape a legitimately empty HEAD has on a
+    /// fresh volume or right after a seal. A confirmed segment beyond
+    /// the scratch means the empty body lost committed entries; a
+    /// held edge means a handoff just consumed inputs whose idx
+    /// markers are gone, so the idx listing undercounts the cut and
+    /// only regeneration (which re-adds consumed inputs from the
+    /// outputs' signed tables) accounts for them. A listing error
+    /// returns `false`, routing the caller to
+    /// `segment_head::regenerate`, which reports it.
     fn empty_head_is_legitimate(&self, anchor: Option<Ulid>) -> bool {
+        if !self.tick_superseded.is_empty() {
+            return false;
+        }
         let confirmed = match self.confirmed_beyond(anchor) {
             Ok(v) => v,
             Err(_) => return false,
@@ -673,7 +681,10 @@ impl GcCycleOrchestrator {
                             // edges ride the same barrier: eligible,
                             // they publish here; otherwise they wait
                             // for the reconcile at the first eligible
-                            // publish.
+                            // publish. Stripping is safe because the
+                            // regenerated `added` keeps the consumed
+                            // inputs, so their claims stay visible
+                            // until the edges commit.
                             if edges_eligible {
                                 self.reconcile_edges = false;
                             } else {
@@ -2310,14 +2321,26 @@ mod tests {
 
         #[derive(Clone, Debug)]
         enum Op {
-            Write { lba: u8 },
+            Write {
+                lba: u8,
+            },
             Seal,
-            Repack { bits: u8 },
-            Tick { fail_after: Option<u8> },
+            Repack {
+                bits: u8,
+            },
+            Tick {
+                fail_after: Option<u8>,
+                /// `promote_wal` confirmation: `false` models the
+                /// volume process down or the IPC failing, so the tick
+                /// runs with no flush and the WAL keeps its writes.
+                flush_ok: bool,
+            },
             GcPass,
             Snapshot,
             CrashCoordinator,
-            DamageHead { delete: bool },
+            DamageHead {
+                delete: bool,
+            },
             FailNextHeadPut,
             FailNextSeedGet,
             Reap,
@@ -2328,8 +2351,11 @@ mod tests {
                 8 => (0u8..6).prop_map(|lba| Op::Write { lba }),
                 3 => Just(Op::Seal),
                 2 => any::<u8>().prop_map(|bits| Op::Repack { bits }),
-                6 => proptest::option::weighted(0.35, 0u8..3)
-                    .prop_map(|fail_after| Op::Tick { fail_after }),
+                6 => (
+                    proptest::option::weighted(0.35, 0u8..3),
+                    proptest::bool::weighted(0.85),
+                )
+                    .prop_map(|(fail_after, flush_ok)| Op::Tick { fail_after, flush_ok }),
                 2 => Just(Op::GcPass),
                 1 => Just(Op::Snapshot),
                 1 => Just(Op::CrashCoordinator),
@@ -2628,10 +2654,12 @@ mod tests {
                 self.committed.push(seg);
             }
 
-            async fn tick(&mut self, fail_after: Option<u8>) {
+            async fn tick(&mut self, fail_after: Option<u8>, flush_ok: bool) {
                 self.orch.tick_seq += 1;
-                self.seal();
-                self.orch.last_flush_seq = self.orch.tick_seq;
+                if flush_ok {
+                    self.seal();
+                    self.orch.last_flush_seq = self.orch.tick_seq;
+                }
 
                 // Handoff cleanup: upload prior GC outputs, record
                 // their edges, retire the consumed inputs' idx — the
@@ -2819,7 +2847,10 @@ mod tests {
                     }
                     Op::Seal => self.seal(),
                     Op::Repack { bits } => self.repack(*bits),
-                    Op::Tick { fail_after } => self.tick(*fail_after).await,
+                    Op::Tick {
+                        fail_after,
+                        flush_ok,
+                    } => self.tick(*fail_after, *flush_ok).await,
                     Op::GcPass => self.gc_pass(),
                     Op::Snapshot => self.snapshot().await,
                     Op::CrashCoordinator => self.crash_coordinator(),
@@ -2846,8 +2877,8 @@ mod tests {
             }
             // Close out: a final complete tick, then one more so held
             // supersession edges get their post-pass flush and publish.
-            world.tick(None).await;
-            world.tick(None).await;
+            world.tick(None, true).await;
+            world.tick(None, true).await;
         }
 
         /// The oracle's first find, materialised: a GC handoff
@@ -2863,17 +2894,66 @@ mod tests {
             let mut world = World::new();
             for op in [
                 Op::Write { lba: 0 },
-                Op::Tick { fail_after: None },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
                 Op::GcPass,
                 Op::Snapshot,
                 Op::Write { lba: 1 },
                 Op::Write { lba: 1 },
-                Op::Tick { fail_after: None },
-                Op::Tick { fail_after: None },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
             ] {
                 world.step(&op).await;
             }
             world.check().await;
+        }
+
+        /// The oracle's second find: HEAD damaged while a GC handoff
+        /// is in flight and the killer write still in the WAL. The
+        /// legitimacy gate must refuse the damaged-empty body (held
+        /// edges mean the idx listing undercounts the cut), and
+        /// regeneration must re-add the consumed inputs from the
+        /// outputs' signed tables — dropping either leaves the input's
+        /// claims out of the cut while its killer is uncommitted.
+        #[tokio::test]
+        async fn damaged_head_with_in_flight_handoff_keeps_consumed_inputs() {
+            let mut world = World::new();
+            for op in [
+                Op::Write { lba: 2 },
+                Op::Write { lba: 0 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+                Op::DamageHead { delete: false },
+                Op::Write { lba: 2 },
+                Op::GcPass,
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: false,
+                },
+            ] {
+                world.step(&op).await;
+            }
+            let vd = crate::volume_data::VolumeData::new(Arc::clone(&world.inner), vol_ulid());
+            let head = vd.head().read().await.unwrap();
+            let ulids: Vec<Ulid> = world.catalog.keys().copied().collect();
+            let [input, output] = ulids[..] else {
+                panic!("expected exactly the input and the GC output uploaded")
+            };
+            assert!(
+                head.added.contains(&input),
+                "consumed input stays in the regenerated cut"
+            );
+            assert!(head.added.contains(&output));
         }
 
         proptest! {
