@@ -5085,3 +5085,199 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// A same-content rewrite racing the flush's worker must not inherit the
+/// flushed Delta's source list (the pg14 GC livelock, root-caused
+/// 2026-08-03).
+///
+/// The promote apply attaches a flush-minted Delta's sources to the claim
+/// its WAL made. A concurrent writer can re-claim the same LBA with the
+/// same content hash between promote-job build and apply; attaching to
+/// that claim pins an in-memory delta-source refcount that no disk
+/// rebuild reproduces — the phantom keeps the source hash alive in the
+/// volume's liveness view, and the volume then vetoes every GC plan that
+/// (correctly) drops the source. The claimant guard in
+/// `set_delta_sources_if_matches` rejects the foreign claim.
+///
+/// The assert states the invariant: after all WAL state is flushed, the
+/// live map's delta-source refcount for the source hash must equal the
+/// disk rebuild's.
+/// 64 KiB clears MIN_SKETCH_BYTES so extents sketch and delta-convert.
+const DELTA_EXTENT_BYTES: usize = 64 * 1024;
+
+/// Deterministic incompressible bytes (sketch::compute refuses constant
+/// input; zstd must not collapse the bodies).
+fn prand_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn same_content_rewrite_racing_flush_apply_keeps_source_refcount_consistent() {
+    const EXTENT_BYTES: usize = DELTA_EXTENT_BYTES;
+
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a = prand_bytes(1, EXTENT_BYTES);
+    let h_a = blake3::hash(&a);
+    // A with one byte per KiB changed: distinct hash, high resemblance.
+    let mut a_prime = a.clone();
+    for i in (0..a_prime.len()).step_by(1024) {
+        a_prime[i] = a_prime[i].wrapping_add(1);
+    }
+
+    // Source extent A, committed and still live at lba 0 — the
+    // resemblance tier's liveness filter accepts referenced sources.
+    vol.write(0, &a).unwrap();
+    vol.flush_wal().unwrap();
+    let s1_ulid = {
+        let mut files = segment::collect_pending_segment_files(&base).unwrap();
+        assert_eq!(files.len(), 1, "one pending segment after the A flush");
+        let name = files.pop().unwrap();
+        let name = name.file_name().unwrap().to_str().unwrap().to_owned();
+        Ulid::from_string(&name).unwrap()
+    };
+
+    // The delta target: similar content at lba 200.
+    vol.write(200, &a_prime).unwrap();
+
+    // Flush split apart as the actor runs it: job built, worker runs,
+    // then a concurrent same-content write lands before the apply.
+    let u_flush = vol.mint.next();
+    let job = vol.take_wal_into_promote_job(u_flush).unwrap();
+    let result = crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default())
+        .expect("promote worker");
+
+    // The worker must have minted a Delta at lba 200 sourcing H_A —
+    // that mint is the mechanism under test.
+    let minted = result
+        .entries
+        .iter()
+        .find(|e| e.kind == segment::EntryKind::Delta && e.start_lba == 200)
+        .unwrap_or_else(|| panic!("no Delta minted at lba 200: {:?}", result.entries));
+    assert!(
+        minted.delta_options.iter().any(|o| o.source_hash == h_a),
+        "Delta at lba 200 does not source H_A"
+    );
+
+    // The race: the LBA is rewritten with different content, then with
+    // the delta's content again. The final claim carries the delta's
+    // hash (a fresh DedupRef claim under a newer WAL) but is not the
+    // claim the flushed delta made.
+    vol.write(200, &prand_bytes(9, EXTENT_BYTES)).unwrap();
+    vol.write(200, &a_prime).unwrap();
+
+    vol.apply_promote(&result).unwrap();
+
+    // H_A's body is evicted to the store before the racing write's own
+    // flush: the resemblance tier reads sources locally (best-effort), so
+    // the racing Data entry stays plain instead of re-attaching a source
+    // list to its claim.
+    vol.promote_segment(s1_ulid).unwrap();
+    fs::remove_file(base.join("cache").join(format!("{s1_ulid}.body"))).unwrap();
+    let _ = fs::remove_file(base.join("cache").join(format!("{s1_ulid}.present")));
+
+    // Flush the racing write too; every claim is now segment-backed.
+    vol.flush_wal().unwrap();
+    let final_seg = segment::collect_pending_segment_files(&base)
+        .unwrap()
+        .into_iter()
+        .max()
+        .unwrap();
+    let (_, final_entries, _) = segment::read_segment_index(&final_seg).unwrap();
+    let final_at_200 = final_entries
+        .iter()
+        .rfind(|e| e.start_lba == 200)
+        .expect("racing write flushed at lba 200");
+    assert_eq!(
+        final_at_200.kind,
+        segment::EntryKind::Data,
+        "racing write must flush as plain Data (source evicted) for the \
+         phantom to persist"
+    );
+
+    let mem_refcount = vol.lbamap.delta_source_refcount(&h_a);
+    let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
+    let disk_refcount = rebuilt.delta_source_refcount(&h_a);
+    assert_eq!(
+        mem_refcount, disk_refcount,
+        "live map's delta-source refcount for H_A diverged from the disk \
+         rebuild: a phantom reference pins the source and vetoes GC forever"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The same-epoch sibling of the race above: A' → B → A' written within
+/// one WAL epoch. The epoch's final claim at the LBA is the closing
+/// DedupRef — same content hash, same WAL claimant — while the Delta
+/// minted from the first record is superseded inside its own segment. Its
+/// sources must not attach to the DedupRef's claim: a DedupRef entry
+/// never carries sources, so the disk rebuild's final claim has none and
+/// an attach would leave the same phantom refcount as the cross-epoch
+/// race.
+#[test]
+fn same_epoch_rewrite_cycle_keeps_source_refcount_consistent() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a = prand_bytes(1, DELTA_EXTENT_BYTES);
+    let h_a = blake3::hash(&a);
+    let mut a_prime = a.clone();
+    for i in (0..a_prime.len()).step_by(1024) {
+        a_prime[i] = a_prime[i].wrapping_add(1);
+    }
+
+    vol.write(0, &a).unwrap();
+    vol.flush_wal().unwrap();
+
+    // One epoch: A' (delta-converts at flush), B, then A' again — the
+    // closing write dedups against the epoch's own first record.
+    vol.write(200, &a_prime).unwrap();
+    vol.write(200, &prand_bytes(9, DELTA_EXTENT_BYTES)).unwrap();
+    vol.write(200, &a_prime).unwrap();
+    vol.flush_wal().unwrap();
+
+    // The flushed segment must end with a DedupRef at 200 (the shape
+    // under test) and carry the Delta minted from the first record.
+    let final_seg = segment::collect_pending_segment_files(&base)
+        .unwrap()
+        .into_iter()
+        .max()
+        .unwrap();
+    let (_, entries, _) = segment::read_segment_index(&final_seg).unwrap();
+    let at_200: Vec<segment::EntryKind> = entries
+        .iter()
+        .filter(|e| e.start_lba == 200)
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(
+        at_200.last(),
+        Some(&segment::EntryKind::DedupRef),
+        "epoch must close with a DedupRef at lba 200, got {at_200:?}"
+    );
+    assert!(
+        at_200.contains(&segment::EntryKind::Delta),
+        "first record must have delta-converted, got {at_200:?}"
+    );
+
+    let mem_refcount = vol.lbamap.delta_source_refcount(&h_a);
+    let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
+    let disk_refcount = rebuilt.delta_source_refcount(&h_a);
+    assert_eq!(
+        mem_refcount, disk_refcount,
+        "live map's delta-source refcount for H_A diverged from the disk \
+         rebuild after a same-epoch rewrite cycle"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}

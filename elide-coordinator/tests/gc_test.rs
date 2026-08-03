@@ -1852,3 +1852,192 @@ fn gc_leaves_a_forks_reachable_range_alone() {
         "child lost the bytes its branch ULID admits"
     );
 }
+
+/// Deterministic incompressible bytes so sketches compute and zstd can't
+/// collapse the body (`sketch::compute` refuses constant input).
+fn prand_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Bare (extensionless, ULID-named) files in `gc/` — a committed fold
+/// output. Empty after a stale-liveness cancellation.
+fn bare_gc_outputs(fork_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(fork_dir.join("gc")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| !n.contains('.') && ulid::Ulid::from_string(n).is_ok())
+        .collect()
+}
+
+/// A stale-liveness cancellation from a window-minted delta is one-shot:
+/// the next pass sees the delta on disk and completes.
+///
+/// The delta sibling of Bug B: a Delta entry minted by the flush-time
+/// resemblance tier *between* the coordinator's plan (which classified the
+/// source hash dead and dropped it) and the volume's apply. The resemblance
+/// tier's liveness filter (`delta_compute.rs`, `referenced.contains`)
+/// consults the live lbamap at flush time — a DedupRef claim written in the
+/// window keeps the hash referenced, so the filter passes and the delta is
+/// minted against a source the in-flight plan omits. Overwriting the
+/// DedupRef's LBA afterwards leaves the shape the volume must veto: no LBA
+/// claims, delta_src_refcount=1.
+///
+/// The volume's stale-liveness check must cancel that plan (the safety
+/// net #789 documents). The follow-up pass then sees the delta segment in
+/// pending/open — the planner counts delta-source references from open
+/// generation segments — carries the source as a canonical, and must
+/// complete without cancelling.
+#[test]
+fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
+    const EXTENT_BYTES: usize = 64 * 1024; // 16 blocks; ≥ MIN_SKETCH_BYTES
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    let a = prand_bytes(1, EXTENT_BYTES);
+    let h_a = blake3::hash(&a);
+    let overwrite = prand_bytes(2, EXTENT_BYTES);
+    // A with one byte per KiB changed: distinct hash, high resemblance.
+    let mut a_prime = a.clone();
+    for i in (0..a_prime.len()).step_by(1024) {
+        a_prime[i] = a_prime[i].wrapping_add(1);
+    }
+    let w3 = prand_bytes(3, EXTENT_BYTES);
+
+    // Committed segment S1 holds A at lba 0; S2 overwrites it. H_A is
+    // LBA-dead on disk, so the pass below plans to drop it.
+    vol.write(0, &a).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &overwrite).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+
+    // ── Plan→apply window ──
+    // A DedupRef write keeps H_A referenced in the live map, so the
+    // resemblance tier's liveness filter accepts it as a delta source.
+    vol.write(100, &a).unwrap();
+    vol.write(200, &a_prime).unwrap();
+    vol.flush_wal().unwrap();
+
+    // The flush must have minted a Delta at lba 200 sourcing H_A —
+    // that mint is the mechanism under test.
+    let minted_delta_sources: Vec<blake3::Hash> =
+        elide_core::segment::collect_pending_segment_files(fork_dir)
+            .unwrap()
+            .iter()
+            .flat_map(|p| {
+                let (_, entries, _) = elide_core::segment::read_segment_index(p).unwrap();
+                entries
+            })
+            .filter(|e| e.kind == elide_core::segment::EntryKind::Delta && e.start_lba == 200)
+            .flat_map(|e| {
+                e.delta_options
+                    .iter()
+                    .map(|o| o.source_hash)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    assert!(
+        minted_delta_sources.contains(&h_a),
+        "flush did not mint a Delta against H_A — resemblance tier \
+         precondition failed, sources found: {minted_delta_sources:?}"
+    );
+
+    // Kill the DedupRef claim: H_A now has no LBA claims and exactly one
+    // delta-source reference — the rig signature (lbas=[],
+    // delta_src_refcount=1).
+    vol.write(100, &w3).unwrap();
+
+    // A fold plan exists: the pass emitted a bucket that drops H_A.
+    // Without this, the empty-`gc/` check below would pass vacuously.
+    let plans = |dir: &std::path::Path| -> Vec<String> {
+        fs::read_dir(dir.join("gc"))
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| n.ends_with(".plan"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(!plans(fork_dir).is_empty(), "pass 1 emitted no fold plan");
+
+    // Apply must cancel: the plan drops H_A, but the volume needs it to
+    // resolve the freshly minted delta. Cancellation removes the plan
+    // without committing a bare output (a divergence refusal would keep
+    // the plan; a successful fold would commit a bare file).
+    vol.apply_gc_handoffs().unwrap();
+    assert!(
+        bare_gc_outputs(fork_dir).is_empty(),
+        "apply committed a fold that orphans a live delta source — \
+         stale-liveness cancellation did not fire"
+    );
+    assert!(
+        plans(fork_dir).is_empty(),
+        "plan survived the apply: refused by divergence, not cancelled \
+         by the stale-liveness check"
+    );
+
+    // ── Follow-up pass, pending/open still populated (generations: GC
+    // runs against a non-empty open generation) ──
+    let u_gc2 = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc2],
+    )
+    .unwrap();
+    vol.apply_gc_handoffs().unwrap();
+    assert!(
+        !bare_gc_outputs(fork_dir).is_empty(),
+        "second pass cancelled again: planner failed to count the \
+         delta-source reference held by a pending/open segment — \
+         persistent livelock, not a window race"
+    );
+    rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
+        .unwrap();
+    simulate_coord_cache_evict(fork_dir);
+
+    // Reads survive the whole sequence.
+    let got = vol.read(200, 16).expect("read lba=200 after fold");
+    assert_eq!(got.as_slice(), a_prime.as_slice(), "lba=200 must read A'");
+    let got = vol.read(100, 16).expect("read lba=100 after fold");
+    assert_eq!(got.as_slice(), w3.as_slice(), "lba=100 must read W3");
+    let got = vol.read(0, 16).expect("read lba=0 after fold");
+    assert_eq!(
+        got.as_slice(),
+        overwrite.as_slice(),
+        "lba=0 must read the overwrite"
+    );
+}

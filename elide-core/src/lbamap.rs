@@ -632,23 +632,28 @@ impl LbaMap {
 
     /// Attach (or replace) the Delta source list for the LBA entry starting
     /// at `start_lba`, but only if the entry's content hash matches
-    /// `expected_hash`. Returns `true` if updated, `false` if the LBA has no
-    /// entry or its hash no longer matches (i.e. a concurrent overwrite
-    /// raced the caller).
+    /// `expected_hash` **and** its claimant matches `expected_claimant`.
+    /// Returns `true` if updated, `false` if the LBA has no entry or either
+    /// field no longer matches (i.e. a concurrent overwrite raced the
+    /// caller).
     ///
-    /// Used by post-flush Data→Delta conversions (`delta_repack`) where the
-    /// segment file is rewritten with Delta entries but the LBA map's
-    /// content hash is unchanged.
+    /// Used by the promote apply to attach a flush-minted Delta's sources
+    /// to the claim its WAL made. The claimant check is load-bearing: a
+    /// concurrent writer can re-claim the LBA with the *same* content hash
+    /// (a rewrite that dedups back to the delta's bytes), and attaching to
+    /// that claim would pin a source refcount no disk rebuild reproduces —
+    /// the phantom then vetoes every GC plan that drops the source.
     pub fn set_delta_sources_if_matches(
         &mut self,
         start_lba: u64,
         expected_hash: blake3::Hash,
+        expected_claimant: Ulid,
         source_hashes: Arc<[blake3::Hash]>,
     ) -> bool {
         let Some(entry) = self.inner.get(&start_lba) else {
             return false;
         };
-        if entry.hash != expected_hash {
+        if entry.hash != expected_hash || entry.claimant_ulid != expected_claimant {
             return false;
         }
         if let Some(old) = self.delta_sources_by_lba.remove(&start_lba) {
@@ -1741,14 +1746,32 @@ mod tests {
         assert!(!map.lba_referenced_hashes().contains(&old_src));
 
         // Attach an initial source.
-        assert!(map.set_delta_sources_if_matches(0, content, Arc::from([old_src])));
+        assert!(map.set_delta_sources_if_matches(0, content, u(0), Arc::from([old_src])));
         assert!(map.lba_referenced_hashes().contains(&old_src));
 
         // Replace with a new source list — old must go away, new must appear.
-        assert!(map.set_delta_sources_if_matches(0, content, Arc::from([new_src])));
+        assert!(map.set_delta_sources_if_matches(0, content, u(0), Arc::from([new_src])));
         let referenced = map.lba_referenced_hashes();
         assert!(!referenced.contains(&old_src));
         assert!(referenced.contains(&new_src));
+    }
+
+    #[test]
+    fn set_delta_sources_if_matches_rejects_claimant_mismatch() {
+        let mut map = LbaMap::new();
+        let content = h(1);
+        let src = h(11);
+
+        map.insert(0, 1, content, u(0));
+        // A concurrent writer re-claimed the LBA with the same content
+        // hash — the claim is no longer the one the caller's WAL made.
+        map.insert(0, 1, content, u(1));
+
+        assert!(
+            !map.set_delta_sources_if_matches(0, content, u(0), Arc::from([src])),
+            "must reject when the claimant is no longer the caller's WAL"
+        );
+        assert!(!map.lba_referenced_hashes().contains(&src));
     }
 
     #[test]
@@ -1763,7 +1786,7 @@ mod tests {
         map.insert(0, 1, other, u(1));
 
         assert!(
-            !map.set_delta_sources_if_matches(0, content, Arc::from([src])),
+            !map.set_delta_sources_if_matches(0, content, u(1), Arc::from([src])),
             "must reject when LBA hash no longer matches"
         );
         assert!(!map.lba_referenced_hashes().contains(&src));
