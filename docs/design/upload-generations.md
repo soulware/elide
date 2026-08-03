@@ -38,10 +38,10 @@ cadence one job.
   consolidation, repack, reclaim. Its job is to keep the local segment
   set compact so that what eventually uploads is the minimal surviving
   byte set. It never awaits S3.
-- **Upload**: a continuous per-volume flow draining the shipping
+- **Upload**: a continuous per-volume flow draining the upload
   generation (below), oldest ULID first, at whatever bandwidth allows.
 - **Cut** (every `cut_interval`): a predicate and a publish. With the
-  shipping generation empty, publish HEAD at its frontier, close the
+  upload generation empty, publish HEAD at its frontier, close the
   open generation, and start a fresh one.
 
 ## Generation directories
@@ -53,35 +53,35 @@ names:
 pending/open/       the open generation — WAL flushes land here, and
                     every fold (repack, journal consolidation, reclaim
                     outputs) reads and writes only here
-pending/shipping/   the closed generation — immutable; the uploader
+pending/upload/     the closed generation — immutable; the uploader
                     drains it, promote removes each file after its
                     upload confirms, and an empty directory is a fully
-                    shipped generation
+                    uploaded generation
 ```
 
-The cut tick, when `pending/shipping/` is empty: publish HEAD, remove
-`shipping/`, rename `open/` → `shipping/`, create a fresh `open/`,
+The cut tick, when `pending/upload/` is empty: publish HEAD, remove
+`upload/`, rename `open/` → `upload/`, create a fresh `open/`,
 fsync `pending/` once. Each step is idempotent or atomic, so a crash
 at any point leaves one of three shapes — `open` alone, `open` beside
-`shipping`, or an empty `shipping` whose publish may or may not have
+`upload`, or an empty `upload` whose publish may or may not have
 landed — and publish is derived (`confirmed_beyond`), so re-running it
 is harmless.
 
 Membership is assigned once, at write time, by which directory a file
 lands in, and nothing can move a file between generations: folds are
-confined to `open/` by construction, and `shipping/` is only ever
+confined to `open/` by construction, and `upload/` is only ever
 read and emptied. The fold-never-crosses rule is therefore not an
 invariant to check but a thing the layout cannot express violating.
 `ls pending/` shows the entire generation state of a volume — what is
-open, what is shipping, and how much of it remains.
+open, what is uploading, and how much of it remains.
 
 The migration from today's flat `pending/` is local-only: the segment
 format, S3 objects, and every published artefact are untouched. First
 start under the new layout moves any flat pending files into `open/`.
 
-## One shipping generation, never a queue
+## One upload generation, never a queue
 
-A cut whose shipping generation has not emptied does not close: the
+A cut whose upload generation has not emptied does not close: the
 open window stretches, cut age grows past `cut_interval`, and the
 `[head]` publish line's `age` field (#848) is the health signal.
 
@@ -91,7 +91,7 @@ boundaries, so content split across queued generations can never
 consolidate again, and each queued window ships its own journal slice
 and its own not-yet-dead data. The stretched-window rule inverts the
 cost — under backpressure the open generation keeps folding, more of
-its content dies before ever shipping, and the eventual batch is
+its content dies before ever uploading, and the eventual batch is
 smaller. A stall's byte cost is negative. RPO degrades identically in
 both schemes (unshipped is unshipped), so the queue would buy no
 durability.
@@ -116,7 +116,7 @@ Directory membership is content age: a file's generation is fixed when
 its content enters `pending/`, and folding inside `open/` re-mints
 ULIDs without moving anything across the boundary. Starvation is
 structurally impossible — every acked byte is durable at most one
-stretched-open window plus one shipping window after write.
+stretched-open window plus one upload window after write.
 
 ## One frontier for both tiers
 
@@ -152,7 +152,7 @@ the same cut. Two rules make every elision safe:
 - **Folds stay in `open/`.** Victim, killer, and fold output share a
   generation and publish together at its cut.
 
-Cross-generation deaths (an open-generation write killing a shipping
+Cross-generation deaths (an open-generation write killing an upload-generation
 byte) are deliberately not elided: the byte ships and dies later in S3
 through the normal GC path. The mortality curve prices this cost — it
 is the tail beyond the knee, and the knee is what the window harvests.
@@ -162,12 +162,12 @@ is the tail beyond the knee, and the knee is what the window harvests.
 The mint is monotonic by design: a rewrite output sorts above every
 write that existed when it was planned, so concurrent writes always
 win their claims. Generations keep that property untouched. The close
-renames the whole directory, minting nothing, so a shipping
+renames the whole directory, minting nothing, so an upload
 generation's ULIDs — including its final consolidation outputs — all
 predate every open-generation write, and claimant order across the
-boundary is the write order. Re-folding shipped content, the one
+boundary is the write order. Re-folding upload-generation content, the one
 operation that would interleave fresh mints above open pending, has no
-expressible form: `shipping/` is not a fold source.
+expressible form: `upload/` is not a fold source.
 
 The strict `max(committed) < min(pending)` reading died with journal
 deferral (#844 split it per tier); a GC output minted mid-window still
@@ -192,7 +192,7 @@ backlog — the strong frontier subsumes the weak ones.
 
 ## The uploader
 
-A per-volume flow draining `pending/shipping/`, oldest ULID first,
+A per-volume flow draining `pending/upload/`, oldest ULID first,
 each PUT followed by its promote IPC as today
 (`upload.rs::drain_pending`), with promote removing the shipped file.
 The directory is immutable while it ships, so the uploader and the
@@ -205,11 +205,11 @@ shaping slots in here as a drain rate, orthogonal to correctness.
 ## Seals
 
 Every seal remains a synchronous cut boundary, now spanning the whole
-backlog: ship `shipping/`, close and ship `open/`, publish. `volume
+backlog: ship `upload/`, close and ship `open/`, publish. `volume
 stop`, snapshot, handoff and displacement latency scale with up to ~2W
 of survivors. This is the user-visible cost of the design and the
 reason the idle-volume early cut matters: a quiescent volume's open
-generation is empty and its shipping generation drains dry, so closing
+generation is empty and its upload generation drains dry, so closing
 early costs nothing and drops both the RPO and the eventual seal
 latency to ~zero.
 
@@ -219,18 +219,18 @@ GC's candidate set, classification, and the Superseded barrier are
 untouched: the pass already works over local `index/` + `pending/` +
 WAL, with pending now read one directory deeper. The pass gate's
 "complete drain" input becomes "uploader healthy" (no failed PUTs
-outstanding), since a mid-window tick with a part-full shipping
+outstanding), since a mid-window tick with a part-full upload
 directory is now the normal complete state — the same reframing
 `deferred ≠ failed` got in #844.
 
 ## Testing
 
 The cut consistency oracle (`gc_cycle.rs` tests) gains the generation
-dimension: mutations interleave with partial shipping, and the
+dimension: mutations interleave with partial uploading, and the
 materialised force-claim reader must always see a whole-generation
 prefix. The volume proptest suite gains ops for the close rename and
-mid-shipping crash, plus invariant checks: `pending/` holds exactly
-`open/` and at most `shipping/`; every fold's inputs and output share
+mid-upload crash, plus invariant checks: `pending/` holds exactly
+`open/` and at most `upload/`; every fold's inputs and output share
 a directory; no published frontier splits a generation; the journal
 frontier equals the data frontier; and every acked write is durable
 within two windows in wall-clock-free simulation time.
