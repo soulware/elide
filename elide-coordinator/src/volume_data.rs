@@ -19,9 +19,10 @@
 //!   verifies in one step (with `get_manifest_bytes` for callers
 //!   that verify the raw bytes themselves).
 //! * [`SegmentsView`] — segment bodies under
-//!   `by_id/<vol>/segments/<YYYYMMDD>/<ulid>`. Multipart PUT for
-//!   bodies (via `put_from_file`), range-GET for header+index
-//!   verification (`get_range`), and DELETE for the retention reaper.
+//!   `by_id/<vol>/segments/<YYYYMMDD>/<ulid>`. PUT for bodies (via
+//!   `put_from_file`; multipart above one part size), range-GET for
+//!   header+index verification (`get_range`), and DELETE for the
+//!   retention reaper.
 //!
 //! `VolumeData` is a concrete struct, not a trait. There is one
 //! impl, no reader/writer split (every op rides one `volume-rw`
@@ -547,14 +548,13 @@ impl SegmentsView<'_> {
         segment_key(self.vol_ulid, seg_ulid)
     }
 
-    /// Multipart PUT of a segment body read from `path`.
+    /// PUT of a segment body read from `path`.
     ///
     /// Used by the drain path (`pending/<ulid>`) and the GC handoff
-    /// cursor (`gc/<ulid>` after `compact`). Multipart is chosen
-    /// unconditionally: each part is a separate request with its own
-    /// timeout and retry budget, so a stalled part doesn't restart
-    /// the whole upload. Small segments still complete in a single
-    /// part at roughly the cost of a plain PUT.
+    /// cursor (`gc/<ulid>` after `compact`). A body that fits in one
+    /// part uploads as a single PUT request. Larger bodies stream as
+    /// a multipart upload: each part is a separate request with its
+    /// own timeout and retry budget, so a stalled part retries alone.
     ///
     /// Part size is the process-global value installed at daemon
     /// boot via [`crate::upload::set_part_size_bytes`]. Two parts
@@ -579,6 +579,26 @@ impl SegmentsView<'_> {
         let mut f = std::fs::File::open(path).map_err(read_err)?;
         let key = self.segment_key(seg_ulid);
         let part_size = crate::upload::part_size_bytes();
+        let len = usize::try_from(f.metadata().map_err(read_err)?.len()).unwrap_or(usize::MAX);
+        if len <= part_size {
+            let mut buf = self.checkout_part_buf(part_size);
+            buf.resize(len, 0);
+            let mut filled = 0;
+            while filled < len {
+                match f.read(&mut buf[filled..]).map_err(read_err)? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            buf.truncate(filled);
+            let payload = buf.split().freeze();
+            self.checkin_part_buf(buf);
+            self.store
+                .put(&key, payload.into())
+                .await
+                .map_err(SegmentsError::Put)?;
+            return Ok(());
+        }
         let upload = self
             .store
             .put_multipart(&key)
@@ -640,13 +660,22 @@ impl SegmentsView<'_> {
         got.bytes().await.map_err(SegmentsError::Get)
     }
 
-    /// Multipart PUT of a fully-formed in-memory segment object. Same
-    /// part discipline as [`Self::put_from_file`]; used by
-    /// forced-claim tail re-own, which composes the object in memory
-    /// (re-signed head + copied body).
+    /// PUT of a fully-formed in-memory segment object. Same
+    /// one-part/multipart split and part discipline as
+    /// [`Self::put_from_file`]; used by forced-claim tail re-own,
+    /// which composes the object in memory (re-signed head + copied
+    /// body).
     pub async fn put_bytes(&self, seg_ulid: Ulid, mut bytes: Bytes) -> Result<(), SegmentsError> {
         let key = self.segment_key(seg_ulid);
         let part_size = crate::upload::part_size_bytes();
+        if bytes.len() <= part_size {
+            return self
+                .store
+                .put(&key, bytes.into())
+                .await
+                .map(|_| ())
+                .map_err(SegmentsError::Put);
+        }
         let upload = self
             .store
             .put_multipart(&key)
@@ -1004,13 +1033,88 @@ fn parse_hex_pubkey(hex: &str) -> Result<VerifyingKey, MetadataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use elide_core::ulid_mint::UlidMint;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOpts, PutOptions,
+        PutPayload, PutResult, Result as OsResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn vd() -> (Arc<dyn ObjectStore>, VolumeData) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let vol = Ulid::from_string("01J0000000000000000000000V").unwrap();
         (Arc::clone(&store), VolumeData::new(store, vol))
+    }
+
+    /// Counts plain-PUT and multipart-open calls so tests can assert
+    /// which upload path a segment body took.
+    #[derive(Debug, Default)]
+    struct CountingStore {
+        inner: InMemory,
+        puts: AtomicUsize,
+        multiparts: AtomicUsize,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.inner, f)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &StorePath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &StorePath,
+            opts: PutMultipartOpts,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.multiparts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &StorePath, options: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &StorePath) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&StorePath>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&StorePath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &StorePath, to: &StorePath) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &StorePath, to: &StorePath) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn counting_vd() -> (Arc<CountingStore>, VolumeData) {
+        let store = Arc::new(CountingStore::default());
+        let as_store: Arc<dyn ObjectStore> = Arc::clone(&store) as _;
+        let vol = Ulid::from_string("01J0000000000000000000000V").unwrap();
+        (store, VolumeData::new(as_store, vol))
     }
 
     fn mint() -> UlidMint {
@@ -1368,28 +1472,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segments_put_from_file_round_trips_via_get_range() {
+    async fn segments_put_from_file_one_part_uses_single_put() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_s, vd) = vd();
+        let (store, vd) = counting_vd();
         let seg = mint().next();
-        // Body larger than the fallback part size would force real
-        // multipart; the in-memory store handles either path
-        // transparently, but we cover the small-payload case here
-        // (one part) since that is the common drain case.
-        let body = b"segment body bytes";
+        // Exactly one part size: the largest body the single-request
+        // path carries, pinning the `<=` boundary.
+        let len = crate::upload::part_size_bytes();
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let path = tmp.path().join(seg.to_string());
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, &body).unwrap();
 
         vd.segments().put_from_file(seg, &path).await.unwrap();
 
-        let got = vd.segments().get_range(seg, 0..body.len()).await.unwrap();
-        assert_eq!(got.as_ref(), body);
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 0);
+        let got = vd.segments().get_range(seg, 0..len).await.unwrap();
+        assert_eq!(got.as_ref(), &body[..]);
     }
 
     #[tokio::test]
     async fn segments_put_from_file_multipart_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_s, vd) = vd();
+        let (store, vd) = counting_vd();
         let seg = mint().next();
         // Two full parts plus a short tail, so the read loop cycles
         // buffers through checkout/checkin across part boundaries.
@@ -1401,7 +1506,42 @@ mod tests {
 
         vd.segments().put_from_file(seg, &path).await.unwrap();
 
+        assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 1);
         let got = vd.segments().get_range(seg, 0..len).await.unwrap();
+        assert_eq!(got.as_ref(), &body[..]);
+    }
+
+    #[tokio::test]
+    async fn segments_put_bytes_one_part_uses_single_put() {
+        let (store, vd) = counting_vd();
+        let seg = mint().next();
+        let body = Bytes::from_static(b"in-memory segment body");
+
+        vd.segments().put_bytes(seg, body.clone()).await.unwrap();
+
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 0);
+        let got = vd.segments().get_bytes(seg).await.unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn segments_put_bytes_multipart_round_trips() {
+        let (store, vd) = counting_vd();
+        let seg = mint().next();
+        let part = crate::upload::part_size_bytes();
+        let len = 2 * part + 4096;
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+        vd.segments()
+            .put_bytes(seg, Bytes::from(body.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.multiparts.load(Ordering::SeqCst), 1);
+        let got = vd.segments().get_bytes(seg).await.unwrap();
         assert_eq!(got.as_ref(), &body[..]);
     }
 
