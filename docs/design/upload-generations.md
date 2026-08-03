@@ -140,6 +140,37 @@ the flush-to-snapshot ordering inside the tick is what makes it safe
 today, and the segment-resident rule makes it explicit. To verify at
 the `register_entry` choke point during implementation.
 
+## ULID order across the boundary
+
+The mint is monotonic by design: a rewrite output sorts above every
+write that existed when it was planned, so concurrent writes always
+win their claims. Generations keep that property under two rules.
+
+**The closing consolidation mints on the boundary tick** — after the
+closing flush, before the next tick's first flush — so a closed
+generation's outputs sit between the generations in ULID order: above
+every generation-N flush claimant (the consumed-claimant override
+applies as usual), below every generation-N+1 claimant, which is
+exactly the order that lets open writes win. The single-file tick is
+what guarantees this window; the worker may finish later, but output
+ULIDs are reserved at plan time (`prepare_repack`).
+
+**A closed generation is never folded again.** An upload retry re-PUTs
+the same immutable file. A re-fold during shipping would mint above
+the open generation's pending flush segments and commit interleaved
+ULIDs above pending ones.
+
+Interleaving of that shape already exists for the committed tier: a GC
+output minted mid-window commits immediately (`Added`) with a ULID
+above the open generation's pending segments — the strict
+`max(committed) < min(pending)` reading died with journal deferral
+(#844 split it per tier). Generations rework the invariant once more,
+to generation scope: within a generation ULID order is total and
+prefix-shaped; across boundaries membership is explicit (HEAD names
+sets, the cut predicate counts confirmations per generation), and
+claimant order alone carries correctness — which the boundary-tick
+minting preserves.
+
 ## The uploader
 
 A per-volume queue of closed-generation segments, drained oldest ULID
