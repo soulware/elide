@@ -365,6 +365,17 @@ fn apply_promoted_partition(
         inline: extentindex::InlineSource::EntryInline,
     };
     let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
+    // Entries apply in write order, so the claim keyed at an LBA belongs
+    // to the epoch's *last* record starting there. A Delta superseded by a
+    // later same-epoch record must not attach its sources to that record's
+    // claim.
+    let mut last_claim_at_start: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
+    for (raw_idx, entry) in entries.iter().enumerate() {
+        if !entry.kind.is_canonical_only() {
+            last_claim_at_start.insert(entry.start_lba, raw_idx);
+        }
+    }
     for (raw_idx, (entry, old_wal_offset)) in entries
         .iter()
         .zip(pre_promote_offsets.iter().copied())
@@ -392,9 +403,20 @@ fn apply_promoted_partition(
                         &delta_ctx,
                         &consumed,
                     )?;
-                    let sources: Arc<[blake3::Hash]> =
-                        entry.delta_options.iter().map(|o| o.source_hash).collect();
-                    lbamap.set_delta_sources_if_matches(entry.start_lba, entry.hash, sources);
+                    // Sources attach only to the claim this delta made:
+                    // the epoch's last claim at this LBA, still owned by
+                    // the flushed WAL. The claimant guard inside rejects a
+                    // concurrent writer's same-hash re-claim.
+                    if last_claim_at_start.get(&entry.start_lba) == Some(&raw_idx) {
+                        let sources: Arc<[blake3::Hash]> =
+                            entry.delta_options.iter().map(|o| o.source_hash).collect();
+                        lbamap.set_delta_sources_if_matches(
+                            entry.start_lba,
+                            entry.hash,
+                            old_wal_ulid,
+                            sources,
+                        );
+                    }
                 }
                 continue;
             }
