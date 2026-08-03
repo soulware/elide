@@ -499,10 +499,11 @@ fn read_inline_section(seg_path: &Path, entries: &[SegmentEntry]) -> io::Result<
 /// `.idx` inline section — the `body_offset`/`body_length` fields on
 /// an Inline location are inline-section-relative and must not be used
 /// as a body seek. For non-inline entries, resolve the segment body
-/// via `segment::locate_segment_body` (canonical precedence wal →
-/// pending → bare gc/<id> → cache/.body) and pick the seek arithmetic
-/// from the returned layout: body-only files seek at `body_offset`
-/// alone, full segment files seek at `body_section_start + body_offset`.
+/// via `segment::locate_segment_body_from` (the home the entry names,
+/// then the canonical precedence wal → pending → bare gc/<id> →
+/// cache/.body) and pick the seek arithmetic from the returned layout:
+/// body-only files seek at `body_offset` alone, full segment files seek
+/// at `body_section_start + body_offset`.
 ///
 /// Errors when the plaintext fails its content hash: a wrong local read
 /// used as a dictionary would form a delta that can never reconstruct,
@@ -516,7 +517,8 @@ fn read_source_extent(
         inline.to_vec()
     } else {
         let (path, layout) =
-            segment::locate_segment_body(source_dir, loc.segment_id).ok_or_else(|| {
+            segment::locate_segment_body_from(source_dir, loc.segment_id, loc.body_source.home())
+                .ok_or_else(|| {
                 io::Error::other(format!(
                     "source extent segment {} not found under {}",
                     loc.segment_id,
@@ -589,9 +591,10 @@ fn read_source_plaintext(
                 return None;
             }
         }
+        let home = loc.body_source.home();
         let (path, layout) = search_dirs
             .iter()
-            .find_map(|d| segment::locate_segment_body(d, loc.segment_id))?;
+            .find_map(|d| segment::locate_segment_body_from(d, loc.segment_id, home))?;
         let f = fs::File::open(&path).ok()?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact_at(&mut buf, layout.body_seek(loc)).ok()?;
