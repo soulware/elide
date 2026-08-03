@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2f41902e8cc6853ce787d4b04a71f119b7e2fdae7bfedf952021a37b14f69c10 # shrinks to ops = [Write { lba: 0 }, Tick { fail_after: None }, GcPass, Snapshot, Write { lba: 1 }, Write { lba: 1 }]
