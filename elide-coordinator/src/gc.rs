@@ -2060,7 +2060,7 @@ mod tests {
         vol_ulid: Ulid,
         store: &Arc<dyn ObjectStore>,
     ) {
-        let pending_dir = elide_core::segment::pending_open_dir(&dir);
+        let pending_dir = elide_core::segment::pending_open_dir(dir);
 
         let _ = vol.repack().unwrap();
 
@@ -2336,7 +2336,7 @@ mod tests {
         vol.write(0, &[0x11u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         let pending =
-            elide_core::segment::read_ulid_dir_sorted(&elide_core::segment::pending_open_dir(&dir))
+            elide_core::segment::read_ulid_dir_sorted(&elide_core::segment::pending_open_dir(dir))
                 .unwrap();
         assert_eq!(pending.len(), 1);
         let s1 = pending[0];
@@ -2405,7 +2405,7 @@ mod tests {
         vol.flush_wal().unwrap();
 
         // Drain both: redact in place, then promote.
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
             let name = entry.file_name();
@@ -2494,7 +2494,7 @@ mod tests {
         vol.write(1, &[5u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
 
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
             .unwrap()
             .flatten()
@@ -2580,7 +2580,7 @@ mod tests {
         vol.write(96, &[3u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
 
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<Ulid> = fs::read_dir(&pending_dir)
             .unwrap()
             .flatten()
@@ -2701,7 +2701,7 @@ mod tests {
         vol.flush_wal().unwrap();
 
         // Drain: promote each pending/<ulid> to index/+cache/.
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
             let name = entry.file_name();
@@ -2824,7 +2824,7 @@ mod tests {
         vol.flush_wal().unwrap();
 
         // Drain pending → index/+cache/.
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
             let name = entry.file_name();
@@ -2903,7 +2903,7 @@ mod tests {
         fork_dir: &std::path::Path,
         vol: &mut elide_core::volume::Volume,
     ) -> Vec<ulid::Ulid> {
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let mut ulids: Vec<ulid::Ulid> = Vec::new();
         for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
             let name = entry.file_name();
@@ -3256,8 +3256,7 @@ mod tests {
         let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
         let delta_blob = compressor.compress(&child_bytes).unwrap();
         let delta_ulid = Ulid::new();
-        let delta_pending =
-            elide_core::segment::pending_open_dir(&dir).join(delta_ulid.to_string());
+        let delta_pending = elide_core::segment::pending_open_dir(dir).join(delta_ulid.to_string());
         let opt = DeltaOption {
             source_hash: parent_hash,
             delta_offset: 0,
@@ -3402,7 +3401,7 @@ mod tests {
         let owner_ulid = mint.next();
         let dup_ulid = mint.next();
         for (ulid, start_lba) in [(owner_ulid, 100u64), (dup_ulid, 200u64)] {
-            let pending = elide_core::segment::pending_open_dir(&dir).join(ulid.to_string());
+            let pending = elide_core::segment::pending_open_dir(dir).join(ulid.to_string());
             let opt = DeltaOption {
                 source_hash: parent_hash,
                 delta_offset: 0,
@@ -3535,8 +3534,7 @@ mod tests {
         let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
         let delta_blob = compressor.compress(&child_bytes).unwrap();
         let delta_ulid = Ulid::new();
-        let delta_pending =
-            elide_core::segment::pending_open_dir(&dir).join(delta_ulid.to_string());
+        let delta_pending = elide_core::segment::pending_open_dir(dir).join(delta_ulid.to_string());
         let opt = DeltaOption {
             source_hash: parent_hash,
             delta_offset: 0,

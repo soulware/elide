@@ -1625,7 +1625,7 @@ fn journal_write_stores_own_body_not_dedup_against_stable() {
 }
 
 fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
-    let seg_path = segment::pending_open_dir(&base).join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     entries.iter().map(|e| e.start_lba).collect()
@@ -1635,7 +1635,7 @@ fn entry_lbas(base: &Path, vol: &Volume, seg: Ulid) -> Vec<u64> {
 /// flag — the disjoint-tier invariant that a segment is pure journal or
 /// pure data, never mixed.
 fn seg_all_journal(base: &Path, vol: &Volume, seg: Ulid) -> bool {
-    let seg_path = segment::pending_open_dir(&base).join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     !entries.is_empty() && entries.iter().all(|e| e.journal)
@@ -2148,7 +2148,7 @@ fn delta_variant_extent(seed: u8, tweak: u8) -> Vec<u8> {
 }
 
 fn pending_entry_kinds(base: &Path, vol: &Volume, seg: Ulid) -> Vec<segment::EntryKind> {
-    let seg_path = segment::pending_open_dir(&base).join(seg.to_string());
+    let seg_path = segment::pending_open_dir(base).join(seg.to_string());
     let (_, entries, _) =
         segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
     entries.iter().map(|e| e.kind).collect()
@@ -2426,7 +2426,7 @@ fn legacy_ref_wal_record_replays_and_promotes() {
 
 /// Helper: collect all pending segment ULIDs (excluding sidecars and tmps).
 fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
-    let pending_dir = segment::pending_open_dir(&base);
+    let pending_dir = segment::pending_open_dir(base);
     let mut ulids: Vec<ulid::Ulid> = Vec::new();
     for entry in fs::read_dir(&pending_dir).unwrap() {
         let entry = entry.unwrap();

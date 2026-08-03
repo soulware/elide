@@ -208,7 +208,7 @@ fn collect_node(dir: &Path, by_id_dir: &Path) -> io::Result<NodeInfo> {
     let is_live = dir.join("wal").is_dir();
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
-    let pending = collect_seg_dir(&elide_core::segment::pending_open_dir(&dir))?;
+    let pending = collect_seg_dir(&elide_core::segment::pending_open_dir(dir))?;
     let cache = collect_cache_dir(dir)?;
     let extent_sources = collect_extent_sources(dir, by_id_dir);
 

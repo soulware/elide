@@ -63,7 +63,7 @@ fn write_single_entry_segment(
     body: Vec<u8>,
 ) -> Ulid {
     let seg_ulid = Ulid::new();
-    let seg_path = elide_core::segment::pending_open_dir(&vol_dir).join(seg_ulid.to_string());
+    let seg_path = elide_core::segment::pending_open_dir(vol_dir).join(seg_ulid.to_string());
     let entries = vec![SegmentEntry::new_data(
         hash,
         start_lba,
@@ -201,7 +201,7 @@ fn rewrite_pending_with_deltas_converts_matching_entry() {
 /// index/<ulid>.idx + cache/<ulid>.{body,present}, deleting pending/<ulid>.
 /// Mirrors what the coordinator does after a successful S3 upload.
 fn drain_source_segment(source_dir: &Path, seg_ulid: Ulid) {
-    let pending = elide_core::segment::pending_open_dir(&source_dir).join(seg_ulid.to_string());
+    let pending = elide_core::segment::pending_open_dir(source_dir).join(seg_ulid.to_string());
     let index_dir = source_dir.join("index");
     let cache_dir = source_dir.join("cache");
     fs::create_dir_all(&index_dir).unwrap();

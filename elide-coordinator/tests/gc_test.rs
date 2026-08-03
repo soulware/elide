@@ -796,7 +796,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     );
 
     // Pending segment must still be present (not lost during failed drain).
-    let pending_count = fs::read_dir(elide_core::segment::pending_upload_dir(&fork_dir))
+    let pending_count = fs::read_dir(elide_core::segment::pending_upload_dir(fork_dir))
         .map(|d| d.flatten().count())
         .unwrap_or(0);
     assert!(
@@ -1092,7 +1092,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     // Local drain helper (no S3 upload): repack, then promote in
     // ULID-ascending order.
     let drain = |vol: &mut Volume| {
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1219,7 +1219,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
     let gc_config = make_gc_config();
 
     let drain = |vol: &mut Volume| {
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1353,7 +1353,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     let gc_config = make_gc_config();
 
     let drain = |vol: &mut Volume| {
-        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1642,7 +1642,7 @@ fn delta_count_in(dir: &std::path::Path, want_ext: Option<&str>) -> usize {
 }
 
 fn pending_delta_count(fork_dir: &std::path::Path) -> usize {
-    delta_count_in(&elide_core::segment::pending_open_dir(&fork_dir), None)
+    delta_count_in(&elide_core::segment::pending_open_dir(fork_dir), None)
 }
 
 fn index_delta_count(fork_dir: &std::path::Path) -> usize {

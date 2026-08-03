@@ -2102,7 +2102,7 @@ fn delta_gc_prefix_mints_a_delta_entry() {
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .unwrap();
-    let minted = std::fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
+    let minted = std::fs::read_dir(elide_core::segment::pending_open_dir(fork_dir))
         .unwrap()
         .flatten()
         .map(|e| e.path())

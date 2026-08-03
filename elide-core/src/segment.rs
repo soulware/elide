@@ -3932,7 +3932,7 @@ mod tests {
     }
 
     fn seg_path(fork_dir: &Path, ulid: &str) -> PathBuf {
-        pending_open_dir(&fork_dir).join(ulid)
+        pending_open_dir(fork_dir).join(ulid)
     }
 
     fn gc_path(fork_dir: &Path, ulid: &str) -> PathBuf {

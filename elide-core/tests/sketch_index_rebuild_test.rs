@@ -26,7 +26,7 @@ fn entropy(seed: u64, len: usize) -> Vec<u8> {
 }
 
 fn make_volume(dir: &Path) -> std::sync::Arc<dyn SegmentSigner> {
-    fs::create_dir_all(elide_core::segment::pending_open_dir(&dir)).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(dir)).unwrap();
     fs::create_dir_all(dir.join("index")).unwrap();
     signing::generate_keypair(dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE).unwrap();
     signing::load_signer(dir, signing::VOLUME_KEY_FILE).unwrap()
@@ -53,7 +53,7 @@ fn write_segment_with(
         })
         .collect();
     write_segment(
-        &elide_core::segment::pending_open_dir(&dir).join(seg.to_string()),
+        &elide_core::segment::pending_open_dir(dir).join(seg.to_string()),
         entries,
         signer,
     )

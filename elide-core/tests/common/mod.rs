@@ -93,7 +93,7 @@ pub fn upload_ulids(base_dir: &Path) -> Vec<Ulid> {
 /// same per-file test the production drain uses to defer.
 fn pending_is_journal(base_dir: &Path, ulid: Ulid) -> bool {
     segment::read_segment_index(
-        &elide_core::segment::pending_open_dir(&base_dir).join(ulid.to_string()),
+        &elide_core::segment::pending_open_dir(base_dir).join(ulid.to_string()),
     )
     .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
     .unwrap_or(false)
@@ -106,7 +106,7 @@ fn segment_indexes(fork_dir: &Path) -> Vec<(String, Vec<segment::SegmentEntry>)>
     for ulid in pending_ulids(fork_dir) {
         let s = ulid.to_string();
         if let Ok((_bss, entries, _inputs)) =
-            segment::read_segment_index(&elide_core::segment::pending_open_dir(&fork_dir).join(&s))
+            segment::read_segment_index(&elide_core::segment::pending_open_dir(fork_dir).join(&s))
         {
             out.push((s, entries));
         }
@@ -264,7 +264,7 @@ pub fn half_promote_first_pending(base_dir: &Path) -> Option<Ulid> {
 /// Panics if any retry fails or leaves a stale pending file.
 pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &Path) {
     let cache_dir = base_dir.join("cache");
-    let pending_dir = elide_core::segment::pending_open_dir(&base_dir);
+    let _pending_dir = elide_core::segment::pending_open_dir(base_dir);
     let stale: Vec<Ulid> = pending_ulids(base_dir)
         .into_iter()
         .filter(|u| cache_dir.join(format!("{u}.body")).exists())

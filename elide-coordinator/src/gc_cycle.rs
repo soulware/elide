@@ -2380,7 +2380,7 @@ mod tests {
     async fn constructor_forces_first_tick_on_backlogged_fork() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (orch, _tmp) = orchestrator_prepped(store, None, |fork_dir| {
-            let pending = elide_core::segment::pending_open_dir(&fork_dir);
+            let pending = elide_core::segment::pending_open_dir(fork_dir);
             std::fs::create_dir_all(&pending).unwrap();
             std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
         });

@@ -290,6 +290,7 @@ fn reclaim_crash_recovery_seed_3f9275b5_regression() {
 ///     and `incompressible_block(1)`.
 ///   - Second WriteMulti at LBA 46..48: writes `incompressible_block(1)`
 ///     and `incompressible_block(2)`, overwriting LBA 47.
+///
 /// LBA 46 (live, written second) and LBA 48 (live, written first) now
 /// share content `incompressible_block(1)` — same hash, different LBAs,
 /// in the same WAL window.
