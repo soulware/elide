@@ -767,10 +767,13 @@ impl GcCycleOrchestrator {
         // process died before publishing, join the cut here
         // (`docs/design/durable-cut.md` *HEAD publishes complete
         // drains only*).
+        let mut added_new = 0usize;
+        let mut edges_new = 0usize;
         match self.confirmed_beyond(head.anchor) {
             Ok(confirmed) => {
                 for u in confirmed {
                     if head.added.insert(u) {
+                        added_new += 1;
                         mutated = true;
                     }
                 }
@@ -796,6 +799,7 @@ impl GcCycleOrchestrator {
                             }
                             head.superseded
                                 .insert(input, segment_head::Supersession { output, since: now });
+                            edges_new += 1;
                             mutated = true;
                         }
                         self.reconcile_edges = false;
@@ -836,6 +840,7 @@ impl GcCycleOrchestrator {
                     since: *since,
                 };
                 if head.superseded.insert(*input, edge) != Some(edge) {
+                    edges_new += 1;
                     mutated = true;
                 }
             }
@@ -856,8 +861,16 @@ impl GcCycleOrchestrator {
             *cache = Some(head);
             return;
         }
+        let age = self.last_cut.elapsed();
         match self.volume_data.head().put(&head).await {
             Ok(()) => {
+                info!(
+                    "[head {}] cut published: added={added_new} superseded={edges_new} \
+                     total_added={} total_superseded={} age={age:.0?}",
+                    self.vol_ulid,
+                    head.added.len(),
+                    head.superseded.len(),
+                );
                 self.tick_added.clear();
                 if edges_eligible {
                     self.tick_superseded.clear();
