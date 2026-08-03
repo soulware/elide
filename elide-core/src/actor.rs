@@ -2904,6 +2904,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             inputs: journal_inputs,
             output,
             bytes_freed: journal_bytes_freed,
+            journal: true,
         });
     }
 
@@ -2992,6 +2993,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 inputs: bucket_inputs,
                 output: None,
                 bytes_freed: bucket_bytes_freed,
+                journal: false,
             });
             continue;
         }
@@ -3058,6 +3060,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 out_entries,
             }),
             bytes_freed: bucket_bytes_freed,
+            journal: false,
         });
     }
 

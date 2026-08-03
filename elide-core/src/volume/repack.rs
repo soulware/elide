@@ -98,6 +98,9 @@ pub struct RepackedBucket {
     pub inputs: Vec<RepackedInput>,
     pub output: Option<RepackedOutput>,
     pub bytes_freed: u64,
+    /// Whether this is the journal-consolidation bucket: inputs and
+    /// output are journal-tier segments.
+    pub journal: bool,
 }
 
 /// One selected input contributing to a [`RepackedBucket`].
@@ -454,15 +457,20 @@ impl Volume {
 
             stats.bytes_freed += bucket.bytes_freed;
 
+            let tier = if bucket.journal {
+                "journal segment, "
+            } else {
+                ""
+            };
             match &bucket.output {
                 Some(out) => log::info!(
-                    "repack: [{inputs_fmt}] -> {} ({} entries, {} bytes freed)",
+                    "repack: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed)",
                     out.new_ulid,
                     out.out_entries.len(),
                     bucket.bytes_freed,
                 ),
                 None => log::info!(
-                    "repack: [{inputs_fmt}] -> deleted ({} bytes freed)",
+                    "repack: [{inputs_fmt}] -> deleted ({tier}{} bytes freed)",
                     bucket.bytes_freed,
                 ),
             }
@@ -693,6 +701,7 @@ mod tests {
                 }],
                 output: None,
                 bytes_freed: 4096,
+                journal: false,
             }],
         };
 
