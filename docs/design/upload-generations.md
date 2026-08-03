@@ -140,6 +140,23 @@ the flush-to-snapshot ordering inside the tick is what makes it safe
 today, and the segment-resident rule makes it explicit. To verify at
 the `register_entry` choke point during implementation.
 
+## Relation to snapshots
+
+A generation is a cut-cadence frontier with snapshot-floor semantics
+that last one window instead of forever, and no artefact. A seal is
+already a synchronous cut boundary, and a snapshot floor already
+excludes every prior segment from rewriting (`collect_stats` skips
+`seg_ulid <= floor`), which is exactly the fold-never-crosses rule —
+so the generation boundary is a **soft floor**: repack and GC
+selection respect it during the shipping window through the same
+floor mechanism, and it expires when the generation publishes, at
+which point its segments become ordinary committed-tier citizens.
+The differences are the ones generations must not inherit: no named
+signed manifest, no retention, accumulate-into-HEAD rather than
+truncate-and-re-anchor. A mid-window user snapshot forcibly closes
+the open generation and ships the backlog — the strong frontier
+subsumes the weak ones.
+
 ## ULID order across the boundary
 
 The mint is monotonic by design: a rewrite output sorts above every
