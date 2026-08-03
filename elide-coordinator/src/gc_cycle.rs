@@ -594,12 +594,20 @@ impl GcCycleOrchestrator {
     }
 
     /// `true` when every confirmed segment (`index/<ulid>.idx`) above
-    /// `anchor` is in the publish scratch — the shape a legitimately
-    /// empty HEAD has on a fresh volume or right after a seal. A
-    /// confirmed segment beyond the scratch means the empty body lost
-    /// committed entries. A listing error returns `false`, routing the
-    /// caller to `segment_head::regenerate`, which reports it.
+    /// `anchor` is in the publish scratch and no supersession edges
+    /// are in hand — the shape a legitimately empty HEAD has on a
+    /// fresh volume or right after a seal. A confirmed segment beyond
+    /// the scratch means the empty body lost committed entries; a
+    /// held edge means a handoff just consumed inputs whose idx
+    /// markers are gone, so the idx listing undercounts the cut and
+    /// only regeneration (which re-adds consumed inputs from the
+    /// outputs' signed tables) accounts for them. A listing error
+    /// returns `false`, routing the caller to
+    /// `segment_head::regenerate`, which reports it.
     fn empty_head_is_legitimate(&self, anchor: Option<Ulid>) -> bool {
+        if !self.tick_superseded.is_empty() {
+            return false;
+        }
         let confirmed = match self.confirmed_beyond(anchor) {
             Ok(v) => v,
             Err(_) => return false,
@@ -673,7 +681,10 @@ impl GcCycleOrchestrator {
                             // edges ride the same barrier: eligible,
                             // they publish here; otherwise they wait
                             // for the reconcile at the first eligible
-                            // publish.
+                            // publish. Stripping is safe because the
+                            // regenerated `added` keeps the consumed
+                            // inputs, so their claims stay visible
+                            // until the edges commit.
                             if edges_eligible {
                                 self.reconcile_edges = false;
                             } else {
@@ -746,6 +757,30 @@ impl GcCycleOrchestrator {
                         self.vol_ulid
                     ),
                 }
+            }
+            // An edge is publishable only when its output sits above
+            // the anchor. A handoff that straddled a seal has an
+            // output at or below the new anchor — permanently
+            // invisible, since the anchor only grows — while the
+            // manifest may still cover its input; the edge would
+            // remove the input from the live set with nothing visible
+            // carrying its claims. Dropped edges leave the input to
+            // the manifest and the objects to reconcile-reap.
+            let mut straddled = 0usize;
+            self.tick_superseded
+                .retain(|(_, output, _)| match head.anchor {
+                    Some(a) if *output <= a => {
+                        straddled += 1;
+                        false
+                    }
+                    _ => true,
+                });
+            if straddled > 0 {
+                info!(
+                    "[head {}] dropped {straddled} supersession edge(s) whose \
+                     output a seal left below the anchor",
+                    self.vol_ulid
+                );
             }
             for (input, output, since) in &self.tick_superseded {
                 let edge = segment_head::Supersession {
@@ -2260,5 +2295,684 @@ mod tests {
         });
         assert!(orch.last_gc.elapsed() >= orch.gc_config.interval);
         assert!(orch.last_reap.elapsed() >= orch.gc_config.reaper_cadence());
+    }
+
+    /// Cut consistency oracle (`docs/design/durable-cut.md` *Testing*).
+    ///
+    /// A simulated guest writes an ordered history of 4 KiB blocks;
+    /// the simulation seals, repacks (with elision and arbitrary
+    /// output regrouping), drains with injected partial failures, runs
+    /// GC passes classified against the full write frontier, seals
+    /// snapshots, crashes the coordinator, damages HEAD, and fails
+    /// HEAD GETs/PUTs — driving the real `publish_head_delta` and its
+    /// scratch/barrier state throughout. After every remote mutation
+    /// the oracle materialises the image exactly as force-claim's
+    /// reader would (`read_status`, newest-seal fallback, `live_set`,
+    /// highest-ULID resolution) and asserts it is a state the write
+    /// history could have produced: some prefix of the acked writes,
+    /// with every visible write preceded by all writes acked before
+    /// it.
+    mod cut_oracle {
+        use super::*;
+        use elide_core::segment::{Codec, SegmentEntry, SegmentSigner};
+        use proptest::prelude::*;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Write {
+                lba: u8,
+            },
+            Seal,
+            Repack {
+                bits: u8,
+            },
+            Tick {
+                fail_after: Option<u8>,
+                /// `promote_wal` confirmation: `false` models the
+                /// volume process down or the IPC failing, so the tick
+                /// runs with no flush and the WAL keeps its writes.
+                flush_ok: bool,
+            },
+            GcPass,
+            Snapshot,
+            CrashCoordinator,
+            DamageHead {
+                delete: bool,
+            },
+            FailNextHeadPut,
+            FailNextSeedGet,
+            Reap,
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                8 => (0u8..6).prop_map(|lba| Op::Write { lba }),
+                3 => Just(Op::Seal),
+                2 => any::<u8>().prop_map(|bits| Op::Repack { bits }),
+                6 => (
+                    proptest::option::weighted(0.35, 0u8..3),
+                    proptest::bool::weighted(0.85),
+                )
+                    .prop_map(|(fail_after, flush_ok)| Op::Tick { fail_after, flush_ok }),
+                2 => Just(Op::GcPass),
+                1 => Just(Op::Snapshot),
+                1 => Just(Op::CrashCoordinator),
+                1 => proptest::bool::ANY.prop_map(|delete| Op::DamageHead { delete }),
+                1 => Just(Op::FailNextHeadPut),
+                1 => Just(Op::FailNextSeedGet),
+                1 => Just(Op::Reap),
+            ]
+        }
+
+        /// Delegates to an inner store; each armed flag fails exactly
+        /// one HEAD operation. Faults are owner-side only — the
+        /// oracle's reader materialises through the inner store, the
+        /// way a claimant on another host would.
+        #[derive(Debug)]
+        struct FaultStore {
+            inner: Arc<dyn ObjectStore>,
+            fail_head_put: AtomicBool,
+            fail_head_get: AtomicBool,
+        }
+
+        impl std::fmt::Display for FaultStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FaultStore")
+            }
+        }
+
+        fn is_head(location: &object_store::path::Path) -> bool {
+            location.as_ref().ends_with("/HEAD")
+        }
+
+        fn fault() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "FaultStore",
+                source: "injected fault".into(),
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for FaultStore {
+            async fn put_opts(
+                &self,
+                location: &object_store::path::Path,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                if is_head(location) && self.fail_head_put.swap(false, Ordering::SeqCst) {
+                    return Err(fault());
+                }
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &object_store::path::Path,
+                opts: object_store::PutMultipartOpts,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            async fn get_opts(
+                &self,
+                location: &object_store::path::Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if is_head(location) && self.fail_head_get.swap(false, Ordering::SeqCst) {
+                    return Err(fault());
+                }
+                self.inner.get_opts(location, options).await
+            }
+
+            async fn delete(
+                &self,
+                location: &object_store::path::Path,
+            ) -> object_store::Result<()> {
+                self.inner.delete(location).await
+            }
+
+            fn list(
+                &self,
+                prefix: Option<&object_store::path::Path>,
+            ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&object_store::path::Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy(
+                &self,
+                from: &object_store::path::Path,
+                to: &object_store::path::Path,
+            ) -> object_store::Result<()> {
+                self.inner.copy(from, to).await
+            }
+
+            async fn copy_if_not_exists(
+                &self,
+                from: &object_store::path::Path,
+                to: &object_store::path::Path,
+            ) -> object_store::Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+        }
+
+        /// One simulated segment: entries map `lba → version`, where
+        /// version is the 1-based index of the write in the history.
+        #[derive(Clone, Debug)]
+        struct Seg {
+            ulid: Ulid,
+            entries: BTreeMap<u8, usize>,
+            inputs: Vec<Ulid>,
+        }
+
+        struct World {
+            history: Vec<u8>,
+            wal: Vec<usize>,
+            pending: Vec<Seg>,
+            handoff: Vec<Seg>,
+            committed: Vec<Seg>,
+            /// Every segment ever uploaded: the resolution table the
+            /// oracle uses to turn a visible ULID set into an image.
+            catalog: BTreeMap<Ulid, BTreeMap<u8, usize>>,
+            mint: UlidMint,
+            faults: Arc<FaultStore>,
+            inner: Arc<dyn ObjectStore>,
+            orch: GcCycleOrchestrator,
+            fork_dir: std::path::PathBuf,
+            signer: Arc<dyn SegmentSigner>,
+            vk: ed25519_dalek::VerifyingKey,
+            _tmp: TempDir,
+        }
+
+        fn body_for(lba: u8, version: usize) -> Vec<u8> {
+            let mut body = vec![lba; 4096];
+            body[..8].copy_from_slice(&(version as u64).to_le_bytes());
+            body
+        }
+
+        impl World {
+            fn new() -> Self {
+                let tmp = TempDir::new().unwrap();
+                let by_id = tmp.path().join("by_id");
+                let fork_dir = by_id.join(vol_ulid().to_string());
+                std::fs::create_dir_all(&fork_dir).unwrap();
+                let key = elide_core::signing::generate_keypair(
+                    &fork_dir,
+                    elide_core::signing::VOLUME_KEY_FILE,
+                    elide_core::signing::VOLUME_PUB_FILE,
+                )
+                .unwrap();
+                let vk = key.verifying_key();
+                let (signer, _) = elide_core::signing::signer_from_bytes(&key.to_bytes()).unwrap();
+                let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let faults = Arc::new(FaultStore {
+                    inner: Arc::clone(&inner),
+                    fail_head_put: AtomicBool::new(false),
+                    fail_head_get: AtomicBool::new(false),
+                });
+                let orch = Self::build_orch(&fork_dir, &faults, tmp.path());
+                World {
+                    history: Vec::new(),
+                    wal: Vec::new(),
+                    pending: Vec::new(),
+                    handoff: Vec::new(),
+                    committed: Vec::new(),
+                    catalog: BTreeMap::new(),
+                    mint: UlidMint::new(Ulid::nil()),
+                    faults,
+                    inner,
+                    orch,
+                    fork_dir,
+                    signer,
+                    vk,
+                    _tmp: tmp,
+                }
+            }
+
+            fn build_orch(
+                fork_dir: &Path,
+                faults: &Arc<FaultStore>,
+                root: &Path,
+            ) -> GcCycleOrchestrator {
+                let store: Arc<dyn ObjectStore> = Arc::clone(faults) as Arc<dyn ObjectStore>;
+                let locks = crate::new_fork_sync_registry();
+                let stores: Arc<dyn crate::stores::ScopedStores> =
+                    Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
+                let identity =
+                    Arc::new(crate::identity::CoordinatorIdentity::load_or_generate(root).unwrap());
+                GcCycleOrchestrator::new(
+                    fork_dir.to_path_buf(),
+                    vol_ulid(),
+                    store,
+                    &stores,
+                    crate::config::GcConfig::default(),
+                    &locks,
+                    None,
+                    identity,
+                )
+            }
+
+            fn last_write(&self, lba: u8) -> Option<usize> {
+                self.history.iter().rposition(|l| *l == lba).map(|i| i + 1)
+            }
+
+            fn seal(&mut self) {
+                if self.wal.is_empty() {
+                    return;
+                }
+                let mut entries = BTreeMap::new();
+                for version in self.wal.drain(..) {
+                    entries.insert(self.history[version - 1], version);
+                }
+                self.pending.push(Seg {
+                    ulid: self.mint.next(),
+                    entries,
+                    inputs: Vec::new(),
+                });
+            }
+
+            fn repack(&mut self, bits: u8) {
+                if self.pending.is_empty() {
+                    return;
+                }
+                let mut best: BTreeMap<u8, usize> = BTreeMap::new();
+                for seg in &self.pending {
+                    for (lba, v) in &seg.entries {
+                        let e = best.entry(*lba).or_insert(*v);
+                        *e = (*e).max(*v);
+                    }
+                }
+                let mut groups: [BTreeMap<u8, usize>; 2] = Default::default();
+                for (i, (lba, v)) in best.into_iter().enumerate() {
+                    groups[usize::from((bits >> (i % 8)) & 1)].insert(lba, v);
+                }
+                self.pending.clear();
+                for entries in groups.into_iter().filter(|g| !g.is_empty()) {
+                    self.pending.push(Seg {
+                        ulid: self.mint.next(),
+                        entries,
+                        inputs: Vec::new(),
+                    });
+                }
+            }
+
+            /// Write the signed, extracted `index/<ulid>.idx` marker a
+            /// promote leaves behind.
+            fn plant_idx(&self, seg: &Seg) {
+                let index_dir = self.fork_dir.join("index");
+                std::fs::create_dir_all(&index_dir).unwrap();
+                let scratch = self.fork_dir.join(format!("{}.seg", seg.ulid));
+                let entries: Vec<_> = seg
+                    .entries
+                    .iter()
+                    .map(|(lba, v)| {
+                        let body = body_for(*lba, *v);
+                        SegmentEntry::new_data(
+                            blake3::hash(&body),
+                            u64::from(*lba),
+                            1,
+                            Codec::None,
+                            body,
+                        )
+                    })
+                    .collect();
+                elide_core::segment::write_segment_full(
+                    &scratch,
+                    entries,
+                    &[],
+                    &seg.inputs,
+                    self.signer.as_ref(),
+                )
+                .unwrap();
+                elide_core::segment::extract_idx(
+                    &scratch,
+                    &index_dir.join(format!("{}.idx", seg.ulid)),
+                )
+                .unwrap();
+                std::fs::remove_file(&scratch).unwrap();
+            }
+
+            async fn upload(&mut self, seg: Seg) {
+                let key = crate::upload::segment_key(vol_ulid(), seg.ulid);
+                self.inner
+                    .put(&key, bytes::Bytes::from_static(b"seg").into())
+                    .await
+                    .unwrap();
+                self.plant_idx(&seg);
+                self.catalog.insert(seg.ulid, seg.entries.clone());
+                self.orch.tick_added.push(seg.ulid);
+                self.committed.push(seg);
+            }
+
+            async fn tick(&mut self, fail_after: Option<u8>, flush_ok: bool) {
+                self.orch.tick_seq += 1;
+                if flush_ok {
+                    self.seal();
+                    self.orch.last_flush_seq = self.orch.tick_seq;
+                }
+
+                // Handoff cleanup: upload prior GC outputs, record
+                // their edges, retire the consumed inputs' idx — the
+                // promote-apply shape (`volume/mod.rs`
+                // `apply_promote_segment_result`).
+                let expired = Utc::now()
+                    - chrono::Duration::from_std(self.orch.gc_config.retention_window).unwrap()
+                    - chrono::Duration::seconds(60);
+                for out in std::mem::take(&mut self.handoff) {
+                    for input in &out.inputs {
+                        let _ = std::fs::remove_file(
+                            self.fork_dir.join("index").join(format!("{input}.idx")),
+                        );
+                        self.committed.retain(|s| s.ulid != *input);
+                        self.orch.tick_superseded.push((*input, out.ulid, expired));
+                    }
+                    if !out.entries.is_empty() {
+                        self.upload(out).await;
+                        self.check().await;
+                    }
+                }
+
+                let take = fail_after.map_or(self.pending.len(), |k| {
+                    usize::from(k).min(self.pending.len())
+                });
+                let drain_ok = take == self.pending.len();
+                let batch: Vec<Seg> = self.pending.drain(..take).collect();
+                for seg in batch {
+                    self.upload(seg).await;
+                    self.check().await;
+                }
+
+                self.orch.publish_head_delta(drain_ok).await;
+                self.check().await;
+            }
+
+            fn gc_pass(&mut self) {
+                if self.committed.is_empty() || !self.handoff.is_empty() {
+                    return;
+                }
+                let inputs: Vec<Seg> = self.committed.iter().take(2).cloned().collect();
+                let mut entries = BTreeMap::new();
+                for seg in &inputs {
+                    for (lba, v) in &seg.entries {
+                        // The pass classifies against everything the
+                        // volume knows, live WAL included: an entry is
+                        // live only if it is the newest write to its
+                        // block.
+                        if self.last_write(*lba) == Some(*v) {
+                            entries.insert(*lba, *v);
+                        }
+                    }
+                }
+                self.handoff.push(Seg {
+                    ulid: self.mint.next(),
+                    entries,
+                    inputs: inputs.iter().map(|s| s.ulid).collect(),
+                });
+                self.orch.last_plan_pass_seq = self.orch.tick_seq;
+            }
+
+            async fn snapshot(&mut self) {
+                self.seal();
+                let batch: Vec<Seg> = self.pending.drain(..).collect();
+                for seg in batch {
+                    self.upload(seg).await;
+                    self.check().await;
+                }
+                let snap = self.mint.next();
+                let ulids: Vec<Ulid> = self.committed.iter().map(|s| s.ulid).collect();
+                let manifest = elide_core::signing::build_snapshot_manifest_bytes(
+                    self.signer.as_ref(),
+                    &ulids,
+                );
+                let vd = crate::volume_data::VolumeData::new(Arc::clone(&self.inner), vol_ulid());
+                vd.snapshots()
+                    .put_manifest(snap, bytes::Bytes::from(manifest.clone()))
+                    .await
+                    .unwrap();
+                vd.snapshots().bump_latest_if_newer(snap).await.unwrap();
+                let snap_dir = self.fork_dir.join("snapshots");
+                std::fs::create_dir_all(&snap_dir).unwrap();
+                std::fs::write(snap_dir.join(format!("{snap}.manifest")), &manifest).unwrap();
+                let truncated = segment_head::SegmentHead::empty(Some(snap));
+                vd.head().put(&truncated).await.unwrap();
+                *self.orch.head_cache.lock().await = Some(truncated);
+                self.check().await;
+            }
+
+            async fn damage_head(&mut self, delete: bool) {
+                let key = segment_head::head_key(vol_ulid());
+                if delete {
+                    match self.inner.delete(&key).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                        Err(e) => panic!("deleting HEAD: {e}"),
+                    }
+                } else {
+                    self.inner
+                        .put(&key, bytes::Bytes::from_static(b"damaged").into())
+                        .await
+                        .unwrap();
+                }
+                // The owner's cache no longer reflects the object;
+                // model the next seed read hitting S3.
+                *self.orch.head_cache.lock().await = None;
+                self.check().await;
+            }
+
+            fn crash_coordinator(&mut self) {
+                self.orch = Self::build_orch(&self.fork_dir, &self.faults, self._tmp.path());
+            }
+
+            /// Materialise the remote image exactly as force-claim's
+            /// reader would (`force_claim.rs::re_own`): basis from
+            /// LATEST, HEAD via `read_status`, damage anchored at the
+            /// newest seal, frontier from the anchor manifest, then
+            /// `live_set` and highest-ULID resolution. Assert the
+            /// image is a prefix-consistent state of the write
+            /// history.
+            async fn check(&self) {
+                let vd = crate::volume_data::VolumeData::new(Arc::clone(&self.inner), vol_ulid());
+                let basis = vd.snapshots().read_latest().await.unwrap().map(|(u, _)| u);
+                let manifest_for = |snap: Ulid| async move {
+                    let vd =
+                        crate::volume_data::VolumeData::new(Arc::clone(&self.inner), vol_ulid());
+                    let m = vd.snapshots().get_manifest(snap, &self.vk).await.unwrap();
+                    m.segment_ulids.into_iter().collect::<BTreeSet<Ulid>>()
+                };
+                let basis_segments = match basis {
+                    Some(snap) => manifest_for(snap).await,
+                    None => BTreeSet::new(),
+                };
+                let (frontier, head) = match vd.head().read_status().await.unwrap() {
+                    Ok(h) => {
+                        let frontier = match h.anchor {
+                            Some(a) if basis.is_none_or(|b| a > b) => manifest_for(a).await,
+                            _ => basis_segments,
+                        };
+                        (frontier, h)
+                    }
+                    Err(_) => {
+                        let newest = vd.snapshots().newest_seal().await.unwrap();
+                        let frontier = match newest {
+                            Some(snap) => manifest_for(snap).await,
+                            None => BTreeSet::new(),
+                        };
+                        (frontier, segment_head::SegmentHead::empty(newest))
+                    }
+                };
+                let visible = segment_head::live_set(&frontier, &head);
+
+                let mut image: BTreeMap<u8, usize> = BTreeMap::new();
+                for ulid in &visible {
+                    let entries = self
+                        .catalog
+                        .get(ulid)
+                        .unwrap_or_else(|| panic!("visible segment {ulid} never uploaded"));
+                    for (lba, v) in entries {
+                        image.insert(*lba, *v);
+                    }
+                }
+
+                let legal = (0..=self.history.len()).rev().any(|t| {
+                    (0u8..8).all(|lba| {
+                        let want = self.history[..t]
+                            .iter()
+                            .rposition(|l| *l == lba)
+                            .map(|i| i + 1);
+                        image.get(&lba).copied() == want
+                    })
+                });
+                assert!(
+                    legal,
+                    "remote image is not a prefix of the write history\n\
+                     history: {:?}\nimage: {image:?}\nvisible: {visible:?}\nhead: {head:?}",
+                    self.history
+                );
+            }
+
+            async fn step(&mut self, op: &Op) {
+                match op {
+                    Op::Write { lba } => {
+                        self.history.push(*lba);
+                        self.wal.push(self.history.len());
+                    }
+                    Op::Seal => self.seal(),
+                    Op::Repack { bits } => self.repack(*bits),
+                    Op::Tick {
+                        fail_after,
+                        flush_ok,
+                    } => self.tick(*fail_after, *flush_ok).await,
+                    Op::GcPass => self.gc_pass(),
+                    Op::Snapshot => self.snapshot().await,
+                    Op::CrashCoordinator => self.crash_coordinator(),
+                    Op::DamageHead { delete } => self.damage_head(*delete).await,
+                    Op::FailNextHeadPut => {
+                        self.faults.fail_head_put.store(true, Ordering::SeqCst);
+                    }
+                    Op::FailNextSeedGet => {
+                        self.faults.fail_head_get.store(true, Ordering::SeqCst);
+                    }
+                    Op::Reap => {
+                        self.orch.last_reap = Instant::now()
+                            - self.orch.gc_config.reaper_cadence()
+                            - Duration::from_secs(1);
+                    }
+                }
+            }
+        }
+
+        async fn run_case(ops: Vec<Op>) {
+            let mut world = World::new();
+            for op in &ops {
+                world.step(op).await;
+            }
+            // Close out: a final complete tick, then one more so held
+            // supersession edges get their post-pass flush and publish.
+            world.tick(None, true).await;
+            world.tick(None, true).await;
+        }
+
+        /// The oracle's first find, materialised: a GC handoff
+        /// straddles a seal. The pass pre-mints its output ULID, the
+        /// snapshot seals with the input still in the manifest and an
+        /// anchor above the output, then handoff cleanup publishes the
+        /// supersession edge — which would remove the manifest-covered
+        /// input from the live set while the output stays permanently
+        /// invisible below the anchor. The publish must drop that edge
+        /// and leave the input to the manifest.
+        #[tokio::test]
+        async fn gc_handoff_straddling_a_seal_keeps_the_manifest_input_live() {
+            let mut world = World::new();
+            for op in [
+                Op::Write { lba: 0 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+                Op::GcPass,
+                Op::Snapshot,
+                Op::Write { lba: 1 },
+                Op::Write { lba: 1 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+            ] {
+                world.step(&op).await;
+            }
+            world.check().await;
+        }
+
+        /// The oracle's second find: HEAD damaged while a GC handoff
+        /// is in flight and the killer write still in the WAL. The
+        /// legitimacy gate must refuse the damaged-empty body (held
+        /// edges mean the idx listing undercounts the cut), and
+        /// regeneration must re-add the consumed inputs from the
+        /// outputs' signed tables — dropping either leaves the input's
+        /// claims out of the cut while its killer is uncommitted.
+        #[tokio::test]
+        async fn damaged_head_with_in_flight_handoff_keeps_consumed_inputs() {
+            let mut world = World::new();
+            for op in [
+                Op::Write { lba: 2 },
+                Op::Write { lba: 0 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                },
+                Op::DamageHead { delete: false },
+                Op::Write { lba: 2 },
+                Op::GcPass,
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: false,
+                },
+            ] {
+                world.step(&op).await;
+            }
+            let vd = crate::volume_data::VolumeData::new(Arc::clone(&world.inner), vol_ulid());
+            let head = vd.head().read().await.unwrap();
+            let ulids: Vec<Ulid> = world.catalog.keys().copied().collect();
+            let [input, output] = ulids[..] else {
+                panic!("expected exactly the input and the GC output uploaded")
+            };
+            assert!(
+                head.added.contains(&input),
+                "consumed input stays in the regenerated cut"
+            );
+            assert!(head.added.contains(&output));
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: std::env::var("PROPTEST_CASES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(64),
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn cut_consistency_oracle(ops in proptest::collection::vec(arb_op(), 1..35)) {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_case(ops));
+            }
+        }
     }
 }
