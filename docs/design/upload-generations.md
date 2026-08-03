@@ -133,12 +133,18 @@ through the normal GC path. The mortality curve prices this cost —
 it is the tail beyond the knee, and the knee is what the window
 harvests.
 
-**Open:** whether today's classifier already refuses WAL-only killers.
-`still_at_input` (`repack.rs`) tests the live map, which carries
-claims for unflushed writes; if those can mark a pending body dead,
-the flush-to-snapshot ordering inside the tick is what makes it safe
-today, and the segment-resident rule makes it explicit. To verify at
-the `register_entry` choke point during implementation.
+**Verified:** the classifier can never see a WAL-only killer.
+`prepare_repack` mints `u_flush` and flushes the WAL into `pending/`
+*before* snapshotting the lbamap (`repack.rs::prepare_repack`), so
+every claim the classifier sees is segment-resident and drains in the
+same batch, and writes racing in after prepare claim under a newer
+WAL the snapshot never contains. The segment-resident rule is
+therefore already structural; the flush-before-snapshot ordering is
+the load-bearing line, pinned by
+`repack_elision_always_ships_the_killer` (volume_reproducers.rs),
+which fails with zeros at the overwritten LBA if the ordering
+regresses. The closing consolidation inherits the guarantee for free:
+its prepare performs the closing flush.
 
 ## Relation to snapshots
 

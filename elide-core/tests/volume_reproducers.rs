@@ -982,3 +982,68 @@ fn repack_pipeline_crash_states_recover() {
     common::check_tier_purity(fork_dir).expect("tier purity violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 }
+
+/// Repack may elide a body only because `prepare_repack` flushed its
+/// killer first.
+///
+/// A guest write claims the lbamap immediately under the WAL ULID;
+/// promote later bumps the claimant to the flush segment
+/// (`apply_promoted_entries`). The classifier tests `still_at_input`,
+/// so a claim that moved anywhere marks the flushed body dead — safe
+/// only if the killer is durable alongside the elision. What makes it
+/// safe is structural: `prepare_repack` mints `u_flush` and flushes
+/// the WAL into `pending/` *before* snapshotting the lbamap, so every
+/// killer the classifier can see is segment-resident and drains in
+/// the same batch, and writes racing in after prepare claim under a
+/// newer WAL the snapshot never contains
+/// (`docs/design/upload-generations.md` *Elision stays inside the
+/// generation*).
+///
+/// This test pins that ordering. The drain and cut are stood in for
+/// by promoting every pending segment; host loss is stood in for by
+/// deleting `wal/` before reopen. The recovered image must show the
+/// killer at the overwritten LBA — flush-before-snapshot regressing
+/// (classifying against a WAL-only killer) leaves neither victim nor
+/// killer committed, and the read comes back zeros.
+#[test]
+fn repack_elision_always_ships_the_killer() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Two blocks flushed into one pending segment.
+    vol.write(10, &common::incompressible_block(1)).unwrap();
+    vol.write(20, &common::incompressible_block(2)).unwrap();
+    vol.flush_wal().unwrap();
+
+    // WAL-only overwrite of lba 10: the killer at classification time.
+    vol.write(10, &common::incompressible_block(3)).unwrap();
+
+    // Repack folds the flushed segment, eliding block 1; prepare's own
+    // WAL flush puts the killer into pending first. Promote everything
+    // — the local form of drain + cut publish.
+    vol.repack().unwrap();
+    for ulid in common::pending_ulids(fork_dir) {
+        vol.promote_segment(ulid).unwrap();
+    }
+
+    // Host loss at the cut: the committed set is all that survives.
+    drop(vol);
+    std::fs::remove_dir_all(fork_dir.join("wal")).unwrap();
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    assert_eq!(
+        vol.read(20, 1).unwrap().as_slice(),
+        common::incompressible_block(2).as_slice(),
+        "unkilled block lost",
+    );
+    assert_eq!(
+        vol.read(10, 1).unwrap().as_slice(),
+        common::incompressible_block(3).as_slice(),
+        "killer missing from the committed set: repack elided a body \
+         against a killer that was not segment-resident",
+    );
+}
