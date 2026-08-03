@@ -982,11 +982,12 @@ proptest! {
                     // cache/+index/ — bypassing pending/. If pending isn't drained
                     // first, a prior `Flush` could leave a u_flush_old (< u_gc)
                     // in pending, and the resulting state has
-                    // max(committed)=u_gc > min(pending)=u_flush_old — violating
-                    // the structural pending-above-committed invariant. Production
-                    // never hits this because the demand-fetch path uses
-                    // S3-minted (lower) ULIDs, not freshly-minted ones; this is a
-                    // test-helper artifact.
+                    // max(committed)=u_gc > min(pending data)=u_flush_old —
+                    // violating the structural invariant that pending *data*
+                    // sits above the promote tier. Production never hits this
+                    // because the demand-fetch path uses S3-minted (lower)
+                    // ULIDs, not freshly-minted ones; this is a test-helper
+                    // artifact.
                     common::drain_with_repack(&mut vol);
 
                     // gc_checkpoint flushes the WAL (may create a pending segment) then

@@ -776,6 +776,7 @@ fn drain_failure_skips_gc_and_data_survives() {
             &fail_store,
             &fail_store,
             &Default::default(),
+            upload::DrainMode::Full,
         ))
         .expect("drain_pending itself should not error");
     assert!(
@@ -813,6 +814,7 @@ fn drain_failure_skips_gc_and_data_survives() {
             &good_store,
             &good_store,
             &Default::default(),
+            upload::DrainMode::Full,
         ))
         .expect("drain should succeed with good store");
     assert_eq!(

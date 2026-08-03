@@ -411,7 +411,14 @@ impl GcCycleOrchestrator {
             gc_buckets = self.prepare_gc_pass().await;
         }
 
-        let drain_ok = self.run_drain().await;
+        // One cut-due decision per tick, taken before the drain and fed
+        // to both the drain mode and the publish gate. The drain and the
+        // publish must agree within a tick: a cut may only publish over
+        // a `Full` drain, because a `DeferJournal` drain leaves journal
+        // segments unconfirmed and a cut derived at that instant would
+        // name data past them.
+        let cut_due = self.cut_due();
+        let drain_ok = self.run_drain(cut_due).await;
 
         if gc_due && drain_ok {
             if let Some(bucket_ulids) = gc_buckets {
@@ -427,9 +434,16 @@ impl GcCycleOrchestrator {
         // HEAD crash ordering (design *Writers and crash ordering*). An
         // idle tick (no drain, no GC outputs) is a no-op; only ticks
         // that actually changed S3 segment state pay the HEAD PUT.
-        self.publish_head_delta(drain_ok).await;
+        self.publish_head_delta(drain_ok, cut_due).await;
 
         TickOutcome::Continue
+    }
+
+    /// Whether this tick closes a cut: `cut_interval` has elapsed since
+    /// the last published cut. Sampled once per tick (`run_tick`) so the
+    /// drain mode and the publish gate see the same answer.
+    fn cut_due(&self) -> bool {
+        self.last_cut.elapsed() >= self.gc_config.cut_interval
     }
 
     /// Volume-side compactions (best-effort; skipped silently if the control
@@ -485,10 +499,22 @@ impl GcCycleOrchestrator {
     /// the GC candidate set, while their LBAs would be invisible to
     /// `collect_stats`; it holds the cut because a partial batch must
     /// never become visible (`docs/design/durable-cut.md`).
-    async fn run_drain(&mut self) -> bool {
+    ///
+    /// Between cuts the drain defers journal: pure-journal pending
+    /// segments stay local, repack keeps consolidating them, and the
+    /// cut tick's `Full` drain uploads the one consolidated segment.
+    /// Deferred segments are not failures — the tick still counts as a
+    /// complete drain for GC, and the cut gate (`cut_due`) is what
+    /// holds publish until a `Full` drain has run.
+    async fn run_drain(&mut self, cut_due: bool) -> bool {
         if !self.fork_dir.join("pending").exists() {
             return true;
         }
+        let mode = if cut_due {
+            upload::DrainMode::Full
+        } else {
+            upload::DrainMode::DeferJournal
+        };
         let vol_ulid = self.vol_ulid;
         match upload::drain_pending(
             &self.fork_dir,
@@ -496,15 +522,17 @@ impl GcCycleOrchestrator {
             &self.store,
             &self.meta_store,
             &self.head_cache,
+            mode,
         )
         .await
         {
             Ok(r) => {
                 if r.seen > 0 {
                     info!(
-                        "[drain {vol_ulid}] pending={} uploaded={} upload_failed={} promote_failed={}",
+                        "[drain {vol_ulid}] pending={} uploaded={} deferred={} upload_failed={} promote_failed={}",
                         r.seen,
                         r.uploaded_ulids.len(),
+                        r.deferred,
                         r.upload_failed,
                         r.promote_failed,
                     );
@@ -625,7 +653,7 @@ impl GcCycleOrchestrator {
         confirmed.iter().all(|u| scratch.contains(u))
     }
 
-    async fn publish_head_delta(&mut self, drain_ok: bool) {
+    async fn publish_head_delta(&mut self, drain_ok: bool, cut_due: bool) {
         let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
         let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
         if !reap_due && !has_scratch {
@@ -635,8 +663,11 @@ impl GcCycleOrchestrator {
         // the loss-window work*): a cut publishes on `cut_interval`,
         // not per tick. Between cuts the scratch and the reap wait,
         // and drained segments stay durable but invisible until the
-        // next cut names them.
-        if self.last_cut.elapsed() < self.gc_config.cut_interval {
+        // next cut names them. `cut_due` is the tick's single sample of
+        // that clock — the same one that selected the drain mode, so a
+        // publish always sits over a `Full` drain with the journal
+        // confirmed.
+        if !cut_due {
             return;
         }
         if !drain_ok {
@@ -1263,7 +1294,7 @@ mod tests {
     async fn idle_tick_writes_nothing() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (mut orch, _tmp) = orchestrator(store.clone());
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
         // Empty scratch ⇒ no PUT ⇒ no HEAD object in the store.
         let res = store.get(&segment_head::head_key(vol_ulid())).await;
         assert!(
@@ -1285,7 +1316,7 @@ mod tests {
         orch.tick_added.push(a1);
         orch.tick_added.push(a2);
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
@@ -1313,7 +1344,7 @@ mod tests {
         orch.tick_superseded.push((input_a, output, since));
         orch.tick_superseded.push((input_b, output, since));
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&output));
@@ -1381,7 +1412,7 @@ mod tests {
         orch.last_flush_seq = 1;
         orch.tick_added.push(fresh);
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&prior), "lost prior tick's segment");
@@ -1404,7 +1435,7 @@ mod tests {
         });
         orch.tick_added.push(a1);
 
-        orch.publish_head_delta(false).await;
+        orch.publish_head_delta(false, orch.cut_due()).await;
 
         let res = store.get(&segment_head::head_key(vol_ulid())).await;
         assert!(
@@ -1415,7 +1446,7 @@ mod tests {
 
         plant_confirmed_segment(orch.fork_dir(), a2, &[]);
         orch.tick_added.push(a2);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
@@ -1444,7 +1475,7 @@ mod tests {
             plant_confirmed_segment(fork, fresh, &[]);
         });
         orch.tick_added.push(fresh);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(
@@ -1472,7 +1503,7 @@ mod tests {
         orch.tick_added.push(output);
         orch.tick_superseded.push((input, output, since));
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&output), "Added commits with the cut");
@@ -1486,7 +1517,7 @@ mod tests {
         );
 
         orch.last_flush_seq = 1;
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert_eq!(head.superseded[&input].output, output);
@@ -1516,7 +1547,7 @@ mod tests {
         orch.last_flush_seq = 1;
         orch.tick_added.push(output);
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert_eq!(
@@ -1563,7 +1594,7 @@ mod tests {
         let output = m.next();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta(false).await;
+        orch.publish_head_delta(false, orch.cut_due()).await;
 
         assert!(store.head(&key).await.is_ok(), "no DELETE on a held tick");
         let head = read_head_via(&store).await;
@@ -1591,7 +1622,7 @@ mod tests {
             plant_confirmed_segment(fork, new, &[]);
         });
         orch.tick_added.push(new);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&prior), "prior entry retained");
@@ -1651,7 +1682,7 @@ mod tests {
         );
         put_head_via(&store, &head).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         // Expired input: S3 object gone, HEAD edge replaced with
         // Tombstoned. Fresh input: untouched on both sides.
@@ -1722,7 +1753,7 @@ mod tests {
         }
         put_head_via(&store, &head).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         assert!(
             store.head(&local_key).await.is_ok(),
@@ -1769,7 +1800,7 @@ mod tests {
             .await
             .unwrap();
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let got = store.get(&key).await.unwrap().bytes().await.unwrap();
         assert_eq!(
@@ -1795,7 +1826,7 @@ mod tests {
         });
 
         orch.tick_added.push(a1);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let mut planted = segment_head::SegmentHead::empty(None);
         planted.added.insert(foreign);
@@ -1803,7 +1834,7 @@ mod tests {
 
         plant_confirmed_segment(orch.fork_dir(), a2, &[]);
         orch.tick_added.push(a2);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
@@ -1830,12 +1861,12 @@ mod tests {
         });
 
         orch.tick_added.push(a1);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let key = seed_expired_input(&store, &mut orch, input, output).await;
         let planted = read_head_via(&store).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         assert!(
             store.head(&key).await.is_ok(),
@@ -1956,7 +1987,7 @@ mod tests {
 
         orch.tick_added.push(a1);
         orch.tick_superseded.push((input, a1, Utc::now()));
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
         assert!(
             !orch.tick_superseded.is_empty(),
             "a failed PUT must keep the scratch for the retry"
@@ -1971,7 +2002,7 @@ mod tests {
             .unwrap();
 
         orch.tick_added.push(a2);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&inner).await;
         assert!(
@@ -2034,7 +2065,7 @@ mod tests {
             .unwrap();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         assert!(
             store.head(&key).await.is_ok(),
@@ -2062,7 +2093,7 @@ mod tests {
             .unwrap();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         assert!(
             matches!(
@@ -2086,7 +2117,7 @@ mod tests {
         let output = m.next();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         assert!(store.head(&key).await.is_ok());
         let head = read_head_via(&store).await;
@@ -2117,7 +2148,7 @@ mod tests {
         orch.tick_added.push(output);
         orch.tick_superseded.push((input, output, since));
 
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&drained));
@@ -2340,7 +2371,7 @@ mod tests {
         orch.gc_config.cut_interval = Duration::from_secs(3600);
         orch.last_cut = std::time::Instant::now() - orch.gc_config.cut_interval;
         orch.tick_added.push(a1);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
         assert!(
             read_head_via(&store).await.added.contains(&a1),
             "first active publish cuts immediately (backdated clock)"
@@ -2350,7 +2381,7 @@ mod tests {
         orch.tick_added.push(a2);
         orch.last_reap =
             std::time::Instant::now() - orch.gc_config.reaper_cadence() - Duration::from_secs(1);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
         let head = read_head_via(&store).await;
         assert!(
             !head.added.contains(&a2),
@@ -2363,7 +2394,7 @@ mod tests {
 
         orch.last_cut =
             std::time::Instant::now() - orch.gc_config.cut_interval - Duration::from_secs(1);
-        orch.publish_head_delta(true).await;
+        orch.publish_head_delta(true, orch.cut_due()).await;
         assert!(
             read_head_via(&store).await.added.contains(&a2),
             "elapsed window releases the cut"
@@ -2779,7 +2810,9 @@ mod tests {
                     self.check().await;
                 }
 
-                self.orch.publish_head_delta(drain_ok).await;
+                self.orch
+                    .publish_head_delta(drain_ok, self.orch.cut_due())
+                    .await;
                 self.check().await;
             }
 

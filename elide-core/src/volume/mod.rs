@@ -2016,15 +2016,21 @@ impl Volume {
     #[inline]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
-    /// Stress-only invariant: every pending ULID must be greater than every
-    /// promote-tier (`index/`) ULID on disk — the structural form of the
-    /// production drain's discipline (`coordinator/upload.rs`), which uploads
-    /// and promotes pending segments in ULID-ascending order, halting at the
-    /// first failure. The lbamap itself admits claims by claimant ULID
-    /// (`register_entry_if_newer`), so rebuild winners are independent of
-    /// tier; this assert is a canary for the drain ordering alone, firing
-    /// structurally with a clearer message than the lbamap drift a broken
-    /// drain would eventually cause.
+    /// Stress-only invariant: every *data* pending ULID must be greater
+    /// than every promote-tier (`index/`) ULID on disk — the structural
+    /// form of the production drain's discipline
+    /// (`coordinator/upload.rs`), which uploads and promotes in
+    /// ULID-ascending order, halting at the first failure, and defers
+    /// pure-journal segments between cuts. A deferred journal segment
+    /// therefore sits below committed data by design; for the journal
+    /// tier the discipline is instead that journal commits ascending
+    /// among themselves, so every *committed journal* ULID must be
+    /// below every pending journal ULID. The lbamap admits claims by
+    /// claimant ULID (`register_entry_if_newer`), so rebuild winners
+    /// are independent of tier either way; this assert is a canary for
+    /// the drain ordering alone, firing structurally with a clearer
+    /// message than the lbamap drift a broken drain would eventually
+    /// cause.
     ///
     /// GC outputs are outside this ordering: their ULID is minted at apply
     /// time and may legitimately exceed a write that was already pending when
@@ -2042,13 +2048,38 @@ impl Volume {
                 return;
             }
         };
-        let Some(&pending_min) = pending_ulids.first() else {
+        if pending_ulids.is_empty() {
             return; // No pending — invariant vacuously holds.
+        }
+
+        // Partition pending by tier from each file's own index section.
+        // A file whose index cannot be read counts as data, the stricter
+        // side. The listing is ascending, so the first of each tier is
+        // its min.
+        let is_journal = |path: &std::path::Path| -> bool {
+            segment::read_segment_index(path)
+                .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
+                .unwrap_or(false)
         };
+        let mut pending_data_min: Option<Ulid> = None;
+        let mut pending_journal_min: Option<Ulid> = None;
+        for u in &pending_ulids {
+            let slot = if is_journal(&pending_dir.join(u.to_string())) {
+                &mut pending_journal_min
+            } else {
+                &mut pending_data_min
+            };
+            if slot.is_none() {
+                *slot = Some(*u);
+            }
+            if pending_data_min.is_some() && pending_journal_min.is_some() {
+                break;
+            }
+        }
 
         // Only the promote tier (`index/`) is scanned; GC outputs are excluded
         // for the reason given in the doc comment.
-        let mut committed_max: Option<Ulid> = None;
+        let mut committed: Vec<(Ulid, std::path::PathBuf)> = Vec::new();
         if let Ok(idx_paths) = segment::collect_idx_files(&self.base_dir.join("index")) {
             for p in idx_paths {
                 let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
@@ -2057,24 +2088,43 @@ impl Volume {
                 let Ok(u) = Ulid::from_string(stem) else {
                     continue;
                 };
-                committed_max = Some(committed_max.map_or(u, |m| m.max(u)));
+                committed.push((u, p));
             }
         }
+        let committed_max = committed.iter().map(|(u, _)| *u).max();
 
         // Strict `>`: same-ULID-in-both-tiers (the mid-promote crash recovery
         // state where `pending/<u>` and `index/<u>.idx` coexist briefly) is
-        // legitimate and the entries are byte-identical, so the walk-order
-        // winner is unambiguous. The bug shape is *different* ULIDs where
-        // pending's min sorts below a promote-tier peer's higher ULID.
-        if let Some(c_max) = committed_max
-            && c_max > pending_min
+        // legitimate and the entries are byte-identical.
+        if let (Some(c_max), Some(p_min)) = (committed_max, pending_data_min)
+            && c_max > p_min
         {
             panic!(
                 "pending-above-committed invariant violation after [{caller}]: \
-                 max(promote-tier)={c_max} > min(pending)={pending_min} \
-                 (a lower-ULID pending peer is alongside a higher-ULID promote-tier \
-                 segment; the next promote will flip the lbamap walk-order winner)"
+                 max(promote-tier)={c_max} > min(pending data)={p_min} \
+                 (a lower-ULID data segment is pending alongside a higher-ULID \
+                 promote-tier segment; the drain promoted out of ULID order)"
             );
+        }
+
+        // Journal-tier ordering: a committed journal segment above a
+        // pending one means journal uploaded out of ULID order — the
+        // shape that would install a stale ring claim on rebuild. Only
+        // committed ULIDs above the pending journal min can violate, so
+        // only those pay an index read.
+        if let Some(j_min) = pending_journal_min {
+            for (u, path) in committed.iter().filter(|(u, _)| *u > j_min) {
+                let committed_journal = segment::read_segment_index(path)
+                    .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
+                    .unwrap_or(false);
+                if committed_journal {
+                    panic!(
+                        "journal drain-order invariant violation after [{caller}]: \
+                         committed journal segment {u} sorts above pending journal \
+                         min {j_min} (journal uploaded out of ULID order)"
+                    );
+                }
+            }
         }
     }
 

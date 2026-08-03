@@ -761,12 +761,15 @@ pub(crate) async fn drain_volume_for_seal(
     // daemon fails the verb before any credential beyond `volume-rw`
     // is requested.
     let meta_store = stores.writer();
+    // Seals drain everything: journal deferral is a between-cuts tick
+    // policy, and every seal is a synchronous cut boundary.
     let drained_user_snapshot = match elide_coordinator::upload::drain_pending(
         fork_dir,
         vol_ulid,
         store,
         &meta_store,
         head_cache,
+        elide_coordinator::upload::DrainMode::Full,
     )
     .await
     {

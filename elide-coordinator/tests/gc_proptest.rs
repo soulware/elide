@@ -30,9 +30,8 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Mirror the production drain: repack, then promote in ULID-ascending
-/// order. Preserves `max(committed) < min(pending)` throughout —
-/// see `coordinator/src/upload.rs::drain_pending`.
+/// Mirror the production drain's `Full` mode: repack, then promote in
+/// ULID-ascending order — see `coordinator/src/upload.rs::drain_pending`.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let pending_dir = dir.join("pending");
     let cache_dir = dir.join("cache");
