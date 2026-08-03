@@ -490,7 +490,10 @@ impl ForceClaimOrchestrator {
     /// ephemeral, so segments they cover are copied, not referenced
     /// through lineage. Anything the displaced owner publishes after
     /// the cut is a post-displacement write and is excluded, the same
-    /// policy as its undrained WAL. Writes the new fork's HEAD
+    /// policy as its undrained WAL. An unreadable HEAD — bucket-level
+    /// damage — anchors the claim at the newest seal manifest of
+    /// either kind instead, with loss bounded by the seal cadence.
+    /// Writes the new fork's HEAD
     /// *first* (the durable intent a resumer reads), then copies each
     /// segment: GET, verify under the source's key, re-sign the
     /// header with the new fork's key, PUT under the new prefix with
@@ -543,12 +546,41 @@ impl ForceClaimOrchestrator {
         self.basis = Some(basis);
 
         // The cut: one post-fence read of the dead fork's HEAD
-        // defines the claim set.
-        let source_head = source_vd
+        // defines the claim set. An unreadable HEAD — missing or
+        // unparseable — is bucket-level damage (the whole-object PUT
+        // survives every crash and host loss), so the claim anchors
+        // at the newest seal manifest instead: a signed, exhaustive,
+        // reaper-stable cut. Loss is bounded by the seal cadence
+        // (`docs/design/durable-cut.md` *Recovery is two-tier*).
+        let head_status = source_vd
             .head()
-            .read()
+            .read_status()
             .await
             .map_err(|e| IpcError::store(format!("reading HEAD for {source}: {e}")))?;
+        let (source_head, head_lost) = match head_status {
+            Ok(h) => (h, false),
+            Err(damage) => {
+                let newest = source_vd
+                    .snapshots()
+                    .newest_seal()
+                    .await
+                    .map_err(|e| IpcError::store(format!("listing seals for {source}: {e}")))?;
+                match newest {
+                    Some(seal) => warn!(
+                        "[force-claim {}] HEAD for {source} is {damage}; anchoring \
+                         the claim at the newest seal {seal} — committed writes \
+                         after that seal are lost, bounded by the seal cadence",
+                        self.volume
+                    ),
+                    None => warn!(
+                        "[force-claim {}] HEAD for {source} is {damage} and no \
+                         seal manifest exists; claiming the empty state",
+                        self.volume
+                    ),
+                }
+                (SegmentHead::empty(newest), true)
+            }
+        };
 
         // Frontier: the newest seal of either kind. A clean `stop`
         // truncates HEAD to empty anchored at its stop-snapshot;
@@ -597,8 +629,20 @@ impl ForceClaimOrchestrator {
         }
 
         // Advisory liveness check: a dead owner's HEAD cannot move.
-        match source_vd.head().read().await {
-            Ok(h) if h != source_head => {
+        // When the claim anchored at a seal because HEAD was gone, a
+        // HEAD that now reads back is the same tripwire — an alive
+        // owner regenerates HEAD from its local state.
+        match source_vd.head().read_status().await {
+            Ok(Ok(h)) if head_lost => {
+                error!(
+                    "[force-claim {}] HEAD of {source} appeared during the \
+                     claim ({} added entries) — the displaced owner appears \
+                     to be alive; its post-displacement writes are lost",
+                    self.volume,
+                    h.added.len()
+                );
+            }
+            Ok(Ok(h)) if h != source_head => {
                 error!(
                     "[force-claim {}] HEAD of {source} changed during the \
                      claim — the displaced owner appears to be alive; its \
@@ -606,7 +650,16 @@ impl ForceClaimOrchestrator {
                     self.volume
                 );
             }
-            Ok(_) => {}
+            Ok(Ok(_)) => {}
+            Ok(Err(damage)) => {
+                if !head_lost {
+                    warn!(
+                        "[force-claim {}] HEAD for {source} became {damage} \
+                         during the claim; skipping liveness check",
+                        self.volume
+                    );
+                }
+            }
             Err(e) => {
                 warn!(
                     "[force-claim {}] re-reading HEAD for {source}: {e}; \
@@ -1587,6 +1640,112 @@ mod tests {
         )
         .unwrap();
         assert!(lineage.parent().is_none());
+    }
+
+    /// HEAD object gone entirely — bucket-level damage. The claim
+    /// anchors at the newest seal manifest discovered by listing
+    /// `snapshots/` — here a stop seal with no `LATEST` pointer — and
+    /// recovers exactly the sealed set
+    /// (`docs/design/durable-cut.md` *Recovery is two-tier*).
+    #[tokio::test]
+    async fn missing_head_claim_anchors_at_newest_seal() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let s2 = mint.next();
+        let stop_snap = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+        for (seg, fill) in [(s1, 1u8), (s2, 2)] {
+            put_segment(
+                &store,
+                dead.vol,
+                seg,
+                build_segment_bytes(dead.signer.as_ref(), fill),
+            )
+            .await;
+        }
+        let manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1, s2]);
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
+        vd.snapshots()
+            .put_stop_manifest(stop_snap, bytes::Bytes::from(manifest))
+            .await
+            .unwrap();
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        assert_reowned(&store, data_dir.path(), fork, s1).await;
+        assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s1);
+        assert_materialised(data_dir.path(), fork, s2);
+    }
+
+    /// HEAD present but unparseable — the same damage class as
+    /// missing. The newest seal of either kind wins: a stop seal
+    /// above the user basis, so only the delta beyond the basis is
+    /// copied and the basis stays a pin.
+    #[tokio::test]
+    async fn corrupt_head_claim_anchors_at_newest_seal_of_either_kind() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut mint = UlidMint::new(Ulid::nil());
+        let s1 = mint.next();
+        let basis = mint.next();
+        let s2 = mint.next();
+        let stop_snap = mint.next();
+        let dead = make_dead_volume(&store, mint.next()).await;
+        for (seg, fill) in [(s1, 1u8), (s2, 2)] {
+            put_segment(
+                &store,
+                dead.vol,
+                seg,
+                build_segment_bytes(dead.signer.as_ref(), fill),
+            )
+            .await;
+        }
+        let vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), dead.vol);
+        let user_manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1]);
+        vd.snapshots()
+            .put_manifest(basis, bytes::Bytes::from(user_manifest))
+            .await
+            .unwrap();
+        vd.snapshots().bump_latest_if_newer(basis).await.unwrap();
+        let stop_manifest =
+            elide_core::signing::build_snapshot_manifest_bytes(dead.signer.as_ref(), &[s1, s2]);
+        vd.snapshots()
+            .put_stop_manifest(stop_snap, bytes::Bytes::from(stop_manifest))
+            .await
+            .unwrap();
+        let head_key = elide_coordinator::segment_head::head_key(dead.vol);
+        store
+            .put(&head_key, PutPayload::from_static(b"not a head"))
+            .await
+            .unwrap();
+
+        let mut rec = NameRecord::live_minimal(dead.vol, 1 << 30);
+        rec.coordinator_id = Some(dead_owner_id());
+        rec.latest_snapshot = Some(basis);
+        elide_coordinator::name_store::create_name_record(&store, "vol", &rec)
+            .await
+            .unwrap();
+
+        let (ctx, data_dir) = fixture(Arc::clone(&store));
+        let fork = run_force_claim(&ctx, &store).await;
+
+        assert_reowned(&store, data_dir.path(), fork, s2).await;
+        assert_materialised(data_dir.path(), fork, s2);
+        let fork_vd = elide_coordinator::volume_data::VolumeData::new(Arc::clone(&store), fork);
+        assert!(
+            fork_vd.segments().get_bytes(s1).await.is_err(),
+            "basis-covered segment is served through the pin, not copied"
+        );
     }
 
     /// User snapshot at `basis` covering s1, then further writes and a
