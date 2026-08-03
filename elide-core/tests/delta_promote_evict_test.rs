@@ -62,7 +62,7 @@ fn setup_delta_volume() -> (
     let vol_dir = tmp.path().join("vol");
     fs::create_dir_all(&vol_dir).unwrap();
     common::write_test_keypair(&vol_dir);
-    fs::create_dir_all(vol_dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
     fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
     let signer = signing::load_signer(&vol_dir, signing::VOLUME_KEY_FILE).unwrap();
 
@@ -83,7 +83,8 @@ fn setup_delta_volume() -> (
 
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_ulid = mint.next();
-    let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
+    let parent_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -94,7 +95,7 @@ fn setup_delta_volume() -> (
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     let delta_ulid = mint.next();
-    let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
+    let delta_path = elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -221,7 +222,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     let vol_dir = tmp.path().join("vol");
     fs::create_dir_all(&vol_dir).unwrap();
     common::write_test_keypair(&vol_dir);
-    fs::create_dir_all(vol_dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
     fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
     let signer: Arc<dyn SegmentSigner> =
         signing::load_signer(&vol_dir, signing::VOLUME_KEY_FILE).unwrap();
@@ -238,7 +239,8 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
 
     let mut mint = UlidMint::new(Ulid::nil());
     let parent_ulid = mint.next();
-    let parent_path = vol_dir.join(format!("pending/{parent_ulid}"));
+    let parent_path =
+        elide_core::segment::pending_open_dir(&vol_dir).join(format!("{parent_ulid}"));
     let parent_entries = vec![SegmentEntry::new_data(
         parent_hash,
         0,
@@ -249,7 +251,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     write_segment(&parent_path, parent_entries, signer.as_ref()).unwrap();
 
     let delta_ulid = mint.next();
-    let delta_path = vol_dir.join(format!("pending/{delta_ulid}"));
+    let delta_path = elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_ulid}"));
     let delta_option = DeltaOption {
         source_hash: parent_hash,
         delta_offset: 0,
@@ -294,7 +296,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     // to the fixture parent/delta and the reclaim output. The reclaim
     // output is always the highest-ULID segment.
     let reclaim_ulid = {
-        let mut hits = fs::read_dir(vol_dir.join("pending"))
+        let mut hits = fs::read_dir(elide_core::segment::pending_open_dir(&vol_dir))
             .unwrap()
             .filter_map(|e| e.ok())
             .filter_map(|e| {
@@ -351,7 +353,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     // the `volume-invariants` consistency check. Promoting in ULID order
     // keeps the just-promoted ULID below every remaining pending ULID,
     // so no overlapping pending peer can take over.
-    let pending_dir = vol_dir.join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(&vol_dir);
     let pending_ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
     for u in pending_ulids {
         vol.promote_segment(u).unwrap();

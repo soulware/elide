@@ -264,7 +264,7 @@ pub fn rewrite_pending_with_deltas(
 
     // Rewrite every pending segment that contains at least one entry
     // matching the conversion map.
-    let pending_dir = vol_dir.join("pending");
+    let pending_dir = segment::pending_open_dir(vol_dir);
     let mut stats = DeltaStats::default();
     let mut entries_iter = fs::read_dir(&pending_dir)?;
     while let Some(entry) = entries_iter.next().transpose()? {
@@ -1034,8 +1034,12 @@ mod source_verify_tests {
     /// resolves it as a full-layout file with the body at offset 0.
     fn dir_with_body(seg: Ulid, bytes: &[u8]) -> tempfile::TempDir {
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        fs::create_dir_all(tmp.path().join("pending")).expect("mkdir");
-        fs::write(tmp.path().join("pending").join(seg.to_string()), bytes).expect("write");
+        fs::create_dir_all(crate::segment::pending_open_dir(tmp.path())).expect("mkdir");
+        fs::write(
+            crate::segment::pending_open_dir(tmp.path()).join(seg.to_string()),
+            bytes,
+        )
+        .expect("write");
         tmp
     }
 

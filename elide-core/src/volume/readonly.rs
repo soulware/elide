@@ -173,7 +173,7 @@ mod tests {
         let vol_dir = temp_dir();
         let fork_dir = vol_dir.join("base");
         // Create the directory structure without a WAL (simulating a readonly base).
-        fs::create_dir_all(fork_dir.join("pending")).unwrap();
+        fs::create_dir_all(crate::segment::pending_open_dir(&fork_dir)).unwrap();
 
         let rv = ReadonlyVolume::open(&fork_dir, &fork_dir).unwrap();
         assert_eq!(rv.read(0, 1).unwrap(), vec![0u8; 4096]);

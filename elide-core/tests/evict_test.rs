@@ -256,7 +256,7 @@ fn evict_reopen_demand_fetch() {
         vol.flush_wal().unwrap();
 
         // Copy pending segments to the store before drain deletes them.
-        let pending_dir = fork_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
         for entry in fs::read_dir(&pending_dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name();
@@ -323,7 +323,7 @@ fn evict_reopen_demand_fetch_via_actor() {
         handle.promote_wal().unwrap();
 
         // Copy pending segments to store before drain deletes them.
-        let pending_dir = fork_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
         for entry in fs::read_dir(&pending_dir).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name();
@@ -392,7 +392,7 @@ fn evict_live_volume_reads_via_demand_fetch() {
     vol.flush_wal().unwrap();
 
     // Copy pending segments to the store before promote deletes them.
-    let pending_dir = fork_dir.join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
     for entry in fs::read_dir(&pending_dir).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();

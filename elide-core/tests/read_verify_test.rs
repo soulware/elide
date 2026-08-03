@@ -22,7 +22,7 @@ fn setup_volume_dir(tmp: &TempDir) -> (PathBuf, Arc<dyn SegmentSigner>) {
     fs::create_dir_all(&vol_dir).unwrap();
     signing::generate_keypair(&vol_dir, signing::VOLUME_KEY_FILE, signing::VOLUME_PUB_FILE)
         .unwrap();
-    fs::create_dir_all(vol_dir.join("pending")).unwrap();
+    fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
     fs::create_dir_all(vol_dir.join("snapshots")).unwrap();
     let signer = signing::load_signer(&vol_dir, signing::VOLUME_KEY_FILE).unwrap();
     VolumeConfig {
@@ -43,7 +43,7 @@ fn write_then_read(
 ) -> std::io::Result<[u8; 4096]> {
     let tmp = TempDir::new().unwrap();
     let (vol_dir, signer) = setup_volume_dir(&tmp);
-    let seg_path = vol_dir.join(format!("pending/{}", Ulid::new()));
+    let seg_path = elide_core::segment::pending_open_dir(&vol_dir).join(Ulid::new().to_string());
     let entries = vec![SegmentEntry::new_data(claimed_hash, 0, 1, codec, stored)];
     write_segment(&seg_path, entries, signer.as_ref()).unwrap();
 
@@ -126,7 +126,7 @@ fn write_then_read_live(
 ) -> std::io::Result<Vec<u8>> {
     let tmp = TempDir::new().unwrap();
     let (vol_dir, signer) = setup_volume_dir(&tmp);
-    let seg_path = vol_dir.join(format!("pending/{}", Ulid::new()));
+    let seg_path = elide_core::segment::pending_open_dir(&vol_dir).join(Ulid::new().to_string());
     let entries = vec![SegmentEntry::new_data(
         claimed_hash,
         0,

@@ -65,7 +65,7 @@ fn flush_waits_for_in_flight_promote_to_complete() {
     // After flush returns we expect:
     //   - pending/<ulid> exists (segment committed by the worker)
     //   - exactly one wal/ file (the fresh one opened during prep)
-    let pending_count = fs::read_dir(fork_dir.join("pending"))
+    let pending_count = fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
         .unwrap()
         .filter(|e| {
             let e = e.as_ref().unwrap();
@@ -106,7 +106,7 @@ fn flush_without_pending_promote_is_fast_path() {
     handle.flush().unwrap();
 
     // No promote was triggered, so pending/ should still be empty.
-    let pending_count = fs::read_dir(fork_dir.join("pending"))
+    let pending_count = fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
         .unwrap()
         .filter(|e| e.is_ok())
         .count();
@@ -188,7 +188,7 @@ fn failed_promote_is_retried_without_restart() {
     let block = incompressible_block(1);
     handle.write(0, &block, false).unwrap();
 
-    let pending = fork_dir.join("pending");
+    let pending = elide_core::segment::pending_open_dir(&fork_dir);
     let blocked = fork_dir.join("pending.blocked");
     fs::rename(&pending, &blocked).unwrap();
 
@@ -226,7 +226,7 @@ fn failed_gc_checkpoint_promote_unblocks_later_checkpoints() {
     let block = incompressible_block(2);
     handle.write(0, &block, false).unwrap();
 
-    let pending = fork_dir.join("pending");
+    let pending = elide_core::segment::pending_open_dir(&fork_dir);
     let blocked = fork_dir.join("pending.blocked");
     fs::rename(&pending, &blocked).unwrap();
 
@@ -269,7 +269,7 @@ fn failed_inline_promote_restores_wal_state() {
 
     vol.write(0, &incompressible_block(3)).unwrap();
 
-    let pending = base.join("pending");
+    let pending = elide_core::segment::pending_open_dir(&base);
     let blocked = base.join("pending.blocked");
     fs::rename(&pending, &blocked).unwrap();
     assert!(vol.promote_for_test().is_err());

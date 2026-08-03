@@ -59,29 +59,44 @@ pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
     }
 }
 
-/// Mirror the production drain's `DeferJournal` mode
-/// (`coordinator/src/upload.rs::drain_pending`): repack, then promote
-/// every pending segment except pure-journal ones, which stay in
-/// `pending/` for a later `Full` drain. Leaves the volume in the
-/// between-cuts steady state — a journal segment pending at a ULID
-/// below committed data.
-pub fn drain_defer_journal(vol: &mut elide_core::volume::Volume) {
+/// Mirror the production cut (`coordinator/src/gc_cycle.rs::run_tick`):
+/// repack, close the open generation into `pending/upload/`, and
+/// promote its segments in ULID-ascending order — the in-process form
+/// of the uploader draining a closed generation.
+pub fn cut_and_drain(vol: &mut elide_core::volume::Volume) {
     vol.repack().unwrap();
     let base = vol.base_dir().to_path_buf();
-    for ulid in pending_ulids(&base) {
-        if pending_is_journal(&base, ulid) {
-            continue;
-        }
+    vol.close_generation().unwrap();
+    for ulid in upload_ulids(&base) {
         vol.promote_segment(ulid).unwrap();
     }
+}
+
+/// ULIDs in the upload generation, ascending.
+pub fn upload_ulids(base_dir: &Path) -> Vec<Ulid> {
+    let mut ulids: Vec<Ulid> = Vec::new();
+    if let Ok(entries) = fs::read_dir(elide_core::segment::pending_upload_dir(base_dir)) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && !name.contains('.')
+                && let Ok(ulid) = Ulid::from_string(name)
+            {
+                ulids.push(ulid);
+            }
+        }
+    }
+    ulids.sort();
+    ulids
 }
 
 /// `true` when `pending/<ulid>` carries a journal-flagged entry — the
 /// same per-file test the production drain uses to defer.
 fn pending_is_journal(base_dir: &Path, ulid: Ulid) -> bool {
-    segment::read_segment_index(&base_dir.join("pending").join(ulid.to_string()))
-        .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
-        .unwrap_or(false)
+    segment::read_segment_index(
+        &elide_core::segment::pending_open_dir(&base_dir).join(ulid.to_string()),
+    )
+    .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
+    .unwrap_or(false)
 }
 
 /// Every readable segment index under `pending/` and `index/`, as
@@ -91,7 +106,7 @@ fn segment_indexes(fork_dir: &Path) -> Vec<(String, Vec<segment::SegmentEntry>)>
     for ulid in pending_ulids(fork_dir) {
         let s = ulid.to_string();
         if let Ok((_bss, entries, _inputs)) =
-            segment::read_segment_index(&fork_dir.join("pending").join(&s))
+            segment::read_segment_index(&elide_core::segment::pending_open_dir(&fork_dir).join(&s))
         {
             out.push((s, entries));
         }
@@ -122,6 +137,32 @@ fn segment_indexes(fork_dir: &Path) -> Vec<(String, Vec<segment::SegmentEntry>)>
 /// misrouted wholesale. Walks `pending/` and `index/`.
 ///
 /// Returns a description of the first violation found.
+/// `pending/` holds exactly the generation layout: an `open/`
+/// directory, optionally an `upload/` directory, and nothing else
+/// (`docs/design/upload-generations.md`).
+pub fn check_generation_layout(fork_dir: &Path) -> Result<(), String> {
+    let pending = fork_dir.join("pending");
+    let entries = fs::read_dir(&pending).map_err(|e| format!("pending/ unreadable: {e}"))?;
+    let mut has_open = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let path = entry.path();
+        match name.to_str() {
+            Some("open") if path.is_dir() => has_open = true,
+            Some("upload") if path.is_dir() => {}
+            other => {
+                return Err(format!(
+                    "stray pending entry {other:?}: pending/ holds only the generation dirs"
+                ));
+            }
+        }
+    }
+    if !has_open {
+        return Err("pending/open missing".to_owned());
+    }
+    Ok(())
+}
+
 pub fn check_tier_purity(fork_dir: &Path) -> Result<(), String> {
     for (ulid_str, entries) in segment_indexes(fork_dir) {
         let journal_count = entries.iter().filter(|e| e.journal).count();
@@ -195,7 +236,7 @@ pub fn check_journal_flag_containment(fork_dir: &Path) -> Result<(), String> {
 pub fn half_promote_first_pending(base_dir: &Path) -> Option<Ulid> {
     let ulid = *pending_ulids(base_dir).first()?;
     let ulid_str = ulid.to_string();
-    let pending_path = base_dir.join("pending").join(&ulid_str);
+    let pending_path = elide_core::segment::find_pending_file(base_dir, &ulid_str)?;
 
     let cache_dir = base_dir.join("cache");
     let _ = fs::create_dir_all(&cache_dir);
@@ -223,7 +264,7 @@ pub fn half_promote_first_pending(base_dir: &Path) -> Option<Ulid> {
 /// Panics if any retry fails or leaves a stale pending file.
 pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &Path) {
     let cache_dir = base_dir.join("cache");
-    let pending_dir = base_dir.join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(&base_dir);
     let stale: Vec<Ulid> = pending_ulids(base_dir)
         .into_iter()
         .filter(|u| cache_dir.join(format!("{u}.body")).exists())
@@ -232,7 +273,7 @@ pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &
         vol.promote_segment(ulid)
             .expect("promote_segment retry failed");
         assert!(
-            !pending_dir.join(ulid.to_string()).exists(),
+            elide_core::segment::find_pending_file(base_dir, &ulid.to_string()).is_none(),
             "pending/{ulid} survived promote_segment retry after crash",
         );
     }
@@ -254,7 +295,7 @@ pub fn assert_promote_recovery(vol: &mut elide_core::volume::Volume, base_dir: &
 pub fn leak_promote_idx_first_pending(base_dir: &Path, store_dir: &Path) -> Option<Ulid> {
     let ulid = *pending_ulids(base_dir).first()?;
     let ulid_str = ulid.to_string();
-    let pending_path = base_dir.join("pending").join(&ulid_str);
+    let pending_path = elide_core::segment::find_pending_file(base_dir, &ulid_str)?;
 
     let index_dir = base_dir.join("index");
     let _ = fs::create_dir_all(&index_dir);
@@ -341,21 +382,22 @@ pub fn check_presence_truthful(fork_dir: &Path) -> Result<(), String> {
 
 /// Collect sorted ULIDs of full segment files in pending/.
 pub fn pending_ulids(base_dir: &Path) -> Vec<Ulid> {
-    let pending_dir = base_dir.join("pending");
-    let Ok(entries) = fs::read_dir(&pending_dir) else {
-        return Vec::new();
-    };
     let mut ulids: Vec<Ulid> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
+    for dir in elide_core::segment::pending_generation_dirs(base_dir) {
+        let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
-        if name_str.contains('.') {
-            continue;
-        }
-        if let Ok(ulid) = Ulid::from_string(name_str) {
-            ulids.push(ulid);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str.contains('.') {
+                continue;
+            }
+            if let Ok(ulid) = Ulid::from_string(name_str) {
+                ulids.push(ulid);
+            }
         }
     }
     ulids.sort();

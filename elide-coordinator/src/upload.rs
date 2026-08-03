@@ -1,20 +1,20 @@
-// Segment upload: drain all committed segments from pending/ to the object store.
+// Segment upload: drain the upload generation (`pending/upload/`) to
+// the object store.
 //
 // Object key format: by_id/<volume_ulid>/segments/YYYYMMDD/<ulid>
 //
 // The date is extracted from the ULID timestamp (creation time, not upload time),
 // so keys are stable and deterministic regardless of when drain-pending runs.
 //
-// Segments upload in ULID-ascending order and the drain halts at the first
-// failure. A `Full` drain therefore commits a ULID-prefix of the local
-// commit order. A `DeferJournal` drain (the between-cuts tick mode) leaves
-// pure-journal segments in `pending/` and continues past them: data
-// segments still commit as an ascending prefix of the data history, and
-// journal segments commit only in `Full` drains, ascending among
-// themselves, so a committed journal ULID is always below every pending
-// journal ULID. A segment committed past a deferred journal segment stays
-// outside HEAD until a cut tick's `Full` drain lands the journal — HEAD
-// names whole cuts only, and every recovery path reads whole cuts
+// Segments upload in ULID-ascending order and the drain halts at the
+// first failure, so each drained generation commits as a ULID-prefix
+// of itself. The open generation (`pending/open/`) is outside the
+// drain by layout: its segments upload only after a cut closes them
+// into `pending/upload/`, so deferral — journal and data alike — is
+// where a file lives, never a drain mode
+// (`docs/design/upload-generations.md`). A committed segment stays
+// outside HEAD until its generation's cut publishes — HEAD names
+// whole generations only, and every recovery path reads whole cuts
 // (`docs/design/durable-cut.md`). The drain interval is the retry
 // cadence — the next tick re-runs from the same oldest ULID with an
 // idempotent re-PUT; there is no in-tick retry.
@@ -209,23 +209,10 @@ pub fn mark_already_uploaded(
     mark_uploaded(&sentinel, content)
 }
 
-/// What a drain uploads from `pending/`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrainMode {
-    /// Upload every pending segment.
-    Full,
-    /// Upload data segments; pure-journal segments stay in `pending/`,
-    /// where repack keeps consolidating them, and upload on the next
-    /// cut tick's `Full` drain. Deferred segments count in
-    /// [`DrainResult::deferred`], never as failures.
-    DeferJournal,
-}
-
 pub struct DrainResult {
-    /// Segments observed in `pending/` at the start of the tick.
+    /// Segments observed in the upload generation at the start of the
+    /// tick.
     pub seen: usize,
-    /// Pure-journal segments a `DeferJournal` drain left in `pending/`.
-    pub deferred: usize,
     /// Segments whose S3 PUT failed before the drain halted (0 or 1 —
     /// the first failure stops the pass).
     pub upload_failed: usize,
@@ -290,9 +277,8 @@ pub async fn drain_pending(
     store: &Arc<dyn ObjectStore>,
     meta_store: &Arc<dyn ObjectStore>,
     head_cache: &crate::HeadCache,
-    mode: DrainMode,
 ) -> Result<DrainResult> {
-    let pending_dir = vol_dir.join("pending");
+    let pending_dir = elide_core::segment::pending_upload_dir(vol_dir);
 
     // Upload volume metadata before segments so that any host that
     // demand-fetches a segment can immediately verify it and bootstrap the vol.
@@ -307,22 +293,23 @@ pub async fn drain_pending(
 
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
-    let mut deferred = 0usize;
     let mut uploaded_ulids: Vec<Ulid> = Vec::new();
     let vd = crate::volume_data::VolumeData::new(Arc::clone(store), vol_ulid);
     let mut segments = vd.segments();
 
-    let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
-        .with_context(|| format!("listing pending dir: {}", pending_dir.display()))?;
+    let pending_snapshot = match elide_core::segment::read_ulid_dir_sorted(&pending_dir) {
+        Ok(v) => v,
+        // Absent between a publish and the next close.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("listing upload generation: {}", pending_dir.display()));
+        }
+    };
     let seen = pending_snapshot.len();
     for ulid in pending_snapshot {
         let upload_name = ulid.to_string();
         let segment_path = pending_dir.join(&upload_name);
-
-        if mode == DrainMode::DeferJournal && is_journal_pending(&segment_path) {
-            deferred += 1;
-            continue;
-        }
 
         let started = Instant::now();
         let size_bytes = std::fs::metadata(&segment_path)
@@ -376,25 +363,11 @@ pub async fn drain_pending(
 
     Ok(DrainResult {
         seen,
-        deferred,
         upload_failed,
         promote_failed,
         uploaded_ulids,
         published_user_snapshot,
     })
-}
-
-/// `true` when the pending segment at `path` is journal-tier, read from
-/// the segment's own index section. Formation partitions an epoch's
-/// journal-window writes into their own segment and consolidation
-/// re-tags every output entry journal, so any journal-flagged entry
-/// marks the whole segment. A file whose index cannot be read counts as
-/// data: the upload path surfaces the real error where deferral would
-/// hide it.
-fn is_journal_pending(path: &Path) -> bool {
-    elide_core::segment::read_segment_index(path)
-        .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
-        .unwrap_or(false)
 }
 
 /// Upload volume metadata: public key, signed provenance, snapshot
@@ -770,8 +743,8 @@ mod tests {
                         serde_json::from_str::<VolumeRequest>(trimmed)
                     {
                         let ulid_str = segment_ulid.to_string();
-                        let src = dir.join("pending").join(&ulid_str);
-                        if src.exists() {
+                        let src = elide_core::segment::find_pending_file(&dir, &ulid_str);
+                        if let Some(src) = src {
                             let cache = dir.join("cache");
                             std::fs::create_dir_all(&cache).ok();
                             let body = cache.join(format!("{ulid_str}.body"));
@@ -829,7 +802,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_upload_dir(&vol_dir);
         let cache_dir = vol_dir.join("cache");
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
@@ -871,7 +844,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -904,14 +876,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defer_journal_drain_skips_journal_and_full_drain_lands_it() {
+    async fn drain_reads_the_upload_generation_only() {
         use elide_core::segment::{Codec, SegmentEntry, write_segment};
         use elide_core::signing::generate_ephemeral_signer;
 
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
-        std::fs::create_dir_all(&pending_dir).unwrap();
+        let upload_dir = elide_core::segment::pending_upload_dir(&vol_dir);
+        let open_dir = elide_core::segment::pending_open_dir(&vol_dir);
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        std::fs::create_dir_all(&open_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
             size: Some(4096),
@@ -922,30 +896,30 @@ mod tests {
 
         let (signer, _) = generate_ephemeral_signer();
 
-        // Journal segment at the LOWEST pending ULID: deferral leaves it
-        // in place while the higher-ULID data segments upload past it.
-        let journal_ulid = make_ulid(1743120000000, 1);
-        let data_ulid = make_ulid(1743120000000, 2);
+        // One closed segment awaiting upload, one still folding in the
+        // open generation — deferral is the layout, not a drain mode.
+        let closed_ulid = make_ulid(1743120000000, 1);
+        let open_ulid = make_ulid(1743120000000, 2);
 
-        let jdata = vec![0x11u8; 4096];
-        let mut jentry = SegmentEntry::new_data(blake3::hash(&jdata), 96, 1, Codec::None, jdata);
-        jentry.entry.journal = true;
-        write_segment(
-            &pending_dir.join(&journal_ulid),
-            vec![jentry],
-            signer.as_ref(),
-        )
-        .unwrap();
-
-        let ddata = vec![0x22u8; 4096];
-        let dentry = vec![SegmentEntry::new_data(
-            blake3::hash(&ddata),
+        let cdata = vec![0x11u8; 4096];
+        let centry = vec![SegmentEntry::new_data(
+            blake3::hash(&cdata),
             0,
             1,
             Codec::None,
-            ddata,
+            cdata,
         )];
-        write_segment(&pending_dir.join(&data_ulid), dentry, signer.as_ref()).unwrap();
+        write_segment(&upload_dir.join(&closed_ulid), centry, signer.as_ref()).unwrap();
+
+        let odata = vec![0x22u8; 4096];
+        let oentry = vec![SegmentEntry::new_data(
+            blake3::hash(&odata),
+            1,
+            1,
+            Codec::None,
+            odata,
+        )];
+        write_segment(&open_dir.join(&open_ulid), oentry, signer.as_ref()).unwrap();
 
         let _mock = spawn_mock_socket(vol_dir.clone()).await;
 
@@ -959,59 +933,32 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::DeferJournal,
         )
         .await
         .unwrap();
 
-        assert_eq!(result.seen, 2);
-        assert_eq!(result.deferred, 1);
-        assert_eq!(result.upload_failed, 0);
-        assert_eq!(result.promote_failed, 0);
+        assert_eq!(result.seen, 1);
         assert_eq!(
             result.uploaded_ulids,
-            vec![data_ulid.parse::<Ulid>().unwrap()],
-            "the data segment uploads past the deferred journal segment"
+            vec![closed_ulid.parse::<Ulid>().unwrap()],
         );
+        assert!(!upload_dir.join(&closed_ulid).exists());
         assert!(
-            pending_dir.join(&journal_ulid).exists(),
-            "the journal segment stays in pending/"
+            open_dir.join(&open_ulid).exists(),
+            "the open generation is outside the drain"
         );
-        let jkey = segment_key(VOL_ULID.parse().unwrap(), journal_ulid.parse().unwrap());
+        let okey = segment_key(VOL_ULID.parse().unwrap(), open_ulid.parse().unwrap());
         assert!(
-            store.head(&jkey).await.is_err(),
-            "the journal segment has no S3 object while deferred"
+            store.head(&okey).await.is_err(),
+            "the open segment has no S3 object"
         );
-
-        let result = drain_pending(
-            &vol_dir,
-            VOL_ULID.parse().unwrap(),
-            &store,
-            &store,
-            &Default::default(),
-            DrainMode::Full,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.deferred, 0);
-        assert_eq!(
-            result.uploaded_ulids,
-            vec![journal_ulid.parse::<Ulid>().unwrap()],
-            "the cut tick's full drain lands the deferred journal segment"
-        );
-        assert!(!pending_dir.join(&journal_ulid).exists());
-        store
-            .head(&jkey)
-            .await
-            .expect("journal object in store after the full drain");
     }
 
     #[tokio::test]
     async fn drain_pending_uploads_pub_key() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_upload_dir(&vol_dir);
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("test-vol".into()),
@@ -1034,7 +981,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1063,7 +1009,7 @@ mod tests {
     async fn drain_pending_does_not_touch_name_record() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_upload_dir(&vol_dir);
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("my-vol".into()),
@@ -1084,7 +1030,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1127,7 +1072,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1147,7 +1091,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1162,7 +1105,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1211,7 +1153,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1360,7 +1301,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_upload_dir(&vol_dir);
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("halt-vol".into()),
@@ -1389,7 +1330,6 @@ mod tests {
             &seg_store,
             &meta_store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();
@@ -1411,7 +1351,7 @@ mod tests {
     async fn drain_halts_at_first_promote_failure() {
         let tmp = TempDir::new().unwrap();
         let vol_dir = tmp.path().join(VOL_ULID);
-        let pending_dir = vol_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_upload_dir(&vol_dir);
         std::fs::create_dir_all(&pending_dir).unwrap();
         elide_core::config::VolumeConfig {
             name: Some("halt-vol".into()),
@@ -1433,7 +1373,6 @@ mod tests {
             &store,
             &store,
             &Default::default(),
-            DrainMode::Full,
         )
         .await
         .unwrap();

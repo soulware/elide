@@ -354,7 +354,7 @@ impl Volume {
             lbamap_snapshot: Arc::clone(&self.lbamap),
             extent_index_snapshot: Arc::clone(&self.extent_index),
             search_dirs,
-            pending_dir: self.base_dir.join("pending"),
+            pending_dir: segment::pending_open_dir(&self.base_dir),
             segment_ulid,
             signer: Arc::clone(&self.signer),
             snapshot_floor_ulid,

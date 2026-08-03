@@ -134,7 +134,8 @@ fn find_snapshot_ulid(snap_dir: &Path) -> String {
 /// Read all segment entries from `vol_dir/pending/*`, returning a flat
 /// Vec of (ulid, entry) pairs in pending-dir order.
 fn read_all_pending_entries(vol_dir: &Path) -> Vec<(String, segment::SegmentEntry)> {
-    let pending = vol_dir.join("pending");
+    // Import rotates its finished batch into the upload generation.
+    let pending = elide_core::segment::pending_upload_dir(&vol_dir);
     let mut segs: Vec<PathBuf> = fs::read_dir(&pending)
         .unwrap()
         .map(|e| e.unwrap().path())

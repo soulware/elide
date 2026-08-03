@@ -19,7 +19,7 @@ pub(in crate::volume) fn temp_dir() -> PathBuf {
 /// tests) then call `promote_segment` on each. `promote_segment` writes
 /// `index/<ulid>.idx`, copies the body to `cache/`, and deletes `pending/<ulid>`.
 pub(in crate::volume) fn simulate_upload(vol: &mut Volume) {
-    let pending_dir = vol.base_dir.join("pending");
+    let pending_dir = crate::segment::pending_open_dir(&vol.base_dir);
     for entry in std::fs::read_dir(&pending_dir).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();

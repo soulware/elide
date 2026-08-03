@@ -87,7 +87,7 @@ This is a direction, not a commitment. None of the three steps are required for 
 
 Four mechanisms compose to guarantee that any read returns correct data, whether the segment body is present locally or must be demand-fetched from S3:
 
-**Directory structure encodes lifecycle state.** `pending/`, `index/`, `cache/`, and `gc/` are not interchangeable storage tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3". `index/<ulid>.idx` means "coordinator-confirmed in S3; LBA index permanently available". `cache/<ulid>.body` means "body bytes locally cached; safe to evict — S3 is authoritative". `gc/<ulid>.staged` means "coordinator compacted; volume has not yet applied". Bare `gc/<ulid>` means "volume-applied, volume-signed; coordinator uploading". The process controlling a volume directory is the sole writer of `index/` and `cache/`: the volume process for writable volumes, the import process for readonly volumes during its serve phase. In both cases the write is triggered by the coordinator's `promote <ulid>` IPC after confirmed S3 upload. `cache/<ulid>.{body,present}` is written alongside `index/<ulid>.idx`; the volume may also write `cache/` on demand-fetch. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
+**Directory structure encodes lifecycle state.** `pending/`, `index/`, `cache/`, and `gc/` are not interchangeable storage tiers — they encode what is known about a segment at each point in its life. `pending/` means "written locally, not yet in S3", split into two generation directories (`docs/design/upload-generations.md`): `pending/open/` is the fold playground where WAL flushes land and repack consolidates, and `pending/upload/` is a closed, immutable generation the drain uploads oldest-first — a cut publishes it whole, then renames `open/` into its place. `index/<ulid>.idx` means "coordinator-confirmed in S3; LBA index permanently available". `cache/<ulid>.body` means "body bytes locally cached; safe to evict — S3 is authoritative". `gc/<ulid>.staged` means "coordinator compacted; volume has not yet applied". Bare `gc/<ulid>` means "volume-applied, volume-signed; coordinator uploading". The process controlling a volume directory is the sole writer of `index/` and `cache/`: the volume process for writable volumes, the import process for readonly volumes during its serve phase. In both cases the write is triggered by the coordinator's `promote <ulid>` IPC after confirmed S3 upload. `cache/<ulid>.{body,present}` is written alongside `index/<ulid>.idx`; the volume may also write `cache/` on demand-fetch. This makes the directory a machine-readable record of durability state, inspectable with standard tools without any binary decoding.
 
 **ULIDs enforce total ordering.** Every segment has a ULID assigned at creation by the volume's own clock. ULIDs give a total order used in three places: (1) LBA map rebuild replays segments oldest-first, so the newest write for any LBA wins unambiguously; (2) fork ancestry walks stop at a ULID cutoff, preventing post-branch ancestor writes from leaking into derived volumes; (3) the GC output ULID is pre-minted by `gc_checkpoint` from the volume's own `UlidMint`, paired with a WAL-flush ULID under the invariant `u_gc < u_flush` (and any subsequent write `> u_flush`), so concurrent writes always carry a higher ULID than the GC output and win at rebuild's oldest-first replay. No external clock synchronisation is required — all ordering decisions are local to the volume's write history.
 
@@ -114,7 +114,9 @@ elide_data/                           — single root (default --data-dir)
       volume.readonly                 — present = permanently readonly (imported/frozen)
       volume.pub                      — Ed25519 public key (uploaded to S3)
       volume.provenance               — signed lineage (parent + extent_index + oci_source); uploaded to S3
-      pending/                        — segments awaiting S3 upload (volume-written)
+      pending/
+        open/                         — the open generation: WAL flushes land here; folds read and write only here
+        upload/                       — the closed generation: immutable, drained oldest-first to S3
       index/                          — volume-written LBA index files (01JQXXXXX.idx)
       cache/                          — volume-owned body cache (.body, .present); evictable
       snapshots/
@@ -127,7 +129,7 @@ elide_data/                           — single root (default --data-dir)
       volume.provenance               — signed: parent="01JQAAAAAAA/01JQXXXXX" + empty extent_index
       volume.pid                      — PID of running volume process
       wal/                            — present = live; write target
-      pending/
+      pending/                        — open/ + upload/ generation dirs
       index/
       cache/
       snapshots/

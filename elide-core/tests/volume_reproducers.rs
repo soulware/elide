@@ -902,6 +902,7 @@ fn straddling_write_splits_at_the_window_boundary() {
     vol.flush_wal().unwrap();
 
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 
     // Crash + reopen: every block of both shares survives recovery.
@@ -963,6 +964,7 @@ fn repack_pipeline_crash_states_recover() {
         );
     }
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 
     // Crash partway through input removal after a completed apply.
@@ -980,6 +982,7 @@ fn repack_pipeline_crash_states_recover() {
         );
     }
     common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_generation_layout(fork_dir).expect("generation layout violated");
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 }
 

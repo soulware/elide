@@ -21,8 +21,8 @@ use elide_core::actor::VolumeClient;
 use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::ReclaimThresholds;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CompactionReply, ConnectedReply, GcCheckpointReply, ReclaimReply,
-    VolumeRequest,
+    ApplyGcHandoffsReply, CloseGenerationReply, CompactionReply, ConnectedReply, GcCheckpointReply,
+    ReclaimReply, VolumeRequest,
 };
 
 /// Start the control socket server for `fork_dir`.
@@ -191,6 +191,22 @@ fn dispatch(
         VolumeRequest::FinalizeGcHandoff { gc_ulid } => {
             write_unit(writer, handle.finalize_gc_handoff(gc_ulid))
         }
+        VolumeRequest::CloseGeneration => match handle.close_generation() {
+            Ok(n) => {
+                let _ = write_envelope(
+                    writer,
+                    &Envelope::ok(CloseGenerationReply {
+                        segments: n.unwrap_or(0),
+                    }),
+                );
+            }
+            Err(e) => {
+                let _ = write_envelope::<CloseGenerationReply>(
+                    writer,
+                    &Envelope::err(IpcError::internal(e.to_string())),
+                );
+            }
+        },
         VolumeRequest::Reclaim { cap } => dispatch_reclaim(cap, handle, writer),
         VolumeRequest::Connected => {
             let connected = client_connected.load(Ordering::Relaxed);

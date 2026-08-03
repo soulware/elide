@@ -411,14 +411,7 @@ impl GcCycleOrchestrator {
             gc_buckets = self.prepare_gc_pass().await;
         }
 
-        // One cut-due decision per tick, taken before the drain and fed
-        // to both the drain mode and the publish gate. The drain and the
-        // publish must agree within a tick: a cut may only publish over
-        // a `Full` drain, because a `DeferJournal` drain leaves journal
-        // segments unconfirmed and a cut derived at that instant would
-        // name data past them.
-        let cut_due = self.cut_due();
-        let drain_ok = self.run_drain(cut_due).await;
+        let drain_ok = self.run_drain().await;
 
         if gc_due && drain_ok {
             if let Some(bucket_ulids) = gc_buckets {
@@ -429,14 +422,39 @@ impl GcCycleOrchestrator {
         // If !drain_ok: the pass is skipped and last_gc is not bumped, so
         // the next tick retries GC immediately once drain recovers.
 
-        // Publish this tick's cut. All S3 segment operations for this
-        // tick are durable before the HEAD overwrite — segments-before-
-        // HEAD crash ordering (design *Writers and crash ordering*). An
-        // idle tick (no drain, no GC outputs) is a no-op; only ticks
-        // that actually changed S3 segment state pay the HEAD PUT.
-        self.publish_head_delta(drain_ok, cut_due).await;
+        // Publish this tick's cut, then close the open generation into
+        // `pending/upload/` for the next window's drain. The cut waits
+        // for the clock AND a fully drained upload generation, so HEAD
+        // only ever advances by whole generations; a slow drain
+        // stretches the window (`docs/design/upload-generations.md`
+        // *One upload generation, never a queue*). All S3 segment
+        // operations for this tick are durable before the HEAD
+        // overwrite — segments-before-HEAD crash ordering (design
+        // *Writers and crash ordering*). The close runs only after the
+        // cut lands: a failed HEAD PUT leaves the window stretched
+        // rather than queueing a second generation.
+        let cut_due = self.cut_due() && Self::upload_generation_drained(&self.fork_dir);
+        let cut_landed = self.publish_head_delta(drain_ok, cut_due).await;
+        if cut_landed
+            && let Some(closed) = control::close_generation(&self.fork_dir).await
+            && closed > 0
+        {
+            info!(
+                "[head {}] generation closed: {closed} segment(s) to upload",
+                self.vol_ulid
+            );
+        }
 
         TickOutcome::Continue
+    }
+
+    /// Whether the upload generation is fully drained — absent, or
+    /// holding no files.
+    fn upload_generation_drained(fork_dir: &std::path::Path) -> bool {
+        match std::fs::read_dir(elide_core::segment::pending_upload_dir(fork_dir)) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(_) => true,
+        }
     }
 
     /// Whether this tick closes a cut: `cut_interval` has elapsed since
@@ -492,29 +510,22 @@ impl GcCycleOrchestrator {
         flushed
     }
 
-    /// Drain pending segments to S3. Returns whether the drain completed —
-    /// the gate for both this tick's GC pass and its cut publish. A drain
-    /// failure forces the GC skip because pending segments that failed to
-    /// promote still have no `cache/<ulid>.body` and would not appear in
-    /// the GC candidate set, while their LBAs would be invisible to
-    /// `collect_stats`; it holds the cut because a partial batch must
-    /// never become visible (`docs/design/durable-cut.md`).
+    /// Drain the upload generation to S3. Returns whether the drain
+    /// completed — the gate for both this tick's GC pass and its cut
+    /// publish. A drain failure forces the GC skip because pending
+    /// segments that failed to promote still have no
+    /// `cache/<ulid>.body` and would not appear in the GC candidate
+    /// set, while their LBAs would be invisible to `collect_stats`; it
+    /// holds the cut because a partial batch must never become visible
+    /// (`docs/design/durable-cut.md`).
     ///
-    /// Between cuts the drain defers journal: pure-journal pending
-    /// segments stay local, repack keeps consolidating them, and the
-    /// cut tick's `Full` drain uploads the one consolidated segment.
-    /// Deferred segments are not failures — the tick still counts as a
-    /// complete drain for GC, and the cut gate (`cut_due`) is what
-    /// holds publish until a `Full` drain has run.
-    async fn run_drain(&mut self, cut_due: bool) -> bool {
+    /// The open generation is outside the drain by layout
+    /// (`docs/design/upload-generations.md`): its segments upload only
+    /// after a cut closes them into `pending/upload/`.
+    async fn run_drain(&mut self) -> bool {
         if !self.fork_dir.join("pending").exists() {
             return true;
         }
-        let mode = if cut_due {
-            upload::DrainMode::Full
-        } else {
-            upload::DrainMode::DeferJournal
-        };
         let vol_ulid = self.vol_ulid;
         match upload::drain_pending(
             &self.fork_dir,
@@ -522,17 +533,15 @@ impl GcCycleOrchestrator {
             &self.store,
             &self.meta_store,
             &self.head_cache,
-            mode,
         )
         .await
         {
             Ok(r) => {
                 if r.seen > 0 {
                     info!(
-                        "[drain {vol_ulid}] pending={} uploaded={} deferred={} upload_failed={} promote_failed={}",
+                        "[drain {vol_ulid}] uploading={} uploaded={} upload_failed={} promote_failed={}",
                         r.seen,
                         r.uploaded_ulids.len(),
-                        r.deferred,
                         r.upload_failed,
                         r.promote_failed,
                     );
@@ -653,11 +662,15 @@ impl GcCycleOrchestrator {
         confirmed.iter().all(|u| scratch.contains(u))
     }
 
-    async fn publish_head_delta(&mut self, drain_ok: bool, cut_due: bool) {
+    /// Returns whether a cut landed this call — the caller's signal to
+    /// close the open generation.
+    async fn publish_head_delta(&mut self, drain_ok: bool, cut_due: bool) -> bool {
         let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
         let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
         if !reap_due && !has_scratch {
-            return;
+            // Nothing changed since the last cut: the cut lands as a
+            // no-op, without a PUT.
+            return cut_due && drain_ok;
         }
         // The cut cadence (`docs/design/durable-cut.md` *Relation to
         // the loss-window work*): a cut publishes on `cut_interval`,
@@ -668,14 +681,14 @@ impl GcCycleOrchestrator {
         // publish always sits over a `Full` drain with the journal
         // confirmed.
         if !cut_due {
-            return;
+            return false;
         }
         if !drain_ok {
             info!(
                 "[head {}] drain incomplete; holding this tick's cut",
                 self.vol_ulid
             );
-            return;
+            return false;
         }
         // Supersession barrier (`docs/design/durable-cut.md` *GC
         // supersession waits for its killers*): edges join a cut only
@@ -746,7 +759,7 @@ impl GcCycleOrchestrator {
                                 "[head {}] regenerate failed: {e}; retrying next tick",
                                 self.vol_ulid
                             );
-                            return;
+                            return false;
                         }
                     },
                 }
@@ -783,7 +796,7 @@ impl GcCycleOrchestrator {
                     "[head {}] index scan failed: {e}; holding this tick's cut",
                     self.vol_ulid
                 );
-                return;
+                return false;
             }
         }
         if edges_eligible {
@@ -859,7 +872,7 @@ impl GcCycleOrchestrator {
             }
             self.last_cut = Instant::now();
             *cache = Some(head);
-            return;
+            return true;
         }
         let age = self.last_cut.elapsed();
         match self.volume_data.head().put(&head).await {
@@ -877,15 +890,19 @@ impl GcCycleOrchestrator {
                 }
                 self.last_cut = Instant::now();
                 *cache = Some(head);
+                true
             }
             // Cache stays empty and the scratch is kept: the next
             // pass re-reads S3 and re-merges the same deltas, which
             // heals the lost overwrite.
-            Err(e) => warn!(
-                "[head {}] put failed: {e}; \
-                 self-heals on the next active tick",
-                self.vol_ulid
-            ),
+            Err(e) => {
+                warn!(
+                    "[head {}] put failed: {e}; \
+                     self-heals on the next active tick",
+                    self.vol_ulid
+                );
+                false
+            }
         }
     }
 
@@ -1210,13 +1227,18 @@ fn fork_has_local_backlog(fork_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `pending/` holds segments the volume flushed but the drain has not
-/// yet promoted to S3 — the signal that this fork has guest writes in
-/// flight. An absent or unreadable dir counts as empty.
+/// The generation directories hold segments the volume flushed but
+/// the drain has not yet promoted to S3 — the signal that this fork
+/// has guest writes in flight. Absent or unreadable dirs count as
+/// empty.
 fn pending_has_files(fork_dir: &Path) -> bool {
-    std::fs::read_dir(fork_dir.join("pending"))
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false)
+    elide_core::segment::pending_generation_dirs(fork_dir)
+        .iter()
+        .any(|d| {
+            std::fs::read_dir(d)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false)
+        })
 }
 
 #[cfg(test)]
@@ -2283,7 +2305,7 @@ mod tests {
         let (mut orch, _tmp) = orchestrator_named(store.clone(), Some("vol2"));
         displace(&store).await;
         orch.last_fence = std::time::Instant::now();
-        let pending = orch.fork_dir().join("pending");
+        let pending = elide_core::segment::pending_open_dir(orch.fork_dir());
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
 
@@ -2297,7 +2319,7 @@ mod tests {
     fn fork_quiescent_when_no_pending_or_gc_dir() {
         let tmp = TempDir::new().unwrap();
         assert!(!super::fork_has_local_backlog(tmp.path()));
-        std::fs::create_dir_all(tmp.path().join("pending")).unwrap();
+        std::fs::create_dir_all(elide_core::segment::pending_open_dir(tmp.path())).unwrap();
         std::fs::create_dir_all(tmp.path().join("gc")).unwrap();
         assert!(!super::fork_has_local_backlog(tmp.path()));
     }
@@ -2305,7 +2327,7 @@ mod tests {
     #[test]
     fn fork_has_backlog_when_pending_has_files() {
         let tmp = TempDir::new().unwrap();
-        let pending = tmp.path().join("pending");
+        let pending = elide_core::segment::pending_open_dir(tmp.path());
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
         assert!(super::fork_has_local_backlog(tmp.path()));
@@ -2358,7 +2380,7 @@ mod tests {
     async fn constructor_forces_first_tick_on_backlogged_fork() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (orch, _tmp) = orchestrator_prepped(store, None, |fork_dir| {
-            let pending = fork_dir.join("pending");
+            let pending = elide_core::segment::pending_open_dir(&fork_dir);
             std::fs::create_dir_all(&pending).unwrap();
             std::fs::write(pending.join("01ARZ3NDEKTSV4RRFFQ69G5FAV"), b"").unwrap();
         });

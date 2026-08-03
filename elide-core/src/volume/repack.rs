@@ -207,7 +207,7 @@ impl Volume {
     ///
     /// Returns `None` when `pending/` is missing or has no segments.
     pub fn prepare_repack(&mut self) -> io::Result<Option<RepackJob>> {
-        let pending_dir = self.base_dir.join("pending");
+        let pending_dir = segment::pending_open_dir(&self.base_dir);
         let segs = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -294,7 +294,7 @@ impl Volume {
     ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
         let RepackResult { mut stats, buckets } = result;
 
-        let pending_dir = self.base_dir.join("pending");
+        let pending_dir = segment::pending_open_dir(&self.base_dir);
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
         for bucket in &buckets {
@@ -504,7 +504,7 @@ impl Volume {
             }
         }
         if !paths.is_empty() {
-            segment::fsync_dir(&self.base_dir.join("pending"))?;
+            segment::fsync_dir(&segment::pending_open_dir(&self.base_dir).join("."))?;
         }
         self.assert_volume_invariants("remove_consumed_inputs");
         Ok(())
@@ -682,7 +682,7 @@ mod tests {
         vol.write(0, &recurring).unwrap();
         vol.promote_for_test().unwrap();
         let (input_ulid, input_path) = {
-            let mut paths: Vec<PathBuf> = fs::read_dir(base.join("pending"))
+            let mut paths: Vec<PathBuf> = fs::read_dir(crate::segment::pending_open_dir(&base))
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .collect();

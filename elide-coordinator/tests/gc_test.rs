@@ -209,7 +209,10 @@ async fn spawn_mock_socket(fork_dir: std::path::PathBuf) -> MockSocket {
                     let ulid_str = segment_ulid.to_string();
                     // Check gc/ first (GC handoff path), then pending/ (drain path).
                     let gc_src = dir.join("gc").join(&ulid_str);
-                    let pending_src = dir.join("pending").join(&ulid_str);
+                    let pending_src = elide_core::segment::find_pending_file(&dir, &ulid_str)
+                        .unwrap_or_else(|| {
+                            elide_core::segment::pending_open_dir(&dir).join(&ulid_str)
+                        });
                     let (src, is_drain) = if gc_src.exists() {
                         (gc_src, false)
                     } else {
@@ -302,7 +305,7 @@ async fn drain_pending_to_store(
     vol_ulid: ulid::Ulid,
     store: &Arc<dyn ObjectStore>,
 ) {
-    let pending_dir = vol.base_dir().join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(vol.base_dir());
     if let Ok(entries) = fs::read_dir(&pending_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -329,7 +332,7 @@ async fn drain_pending_to_store(
 /// index/cache file surgery behind a live volume is exactly the
 /// divergence `apply_gc_handoffs` now refuses to fold.
 fn drain_pending(vol: &mut Volume) {
-    let pending_dir = vol.base_dir().join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(vol.base_dir());
     let Ok(entries) = fs::read_dir(&pending_dir) else {
         return;
     };
@@ -762,6 +765,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     let d2 = [33u8; 4096];
     vol.write(1, &d2).unwrap();
     vol.flush_wal().unwrap();
+    vol.close_generation().unwrap();
 
     // --- Tick N: drain fails ---
     //
@@ -776,7 +780,6 @@ fn drain_failure_skips_gc_and_data_survives() {
             &fail_store,
             &fail_store,
             &Default::default(),
-            upload::DrainMode::Full,
         ))
         .expect("drain_pending itself should not error");
     assert!(
@@ -793,7 +796,7 @@ fn drain_failure_skips_gc_and_data_survives() {
     );
 
     // Pending segment must still be present (not lost during failed drain).
-    let pending_count = fs::read_dir(fork_dir.join("pending"))
+    let pending_count = fs::read_dir(elide_core::segment::pending_upload_dir(&fork_dir))
         .map(|d| d.flatten().count())
         .unwrap_or(0);
     assert!(
@@ -814,7 +817,6 @@ fn drain_failure_skips_gc_and_data_survives() {
             &good_store,
             &good_store,
             &Default::default(),
-            upload::DrainMode::Full,
         ))
         .expect("drain should succeed with good store");
     assert_eq!(
@@ -1090,7 +1092,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     // Local drain helper (no S3 upload): repack, then promote in
     // ULID-ascending order.
     let drain = |vol: &mut Volume| {
-        let pending_dir = fork_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1217,7 +1219,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
     let gc_config = make_gc_config();
 
     let drain = |vol: &mut Volume| {
-        let pending_dir = fork_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1351,7 +1353,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     let gc_config = make_gc_config();
 
     let drain = |vol: &mut Volume| {
-        let pending_dir = fork_dir.join("pending");
+        let pending_dir = elide_core::segment::pending_open_dir(&fork_dir);
         let _ = vol.repack();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
@@ -1640,7 +1642,7 @@ fn delta_count_in(dir: &std::path::Path, want_ext: Option<&str>) -> usize {
 }
 
 fn pending_delta_count(fork_dir: &std::path::Path) -> usize {
-    delta_count_in(&fork_dir.join("pending"), None)
+    delta_count_in(&elide_core::segment::pending_open_dir(&fork_dir), None)
 }
 
 fn index_delta_count(fork_dir: &std::path::Path) -> usize {

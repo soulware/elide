@@ -164,26 +164,23 @@ and needs no migration.
 
 ## Journal upload rides the cut
 
-The tick's drain defers pure-journal segments (`DrainMode::DeferJournal`,
-`elide-coordinator/src/upload.rs`): they stay in `pending/`, where the
-consolidation pass keeps collapsing them — the steady state is the last
-window's ring merging with each new tick's journal — and the tick that
-closes a cut (`gc.cut_interval`) drains everything (`DrainMode::Full`)
-before HEAD publishes. Journal costs one PUT per cut instead of one per
-tick, and every published cut is complete by construction: HEAD only
-ever names a frontier whose journal is confirmed. Data segments keep
-uploading every tick as staging; between cuts they are durable but
-invisible, exactly the partial residue the cut design licenses
-(`durable-cut.md` § *The principle*). The volume's recovery point is
-the last cut for every LBA, so the cut interval is the volume's RPO and
+Deferral is the generation layout
+(`docs/design/upload-generations.md`): journal segments land in
+`pending/open/` and the consolidation pass keeps collapsing them there
+— the steady state is the window's ring merging with each new tick's
+journal — and a cut closes the open generation into `pending/upload/`,
+whose drain uploads it whole before the next cut publishes. Journal
+costs one PUT per cut instead of one per tick, and every published cut
+is complete by construction: HEAD only ever names whole generations,
+journal and data at one frontier. The volume's recovery point is the
+last cut for every LBA, so the cut interval is the volume's RPO and
 "journal upload cadence" is the same number.
 
-Deferral is all-or-nothing per drain, and a `Full` drain uploads
-ULID-ascending, so journal commits ascending among themselves: a
-committed journal ULID is always below every pending journal ULID. That
-ordering is what keeps a rebuild's claimant comparison resolving every
-ring position to its newest writer while a deferred segment holds the
-live ring.
+A drained generation uploads ULID-ascending, so journal commits
+ascending among themselves: a committed journal ULID is always below
+every pending journal ULID. That ordering is what keeps a rebuild's
+claimant comparison resolving every ring position to its newest writer
+while the open generation holds the live ring.
 
 Seals drain fully — snapshot, stop, and handoff each close the window
 synchronously (`drain_volume_for_seal`), so the snapshot floor never

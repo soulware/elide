@@ -847,7 +847,7 @@ impl<'a> MaterialiseCtx<'a> {
         extent_index: &'a ExtentIndex,
         resolver: &'a dyn BodyResolver,
     ) -> Result<Self, MaterialiseOutcome> {
-        let pending_dir = base_dir.join("pending");
+        let pending_dir = crate::segment::pending_open_dir(base_dir);
         let input_states = load_input_states_from(inputs, |u| pending_dir.join(u.to_string()))?;
         Ok(Self {
             base_dir,

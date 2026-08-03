@@ -96,7 +96,7 @@ impl PendingSummary {
 }
 
 pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
-    let pending_paths = segment::collect_segment_files(&vol_dir.join("pending"))?;
+    let pending_paths = elide_core::segment::collect_pending_segment_files(vol_dir)?;
     let pending_files = pending_paths.len();
     let mut pending_bytes = 0u64;
     for p in &pending_paths {
@@ -208,7 +208,7 @@ fn collect_node(dir: &Path, by_id_dir: &Path) -> io::Result<NodeInfo> {
     let is_live = dir.join("wal").is_dir();
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
-    let pending = collect_seg_dir(&dir.join("pending"))?;
+    let pending = collect_seg_dir(&elide_core::segment::pending_open_dir(&dir))?;
     let cache = collect_cache_dir(dir)?;
     let extent_sources = collect_extent_sources(dir, by_id_dir);
 
@@ -1119,11 +1119,15 @@ mod tests {
     #[test]
     fn pending_summary_counts_pending_files_and_wal_payload() {
         let tmp = temp_vol_dir();
-        fs::create_dir_all(tmp.join("pending")).unwrap();
+        fs::create_dir_all(elide_core::segment::pending_open_dir(&tmp)).unwrap();
         fs::create_dir_all(tmp.join("wal")).unwrap();
-        fs::write(tmp.join("pending/01AAAAAAAAAAAAAAAAAAAAAAAA"), [0u8; 100]).unwrap();
         fs::write(
-            tmp.join("pending/01AAAAAAAAAAAAAAAAAAAAAAAB.tmp"),
+            elide_core::segment::pending_open_dir(&tmp).join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            [0u8; 100],
+        )
+        .unwrap();
+        fs::write(
+            elide_core::segment::pending_open_dir(&tmp).join("01AAAAAAAAAAAAAAAAAAAAAAAB.tmp"),
             [0u8; 999],
         )
         .unwrap();
@@ -1165,7 +1169,7 @@ mod tests {
         use ulid::Ulid;
 
         let tmp = temp_vol_dir();
-        let pending = tmp.join("pending");
+        let pending = elide_core::segment::pending_open_dir(&tmp);
         fs::create_dir_all(&pending).unwrap();
         let (signer, _vk) = elide_core::signing::generate_ephemeral_signer();
         let body = |blocks: usize| vec![0u8; blocks * 4096];
@@ -1409,7 +1413,7 @@ mod tests {
         let vol_dir = by_id_dir.join("01JQAAAAAAAAAAAAAAAAAAAAAA");
 
         fs::create_dir_all(vol_dir.join("index")).unwrap();
-        fs::create_dir_all(vol_dir.join("pending")).unwrap();
+        fs::create_dir_all(elide_core::segment::pending_open_dir(&vol_dir)).unwrap();
 
         let node = collect_node(&vol_dir, &by_id_dir).unwrap();
         assert!(!node.is_live);

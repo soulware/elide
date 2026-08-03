@@ -68,7 +68,7 @@ fn load(dir: &Path, max_bytes: u64) -> io::Result<Vec<Version>> {
     // `pending/` with the body section at an offset inside the same file.
     let index_dir = dir.join("index");
     let cache_dir = dir.join("cache");
-    let pending_dir = dir.join("pending");
+    let pending_dir = elide_core::segment::pending_open_dir(&dir);
 
     let ulids_in = |d: &Path, suffix: &str| -> io::Result<Vec<ulid::Ulid>> {
         let mut out = Vec::new();

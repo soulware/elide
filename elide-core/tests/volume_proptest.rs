@@ -32,8 +32,9 @@ use common::{incompressible_block, pick_snap_ulid};
 /// Collect every ULID-named file across wal/, pending/, and index/*.idx.
 fn all_segment_ulids(fork_dir: &Path) -> std::collections::BTreeSet<Ulid> {
     let mut result = std::collections::BTreeSet::new();
-    for subdir in ["wal", "pending"] {
-        let dir = fork_dir.join(subdir);
+    let mut dirs = vec![fork_dir.join("wal")];
+    dirs.extend(elide_core::segment::pending_generation_dirs(fork_dir));
+    for dir in dirs {
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -224,11 +225,11 @@ enum SimOp {
     /// promote_segment (extracts .idx + cache body, updates extent index,
     /// publishes snapshot).
     DrainWithRedact,
-    /// The coordinator drain's between-cuts mode: repack, then promote
-    /// every pending segment except pure-journal ones. Leaves a journal
-    /// segment pending at a ULID below committed data — the deferral
-    /// steady state the claimant-aware rebuild resolves.
-    DrainDeferJournal,
+    /// The production cut: repack, close the open generation into
+    /// `pending/upload/`, promote its segments ascending. Exercises the
+    /// generation rotation and the claimant-aware rebuild across the
+    /// committed/pending boundary.
+    CutAndDrain,
     /// A multi-block write whose LBA range can cross the journal-window
     /// boundary in either direction. `commit_or_skip` splits it into
     /// boundary-aligned runs, so its blocks land in both tiers under
@@ -458,7 +459,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
         Just(SimOp::DrainWithRedact),
-        Just(SimOp::DrainDeferJournal),
+        Just(SimOp::CutAndDrain),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::GcCheckpoint),
         (2usize..=5).prop_map(|n| SimOp::GcApply { n }),
@@ -901,8 +902,8 @@ proptest! {
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
                 }
-                SimOp::DrainDeferJournal => {
-                    common::drain_defer_journal(&mut vol);
+                SimOp::CutAndDrain => {
+                    common::cut_and_drain(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // A complete GC pass invalidates any previously-stashed
@@ -1235,6 +1236,7 @@ proptest! {
                     prop_assert!(read.is_ok(), "read of lba {} failed: {:?}", lba, read.err());
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     let after = all_segment_ulids(fork_dir);
                     prop_assert_eq!(
@@ -1300,6 +1302,7 @@ proptest! {
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                         common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                         common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                         for (&lba, expected) in &oracle {
                             let actual = vol.read(lba, 1).unwrap();
@@ -1318,8 +1321,8 @@ proptest! {
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
                 }
-                SimOp::DrainDeferJournal => {
-                    common::drain_defer_journal(&mut vol);
+                SimOp::CutAndDrain => {
+                    common::cut_and_drain(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1403,6 +1406,7 @@ proptest! {
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
@@ -1624,6 +1628,7 @@ proptest! {
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
@@ -1689,6 +1694,7 @@ proptest! {
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                         common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                         common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                         for (&lba, expected) in &oracle {
                             let actual = vol.read(lba, 1).unwrap();
@@ -1707,8 +1713,8 @@ proptest! {
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
                 }
-                SimOp::DrainDeferJournal => {
-                    common::drain_defer_journal(&mut vol);
+                SimOp::CutAndDrain => {
+                    common::cut_and_drain(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1788,6 +1794,7 @@ proptest! {
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
@@ -1958,6 +1965,7 @@ proptest! {
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
@@ -2094,7 +2102,7 @@ fn delta_gc_prefix_mints_a_delta_entry() {
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .unwrap();
-    let minted = std::fs::read_dir(fork_dir.join("pending"))
+    let minted = std::fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
         .unwrap()
         .flatten()
         .map(|e| e.path())

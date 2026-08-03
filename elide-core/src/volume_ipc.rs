@@ -56,6 +56,9 @@ pub enum VolumeRequest {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         cap: Option<u32>,
     },
+    /// Close the open generation into `pending/upload/`; the upload
+    /// generation must already be drained.
+    CloseGeneration,
     /// Report whether a block-device client is currently connected.
     Connected,
     /// Flush the WAL and exit cleanly. The supervisor decides whether to
@@ -112,6 +115,14 @@ impl SegmentSetCommitment {
 
 fn default_max_buckets() -> u32 {
     1
+}
+
+/// Reply for [`VolumeRequest::CloseGeneration`]. `segments` is the
+/// closed generation's file count; 0 means the open generation was
+/// empty and nothing rotated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CloseGenerationReply {
+    pub segments: u32,
 }
 
 /// Reply for [`VolumeRequest::ApplyGcHandoffs`].
