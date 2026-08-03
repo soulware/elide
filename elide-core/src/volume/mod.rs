@@ -26,7 +26,6 @@
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -75,7 +74,9 @@ use open_state::open_read_state;
 #[cfg(test)]
 pub(in crate::volume) use read::SegmentLayout;
 pub use read::{DmatCache, FILE_CACHE_CAPACITY, ReadStats, ReadStatsSnapshot};
-pub(crate) use read::{FileCache, find_segment_in_dirs, open_delta_body_in_dirs, read_extents};
+pub(crate) use read::{
+    SharedFileCache, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
+};
 pub use readonly::ReadonlyVolume;
 pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
@@ -593,13 +594,13 @@ pub struct Volume {
     /// or `None` if no segments exist. Used by `snapshot()` to name the snapshot
     /// marker with the same ULID as the segment it covers.
     pub(in crate::volume) last_segment_ulid: Option<Ulid>,
-    /// LRU cache of open segment file handles for the read path.
+    /// Cache of open segment file handles for reads served off the `Volume`.
     ///
     /// Retains recently-opened segment files across `read` calls so that
     /// reads hitting the same segments avoid repeated `open` syscalls.
-    /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
-    /// the cache to be updated internally.
-    pub(in crate::volume) file_cache: RefCell<FileCache>,
+    /// Reads here run under the volume lock and eviction is explicit
+    /// (`evict_cached_segment`), so every op passes layout generation 0.
+    pub(in crate::volume) file_cache: SharedFileCache,
     /// Descriptor-cache counters for reads served directly off the `Volume`.
     pub(in crate::volume) read_stats: Arc<read::ReadStats>,
     /// In-memory cache of opened `cache/<ULID>.dmat` sidecars. Populated
@@ -918,7 +919,7 @@ impl Volume {
             pending,
             has_new_segments,
             last_segment_ulid,
-            file_cache: RefCell::new(FileCache::default()),
+            file_cache: SharedFileCache::default(),
             read_stats: Arc::new(read::ReadStats::default()),
             dmat_cache: read::DmatCache::default(),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
@@ -1315,6 +1316,7 @@ impl Volume {
             buf,
             &self.lbamap,
             &self.extent_index,
+            0,
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
@@ -2732,7 +2734,7 @@ impl Volume {
     /// applies `body_section_start` from the new extent index entry against
     /// the old file layout, seeking past the body section.
     pub(in crate::volume) fn evict_cached_segment(&self, segment_id: Ulid) {
-        self.file_cache.borrow_mut().evict(segment_id);
+        lock_file_cache(&self.file_cache).evict(segment_id);
     }
 
     /// Flush the current WAL to a fresh `pending/<segment_ulid>` and leave

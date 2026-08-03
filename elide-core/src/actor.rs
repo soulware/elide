@@ -21,7 +21,7 @@
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -41,12 +41,13 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
-    AncestorLayer, CompactionStats, FileCache, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
+    AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
-    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult,
+    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, SharedFileCache,
     SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob, WorkerResult,
-    find_segment_in_dirs, open_delta_body_in_dirs, read_extents, scan_reclaim_candidates,
+    find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
+    scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -1436,41 +1437,40 @@ pub struct VolumeClient {
     /// The volume's single per-process dmat cache, handed to every
     /// reader (see `volume::read::DmatCache`).
     dmat_cache: crate::volume::DmatCache,
+    /// The volume's single per-process segment-descriptor cache, shared
+    /// by every reader (see `volume::read::FileCache` for the layout-
+    /// generation discipline that keeps overlapping snapshots safe).
+    file_cache: SharedFileCache,
 }
 
 /// Per-thread reader for a volume session.
 ///
-/// Owns the file-descriptor cache for segment bodies and the generation
-/// counter used to evict that cache when the extent index changes. `Send`
-/// but `!Sync` — each thread serving reads constructs its own reader via
-/// [`VolumeClient::reader`].
+/// Reads resolve segment descriptors through the volume's shared
+/// `FileCache` (held on the client), keyed by the snapshot's layout
+/// generation. `Send` but `!Sync` — each thread serving reads constructs
+/// its own reader via [`VolumeClient::reader`].
 ///
 /// Derefs to [`VolumeClient`], so a reader can also issue writes, flushes,
 /// and other control operations without requiring a separate client
 /// reference.
 pub struct VolumeReader {
     client: VolumeClient,
-    /// Per-reader LRU cache of open segment file handles. Never contended:
-    /// each transport thread holds its own reader. `RefCell` is sufficient;
-    /// `Mutex` is not needed.
-    file_cache: RefCell<FileCache>,
     /// The volume's shared cache of opened `cache/<ULID>.dmat` sidecars —
     /// one instance per volume per process (see `volume::read::DmatCache`).
-    /// Cleared alongside `file_cache` whenever the snapshot's `layout_gen`
-    /// changes, so an eviction that drops `.dmat` from disk can't leave a
-    /// stale FD pointing at a removed inode.
+    /// Cleared whenever the snapshot's `layout_gen` changes, so an
+    /// eviction that drops `.dmat` from disk can't leave a stale FD
+    /// pointing at a removed inode.
     dmat_cache: crate::volume::DmatCache,
     /// Telemetry counters for the dmat cache. Per-reader; aggregate by
     /// summing snapshots across readers if needed.
     dmat_stats: Arc<crate::dmat::DmatStats>,
     /// Telemetry counters for the descriptor cache, on the same terms.
     read_stats: Arc<crate::volume::ReadStats>,
-    /// Generation of the last snapshot whose segment files this reader's
-    /// descriptors were opened against. Compared against
-    /// `ReadSnapshot::layout_gen` on every read; if they differ the caches
-    /// are evicted before proceeding. Reading the generation and the extent
-    /// index from the same snapshot load means the two are always in sync —
-    /// no separate atomic needed.
+    /// Generation at which this reader last cleared the shared dmat cache.
+    /// Compared against `ReadSnapshot::layout_gen` on every read; on
+    /// change the dmat cache is cleared before proceeding. Reading the
+    /// generation and the extent index from the same snapshot load means
+    /// the two are always in sync — no separate atomic needed.
     last_layout_gen: Cell<u64>,
 }
 
@@ -1490,21 +1490,20 @@ impl VolumeClient {
         VolumeReader {
             dmat_cache: self.dmat_cache.clone(),
             client: self.clone(),
-            file_cache: RefCell::new(FileCache::default()),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             read_stats: Arc::new(crate::volume::ReadStats::default()),
             last_layout_gen: Cell::new(current_gen),
         }
     }
 
-    /// Construct a reader whose descriptor cache holds `capacity` files.
+    /// Resize the volume's shared segment-descriptor cache to hold
+    /// `capacity` files.
     ///
-    /// The cache is per reader, so a volume's descriptor budget is
-    /// `capacity` times the number of readers its transport starts.
-    pub fn reader_with_cache_capacity(&self, capacity: usize) -> VolumeReader {
-        let mut reader = self.reader();
-        reader.file_cache = RefCell::new(FileCache::new(capacity));
-        reader
+    /// The cache is shared by every reader of this volume, so `capacity`
+    /// is the volume's whole descriptor budget for segment bodies. Drops
+    /// every cached descriptor; readers re-open files on their next read.
+    pub fn set_read_cache_capacity(&self, capacity: usize) {
+        lock_file_cache(&self.file_cache).set_capacity(capacity);
     }
 }
 
@@ -1892,7 +1891,6 @@ impl VolumeReader {
         buf: &mut [u8],
     ) -> io::Result<()> {
         if snap.layout_gen != self.last_layout_gen.get() {
-            self.file_cache.borrow_mut().clear();
             self.dmat_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1906,7 +1904,8 @@ impl VolumeReader {
             buf,
             &snap.lbamap,
             extent_index,
-            &self.file_cache,
+            snap.layout_gen,
+            &self.client.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
             &self.read_stats,
@@ -3341,6 +3340,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         snapshot,
         config,
         dmat_cache: lock_volume(&volume).dmat_cache_handle(),
+        file_cache: SharedFileCache::default(),
         volume: Arc::downgrade(&volume),
         flush_gen,
         layout_gen,
@@ -3982,7 +3982,7 @@ mod tests {
 
     /// The descriptor-cache counters follow the cache: the first read of a
     /// segment opens a file, and a second read of the same segment reuses the
-    /// descriptor. A reader sized to hold one file evicts on the second
+    /// descriptor. A cache sized to hold one file evicts on the second
     /// segment, so returning to the first opens it again.
     #[test]
     fn read_stats_count_descriptor_hits_and_misses() {
@@ -3996,7 +3996,8 @@ mod tests {
         client.write(1, &unique_block(2), false).unwrap();
         client.promote_wal().unwrap();
 
-        let reader = client.reader_with_cache_capacity(1);
+        client.set_read_cache_capacity(1);
+        let reader = client.reader();
         let mut buf = vec![0u8; 4096];
 
         reader.read_into(0, &mut buf).unwrap();
@@ -4025,6 +4026,38 @@ mod tests {
         assert!((total.fd_miss_rate() - 0.75).abs() < f64::EPSILON);
 
         drop(reader);
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The descriptor cache is per volume: a segment opened through one
+    /// reader serves the next reader's read of the same segment.
+    #[test]
+    fn readers_share_the_descriptor_cache() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        client.write(0, &unique_block(1), false).unwrap();
+        client.promote_wal().unwrap();
+
+        let warmer = client.reader();
+        let sharer = client.reader();
+        let mut buf = vec![0u8; 4096];
+
+        warmer.read_into(0, &mut buf).unwrap();
+        assert_eq!(warmer.read_stats().fd_miss_total, 1);
+
+        sharer.read_into(0, &mut buf).unwrap();
+        let stats = sharer.read_stats();
+        assert_eq!(stats.fd_hit_total, 1, "the warmed descriptor is shared");
+        assert_eq!(stats.fd_miss_total, 0);
+
+        drop(warmer);
+        drop(sharer);
         client.shutdown();
         drop(client);
         actor_thread.join().unwrap();

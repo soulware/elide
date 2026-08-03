@@ -8,7 +8,6 @@
 //! in `volume/ancestry.rs`; the shared open-time rebuild lives in
 //! `volume/open_state.rs`.
 
-use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    AncestorLayer, BoxFetcher, FileCache, find_segment_in_dirs, open_delta_body_in_dirs,
+    AncestorLayer, BoxFetcher, SharedFileCache, find_segment_in_dirs, open_delta_body_in_dirs,
     read::DmatCache, read_extents,
 };
 
@@ -39,7 +38,7 @@ pub struct ReadonlyVolume {
     ancestor_layers: Vec<AncestorLayer>,
     lbamap: Arc<lbamap::LbaMap>,
     extent_index: Arc<extentindex::ExtentIndex>,
-    file_cache: RefCell<FileCache>,
+    file_cache: SharedFileCache,
     read_stats: Arc<super::ReadStats>,
     dmat_cache: DmatCache,
     dmat_stats: Arc<DmatStats>,
@@ -65,7 +64,7 @@ impl ReadonlyVolume {
             ancestor_layers,
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
-            file_cache: RefCell::new(FileCache::default()),
+            file_cache: SharedFileCache::default(),
             read_stats: Arc::new(super::ReadStats::default()),
             dmat_cache: DmatCache::default(),
             dmat_stats: Arc::new(DmatStats::default()),
@@ -97,6 +96,7 @@ impl ReadonlyVolume {
             buf,
             &self.lbamap,
             &self.extent_index,
+            0,
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,

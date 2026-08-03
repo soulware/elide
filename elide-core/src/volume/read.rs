@@ -46,6 +46,20 @@ fn lock_dmat_cache(cache: &DmatCache) -> std::sync::MutexGuard<'_, HashMap<Ulid,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Shared per-volume cache of open segment-body descriptors, keyed by
+/// segment ULID. One instance per volume per process, cloned into every
+/// reader thread on the same terms as [`DmatCache`].
+pub(crate) type SharedFileCache = Arc<std::sync::Mutex<FileCache>>;
+
+/// Lock a [`SharedFileCache`], recovering from poisoning: the cache only
+/// holds re-openable descriptors, and every byte served through them is
+/// hash-verified downstream.
+pub(crate) fn lock_file_cache(cache: &SharedFileCache) -> std::sync::MutexGuard<'_, FileCache> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Per-thread scratch buffers for compressed-extent reads.
 ///
 /// `compressed` holds the stored bytes pread'd from the segment file;
@@ -240,8 +254,13 @@ fn serve_chunked(
 /// 28 MiB, so a second read is the tail of the size distribution.
 const TABLE_READ_PREFIX: usize = 4096;
 
-/// Default capacity for the segment file handle LRU cache.
-pub const FILE_CACHE_CAPACITY: usize = 16;
+/// Default capacity for a volume's shared segment-descriptor cache.
+///
+/// One cache per volume, so this is the volume's whole descriptor budget
+/// for segment bodies. Sized to cover the live segment count of a churned
+/// volume — misses climb once segments outnumber slots — while staying a
+/// small fraction of a typical 10240 fd rlimit.
+pub const FILE_CACHE_CAPACITY: usize = 128;
 
 /// Telemetry for the segment-descriptor cache.
 ///
@@ -340,18 +359,29 @@ impl SegmentLayout {
 /// bit that is set on access. On eviction the clock hand sweeps the ring,
 /// clearing referenced bits until it finds an unreferenced slot to evict.
 ///
-/// The hot-path operation (`get`) is a linear scan + flag set — no data
-/// movement, no allocation, no pointer chasing.  At 16 slots the scan fits
-/// comfortably in L1 cache.
+/// The hot-path operation (`get`) is a linear scan + flag set + `Arc` clone —
+/// no data movement, no pointer chasing — cheap next to the `open` it saves.
+///
+/// Every slot belongs to the cache's current layout generation. `get` and
+/// `insert` take the caller's generation: a newer generation empties the
+/// cache and becomes current, the current generation operates normally, and
+/// an older generation misses on `get` and is dropped on `insert`. Segment
+/// files are replaced on disk across a generation bump (promote, drain,
+/// repack, eviction), so this pins every served descriptor to the inode
+/// that the caller's snapshot — and its presence bitsets — describe, even
+/// while readers on different snapshots overlap mid-publication.
+/// Single-owner users (`Volume`, `ReadonlyVolume`) pass a constant 0 and
+/// evict explicitly.
 pub(crate) struct FileCache {
     slots: Vec<Option<FileCacheSlot>>,
     hand: usize,
+    layout_gen: u64,
 }
 
 struct FileCacheSlot {
     segment_id: Ulid,
     layout: SegmentLayout,
-    file: fs::File,
+    file: Arc<fs::File>,
     referenced: bool,
 }
 
@@ -365,36 +395,71 @@ impl FileCache {
     pub(crate) fn new(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || None);
-        Self { slots, hand: 0 }
+        Self {
+            slots,
+            hand: 0,
+            layout_gen: 0,
+        }
     }
 
-    /// Look up a cached file handle by segment id.
-    /// On hit, sets the referenced bit and returns the layout and file handle.
+    /// Empty the cache and adopt `layout_gen` when it is newer than the
+    /// current generation.
+    fn advance(&mut self, layout_gen: u64) {
+        if layout_gen > self.layout_gen {
+            self.clear();
+            self.layout_gen = layout_gen;
+        }
+    }
+
+    /// Replace the slot array with `capacity` empty slots, keeping the
+    /// generation.
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.slots.clear();
+        self.slots.resize_with(capacity, || None);
+        self.hand = 0;
+    }
+
+    /// Look up a cached file handle by segment id, on behalf of a caller
+    /// at layout generation `layout_gen`.
     ///
-    /// Returns a shared `&File` because the read path uses positional
-    /// (`pread`) reads, which don't touch the file cursor. Holding `&mut`
-    /// here would force serialization that the syscall doesn't require.
+    /// On hit, sets the referenced bit and returns the layout and a clone
+    /// of the handle, so the caller releases the cache lock before the
+    /// positional reads the handle serves.
     pub(in crate::volume) fn get(
         &mut self,
+        layout_gen: u64,
         segment_id: Ulid,
-    ) -> Option<(SegmentLayout, &fs::File)> {
+    ) -> Option<(SegmentLayout, Arc<fs::File>)> {
+        self.advance(layout_gen);
+        if layout_gen < self.layout_gen {
+            return None;
+        }
         let slot = self
             .slots
             .iter_mut()
             .flatten()
             .find(|s| s.segment_id == segment_id)?;
         slot.referenced = true;
-        Some((slot.layout, &slot.file))
+        Some((slot.layout, Arc::clone(&slot.file)))
     }
 
-    /// Insert a file handle. If the segment is already cached, replaces it
-    /// in-place. Otherwise, uses the CLOCK algorithm to find a slot to evict.
+    /// Insert a file handle opened by a caller at layout generation
+    /// `layout_gen`;
+    /// a stale generation is dropped, and the caller reads through the
+    /// handle it already holds. If the segment is already cached, replaces
+    /// it in-place. Otherwise, uses the CLOCK algorithm to find a slot to
+    /// evict.
     pub(in crate::volume) fn insert(
         &mut self,
+        layout_gen: u64,
         segment_id: Ulid,
         layout: SegmentLayout,
-        file: fs::File,
+        file: Arc<fs::File>,
     ) {
+        self.advance(layout_gen);
+        if layout_gen < self.layout_gen || self.slots.is_empty() {
+            return;
+        }
         // Replace in-place if already present.
         for slot in self.slots.iter_mut() {
             if slot.as_ref().is_some_and(|s| s.segment_id == segment_id) {
@@ -472,7 +537,8 @@ pub(crate) fn read_extents(
     out: &mut [u8],
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<FileCache>,
+    layout_gen: u64,
+    file_cache: &SharedFileCache,
     dmat_cache: &DmatCache,
     dmat_stats: &Arc<dmat::DmatStats>,
     read_stats: &ReadStats,
@@ -533,6 +599,7 @@ pub(crate) fn read_extents(
                     &er,
                     lba,
                     extent_index,
+                    layout_gen,
                     file_cache,
                     dmat_cache,
                     dmat_stats,
@@ -597,9 +664,10 @@ pub(crate) fn read_extents(
         // The fetcher updates the bitset under its per-segment lock,
         // and `cache/<id>.body` is grown in place (no rename), so a
         // hot FD remains valid across demand-fetch completion. Inode
-        // replacement events (sweep/drain/GC apply) bump `layout_gen`
-        // and clear the entire FileCache, so a hot FD here is
-        // guaranteed to point at the same inode the bitset describes.
+        // replacement events (sweep/drain/GC apply) bump `layout_gen`,
+        // which retires every descriptor the cache opened under earlier
+        // generations — so a hot FD here is guaranteed to point at the
+        // same inode the bitset describes.
         let presence_known_set = match loc.body_source {
             BodySource::Local => true,
             BodySource::Cached(idx) => {
@@ -614,18 +682,31 @@ pub(crate) fn read_extents(
                 presence.is_some_and(|p| p.test(idx))
             }
         };
-        let mut cache = file_cache.borrow_mut();
-        if !presence_known_set || cache.get(loc.segment_id).is_none() {
-            read_stats.record_miss();
-            let path = find_segment(loc.segment_id, loc.body_section_start, loc.body_source)?;
-            let layout = SegmentLayout::from_path(&path);
-            cache.insert(loc.segment_id, layout, fs::File::open(&path)?);
+        let cached = if presence_known_set {
+            lock_file_cache(file_cache).get(layout_gen, loc.segment_id)
         } else {
-            read_stats.record_hit();
-        }
-        let (layout, f) = cache
-            .get(loc.segment_id)
-            .expect("entry was just inserted or found");
+            None
+        };
+        let (layout, file) = match cached {
+            Some(hit) => {
+                read_stats.record_hit();
+                hit
+            }
+            None => {
+                read_stats.record_miss();
+                let path = find_segment(loc.segment_id, loc.body_section_start, loc.body_source)?;
+                let layout = SegmentLayout::from_path(&path);
+                let file = Arc::new(fs::File::open(&path)?);
+                lock_file_cache(file_cache).insert(
+                    layout_gen,
+                    loc.segment_id,
+                    layout,
+                    Arc::clone(&file),
+                );
+                (layout, file)
+            }
+        };
+        let f = file.as_ref();
 
         // body_offset is always body-relative (= stored_offset from the segment index).
         // For full segment files we must add body_section_start to get the file offset.
@@ -765,7 +846,8 @@ fn try_read_delta_extent(
     er: &lbamap::ExtentRead,
     lba: u64,
     extent_index: &extentindex::ExtentIndex,
-    file_cache: &RefCell<FileCache>,
+    layout_gen: u64,
+    file_cache: &SharedFileCache,
     dmat_cache: &DmatCache,
     dmat_stats: &Arc<dmat::DmatStats>,
     read_stats: &ReadStats,
@@ -837,35 +919,48 @@ fn try_read_delta_extent(
         // Same FD-cache + bitset short-circuit as the main read path:
         // skip `find_segment` when the FD is hot and presence is known
         // set, since `cache/<id>.body` is grown in place and inode
-        // replacement bumps `layout_gen` (which clears the FileCache).
+        // replacement bumps `layout_gen` (which retires cached
+        // descriptors).
         let presence_known_set = match source_loc.body_source {
             BodySource::Local => true,
             BodySource::Cached(idx) => extent_index
                 .segment_presence(source_loc.segment_id)
                 .is_some_and(|p| p.test(idx)),
         };
-        let mut cache = file_cache.borrow_mut();
-        if !presence_known_set || cache.get(source_loc.segment_id).is_none() {
-            read_stats.record_miss();
-            let path = find_segment(
-                source_loc.segment_id,
-                source_loc.body_section_start,
-                source_loc.body_source,
-            )?;
-            let layout = SegmentLayout::from_path(&path);
-            cache.insert(source_loc.segment_id, layout, fs::File::open(&path)?);
+        let cached = if presence_known_set {
+            lock_file_cache(file_cache).get(layout_gen, source_loc.segment_id)
         } else {
-            read_stats.record_hit();
-        }
-        let (layout, f) = cache
-            .get(source_loc.segment_id)
-            .expect("source just inserted or found");
+            None
+        };
+        let (layout, file) = match cached {
+            Some(hit) => {
+                read_stats.record_hit();
+                hit
+            }
+            None => {
+                read_stats.record_miss();
+                let path = find_segment(
+                    source_loc.segment_id,
+                    source_loc.body_section_start,
+                    source_loc.body_source,
+                )?;
+                let layout = SegmentLayout::from_path(&path);
+                let file = Arc::new(fs::File::open(&path)?);
+                lock_file_cache(file_cache).insert(
+                    layout_gen,
+                    source_loc.segment_id,
+                    layout,
+                    Arc::clone(&file),
+                );
+                (layout, file)
+            }
+        };
         let file_body_offset = match layout {
             SegmentLayout::BodyOnly => source_loc.body_offset,
             SegmentLayout::Full => source_loc.body_section_start + source_loc.body_offset,
         };
         let mut buf = vec![0u8; source_loc.body_length as usize];
-        f.read_exact_at(&mut buf, file_body_offset)?;
+        file.read_exact_at(&mut buf, file_body_offset)?;
         source_loc.codec.decode(Cow::Owned(buf))?.into_owned()
     };
 
@@ -883,20 +978,28 @@ fn try_read_delta_extent(
             body_section_start: delta_bss,
             body_length: delta_body_length,
         } => {
-            let mut cache = file_cache.borrow_mut();
-            if cache.get(delta_segment_id).is_none() {
-                read_stats.record_miss();
-                let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
-                let layout = SegmentLayout::from_path(&path);
-                cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
-            } else {
-                read_stats.record_hit();
-            }
-            let (_layout, f) = cache
-                .get(delta_segment_id)
-                .expect("delta segment just inserted or found");
+            let cached = lock_file_cache(file_cache).get(layout_gen, delta_segment_id);
+            let file = match cached {
+                Some((_layout, f)) => {
+                    read_stats.record_hit();
+                    f
+                }
+                None => {
+                    read_stats.record_miss();
+                    let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
+                    let layout = SegmentLayout::from_path(&path);
+                    let f = Arc::new(fs::File::open(&path)?);
+                    lock_file_cache(file_cache).insert(
+                        layout_gen,
+                        delta_segment_id,
+                        layout,
+                        Arc::clone(&f),
+                    );
+                    f
+                }
+            };
             let mut buf = vec![0u8; opt.delta_length as usize];
-            f.read_exact_at(&mut buf, delta_bss + delta_body_length + opt.delta_offset)?;
+            file.read_exact_at(&mut buf, delta_bss + delta_body_length + opt.delta_offset)?;
             buf
         }
         extentindex::DeltaBodySource::Cached => {

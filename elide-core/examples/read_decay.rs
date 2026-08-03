@@ -149,10 +149,9 @@ impl Measurement {
 /// Time `reads` random 8 KiB reads spread uniformly over the volume, divided
 /// evenly across `readers`.
 ///
-/// Every reader holds its own descriptor cache, as a ublk backend worker
-/// does, so a volume's descriptor budget is the per-reader capacity times
-/// this count — and readers drawing from one uniform LBA range converge on
-/// the same hot segments, so those budgets hold largely the same files.
+/// Readers share the volume's descriptor cache, as ublk backend workers
+/// do, so `FD_CAPACITY` is the volume's whole descriptor budget however
+/// many readers run, and a file one reader opens serves them all.
 fn measure(
     readers: &mut [VolumeReader],
     handle: &VolumeClient,
@@ -243,10 +242,9 @@ fn main() -> io::Result<()> {
     println!(
         "blocks={blocks} ({} MiB)  rounds={rounds}  overwrites/round={overwrites} pages  \
          reads/measure={reads}\npromote_every={promote_every}  readers={n_readers}  \
-         fd_capacity={capacity} (x{n_readers} = {} descriptors)  write_during={writing}  \
+         fd_capacity={capacity} (shared)  write_during={writing}  \
          drain={draining}  seed={seed:#x}",
         blocks * BLOCK as u64 / (1024 * 1024),
-        capacity * n_readers
     );
 
     let dir = tempfile::TempDir::new()?;
@@ -268,9 +266,8 @@ fn main() -> io::Result<()> {
     }
     println!("{:.1}s", start.elapsed().as_secs_f64());
 
-    let mut readers: Vec<VolumeReader> = (0..n_readers)
-        .map(|_| handle.reader_with_cache_capacity(capacity))
-        .collect();
+    handle.set_read_cache_capacity(capacity);
+    let mut readers: Vec<VolumeReader> = (0..n_readers).map(|_| handle.reader()).collect();
     println!("\n round  cache/pend/wal    reads/s  vs fresh  extents/read  fd miss  writes");
 
     let report = |round: &str, m: &Measurement, fresh: Option<f64>, dir: &Path| {
