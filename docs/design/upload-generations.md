@@ -38,61 +38,85 @@ cadence one job.
   consolidation, repack, reclaim. Its job is to keep the local segment
   set compact so that what eventually uploads is the minimal surviving
   byte set. It never awaits S3.
-- **Upload**: a continuous per-volume flow draining closed generations
-  (below), oldest ULID first, at whatever bandwidth allows.
-- **Cut** (every `cut_interval`): a predicate and a publish. Verify the
-  previous generation is fully confirmed, close the current one, and
-  publish HEAD at the closed frontier.
+- **Upload**: a continuous per-volume flow draining the upload
+  generation (below), oldest ULID first, at whatever bandwidth allows.
+- **Cut** (every `cut_interval`): a predicate and a publish. With the
+  upload generation empty, publish HEAD at its frontier, close the
+  open generation, and start a fresh one.
 
-## Generations
+## Generation directories
 
-Cut boundaries partition the write stream into generations. With
-window N spanning `(T0, T1]`:
+Generations are directories. `pending/` holds exactly two, under fixed
+names:
 
-1. **Open** `(T0 < now ≤ T1)`: generation N is repack's playground.
-   Every tick folds its segments — journal consolidation, data repack,
-   reclaim — harvesting deaths as they happen. Nothing in an open
-   generation uploads.
-2. **Closing** (the cut tick at `T1`): the closing WAL flush lands,
-   the generation takes one final consolidation among its own
-   segments, and its survivor set becomes immutable.
-3. **Shipping** `(T1 < now ≤ T2)`: the uploader drains generation N's
-   survivors across window N+1, spreading the bytes over the whole
-   window. Steady-state bandwidth is `(1 − elided) × write rate`, with
-   no burst at the boundary.
-4. **Published** (the cut at `T2`): with generation N fully confirmed,
-   HEAD publishes at frontier `T1`. Segments and HEAD keep the
-   existing crash ordering.
+```
+pending/open/       the open generation — WAL flushes land here, and
+                    every fold (repack, journal consolidation, reclaim
+                    outputs) reads and writes only here
+pending/upload/     the closed generation — immutable; the uploader
+                    drains it, promote removes each file after its
+                    upload confirms, and an empty directory is a fully
+                    uploaded generation
+```
 
-Worst-case durability lag is ~2W: a byte written just after `T0` is
-published at `T2`. That is the loss-window semantics already accepted
-for the journal tier, now uniform across the stream.
+The cut tick, when `pending/upload/` is empty: publish HEAD, remove
+`upload/`, rename `open/` → `upload/`, create a fresh `open/`,
+fsync `pending/` once. Each step is idempotent or atomic, so a crash
+at any point leaves one of three shapes — `open` alone, `open` beside
+`upload`, or an empty `upload` whose publish may or may not have
+landed — and publish is derived (`confirmed_beyond`), so re-running it
+is harmless.
 
-A cut whose previous generation has not finished shipping does not
-close: the window stretches, cut age grows past `cut_interval`, and
-the `[head]` publish line's `age` field (#848) is the health signal.
-Bandwidth below the sustained survivor rate therefore degrades RPO
-visibly rather than corrupting anything.
+Membership is assigned once, at write time, by which directory a file
+lands in, and nothing can move a file between generations: folds are
+confined to `open/` by construction, and `upload/` is only ever
+read and emptied. The fold-never-crosses rule is therefore not an
+invariant to check but a thing the layout cannot express violating.
+`ls pending/` shows the entire generation state of a volume — what is
+open, what is uploading, and how much of it remains.
 
-## Content age, never fold identity
+The migration from today's flat `pending/` is local-only: the segment
+format, S3 objects, and every published artefact are untouched. First
+start under the new layout moves any flat pending files into `open/`.
+
+## One upload generation, never a queue
+
+A cut whose upload generation has not emptied does not close: the
+open window stretches, cut age grows past `cut_interval`, and the
+`[head]` publish line's `age` field (#848) is the health signal.
+
+Letting closed generations queue instead would upload *more* bytes
+precisely when bandwidth is scarcest: folds cannot cross generation
+boundaries, so content split across queued generations can never
+consolidate again, and each queued window ships its own journal slice
+and its own not-yet-dead data. The stretched-window rule inverts the
+cost — under backpressure the open generation keeps folding, more of
+its content dies before ever uploading, and the eventual batch is
+smaller. A stall's byte cost is negative. RPO degrades identically in
+both schemes (unshipped is unshipped), so the queue would buy no
+durability.
+
+Worst-case durability lag in steady state is ~2W: a byte written just
+after a close is published two cuts later. That is the loss-window
+semantics already accepted for the journal tier, now uniform across
+the stream.
+
+## Why membership is not fold identity
 
 An age gate on segment ULIDs starves. Repack mints a fresh ULID for
 every fold, so a segment that consolidation keeps absorbing never ages
 — observed directly on the rig as the consolidation chain
 `X9V → H8N → 0R → EAV`, one fold per tick — while the write-times of
 the content it carries grow arbitrarily old. Any eligibility rule
-keyed on fold identity lets live claims for old acked writes sit
-local forever, and a cut anchored past those write-times would publish
-a set missing them.
+keyed on fold identity lets live claims for old acked writes sit local
+forever, and a cut anchored past those write-times would publish a set
+missing them.
 
-Eligibility and cut completeness are therefore defined over **content
-age**: each segment carries a content ceiling, the newest write it
-holds (a flush segment's own ULID; a fold output takes the max of its
-inputs). A fold may combine segments only within one generation, so
-ceilings stay inside their window and the closing consolidation is the
-last fold a generation ever sees. Starvation is structurally
-impossible: every acked byte is durable at most one closing plus one
-shipping window after write.
+Directory membership is content age: a file's generation is fixed when
+its content enters `pending/`, and folding inside `open/` re-mints
+ULIDs without moving anything across the boundary. Starvation is
+structurally impossible — every acked byte is durable at most one
+stretched-open window plus one upload window after write.
 
 ## One frontier for both tiers
 
@@ -102,12 +126,12 @@ metadata that references data blocks older than the metadata records —
 a `data=ordered` violation no real crash can produce, and exactly the
 class of un-crash-like image the durable cut exists to prevent.
 
-So the journal defers a full window too. Consolidation becomes
-per-generation rather than unbounded: each cut ships the closed
-window's ring slice, and S3 holds per-window journal slices ordered by
-claimant, the same shape the committed tier has today at per-tick
-granularity. Journal PUTs stay at one per cut; only the content they
-carry lags a window. This amends the single-output merge in
+So the journal defers a full window too: consolidation runs within
+`open/`, each generation ships its own ring slice, and S3 holds
+per-window journal slices ordered by claimant — the same shape the
+committed tier has today at per-tick granularity. Journal PUTs stay at
+one per cut; only the content they carry lags a window. This amends
+the single-output merge in
 [journal-pending-consolidation.md](journal-pending-consolidation.md)
 to generation scope.
 
@@ -117,128 +141,96 @@ A rewrite may elide a victim only against a killer that publishes in
 the same cut. Two rules make every elision safe:
 
 - **Segment-resident killers only.** Repack classifies a body dead
-  only when the superseding claim is held by a pending or committed
-  segment. A claim still in the WAL does not kill: it waits for its
-  flush, which the very next tick's fold sees. This mirrors GC's
-  supersession barrier (`durable-cut.md` *GC supersession waits for
-  its killers*) at the repack layer.
-- **Folds never cross a boundary.** With the closing consolidation
-  running on the cut tick immediately after the closing flush, every
-  killer visible to it is generation-N-resident, so victim and killer
-  always publish together at `T2`.
+  only when the superseding claim is held by a segment. **Verified:**
+  this is already structural — `prepare_repack` mints `u_flush` and
+  flushes the WAL into the open generation *before* snapshotting the
+  lbamap, so every claim the classifier sees is segment-resident and
+  publishes with the elision; writes racing in after prepare claim
+  under a newer WAL the snapshot never contains. The
+  flush-before-snapshot ordering is the load-bearing line, pinned by
+  `repack_elision_always_ships_the_killer` (volume_reproducers.rs).
+- **Folds stay in `open/`.** Victim, killer, and fold output share a
+  generation and publish together at its cut.
 
-Cross-generation deaths (a window-N+1 write killing a window-N byte)
-are deliberately not elided: the byte ships and dies later in S3
-through the normal GC path. The mortality curve prices this cost —
-it is the tail beyond the knee, and the knee is what the window
-harvests.
-
-**Verified:** the classifier can never see a WAL-only killer.
-`prepare_repack` mints `u_flush` and flushes the WAL into `pending/`
-*before* snapshotting the lbamap (`repack.rs::prepare_repack`), so
-every claim the classifier sees is segment-resident and drains in the
-same batch, and writes racing in after prepare claim under a newer
-WAL the snapshot never contains. The segment-resident rule is
-therefore already structural; the flush-before-snapshot ordering is
-the load-bearing line, pinned by
-`repack_elision_always_ships_the_killer` (volume_reproducers.rs),
-which fails with zeros at the overwritten LBA if the ordering
-regresses. The closing consolidation inherits the guarantee for free:
-its prepare performs the closing flush.
-
-## Relation to snapshots
-
-A generation is a cut-cadence frontier with snapshot-floor semantics
-that last one window instead of forever, and no artefact. A seal is
-already a synchronous cut boundary, and a snapshot floor already
-excludes every prior segment from rewriting (`collect_stats` skips
-`seg_ulid <= floor`), which is exactly the fold-never-crosses rule —
-so the generation boundary is a **soft floor**: repack and GC
-selection respect it during the shipping window through the same
-floor mechanism, and it expires when the generation publishes, at
-which point its segments become ordinary committed-tier citizens.
-The differences are the ones generations must not inherit: no named
-signed manifest, no retention, accumulate-into-HEAD rather than
-truncate-and-re-anchor. A mid-window user snapshot forcibly closes
-the open generation and ships the backlog — the strong frontier
-subsumes the weak ones.
+Cross-generation deaths (an open-generation write killing an upload-generation
+byte) are deliberately not elided: the byte ships and dies later in S3
+through the normal GC path. The mortality curve prices this cost — it
+is the tail beyond the knee, and the knee is what the window harvests.
 
 ## ULID order across the boundary
 
 The mint is monotonic by design: a rewrite output sorts above every
 write that existed when it was planned, so concurrent writes always
-win their claims. Generations keep that property under two rules.
+win their claims. Generations keep that property untouched. The close
+renames the whole directory, minting nothing, so an upload
+generation's ULIDs — including its final consolidation outputs — all
+predate every open-generation write, and claimant order across the
+boundary is the write order. Re-folding upload-generation content, the one
+operation that would interleave fresh mints above open pending, has no
+expressible form: `upload/` is not a fold source.
 
-**The closing consolidation mints on the boundary tick** — after the
-closing flush, before the next tick's first flush — so a closed
-generation's outputs sit between the generations in ULID order: above
-every generation-N flush claimant (the consumed-claimant override
-applies as usual), below every generation-N+1 claimant, which is
-exactly the order that lets open writes win. The single-file tick is
-what guarantees this window; the worker may finish later, but output
-ULIDs are reserved at plan time (`prepare_repack`).
+The strict `max(committed) < min(pending)` reading died with journal
+deferral (#844 split it per tier); a GC output minted mid-window still
+commits (`Added`) above the open generation's pending ULIDs.
+Generations scope the invariant once more: within a generation ULID
+order is total; across the boundary, membership is the directory and
+claimant order alone carries correctness.
 
-**A closed generation is never folded again.** An upload retry re-PUTs
-the same immutable file. A re-fold during shipping would mint above
-the open generation's pending flush segments and commit interleaved
-ULIDs above pending ones.
+## Relation to snapshots
 
-Interleaving of that shape already exists for the committed tier: a GC
-output minted mid-window commits immediately (`Added`) with a ULID
-above the open generation's pending segments — the strict
-`max(committed) < min(pending)` reading died with journal deferral
-(#844 split it per tier). Generations rework the invariant once more,
-to generation scope: within a generation ULID order is total and
-prefix-shaped; across boundaries membership is explicit (HEAD names
-sets, the cut predicate counts confirmations per generation), and
-claimant order alone carries correctness — which the boundary-tick
-minting preserves.
+A generation is a cut-cadence frontier with snapshot-floor semantics
+that last one window instead of forever, and no published artefact. A
+seal is already a synchronous cut boundary, and a snapshot floor
+already excludes every prior segment from rewriting (`collect_stats`
+skips `seg_ulid <= floor`) — the generation boundary is the same
+exclusion made literal: a directory folds cannot reach. It expires
+when the generation publishes and its segments become ordinary
+committed-tier citizens, with no named manifest, no retention, and
+accumulate-into-HEAD rather than truncate-and-re-anchor. A mid-window
+user snapshot forcibly closes the open generation and ships the
+backlog — the strong frontier subsumes the weak ones.
 
 ## The uploader
 
-A per-volume queue of closed-generation segments, drained oldest ULID
-first, each PUT followed by its promote IPC as today
-(`upload.rs::drain_pending`). Closed segments are immutable by the
-generation rule, so the repack-vs-upload race collapses to the closing
-instant: the promote-after-upload step keeps a *still-pending* gate
-(a segment consumed between PUT and promote leaves a harmless S3
-orphan for reconcile-reap and must not re-register), but in steady
-state the uploader and repack work disjoint sets by construction.
-
-Upload confirms advance a per-generation completion count; the cut
-predicate is "generation N fully confirmed". Per-volume bandwidth
-shaping slots in here as a queue drain rate, orthogonal to
-correctness.
+A per-volume flow draining `pending/upload/`, oldest ULID first,
+each PUT followed by its promote IPC as today
+(`upload.rs::drain_pending`), with promote removing the shipped file.
+The directory is immutable while it ships, so the uploader and the
+tick work disjoint sets by construction; a path listed before the seal
+races only the seal's own full drain, which the per-volume snapshot
+lock already serialises. Upload confirms are the file removals — the
+cut predicate is the directory being empty. Per-volume bandwidth
+shaping slots in here as a drain rate, orthogonal to correctness.
 
 ## Seals
 
 Every seal remains a synchronous cut boundary, now spanning the whole
-backlog: close the open generation, ship everything (both closed
-windows), publish. `volume stop`, snapshot, handoff and displacement
-latency scale with up to ~2W of survivors. This is the user-visible
-cost of the design and the reason the idle-volume early cut matters:
-a quiescent volume's open generation is empty and its shipping window
-drains dry, so closing early costs nothing and drops both the RPO and
-the eventual seal latency to ~zero.
+backlog: ship `upload/`, close and ship `open/`, publish. `volume
+stop`, snapshot, handoff and displacement latency scale with up to ~2W
+of survivors. This is the user-visible cost of the design and the
+reason the idle-volume early cut matters: a quiescent volume's open
+generation is empty and its upload generation drains dry, so closing
+early costs nothing and drops both the RPO and the eventual seal
+latency to ~zero.
 
 ## GC
 
 GC's candidate set, classification, and the Superseded barrier are
 untouched: the pass already works over local `index/` + `pending/` +
-WAL, and edge visibility already waits for a covering cut. The pass
-gate's "complete drain" input becomes "uploader healthy" (no failed
-PUTs outstanding), since a mid-window tick with a deferring uploader
-is now the normal complete state — the same reframing `deferred ≠
-failed` got in #844.
+WAL, with pending now read one directory deeper. The pass gate's
+"complete drain" input becomes "uploader healthy" (no failed PUTs
+outstanding), since a mid-window tick with a part-full upload
+directory is now the normal complete state — the same reframing
+`deferred ≠ failed` got in #844.
 
 ## Testing
 
 The cut consistency oracle (`gc_cycle.rs` tests) gains the generation
-dimension: mutations interleave with partial shipping, and the
+dimension: mutations interleave with partial uploading, and the
 materialised force-claim reader must always see a whole-generation
-prefix. The volume proptest suite gains ops for generation close and
-mid-shipping crash, plus invariant checks: content ceilings are
-monotone under folds and never cross a boundary; no published frontier
-splits a generation; journal frontier equals data frontier; every
-acked write is durable within two windows in wall-clock-free
-simulation time.
+prefix. The volume proptest suite gains ops for the close rename and
+mid-upload crash, plus invariant checks: `pending/` holds exactly
+`open/` and at most `upload/`; every fold's inputs and output share
+a directory; no published frontier splits a generation; the journal
+frontier equals the data frontier; and every acked write is durable
+within two windows in wall-clock-free simulation time.
