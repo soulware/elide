@@ -3366,9 +3366,10 @@ fn read_full_extent_body(
     if let Some(ref idata) = loc.inline_data {
         return Ok(loc.codec.decode(Cow::Borrowed(idata))?.into_owned());
     }
+    let home = loc.body_source.home();
     let mut found = None;
     for dir in search_dirs {
-        if let Some(hit) = segment::locate_segment_body(dir, loc.segment_id) {
+        if let Some(hit) = segment::locate_segment_body_from(dir, loc.segment_id, home) {
             found = Some(hit);
             break;
         }

@@ -339,7 +339,8 @@ impl BlockReader {
 
         self.ensure_extent_present(loc)?;
 
-        let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
+        let (path, layout) =
+            find_segment_file(&self.search_dirs, loc.segment_id, loc.body_source.home())?;
         let seek = layout.body_seek(loc);
         let f = fs::File::open(path)?;
         // The whole stored payload, not just the requested 4 KiB: the content
@@ -435,7 +436,13 @@ impl BlockReader {
                 body_section_start,
                 body_length,
             } => {
-                let (path, layout) = find_segment_file(&self.search_dirs, segment_id)?;
+                // A `Full` delta body sits inside a complete segment file, so
+                // the canonical walk already reaches it first.
+                let (path, layout) = find_segment_file(
+                    &self.search_dirs,
+                    segment_id,
+                    crate::segment::BodyHome::LocalFile,
+                )?;
                 // Delta body sits right after the body section.
                 let base = layout.body_section_file_offset(body_section_start) + body_length;
                 (path, base)
@@ -558,7 +565,8 @@ impl BlockReader {
             return Ok(loc.codec.decode(Cow::Borrowed(idata))?.into_owned());
         }
         self.ensure_extent_present(loc)?;
-        let (path, layout) = find_segment_file(&self.search_dirs, loc.segment_id)?;
+        let (path, layout) =
+            find_segment_file(&self.search_dirs, loc.segment_id, loc.body_source.home())?;
         let f = fs::File::open(path)?;
         let mut buf = vec![0u8; loc.body_length as usize];
         f.read_exact_at(&mut buf, layout.body_seek(loc))?;
@@ -905,9 +913,10 @@ fn apply_snapshot_layer(
 fn find_segment_file(
     search_dirs: &[PathBuf],
     segment_id: ulid::Ulid,
+    home: crate::segment::BodyHome,
 ) -> io::Result<(PathBuf, crate::segment::SegmentBodyLayout)> {
     for dir in search_dirs {
-        if let Some(hit) = crate::segment::locate_segment_body(dir, segment_id) {
+        if let Some(hit) = crate::segment::locate_segment_body_from(dir, segment_id, home) {
             return Ok(hit);
         }
     }

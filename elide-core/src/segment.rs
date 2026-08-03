@@ -2566,6 +2566,47 @@ pub fn locate_segment_body(
     None
 }
 
+/// Where the extent index says a body is, so a lookup can probe there first.
+///
+/// The index records this per entry, and it is the same fact
+/// [`locate_segment_body`] rediscovers by walking the lifecycle in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyHome {
+    /// A complete segment file: `wal/<id>`, `pending/<id>` or `gc/<id>`.
+    /// These are the first three the canonical walk tries, so it already
+    /// reaches them in one to three probes.
+    LocalFile,
+    /// A `cache/<id>.body`, written by promotion or demand-fetch. Last in
+    /// the canonical walk, and the steady state for a promoted volume.
+    Cache,
+}
+
+/// Resolve a segment's body starting at the directory `home` names, falling
+/// back to the canonical walk.
+///
+/// The fallback is what serves an entry whose body moved between the
+/// snapshot recording `home` and this lookup — a `LocalFile` entry promoted
+/// to `cache/` since, most often.
+///
+/// Reaching a `Cache` home directly is sound because a segment's bytes are
+/// fixed once written: for a given ULID every location holds the same
+/// content, and the lifecycle order encodes which copy is *retained*, not
+/// which is correct. A partially demand-fetched `cache/<id>.body` is the one
+/// exception, and callers gate that on the `.present` bit either way.
+pub fn locate_segment_body_from(
+    base_dir: &Path,
+    segment_id: ulid::Ulid,
+    home: BodyHome,
+) -> Option<(PathBuf, SegmentBodyLayout)> {
+    if home == BodyHome::Cache {
+        let cache_body = base_dir.join("cache").join(format!("{segment_id}.body"));
+        if cache_body.exists() {
+            return Some((cache_body, SegmentBodyLayout::BodyOnly));
+        }
+    }
+    locate_segment_body(base_dir, segment_id)
+}
+
 /// Return ULIDs of bare-named files in `dir`, sorted ascending.
 ///
 /// Skips files with any extension (e.g. `.tmp`, `.idx`, `.plan`) and any
@@ -4495,6 +4536,56 @@ mod tests {
             err.to_string().contains("overflows"),
             "expected overflow error, got: {err}"
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A `Cache` home reaches `cache/<id>.body` without probing the three
+    /// lifecycle directories first, and a home that has gone stale still
+    /// resolves through the canonical walk.
+    #[test]
+    fn locate_segment_body_from_starts_at_the_named_home() {
+        let dir = temp_dir();
+        for sub in ["wal", "pending", "gc", "cache"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let sid = ulid::Ulid::new();
+        let sid_s = sid.to_string();
+
+        let cache_body = dir.join("cache").join(format!("{sid_s}.body"));
+        fs::write(&cache_body, b"cache").unwrap();
+        assert_eq!(
+            locate_segment_body_from(&dir, sid, BodyHome::Cache),
+            Some((cache_body.clone(), SegmentBodyLayout::BodyOnly))
+        );
+
+        // A `pending/<id>` alongside it is what the canonical walk would
+        // have returned. Both hold the same bytes for the same ULID, and the
+        // named home decides which copy the read opens.
+        let pending = dir.join("pending").join(&sid_s);
+        fs::write(&pending, b"pending").unwrap();
+        assert_eq!(
+            locate_segment_body_from(&dir, sid, BodyHome::Cache),
+            Some((cache_body, SegmentBodyLayout::BodyOnly))
+        );
+        assert_eq!(
+            locate_segment_body_from(&dir, sid, BodyHome::LocalFile),
+            Some((pending.clone(), SegmentBodyLayout::FullSegment))
+        );
+
+        // A `Cache` home whose body is gone falls through to the walk, which
+        // is what serves an entry evicted since the snapshot named it.
+        fs::remove_file(dir.join("cache").join(format!("{sid_s}.body"))).unwrap();
+        assert_eq!(
+            locate_segment_body_from(&dir, sid, BodyHome::Cache),
+            Some((pending, SegmentBodyLayout::FullSegment))
+        );
+
+        // Absent everywhere, either home reports nothing rather than a path
+        // that cannot be opened.
+        fs::remove_file(dir.join("pending").join(&sid_s)).unwrap();
+        assert!(locate_segment_body_from(&dir, sid, BodyHome::Cache).is_none());
+        assert!(locate_segment_body_from(&dir, sid, BodyHome::LocalFile).is_none());
 
         fs::remove_dir_all(dir).unwrap();
     }

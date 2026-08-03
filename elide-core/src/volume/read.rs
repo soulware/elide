@@ -1103,12 +1103,13 @@ pub(crate) fn find_segment_in_dirs(
     body_source: BodySource,
 ) -> io::Result<PathBuf> {
     let sid = segment_id.to_string();
-    // Self dir: full canonical precedence (wal → pending → bare gc/<id> → cache).
-    // The bare-`gc/<id>` branch matters here because the extent index flips to
-    // the new segment_id the moment the volume renames `<id>.tmp → <id>` (the
-    // commit point of apply), before the coordinator has promoted the body to
-    // `cache/`.
-    if let Some((path, layout)) = segment::locate_segment_body(base_dir, segment_id)
+    let home = body_source.home();
+    // Self dir: start where the index says the body is, then the canonical
+    // precedence (wal → pending → bare gc/<id> → cache). The bare-`gc/<id>`
+    // branch matters here because the extent index flips to the new segment_id
+    // the moment the volume renames `<id>.tmp → <id>` (the commit point of
+    // apply), before the coordinator has promoted the body to `cache/`.
+    if let Some((path, layout)) = segment::locate_segment_body_from(base_dir, segment_id, home)
         && cache_hit_allowed(layout, base_dir, extent_index, segment_id, body_source)
     {
         return Ok(path);
@@ -1118,7 +1119,8 @@ pub(crate) fn find_segment_in_dirs(
     // wal/, but pending/ and cache/<id>.body can both appear — the same helper
     // yields the right path; cache hits re-gate on the same in-memory bitset.
     for layer in ancestor_layers.iter().rev() {
-        if let Some((path, layout)) = segment::locate_segment_body(&layer.dir, segment_id)
+        if let Some((path, layout)) =
+            segment::locate_segment_body_from(&layer.dir, segment_id, home)
             && cache_hit_allowed(layout, &layer.dir, extent_index, segment_id, body_source)
         {
             return Ok(path);

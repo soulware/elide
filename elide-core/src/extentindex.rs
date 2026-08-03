@@ -55,6 +55,16 @@ pub enum BodySource {
     Cached(u32),
 }
 
+impl BodySource {
+    /// The directory a lookup should probe first for this entry's body.
+    pub fn home(&self) -> segment::BodyHome {
+        match self {
+            Self::Local => segment::BodyHome::LocalFile,
+            Self::Cached(_) => segment::BodyHome::Cache,
+        }
+    }
+}
+
 /// Physical location of an extent within a segment file.
 #[derive(Clone)]
 pub struct ExtentLocation {
