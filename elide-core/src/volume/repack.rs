@@ -142,6 +142,56 @@ impl Volume {
         Ok(stats)
     }
 
+    /// Simulate a crash inside the repack pipeline, for proptests.
+    ///
+    /// With `apply: false`, runs the prep and worker phases only:
+    /// outputs land in `pending/` (journal consolidation first, its
+    /// inputs' promote siblings invalidated), the apply phase and input
+    /// removal never run, and the in-memory maps keep their pre-worker
+    /// view — the state the offload window holds while a worker runs,
+    /// and the state a process crash between `execute_repack` and
+    /// `apply_repack_result` leaves on disk. `remove_inputs` must be 0:
+    /// the in-memory index still resolves through the inputs, so
+    /// removing one before apply would fail live reads production never
+    /// fails.
+    ///
+    /// With `apply: true`, additionally applies every bucket, then
+    /// unlinks only the first `remove_inputs` consumed-input files — a
+    /// crash partway through `remove_consumed_inputs`. The caller must
+    /// crash (drop and reopen) immediately after: applied-in-memory
+    /// state with input files still on disk is interruptible only by a
+    /// crash in production (apply and removal are atomic with respect
+    /// to other ops on the actor), and its claimant view deliberately
+    /// diverges from a disk rebuild until the inputs are gone (consumed
+    /// claimants override at any ULID order; see
+    /// `docs/finding-sweep-flush-claimant-bug.md`) — which is also why
+    /// the removal here is raw unlinks: `remove_consumed_inputs` ends
+    /// with the live-state divergence check, sound only on the
+    /// complete set.
+    ///
+    /// Returns `false` when there was nothing to repack.
+    pub fn repack_crash_for_test(&mut self, apply: bool, remove_inputs: usize) -> io::Result<bool> {
+        assert!(
+            apply || remove_inputs == 0,
+            "inputs are only removable after apply"
+        );
+        let Some(job) = self.prepare_repack()? else {
+            return Ok(false);
+        };
+        let result = crate::actor::execute_repack(job)?;
+        if apply {
+            let (_stats, consumed_inputs) = self.apply_repack_result(result)?;
+            for path in consumed_inputs.iter().take(remove_inputs) {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Prep phase of `repack` — runs on the actor thread.
     ///
     /// Pre-mints `u_flush` and one output ULID per pending segment at

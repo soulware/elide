@@ -239,6 +239,14 @@ enum SimOp {
         lba_count: u8,
         seed: u8,
     },
+    /// A crash inside the repack pipeline (`repack_crash_for_test`).
+    /// `apply: false` stops after the worker phase: outputs and inputs
+    /// coexist in `pending/` and the in-memory maps keep their
+    /// pre-worker view — the offload window's state, and the on-disk
+    /// state of a crash before apply. `apply: true` applies every
+    /// bucket then removes only `remove_inputs` consumed-input files —
+    /// a crash partway through `remove_consumed_inputs`.
+    HalfRepack { apply: bool, remove_inputs: u8 },
     /// Simulate one coordinator GC sweep pass directly on the filesystem,
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
@@ -502,6 +510,12 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
                 lba_count,
                 seed,
             }
+        }),
+        (any::<bool>(), 0u8..=2).prop_map(|(apply, r)| SimOp::HalfRepack {
+            apply,
+            // Inputs are only removable after apply (the in-memory index
+            // still resolves through them until then).
+            remove_inputs: if apply { r } else { 0 },
         }),
     ]
 }
@@ -834,6 +848,29 @@ proptest! {
                             "sweep_pending deleted frozen segment {u} (floor {:?})",
                             snapshot_floor
                         );
+                    }
+                }
+                SimOp::HalfRepack {
+                    apply,
+                    remove_inputs,
+                } => {
+                    let _ = vol.repack_crash_for_test(*apply, *remove_inputs as usize);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "half-repack produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
+                    {
+                        // Both variants are crash states: the offload
+                        // window and the applied-but-inputs-present
+                        // transient each diverge from a disk rebuild on
+                        // claimants until the pipeline completes, so the
+                        // op takes the crash it models immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
                     }
                 }
                 SimOp::Repack => {
@@ -1246,6 +1283,35 @@ proptest! {
                 SimOp::SweepPending => {
                     let _ = vol.repack();
                 }
+                SimOp::HalfRepack {
+                    apply,
+                    remove_inputs,
+                } => {
+                    let _ = vol.repack_crash_for_test(*apply, *remove_inputs as usize);
+                    {
+                        // Both variants are crash states: the offload
+                        // window and the applied-but-inputs-present
+                        // transient each diverge from a disk rebuild on
+                        // claimants until the pipeline completes, so the
+                        // op takes the crash it models immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
+                        common::assert_promote_recovery(&mut vol, fork_dir);
+                        common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
+                        for (&lba, expected) in &oracle {
+                            let actual = vol.read(lba, 1).unwrap();
+                            prop_assert_eq!(
+                                actual.as_slice(),
+                                expected.as_slice(),
+                                "lba {} wrong after half-repack crash+rebuild",
+                                lba
+                            );
+                        }
+                    }
+                }
                 SimOp::Repack => {
                     let _ = vol.repack();
                 }
@@ -1605,6 +1671,35 @@ proptest! {
                 }
                 SimOp::SweepPending => {
                     let _ = vol.repack();
+                }
+                SimOp::HalfRepack {
+                    apply,
+                    remove_inputs,
+                } => {
+                    let _ = vol.repack_crash_for_test(*apply, *remove_inputs as usize);
+                    {
+                        // Both variants are crash states: the offload
+                        // window and the applied-but-inputs-present
+                        // transient each diverge from a disk rebuild on
+                        // claimants until the pipeline completes, so the
+                        // op takes the crash it models immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
+                        common::assert_promote_recovery(&mut vol, fork_dir);
+                        common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
+                        for (&lba, expected) in &oracle {
+                            let actual = vol.read(lba, 1).unwrap();
+                            prop_assert_eq!(
+                                actual.as_slice(),
+                                expected.as_slice(),
+                                "lba {} wrong after half-repack crash+rebuild",
+                                lba
+                            );
+                        }
+                    }
                 }
                 SimOp::Repack => {
                     let _ = vol.repack();
