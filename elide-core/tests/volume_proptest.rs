@@ -224,6 +224,11 @@ enum SimOp {
     /// promote_segment (extracts .idx + cache body, updates extent index,
     /// publishes snapshot).
     DrainWithRedact,
+    /// The coordinator drain's between-cuts mode: repack, then promote
+    /// every pending segment except pure-journal ones. Leaves a journal
+    /// segment pending at a ULID below committed data — the deferral
+    /// steady state the claimant-aware rebuild resolves.
+    DrainDeferJournal,
     /// Simulate one coordinator GC sweep pass directly on the filesystem,
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
@@ -435,6 +440,7 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
         Just(SimOp::DrainWithRedact),
+        Just(SimOp::DrainDeferJournal),
         (2usize..=5).prop_map(|n| SimOp::CoordGcLocal { n }),
         Just(SimOp::GcCheckpoint),
         (2usize..=5).prop_map(|n| SimOp::GcApply { n }),
@@ -840,6 +846,9 @@ proptest! {
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
                 }
+                SimOp::DrainDeferJournal => {
+                    common::drain_defer_journal(&mut vol);
+                }
                 SimOp::CoordGcLocal { n } => {
                     // A complete GC pass invalidates any previously-stashed
                     // `GcCheckpoint` ULIDs. Production enforces one GC pass
@@ -1156,6 +1165,7 @@ proptest! {
                     let read = vol.read(*lba as u64, 1);
                     prop_assert!(read.is_ok(), "read of lba {} failed: {:?}", lba, read.err());
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
                     let after = all_segment_ulids(fork_dir);
                     prop_assert_eq!(
                         &after,
@@ -1208,6 +1218,9 @@ proptest! {
                 }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
+                }
+                SimOp::DrainDeferJournal => {
+                    common::drain_defer_journal(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1290,6 +1303,7 @@ proptest! {
                     // runs inline with prop_assert via the helper.
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1489,6 +1503,7 @@ proptest! {
                         .unwrap_or([0u8; 4096]);
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),
@@ -1541,6 +1556,9 @@ proptest! {
                 }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
+                }
+                SimOp::DrainDeferJournal => {
+                    common::drain_defer_journal(&mut vol);
                 }
                 SimOp::CoordGcLocal { n } => {
                     // See ulid_monotonicity's CoordGcLocal — a full GC
@@ -1619,6 +1637,7 @@ proptest! {
                     // See crash_recovery_oracle for rationale.
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1767,6 +1786,7 @@ proptest! {
                         .unwrap_or([0u8; 4096]);
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),
