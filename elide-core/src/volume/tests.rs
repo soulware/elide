@@ -4261,8 +4261,10 @@ fn gc_handoff_idempotent_after_crash() {
 
 // --- FileCache (CLOCK) tests ---
 
-fn dummy_file() -> fs::File {
-    fs::File::open("/dev/null").unwrap()
+use read::FileCache;
+
+fn dummy_file() -> Arc<fs::File> {
+    Arc::new(fs::File::open("/dev/null").unwrap())
 }
 
 fn ulid(n: u128) -> Ulid {
@@ -4272,59 +4274,59 @@ fn ulid(n: u128) -> Ulid {
 #[test]
 fn file_cache_hit_and_miss() {
     let mut cache = FileCache::new(4);
-    assert!(cache.get(ulid(1)).is_none());
+    assert!(cache.get(0, ulid(1)).is_none());
 
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    assert!(cache.get(ulid(1)).is_some());
-    assert!(cache.get(ulid(2)).is_none());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(0, ulid(1)).is_some());
+    assert!(cache.get(0, ulid(2)).is_none());
 }
 
 #[test]
 fn file_cache_returns_correct_layout() {
     let mut cache = FileCache::new(4);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::BodyOnly, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::BodyOnly, dummy_file());
 
-    let (layout, _) = cache.get(ulid(1)).unwrap();
+    let (layout, _) = cache.get(0, ulid(1)).unwrap();
     assert_eq!(layout, SegmentLayout::Full);
 
-    let (layout, _) = cache.get(ulid(2)).unwrap();
+    let (layout, _) = cache.get(0, ulid(2)).unwrap();
     assert_eq!(layout, SegmentLayout::BodyOnly);
 }
 
 #[test]
 fn file_cache_replace_in_place() {
     let mut cache = FileCache::new(4);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(1), SegmentLayout::BodyOnly, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::BodyOnly, dummy_file());
 
-    let (layout, _) = cache.get(ulid(1)).unwrap();
+    let (layout, _) = cache.get(0, ulid(1)).unwrap();
     assert_eq!(layout, SegmentLayout::BodyOnly);
 }
 
 #[test]
 fn file_cache_fills_empty_slots_before_evicting() {
     let mut cache = FileCache::new(3);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(3), SegmentLayout::Full, dummy_file());
 
     // All three should be present — no eviction yet.
-    assert!(cache.get(ulid(1)).is_some());
-    assert!(cache.get(ulid(2)).is_some());
-    assert!(cache.get(ulid(3)).is_some());
+    assert!(cache.get(0, ulid(1)).is_some());
+    assert!(cache.get(0, ulid(2)).is_some());
+    assert!(cache.get(0, ulid(3)).is_some());
 }
 
 #[test]
 fn file_cache_clock_evicts_unreferenced() {
     let mut cache = FileCache::new(3);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(3), SegmentLayout::Full, dummy_file());
 
     // Touch 2 and 3 so their referenced bits are set.
-    cache.get(ulid(2));
-    cache.get(ulid(3));
+    cache.get(0, ulid(2));
+    cache.get(0, ulid(3));
 
     // Insert a 4th — should evict ulid(1) (unreferenced after insert,
     // since insert sets referenced but the CLOCK sweep clears it).
@@ -4335,13 +4337,13 @@ fn file_cache_clock_evicts_unreferenced() {
     // referenced=true from get, cleared, hand advances. Slot 2 (ulid 3)
     // has referenced=true from get, cleared, hand advances. Back to
     // slot 0 (ulid 1) — now unreferenced — evicted.
-    cache.insert(ulid(4), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(4), SegmentLayout::Full, dummy_file());
 
     assert!(
-        cache.get(ulid(1)).is_none(),
+        cache.get(0, ulid(1)).is_none(),
         "ulid(1) should have been evicted"
     );
-    assert!(cache.get(ulid(4)).is_some());
+    assert!(cache.get(0, ulid(4)).is_some());
 }
 
 #[test]
@@ -4355,66 +4357,94 @@ fn file_cache_recently_accessed_survives_eviction() {
     // like everyone else — but if we access it *between* two inserts, the
     // second sweep finds it referenced again.
     let mut cache = FileCache::new(3);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(3), SegmentLayout::Full, dummy_file());
 
     // First overflow: inserts ulid(4). The sweep clears all three
     // referenced bits (first pass), then evicts slot 0 (ulid(1)) on
     // the second pass. Hand ends at slot 1.
-    cache.insert(ulid(4), SegmentLayout::Full, dummy_file());
-    assert!(cache.get(ulid(1)).is_none(), "ulid(1) evicted");
+    cache.insert(0, ulid(4), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(0, ulid(1)).is_none(), "ulid(1) evicted");
 
     // Now touch ulid(2) — refreshes its referenced bit.
-    cache.get(ulid(2));
+    cache.get(0, ulid(2));
 
     // Second overflow: inserts ulid(5). Hand is at slot 1.
     // Slot 1 (ulid(2)) ref=true → cleared, hand→2.
     // Slot 2 (ulid(3)) ref=false (cleared by first sweep, never re-accessed) → evicted.
-    cache.insert(ulid(5), SegmentLayout::Full, dummy_file());
-    assert!(cache.get(ulid(3)).is_none(), "ulid(3) evicted");
+    cache.insert(0, ulid(5), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(0, ulid(3)).is_none(), "ulid(3) evicted");
     assert!(
-        cache.get(ulid(2)).is_some(),
+        cache.get(0, ulid(2)).is_some(),
         "ulid(2) survived — was accessed"
     );
-    assert!(cache.get(ulid(4)).is_some());
-    assert!(cache.get(ulid(5)).is_some());
+    assert!(cache.get(0, ulid(4)).is_some());
+    assert!(cache.get(0, ulid(5)).is_some());
 }
 
 #[test]
 fn file_cache_evict_by_id() {
     let mut cache = FileCache::new(4);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
 
     cache.evict(ulid(1));
-    assert!(cache.get(ulid(1)).is_none());
-    assert!(cache.get(ulid(2)).is_some());
+    assert!(cache.get(0, ulid(1)).is_none());
+    assert!(cache.get(0, ulid(2)).is_some());
 }
 
 #[test]
 fn file_cache_clear() {
     let mut cache = FileCache::new(4);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
 
     cache.clear();
-    assert!(cache.get(ulid(1)).is_none());
-    assert!(cache.get(ulid(2)).is_none());
+    assert!(cache.get(0, ulid(1)).is_none());
+    assert!(cache.get(0, ulid(2)).is_none());
 }
 
 #[test]
 fn file_cache_evict_frees_slot_for_reuse() {
     let mut cache = FileCache::new(2);
-    cache.insert(ulid(1), SegmentLayout::Full, dummy_file());
-    cache.insert(ulid(2), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(1), SegmentLayout::Full, dummy_file());
+    cache.insert(0, ulid(2), SegmentLayout::Full, dummy_file());
 
     cache.evict(ulid(1));
 
     // The freed slot should be reused without evicting ulid(2).
-    cache.insert(ulid(3), SegmentLayout::Full, dummy_file());
-    assert!(cache.get(ulid(2)).is_some());
-    assert!(cache.get(ulid(3)).is_some());
+    cache.insert(0, ulid(3), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(0, ulid(2)).is_some());
+    assert!(cache.get(0, ulid(3)).is_some());
+}
+
+/// The generation rules that make one cache safe under readers on
+/// different snapshots: a newer generation empties the cache and becomes
+/// current; an older generation misses on `get` and its `insert` is
+/// dropped, so a descriptor opened against replaced segment files can
+/// never be served to a reader whose snapshot postdates the replacement.
+#[test]
+fn file_cache_generation_pins_descriptors_to_snapshots() {
+    let mut cache = FileCache::new(4);
+
+    cache.insert(1, ulid(1), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(1, ulid(1)).is_some());
+
+    // A generation-2 caller empties the cache on first contact.
+    assert!(cache.get(2, ulid(1)).is_none());
+
+    // The generation-1 caller is now stale: it misses even after the
+    // entry it wants is re-inserted at generation 2...
+    cache.insert(2, ulid(1), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(1, ulid(1)).is_none());
+
+    // ...and its own late insert is dropped, invisible to generation 2.
+    cache.insert(1, ulid(9), SegmentLayout::Full, dummy_file());
+    assert!(cache.get(2, ulid(9)).is_none());
+
+    // The current generation operates normally throughout.
+    assert!(cache.get(2, ulid(1)).is_some());
 }
 
 // --- inline extent tests ---
@@ -4854,7 +4884,7 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
     let mut map = lbamap::LbaMap::new();
     map.insert(0, 1, blake3::hash(b"orphan"), ulid::Ulid::new());
     let index = extentindex::ExtentIndex::new();
-    let file_cache = std::cell::RefCell::new(read::FileCache::new(4));
+    let file_cache = read::SharedFileCache::default();
     let dmat_cache: read::DmatCache = Default::default();
     let dmat_stats = Arc::new(crate::dmat::DmatStats::default());
     let read_stats = read::ReadStats::default();
@@ -4864,6 +4894,7 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
         &mut out,
         &map,
         &index,
+        0,
         &file_cache,
         &dmat_cache,
         &dmat_stats,

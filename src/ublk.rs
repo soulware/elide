@@ -204,8 +204,10 @@ mod imp {
     /// IoBuf + one eventfd + one atomic result slot.
     const QUEUE_DEPTH: u16 = 64;
 
-    /// Upper bound on queue count. With blk-mq one queue per CPU is ideal for
-    /// locality; capped so tiny hosts do not pay for idle queues.
+    /// Upper bound on queue count. `pick_nr_queues` tracks CPU count up to
+    /// this cap; each queue costs `QUEUE_DEPTH` pinned IoBufs (64 MiB) plus
+    /// `WORKERS_PER_QUEUE` backend threads, so the cap bounds what a volume
+    /// spends on many-core hosts.
     const MAX_QUEUES: u16 = 4;
 
     /// Backend worker threads per queue. Each worker owns a `VolumeReader`
