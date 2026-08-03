@@ -98,6 +98,17 @@ sql() { as_pg "$PGBIN/psql" -X -At -d "$DB" -c "$1"; }
 
 pg_running() { as_pg "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; }
 
+# One port serves one cluster, so a server left running on another volume
+# answers for this one and every number it produces carries the wrong
+# volume's name. Verify the server reached is the one this volume owns.
+assert_pgdata() {
+    local live
+    live="$(as_pg "$PGBIN/psql" -X -At -d postgres -c 'SHOW data_directory' 2>/dev/null)" \
+        || die "no postgres reachable on the socket (expected $PGDATA)"
+    [ "$live" = "$PGDATA" ] \
+        || die "postgres on the socket serves $live, not $PGDATA"
+}
+
 # --direct-io=on so writes reach the backing file rather than resting in the
 # page cache: a buffered loop device would report throughput no durable
 # configuration can deliver, which is the opposite of a baseline.
@@ -154,13 +165,16 @@ do_start() {
         || install -m 644 -o postgres -g postgres /dev/null "$OUT_ROOT/postgres.log"
     if ! pg_running; then
         as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 300 \
-            -l "$OUT_ROOT/postgres.log" start
+            -l "$OUT_ROOT/postgres.log" start \
+            || die "pg_ctl start failed for $PGDATA (see $OUT_ROOT/postgres.log)"
         log "postgres started (recovery complete)"
     fi
+    assert_pgdata
 }
 
 do_verify() {
     local sums b t a h
+    assert_pgdata
     sums="$(sql "SELECT (SELECT sum(bbalance) FROM pgbench_branches),
                         (SELECT sum(tbalance) FROM pgbench_tellers),
                         (SELECT sum(abalance) FROM pgbench_accounts),
@@ -209,6 +223,7 @@ record_tps() {
 
 do_bench() {
     local secs="${1:-$RUN_SECS}"
+    assert_pgdata
     local out="$OUT_ROOT/pgbench-$(date -u +%Y%m%dT%H%M%SZ).log"
     as_pg "$PGBIN/pgbench" -n -c "$CLIENTS" -j "$JOBS" -T "$secs" -P 10 "$DB" 2>&1 | tee "$out"
     record_tps "$out" "$secs"
