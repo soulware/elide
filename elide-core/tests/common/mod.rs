@@ -84,6 +84,36 @@ fn pending_is_journal(base_dir: &Path, ulid: Ulid) -> bool {
         .unwrap_or(false)
 }
 
+/// Every readable segment index under `pending/` and `index/`, as
+/// `(ulid string, entries)`. Unreadable or non-ULID files are skipped.
+fn segment_indexes(fork_dir: &Path) -> Vec<(String, Vec<segment::SegmentEntry>)> {
+    let mut out = Vec::new();
+    for ulid in pending_ulids(fork_dir) {
+        let s = ulid.to_string();
+        if let Ok((_bss, entries, _inputs)) =
+            segment::read_segment_index(&fork_dir.join("pending").join(&s))
+        {
+            out.push((s, entries));
+        }
+    }
+    let index_dir = fork_dir.join("index");
+    if let Ok(dirents) = fs::read_dir(&index_dir) {
+        for dirent in dirents.flatten() {
+            let name = dirent.file_name();
+            let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".idx")) else {
+                continue;
+            };
+            if Ulid::from_string(stem).is_err() {
+                continue;
+            }
+            if let Ok((_bss, entries, _inputs)) = segment::read_segment_index(&dirent.path()) {
+                out.push((stem.to_owned(), entries));
+            }
+        }
+    }
+    out
+}
+
 /// Verify every on-disk segment is tier-pure: its entries are either all
 /// journal-flagged or all stable. Formation partitions each flush epoch
 /// into a segment pair and the rewriters keep tiers apart, and every
@@ -93,10 +123,7 @@ fn pending_is_journal(base_dir: &Path, ulid: Ulid) -> bool {
 ///
 /// Returns a description of the first violation found.
 pub fn check_tier_purity(fork_dir: &Path) -> Result<(), String> {
-    let check = |path: &Path, ulid_str: &str| -> Result<(), String> {
-        let Ok((_bss, entries, _inputs)) = segment::read_segment_index(path) else {
-            return Ok(());
-        };
+    for (ulid_str, entries) in segment_indexes(fork_dir) {
         let journal_count = entries.iter().filter(|e| e.journal).count();
         if journal_count != 0 && journal_count != entries.len() {
             return Err(format!(
@@ -104,21 +131,49 @@ pub fn check_tier_purity(fork_dir: &Path) -> Result<(), String> {
                 entries.len(),
             ));
         }
-        Ok(())
-    };
-    for ulid in pending_ulids(fork_dir) {
-        let s = ulid.to_string();
-        check(&fork_dir.join("pending").join(&s), &s)?;
     }
-    let index_dir = fork_dir.join("index");
-    if let Ok(entries) = fs::read_dir(&index_dir) {
-        for dirent in entries.flatten() {
-            let name = dirent.file_name();
-            let Some(stem) = name.to_str().and_then(|s| s.strip_suffix(".idx")) else {
+    Ok(())
+}
+
+/// Verify flag/window agreement for every claim-bearing entry: a
+/// journal-flagged range lies fully inside the configured window, an
+/// unflagged one fully outside. The write path splits at window
+/// boundaries (`commit_or_skip`), which is what makes the start-LBA
+/// classification cover each entry's whole range. The outside half
+/// assumes the window predates every write — true for the proptest
+/// forks, which stamp `volume.toml` before first open (production
+/// legitimately holds unflagged in-window content written before a
+/// mid-session mkfs derived the window). Zero extents carry no flag
+/// and stay whole across boundaries; canonicals claim no LBAs.
+///
+/// Returns a description of the first violation found.
+pub fn check_journal_flag_containment(fork_dir: &Path) -> Result<(), String> {
+    let Ok(cfg) = elide_core::config::VolumeConfig::read(fork_dir) else {
+        return Ok(());
+    };
+    let ranges = cfg.journal_ranges();
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    for (ulid_str, entries) in segment_indexes(fork_dir) {
+        for (i, e) in entries.iter().enumerate() {
+            if e.kind.is_canonical_only() || e.kind == EntryKind::Zero {
                 continue;
-            };
-            if Ulid::from_string(stem).is_ok() {
-                check(&dirent.path(), stem)?;
+            }
+            let lbas = || e.start_lba..e.start_lba + e.lba_length as u64;
+            if e.journal && !lbas().all(|l| ranges.contains(l)) {
+                return Err(format!(
+                    "segment {ulid_str} entry {i}: journal-flagged range \
+                     [{}, +{}) leaves the window",
+                    e.start_lba, e.lba_length,
+                ));
+            }
+            if !e.journal && lbas().any(|l| ranges.contains(l)) {
+                return Err(format!(
+                    "segment {ulid_str} entry {i}: unflagged range \
+                     [{}, +{}) enters the window",
+                    e.start_lba, e.lba_length,
+                ));
             }
         }
     }

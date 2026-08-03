@@ -229,6 +229,16 @@ enum SimOp {
     /// segment pending at a ULID below committed data — the deferral
     /// steady state the claimant-aware rebuild resolves.
     DrainDeferJournal,
+    /// A multi-block write whose LBA range can cross the journal-window
+    /// boundary in either direction. `commit_or_skip` splits it into
+    /// boundary-aligned runs, so its blocks land in both tiers under
+    /// matching flags — the containment invariant
+    /// (`common::check_journal_flag_containment`) verifies the split.
+    JournalStraddleWrite {
+        start_lba: u8,
+        lba_count: u8,
+        seed: u8,
+    },
     /// Simulate one coordinator GC sweep pass directly on the filesystem,
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
@@ -481,23 +491,31 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             }
         }),
         Just(SimOp::EvictCacheBody),
-        prop_oneof![0u8..56, 96u8..98].prop_map(|lba| SimOp::ReadAfterDrain { lba }),
+        prop_oneof![0u8..56, 96u8..101].prop_map(|lba| SimOp::ReadAfterDrain { lba }),
         (any::<bool>(), 0u8..128u8).prop_map(|(journal_first, seed)| SimOp::JournalDupWrite {
             journal_first,
             seed,
         }),
+        (93u8..=98, 2u8..=6, any::<u8>()).prop_map(|(start_lba, lba_count, seed)| {
+            SimOp::JournalStraddleWrite {
+                start_lba,
+                lba_count,
+                seed,
+            }
+        }),
     ]
 }
 
-/// The journal window every proptest fork runs with: LBA 96, one block.
+/// The journal window every proptest fork runs with: LBAs 96–99.
 /// Stamped into `volume.toml` before the first open so the extent
 /// index's non-journal ownership preference and journal segment
-/// segregation are live for `JournalDupWrite`. Empty-window behaviour is
-/// covered by every other volume test in the workspace.
+/// segregation are live for `JournalDupWrite`, and wide enough that
+/// `JournalStraddleWrite` can cross either boundary. Empty-window
+/// behaviour is covered by every other volume test in the workspace.
 fn stamp_journal_window(fork_dir: &std::path::Path) {
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
-        ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
+        ranges: elide_core::journal::JournalRanges::new(vec![(96, 4)]),
     });
     cfg.write(fork_dir).unwrap();
 }
@@ -1144,9 +1162,23 @@ proptest! {
                 }
                 SimOp::JournalDupWrite { journal_first, seed } => {
                     let data = incompressible_block(*seed);
-                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let (first, second) = if *journal_first { (96u64, 100u64) } else { (100u64, 96u64) };
                     let _ = vol.write(first, &data);
                     let _ = vol.write(second, &data);
+                }
+                SimOp::JournalStraddleWrite {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    // Append-only WAL write; commit_or_skip splits it
+                    // into boundary-aligned runs, no new ULID files
+                    // until Flush.
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let _ = vol.write(*start_lba as u64, &payload);
                 }
                 SimOp::ReadAfterDrain { lba } => {
                     // Reads must not mint new ULIDs. A demand fetch may
@@ -1166,6 +1198,7 @@ proptest! {
                     prop_assert!(read.is_ok(), "read of lba {} failed: {:?}", lba, read.err());
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     let after = all_segment_ulids(fork_dir);
                     prop_assert_eq!(
                         &after,
@@ -1304,6 +1337,7 @@ proptest! {
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1481,13 +1515,33 @@ proptest! {
                 }
                 SimOp::JournalDupWrite { journal_first, seed } => {
                     let data = incompressible_block(*seed);
-                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let (first, second) = if *journal_first { (96u64, 100u64) } else { (100u64, 96u64) };
                     let _ = vol.write(first, &data);
                     let _ = vol.write(second, &data);
                     let mut block = [0u8; 4096];
                     block.copy_from_slice(&data);
                     oracle.insert(96, block);
-                    oracle.insert(97, block);
+                    oracle.insert(100, block);
+                }
+                SimOp::JournalStraddleWrite {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    // commit_or_skip splits the range into
+                    // boundary-aligned runs; the oracle records each
+                    // block so the next Crash verifies both tiers'
+                    // shares survive recovery.
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let _ = vol.write(*start_lba as u64, &payload);
+                    for i in 0..*lba_count {
+                        let mut block = [0u8; 4096];
+                        block.copy_from_slice(&payload[i as usize * 4096..][..4096]);
+                        oracle.insert(*start_lba as u64 + i as u64, block);
+                    }
                 }
                 SimOp::ReadAfterDrain { lba } => {
                     // Read in-process against the oracle without
@@ -1504,6 +1558,7 @@ proptest! {
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),
@@ -1638,6 +1693,7 @@ proptest! {
                     common::assert_promote_recovery(&mut vol, fork_dir);
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     for (&lba, expected) in &oracle {
                         let actual = vol.read(lba, 1).unwrap();
                         prop_assert_eq!(
@@ -1771,13 +1827,33 @@ proptest! {
                 }
                 SimOp::JournalDupWrite { journal_first, seed } => {
                     let data = incompressible_block(*seed);
-                    let (first, second) = if *journal_first { (96u64, 97u64) } else { (97u64, 96u64) };
+                    let (first, second) = if *journal_first { (96u64, 100u64) } else { (100u64, 96u64) };
                     let _ = vol.write(first, &data);
                     let _ = vol.write(second, &data);
                     let mut block = [0u8; 4096];
                     block.copy_from_slice(&data);
                     oracle.insert(96, block);
-                    oracle.insert(97, block);
+                    oracle.insert(100, block);
+                }
+                SimOp::JournalStraddleWrite {
+                    start_lba,
+                    lba_count,
+                    seed,
+                } => {
+                    // commit_or_skip splits the range into
+                    // boundary-aligned runs; the oracle records each
+                    // block so the next Crash verifies both tiers'
+                    // shares survive recovery.
+                    let mut payload = Vec::with_capacity(*lba_count as usize * 4096);
+                    for i in 0..*lba_count {
+                        payload.extend_from_slice(&incompressible_block(seed.wrapping_add(i)));
+                    }
+                    let _ = vol.write(*start_lba as u64, &payload);
+                    for i in 0..*lba_count {
+                        let mut block = [0u8; 4096];
+                        block.copy_from_slice(&payload[i as usize * 4096..][..4096]);
+                        oracle.insert(*start_lba as u64 + i as u64, block);
+                    }
                 }
                 SimOp::ReadAfterDrain { lba } => {
                     let expected = oracle
@@ -1787,6 +1863,7 @@ proptest! {
                     let actual = vol.read(*lba as u64, 1).unwrap();
                     common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
                     common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                    common::check_journal_flag_containment(fork_dir).map_err(TestCaseError::fail)?;
                     prop_assert_eq!(
                         actual.as_slice(),
                         expected.as_slice(),

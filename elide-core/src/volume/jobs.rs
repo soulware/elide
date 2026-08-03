@@ -61,7 +61,9 @@ impl PendingPartition {
 
     /// Split off the journal-window share, each write keeping its token and
     /// gaining `entry.journal`. Stays whole as the primary when the window is
-    /// empty or no write falls inside it.
+    /// empty or no write falls inside it. The start LBA classifies each
+    /// write's whole range: `commit_or_skip` splits writes at window
+    /// boundaries, so every pending write is uniformly inside or outside.
     pub(super) fn split_journal(
         self,
         journal_ranges: &crate::journal::JournalRanges,

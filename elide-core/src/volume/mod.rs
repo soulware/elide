@@ -1164,6 +1164,29 @@ impl Volume {
     ) -> io::Result<bool> {
         let lba_length = (data.len() / 4096) as u32;
 
+        // A write crossing a journal-window boundary commits as
+        // boundary-aligned runs, each hashed and compressed on its own,
+        // so every WAL record, LBA claim, and segment entry it produces
+        // is uniformly journal or stable — the tier purity every
+        // downstream consumer (formation's split, drain deferral, repack
+        // routing, reap-whole) classifies whole segments by. The
+        // caller's hash and compression cover the whole buffer and are
+        // recomputed per run; jbd2 confines its I/O to the journal
+        // extents, so a crossing write is guest misbehaviour and the
+        // recompute cost is irrelevant.
+        if self.journal.crosses_boundary(lba, lba_length) {
+            let mut committed = false;
+            for (run_lba, run_len) in self.journal.split_at_boundaries(lba, lba_length) {
+                let offset = ((run_lba - lba) as usize) * 4096;
+                let bytes = &data[offset..offset + run_len as usize * 4096];
+                let run_hash = blake3::hash(bytes);
+                let run_compressed = maybe_compress(bytes);
+                committed |=
+                    self.commit_or_skip(run_lba, bytes, run_hash, run_compressed.as_deref())?;
+            }
+            return Ok(committed);
+        }
+
         // No-op skip — pure LBA map lookup, zero body I/O. BLAKE3
         // collision resistance means hash equality implies byte equality,
         // so this is safe regardless of where the body lives (Local,
@@ -1228,6 +1251,8 @@ impl Volume {
         // that already resolves (a prior canonical, or an earlier write of
         // the same bytes in this epoch) keeps its owner, and the non-owner is
         // minted as a DedupRef at formation (`classify_pending_dedup`).
+        // `commit_or_skip` splits at window boundaries, so the start LBA's
+        // classification covers the entry's whole range.
         let is_journal = self.journal.contains(lba);
         let location = extentindex::ExtentLocation {
             segment_id: wal_ulid,

@@ -68,6 +68,42 @@ impl JournalRanges {
     pub fn lba_count(&self) -> u64 {
         self.ranges.iter().map(|&(_, len)| len).sum()
     }
+
+    /// Whether `[start_lba, start_lba + lba_count)` crosses a window
+    /// boundary — a run that is neither fully inside one journal range
+    /// nor fully outside all of them. The ranges are few (jbd2 journals
+    /// are one or two extents), so a linear scan beats building anything.
+    pub fn crosses_boundary(&self, start_lba: u64, lba_count: u32) -> bool {
+        let end = start_lba + lba_count as u64;
+        self.ranges.iter().any(|&(s, l)| {
+            let range_end = s + l;
+            (s > start_lba && s < end) || (range_end > start_lba && range_end < end)
+        })
+    }
+
+    /// Split `[start_lba, start_lba + lba_count)` at every window
+    /// boundary it crosses. Each returned `(start, len)` run lies fully
+    /// inside one journal range or fully outside all of them, in LBA
+    /// order; a run that crosses nothing comes back whole.
+    pub fn split_at_boundaries(&self, start_lba: u64, lba_count: u32) -> Vec<(u64, u32)> {
+        let end = start_lba + lba_count as u64;
+        // Ranges are sorted and disjoint, so their starts and ends form
+        // an ascending boundary sequence; keep the cuts interior to the
+        // run.
+        let cuts = self
+            .ranges
+            .iter()
+            .flat_map(|&(s, l)| [s, s + l])
+            .filter(|&b| b > start_lba && b < end);
+        let mut runs = Vec::new();
+        let mut cursor = start_lba;
+        for cut in cuts {
+            runs.push((cursor, (cut - cursor) as u32));
+            cursor = cut;
+        }
+        runs.push((cursor, (end - cursor) as u32));
+        runs
+    }
 }
 
 #[cfg(test)]
@@ -97,5 +133,45 @@ mod tests {
         let r = JournalRanges::default();
         assert!(!r.contains(0));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn crosses_boundary_detects_entering_and_leaving_runs() {
+        let r = JournalRanges::new(vec![(100, 10)]);
+        assert!(
+            !r.crosses_boundary(90, 10),
+            "ends exactly at the window start"
+        );
+        assert!(r.crosses_boundary(95, 10), "enters the window mid-run");
+        assert!(!r.crosses_boundary(100, 10), "exactly the window");
+        assert!(!r.crosses_boundary(102, 4), "fully inside");
+        assert!(r.crosses_boundary(105, 10), "leaves the window mid-run");
+        assert!(
+            !r.crosses_boundary(110, 5),
+            "starts exactly at the window end"
+        );
+        assert!(r.crosses_boundary(95, 20), "spans the whole window");
+        assert!(!JournalRanges::default().crosses_boundary(0, 100));
+    }
+
+    #[test]
+    fn split_at_boundaries_yields_uniform_runs() {
+        let r = JournalRanges::new(vec![(100, 10), (200, 5)]);
+        assert_eq!(r.split_at_boundaries(102, 4), vec![(102, 4)]);
+        assert_eq!(r.split_at_boundaries(95, 10), vec![(95, 5), (100, 5)]);
+        assert_eq!(
+            r.split_at_boundaries(95, 20),
+            vec![(95, 5), (100, 10), (110, 5)]
+        );
+        assert_eq!(
+            r.split_at_boundaries(90, 120),
+            vec![(90, 10), (100, 10), (110, 90), (200, 5), (205, 5)]
+        );
+        for (start, len) in r.split_at_boundaries(90, 120) {
+            let inside = r.contains(start);
+            for lba in start..start + len as u64 {
+                assert_eq!(r.contains(lba), inside, "run [{start},+{len}) mixes tiers");
+            }
+        }
     }
 }
