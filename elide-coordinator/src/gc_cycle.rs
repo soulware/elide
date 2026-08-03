@@ -88,6 +88,31 @@ pub struct GcCycleOrchestrator {
     /// output ULID is history-derived, not wall-clock). Kept across
     /// ticks until a publish lands them in HEAD's `Superseded` set.
     tick_superseded: Vec<(Ulid, Ulid, DateTime<Utc>)>,
+    /// Monotonic tick counter, the clock for the supersession barrier
+    /// below.
+    tick_seq: u64,
+    /// Tick of the last confirmed WAL flush — a successful
+    /// `promote_wal` round trip, including the empty-WAL reply.
+    last_flush_seq: u64,
+    /// Tick of the last GC pass that could have emitted plans.
+    /// Supersession edges publish only when a confirmed flush
+    /// postdates it (`docs/design/durable-cut.md` *GC supersession
+    /// waits for its killers*): the pass classifies liveness against
+    /// the live WAL, so an input's block can be dead only to an
+    /// uncommitted write. The post-pass flush seals every write the
+    /// pass could have seen into `pending/`, and the complete-drain
+    /// publish gate puts that flush segment inside any cut that
+    /// carries the edges. Both counters start at zero, so a fresh
+    /// process holds edges until its first confirmed flush covers
+    /// whatever a pre-crash pass saw.
+    last_plan_pass_seq: u64,
+    /// One-shot per process: fold supersession edges missing from
+    /// HEAD back in from the confirmed outputs' signed `inputs`
+    /// tables, at the first edge-eligible publish. Held edges live in
+    /// `tick_superseded` between cleanup and publish, so a crash in
+    /// that window loses them from memory; the signed tables are the
+    /// durable authority they re-derive from.
+    reconcile_edges: bool,
     /// `coord-rw` handle for the `names/<name>.latest_snapshot` bump
     /// after a drain uploads a `User` manifest (the retry path for a
     /// manifest whose inline snapshot-op upload failed, and the import
@@ -169,6 +194,10 @@ impl GcCycleOrchestrator {
             last_fence,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
+            tick_seq: 0,
+            last_flush_seq: 0,
+            last_plan_pass_seq: 0,
+            reconcile_edges: true,
             name_claims,
             head_cache,
             volume_name,
@@ -346,7 +375,10 @@ impl GcCycleOrchestrator {
             }
         };
 
-        self.run_volume_compactions().await;
+        self.tick_seq += 1;
+        if self.run_volume_compactions().await {
+            self.last_flush_seq = self.tick_seq;
+        }
 
         // GC preparation runs before the drain so the checkpoint's WAL
         // flush lands in `pending/` in time to drain — and so commit —
@@ -397,15 +429,20 @@ impl GcCycleOrchestrator {
     /// WAL and compaction operations that only make sense for writable
     /// volumes. During an import serve phase, control.sock is bound by the
     /// import process which only handles promote IPC.
-    async fn run_volume_compactions(&self) {
+    ///
+    /// Returns whether the WAL flush was confirmed — a successful
+    /// `promote_wal` round trip, which replies only once the flush
+    /// segment is in `pending/` (or the WAL was empty). The tick loop
+    /// feeds this into the supersession barrier.
+    async fn run_volume_compactions(&self) -> bool {
         if !self.fork_dir.join("control.sock").exists()
             || self.fork_dir.join("volume.readonly").exists()
         {
-            return;
+            return false;
         }
 
         let vol_ulid = self.vol_ulid;
-        control::promote_wal(&self.fork_dir).await;
+        let flushed = control::promote_wal(&self.fork_dir).await;
 
         if let Some(s) = control::repack(&self.fork_dir).await
             && s.segments_compacted > 0
@@ -429,6 +466,7 @@ impl GcCycleOrchestrator {
                 s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
             );
         }
+        flushed
     }
 
     /// Drain pending segments to S3. Returns whether the drain completed —
@@ -546,26 +584,13 @@ impl GcCycleOrchestrator {
     /// its failure paths). A lost HEAD self-heals on the next active
     /// tick's seed: `read` treats a 404 or unparseable body as empty,
     /// and we rewrite from the current truth.
-    /// Every confirmed segment (`index/<ulid>.idx`) with a ULID beyond
-    /// `anchor`. An idx file is written only at promote, after the
-    /// segment object is durable in S3, so this listing enumerates
-    /// exactly the confirmed set — the cut's `added` universe.
+    /// The cut's `added` universe: every confirmed segment
+    /// (`index/<ulid>.idx`) with a ULID beyond `anchor`.
     fn confirmed_beyond(&self, anchor: Option<Ulid>) -> std::io::Result<Vec<Ulid>> {
-        let idx = elide_core::segment::collect_idx_files(&self.fork_dir.join("index"))?;
-        let mut out = Vec::new();
-        for path in idx {
-            let ulid = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| Ulid::from_string(s).ok())
-                .ok_or_else(|| {
-                    std::io::Error::other(format!("bad idx filename {}", path.display()))
-                })?;
-            if anchor.is_none_or(|a| ulid > a) {
-                out.push(ulid);
-            }
-        }
-        Ok(out)
+        Ok(segment_head::confirmed_segments(&self.fork_dir, anchor)?
+            .into_iter()
+            .map(|(ulid, _)| ulid)
+            .collect())
     }
 
     /// `true` when every confirmed segment (`index/<ulid>.idx`) above
@@ -596,6 +621,18 @@ impl GcCycleOrchestrator {
             );
             return;
         }
+        // Supersession barrier (`docs/design/durable-cut.md` *GC
+        // supersession waits for its killers*): edges join a cut only
+        // once a confirmed WAL flush postdates the last plan-emitting
+        // pass. The pass classifies liveness against the live WAL, so
+        // an input's block can be dead only to an uncommitted write;
+        // the post-pass flush seals every write the pass could have
+        // seen into `pending/`, and the complete-drain gate above puts
+        // that flush segment inside any cut that carries the edges.
+        // Until then the inputs stay in the live set and force-claim
+        // resolves through them; an output alongside its still-live
+        // inputs is harmless duplication.
+        let edges_eligible = self.last_flush_seq > self.last_plan_pass_seq;
 
         // Cloning the Arc gives the guard an owner that is not
         // borrowed from `self`, so `reap_expired(&mut self, ..)` below
@@ -630,7 +667,18 @@ impl GcCycleOrchestrator {
                     Some(h) if !h.is_empty() => (h, false),
                     Some(h) if self.empty_head_is_legitimate(h.anchor) => (h, false),
                     _ => match segment_head::regenerate(&self.fork_dir) {
-                        Ok(r) => {
+                        Ok(mut r) => {
+                            // A regenerated body carries every edge the
+                            // signed inputs tables record, so those
+                            // edges ride the same barrier: eligible,
+                            // they publish here; otherwise they wait
+                            // for the reconcile at the first eligible
+                            // publish.
+                            if edges_eligible {
+                                self.reconcile_edges = false;
+                            } else {
+                                r.superseded.clear();
+                            }
                             let repaired = !r.is_empty();
                             (r, repaired)
                         }
@@ -676,26 +724,60 @@ impl GcCycleOrchestrator {
                 return;
             }
         }
-        for (input, output, since) in &self.tick_superseded {
-            let edge = segment_head::Supersession {
-                output: *output,
-                since: *since,
-            };
-            if head.superseded.insert(*input, edge) != Some(edge) {
-                mutated = true;
+        if edges_eligible {
+            if self.reconcile_edges {
+                match segment_head::confirmed_edges(&self.fork_dir, head.anchor) {
+                    Ok(edges) => {
+                        let now = Utc::now();
+                        for (input, output) in edges {
+                            if head.tombstoned.contains(&input)
+                                || head.superseded.contains_key(&input)
+                            {
+                                continue;
+                            }
+                            head.superseded
+                                .insert(input, segment_head::Supersession { output, since: now });
+                            mutated = true;
+                        }
+                        self.reconcile_edges = false;
+                    }
+                    Err(e) => warn!(
+                        "[head {}] edge reconcile failed: {e}; retrying next publish",
+                        self.vol_ulid
+                    ),
+                }
             }
+            for (input, output, since) in &self.tick_superseded {
+                let edge = segment_head::Supersession {
+                    output: *output,
+                    since: *since,
+                };
+                if head.superseded.insert(*input, edge) != Some(edge) {
+                    mutated = true;
+                }
+            }
+        } else if !self.tick_superseded.is_empty() {
+            info!(
+                "[head {}] holding {} supersession edge(s) for a post-pass WAL flush",
+                self.vol_ulid,
+                self.tick_superseded.len()
+            );
         }
 
         if !mutated {
             self.tick_added.clear();
-            self.tick_superseded.clear();
+            if edges_eligible {
+                self.tick_superseded.clear();
+            }
             *cache = Some(head);
             return;
         }
         match self.volume_data.head().put(&head).await {
             Ok(()) => {
                 self.tick_added.clear();
-                self.tick_superseded.clear();
+                if edges_eligible {
+                    self.tick_superseded.clear();
+                }
                 *cache = Some(head);
             }
             // Cache stays empty and the scratch is kept: the next
@@ -957,6 +1039,7 @@ impl GcCycleOrchestrator {
                 ..
             }) => {
                 self.gc_was_active = true;
+                self.last_plan_pass_seq = self.tick_seq;
                 let cold_note = if deferred_cold > 0 {
                     format!(", {deferred_cold} cold-deferred")
                 } else {
@@ -988,7 +1071,12 @@ impl GcCycleOrchestrator {
                     self.gc_was_active = false;
                 }
             }
-            Err(e) => error!("[gc {vol_ulid}] error: {e:#}"),
+            Err(e) => {
+                // A failed pass may have staged plans before erroring;
+                // treat it as plan-emitting for the barrier.
+                self.last_plan_pass_seq = self.tick_seq;
+                error!("[gc {vol_ulid}] error: {e:#}");
+            }
         }
     }
 }
@@ -1158,6 +1246,8 @@ mod tests {
         let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
             plant_confirmed_segment(fork, output, &[input_a, input_b]);
         });
+        orch.last_flush_seq = 1;
+        orch.reconcile_edges = false;
         let since = Utc::now();
         orch.tick_added.push(output);
         orch.tick_superseded.push((input_a, output, since));
@@ -1228,6 +1318,7 @@ mod tests {
             plant_confirmed_segment(fork, gc_out, &[gc_input]);
             plant_confirmed_segment(fork, fresh, &[]);
         });
+        orch.last_flush_seq = 1;
         orch.tick_added.push(fresh);
 
         orch.publish_head_delta(true).await;
@@ -1301,6 +1392,104 @@ mod tests {
             "confirmed but unpublished segment joins the cut"
         );
         assert!(head.added.contains(&fresh));
+    }
+
+    #[tokio::test]
+    async fn superseded_edges_wait_for_a_post_pass_flush() {
+        // Edges publish only once a confirmed WAL flush postdates the
+        // last plan-emitting pass; the output's Added entry commits
+        // immediately. Both counters start equal, so a fresh process
+        // holds edges until its first confirmed flush.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, output, &[input]);
+        });
+        orch.reconcile_edges = false;
+        let since = Utc::now();
+        orch.tick_added.push(output);
+        orch.tick_superseded.push((input, output, since));
+
+        orch.publish_head_delta(true).await;
+
+        let head = read_head_via(&store).await;
+        assert!(head.added.contains(&output), "Added commits with the cut");
+        assert!(
+            head.superseded.is_empty(),
+            "edges wait for a post-pass flush"
+        );
+        assert!(
+            !orch.tick_superseded.is_empty(),
+            "held edges stay in the scratch"
+        );
+
+        orch.last_flush_seq = 1;
+        orch.publish_head_delta(true).await;
+
+        let head = read_head_via(&store).await;
+        assert_eq!(head.superseded[&input].output, output);
+        assert!(orch.tick_superseded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crash_lost_edges_reconcile_from_signed_inputs() {
+        // A crash between handoff cleanup and publish loses held edges
+        // from memory. The first edge-eligible publish of a fresh
+        // process re-derives them from the confirmed outputs' signed
+        // inputs tables; tombstoned inputs stay tombstoned.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let reaped = m.next();
+        let lost = m.next();
+        let output = m.next();
+
+        let mut seed = segment_head::SegmentHead::empty(None);
+        seed.added.insert(output);
+        seed.tombstoned.insert(reaped);
+        put_head_via(&store, &seed).await;
+
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, output, &[reaped, lost]);
+        });
+        orch.last_flush_seq = 1;
+        orch.tick_added.push(output);
+
+        orch.publish_head_delta(true).await;
+
+        let head = read_head_via(&store).await;
+        assert_eq!(
+            head.superseded[&lost].output, output,
+            "lost edge re-derived from the output's signed inputs"
+        );
+        assert!(
+            !head.superseded.contains_key(&reaped),
+            "tombstoned inputs are not resurrected"
+        );
+        assert!(head.tombstoned.contains(&reaped));
+    }
+
+    #[tokio::test]
+    async fn run_tick_without_volume_flush_holds_edges() {
+        // With no volume process there is no flush confirmation, so a
+        // tick publishes Added but keeps supersession edges in hand —
+        // whether they arrive via the scratch or via regeneration.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, output, &[input]);
+        });
+        orch.tick_superseded.push((input, output, Utc::now()));
+
+        orch.run_tick().await;
+
+        let head = read_head_via(&store).await;
+        assert!(head.added.contains(&output));
+        assert!(head.superseded.is_empty());
+        assert!(!orch.tick_superseded.is_empty());
     }
 
     #[tokio::test]
@@ -1702,6 +1891,8 @@ mod tests {
             plant_confirmed_segment(fork, a1, &[input]);
             plant_confirmed_segment(fork, a2, &[]);
         });
+        orch.last_flush_seq = 1;
+        orch.reconcile_edges = false;
 
         orch.tick_added.push(a1);
         orch.tick_superseded.push((input, a1, Utc::now()));
@@ -1859,6 +2050,8 @@ mod tests {
             plant_confirmed_segment(fork, drained, &[]);
             plant_confirmed_segment(fork, output, &[input]);
         });
+        orch.last_flush_seq = 1;
+        orch.reconcile_edges = false;
         let since = Utc::now();
         orch.tick_added.push(drained);
         orch.tick_added.push(output);
