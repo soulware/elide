@@ -655,8 +655,8 @@ fn gc_apply_double_fold_serialized_by_pending_gate() {
     let store_dir = tmp.path().join("_store");
     common::write_test_keypair(fork_dir);
 
-    // Journal window (96, 1): LBA 96 is journal, LBA 97 is not. Matches
-    // `stamp_journal_window` in the proptest harness.
+    // Journal window (96, 1): LBA 96 is journal, LBA 97 is not — the
+    // window the shrunk sequence originally ran under.
     let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
     cfg.journal = Some(elide_core::config::JournalConfig {
         ranges: elide_core::journal::JournalRanges::new(vec![(96, 1)]),
@@ -867,4 +867,52 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     );
     // ...and the short present bitmap it leaves is not a presence violation.
     common::check_presence_truthful(fork_dir).expect("presence truth violated");
+}
+
+/// A write crossing the journal-window boundary commits as
+/// boundary-aligned runs (`commit_or_skip`), so the flush partitions
+/// the epoch into a pure-journal and a pure-stable segment whose entry
+/// flags match window containment. Under the pre-split classification
+/// the whole write took its start LBA's tier, producing a journal
+/// segment claiming stable LBAs.
+#[test]
+fn straddling_write_splits_at_the_window_boundary() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+
+    // Journal window (96, 4): LBAs 96..100.
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal = Some(elide_core::config::JournalConfig {
+        ranges: elide_core::journal::JournalRanges::new(vec![(96, 4)]),
+    });
+    cfg.write(fork_dir).unwrap();
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Four blocks starting outside the window and ending inside it:
+    // [94, 98) = stable 94, 95 + journal 96, 97.
+    let mut payload = Vec::with_capacity(4 * 4096);
+    for i in 0..4u8 {
+        payload.extend_from_slice(&common::incompressible_block(i));
+    }
+    vol.write(94, &payload).unwrap();
+    vol.flush_wal().unwrap();
+
+    common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
+
+    // Crash + reopen: every block of both shares survives recovery.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    for i in 0..4u8 {
+        assert_eq!(
+            vol.read(94 + i as u64, 1).unwrap().as_slice(),
+            common::incompressible_block(i).as_slice(),
+            "lba {} wrong after crash + rebuild",
+            94 + i as u64,
+        );
+    }
 }
