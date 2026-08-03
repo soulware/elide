@@ -2617,10 +2617,9 @@ pub fn locate_segment_body_from(
 /// where caller order matters — `pending/`, bare `gc/<u>` outputs, etc.
 /// `read_dir` itself returns entries in filesystem-defined order
 /// (inode-order on APFS, hash-bucket order on ext4 htree, …) which is
-/// **not** ULID-ascending. Drain loops in particular depend on the
-/// just-promoted ULID being below every remaining pending ULID so that
-/// `discover_fork_segments`'s walk-order winner doesn't flip when a
-/// segment crosses from pending to committed; sort here closes that gap.
+/// **not** ULID-ascending. Drain loops upload in ULID order, and
+/// intra-tier processing everywhere assumes ascending ULIDs; sort here
+/// closes that gap.
 pub fn read_ulid_dir_sorted(dir: &Path) -> io::Result<Vec<ulid::Ulid>> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -2931,11 +2930,11 @@ pub struct SegmentRef {
 /// finalize (`promote_segment`) has not yet run. Logically it occupies the
 /// same priority tier as `index/<ulid>.idx` — the `inputs` list names the
 /// older segments it replaces, and its own ULID was minted higher than any
-/// input ULID. Processing gc and index together in ULID order lets the
-/// bare output supersede any lower-ULID (non-input) segment at the same
-/// LBA, matching the lbamap's last-write-wins rule. Pending remains the
-/// highest priority because post-checkpoint writes land at ULIDs above any
-/// gc output from the same checkpoint.
+/// input ULID. The ascending committed walk is what gives the extent
+/// index's first-write-wins insert its lowest-ULID canonical ownership.
+/// The lbamap admits every claim by claimant ULID
+/// (`register_entry_if_newer`), so its winners are the highest-ULID
+/// claimants regardless of walk order.
 ///
 /// `branch_ulid` applies an ULID-string cutoff used for ancestor layers
 /// in forked volumes: entries with ULID string greater than the cutoff

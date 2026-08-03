@@ -2017,26 +2017,18 @@ impl Volume {
     pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 
     /// Stress-only invariant: every pending ULID must be greater than every
-    /// promote-tier (`index/`) ULID on disk. This is the structural form of the
-    /// drain-ordering invariant the production drain (`coordinator/upload.rs`)
-    /// relies on — `discover_fork_segments` walks committed (sorted by ULID)
-    /// then pending (sorted by ULID) with the "pending wins last" semantic;
-    /// that semantic is correct *only* when every pending ULID sorts above
-    /// every promote-tier ULID. If a lower-ULID pending peer ever ends up
-    /// alongside a higher-ULID promote-tier segment claiming the same LBA, the
-    /// next promote crosses a tier boundary and flips the walk-order winner
-    /// in a way `self.lbamap` doesn't reflect — exactly the drain bug fixed
-    /// in #265.
+    /// promote-tier (`index/`) ULID on disk — the structural form of the
+    /// production drain's discipline (`coordinator/upload.rs`), which uploads
+    /// and promotes pending segments in ULID-ascending order, halting at the
+    /// first failure. The lbamap itself admits claims by claimant ULID
+    /// (`register_entry_if_newer`), so rebuild winners are independent of
+    /// tier; this assert is a canary for the drain ordering alone, firing
+    /// structurally with a clearer message than the lbamap drift a broken
+    /// drain would eventually cause.
     ///
     /// GC outputs are outside this ordering: their ULID is minted at apply
     /// time and may legitimately exceed a write that was already pending when
-    /// the pass forked, so they are excluded from the comparison. A GC output
-    /// never claims an LBA a pending write owns, so its higher ULID cannot flip
-    /// a walk-order winner.
-    ///
-    /// `assert_lbamap_consistent` catches that flip after the fact (via
-    /// lbamap drift); this assert catches it structurally before any drift
-    /// surfaces, with a clearer panic message.
+    /// the pass forked, so they are excluded from the comparison.
     ///
     /// Same `volume-invariants` feature gate so the perf cost only applies
     /// to coordinator-layer stress runs.
