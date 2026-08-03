@@ -40,6 +40,7 @@
 //   [gc]
 //   density_threshold    = 0.70   # compact when live_bytes/file_bytes < threshold
 //   interval             = "10s"  # how often GC runs per fork
+//   cut_interval         = "10s"  # how often the per-volume HEAD publishes a cut
 //   retention_window     = "10m"  # how long GC inputs are retained in S3
 //   max_buckets_per_tick = 4      # max independent output buckets per GC tick
 //
@@ -538,6 +539,14 @@ pub struct GcConfig {
     #[serde(default = "default_gc_interval", with = "humantime_serde")]
     pub interval: Duration,
 
+    /// How often the per-volume HEAD publishes a cut
+    /// (`docs/design/durable-cut.md`). Between cuts, drained segments
+    /// stay durable in S3 but invisible to readers; the reap step
+    /// rides the same cadence. Worst-case recoverable-image staleness
+    /// is about twice this value. Default: `10s`.
+    #[serde(default = "default_cut_interval", with = "humantime_serde")]
+    pub cut_interval: Duration,
+
     /// Retention window for GC input segments. After a successful GC
     /// handoff, inputs are not deleted from S3 immediately; the
     /// handoff records them as `superseded` entries in
@@ -563,6 +572,9 @@ fn default_gc_density() -> f64 {
 fn default_gc_interval() -> Duration {
     Duration::from_secs(10)
 }
+fn default_cut_interval() -> Duration {
+    Duration::from_secs(10)
+}
 fn default_retention_window() -> Duration {
     Duration::from_secs(10 * 60)
 }
@@ -585,6 +597,7 @@ impl Default for GcConfig {
         Self {
             density_threshold: default_gc_density(),
             interval: default_gc_interval(),
+            cut_interval: default_cut_interval(),
             retention_window: default_retention_window(),
             max_buckets_per_tick: default_max_buckets_per_tick(),
         }
@@ -630,6 +643,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Elide coordinator configuration.
 [gc]
 # density_threshold    = 0.70    # compact when live_bytes / file_bytes < threshold
 # interval             = "10s"   # how often GC runs per fork
+# cut_interval         = "10s"   # how often the per-volume HEAD publishes a cut
 # retention_window     = "10m"   # how long GC inputs stay in S3 before reaping
 # max_buckets_per_tick = 4       # max independent output buckets per GC tick
 

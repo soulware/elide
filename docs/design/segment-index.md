@@ -114,16 +114,18 @@ merge re-reads S3 before trusting anything. The reap gate evaluates
 the cached `Superseded` set locally, so a quiescent fork's 60s reap
 passes touch S3 only when an edge is actually past retention — a
 fully idle volume generates no steady-state HEAD traffic beyond the
-per-process seed. A lost or 404 HEAD self-heals at the next seed GET
-(treat the result as empty and rewrite); in-flight `Superseded`
-edges lose their `since` values, so those edges are over-retained by
-one `retention_window` — benign, never under-retained. Cost is one
-PUT per active tick per volume plus the seed GET — fixed-key, small
-body, operationally invisible at any realistic scale.
+per-process seed. A lost or unreadable HEAD is regenerated from the
+owner's local state — `index/` plus the GC outputs' signed `inputs`
+tables — at the next publish; regenerated `Superseded` edges are
+stamped `since = now`, so they are over-retained by up to one
+`retention_window` — benign, never under-retained. Cost is one PUT
+per cut per volume (`gc.cut_interval`, default 10s) plus the seed
+GET — fixed-key, small body, operationally invisible at any
+realistic scale.
 
 **Reaper fold: mechanic and SLA.** The reap step mirrors GC's
 existing gate exactly — a cross-tick `last_reap: Instant` on the
-orchestrator, fired inside `run_tick` whenever
+orchestrator, fired at the first cut publish after
 `last_reap.elapsed() >= gc_config.reaper_cadence()` (current formula
 unchanged: `max(retention_window/10, 1s)`, default 60s at the default
 10m window). The `daemon.rs` spawn of the standalone reaper task is

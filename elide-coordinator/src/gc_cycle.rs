@@ -71,6 +71,13 @@ pub struct GcCycleOrchestrator {
     /// unchanged from the old standalone reaper); see
     /// `docs/design/segment-index.md` *Reaper fold*.
     last_reap: Instant,
+    /// Cross-tick: last time a cut landed in HEAD. The publish runs
+    /// on `gc_config.cut_interval`, not per tick; bumped only when a
+    /// cut actually publishes (or confirms nothing changed), so an
+    /// idle stretch costs no latency once activity resumes.
+    /// Constructed backdated so a fresh process cuts on its first
+    /// active tick.
+    last_cut: Instant,
     /// Cross-tick: last time the displacement fence completed a
     /// name-binding check. Constructed backdated so the first tick
     /// always checks; not bumped when the fence returns an outcome,
@@ -178,6 +185,7 @@ impl GcCycleOrchestrator {
             now
         };
         let last_fence = now.checked_sub(FENCE_HEARTBEAT).unwrap_or(now);
+        let last_cut = now.checked_sub(gc_config.cut_interval).unwrap_or(now);
         let volume_data = VolumeData::new(Arc::clone(&store), vol_ulid);
         Self {
             fork_dir,
@@ -192,6 +200,7 @@ impl GcCycleOrchestrator {
             gc_was_active: true,
             last_reap,
             last_fence,
+            last_cut,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
             tick_seq: 0,
@@ -622,6 +631,14 @@ impl GcCycleOrchestrator {
         if !reap_due && !has_scratch {
             return;
         }
+        // The cut cadence (`docs/design/durable-cut.md` *Relation to
+        // the loss-window work*): a cut publishes on `cut_interval`,
+        // not per tick. Between cuts the scratch and the reap wait,
+        // and drained segments stay durable but invisible until the
+        // next cut names them.
+        if self.last_cut.elapsed() < self.gc_config.cut_interval {
+            return;
+        }
         if !drain_ok {
             info!(
                 "[head {}] drain incomplete; holding this tick's cut",
@@ -804,6 +821,7 @@ impl GcCycleOrchestrator {
             if edges_eligible {
                 self.tick_superseded.clear();
             }
+            self.last_cut = Instant::now();
             *cache = Some(head);
             return;
         }
@@ -813,6 +831,7 @@ impl GcCycleOrchestrator {
                 if edges_eligible {
                     self.tick_superseded.clear();
                 }
+                self.last_cut = Instant::now();
                 *cache = Some(head);
             }
             // Cache stays empty and the scratch is kept: the next
@@ -1221,12 +1240,18 @@ mod tests {
             Arc::new(crate::stores::PassthroughStores::new(Arc::clone(&store)));
         let identity =
             Arc::new(crate::identity::CoordinatorIdentity::load_or_generate(tmp.path()).unwrap());
+        // Zero cut interval: these tests exercise the publish body,
+        // not the cadence; the cadence tests set a real interval.
+        let gc_config = crate::config::GcConfig {
+            cut_interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
         let orch = GcCycleOrchestrator::new(
             fork_dir,
             vol,
             store,
             &stores,
-            crate::config::GcConfig::default(),
+            gc_config,
             &locks,
             volume_name.map(String::from),
             identity,
@@ -2297,6 +2322,54 @@ mod tests {
         assert!(orch.last_reap.elapsed() >= orch.gc_config.reaper_cadence());
     }
 
+    #[tokio::test]
+    async fn cut_interval_holds_publish_between_cuts() {
+        // A cut publishes on `cut_interval`, not per tick: after one
+        // cut lands, further scratch — and a due reap — wait out the
+        // window; an elapsed clock releases them. The clock starts
+        // backdated by the interval (the constructor's init, redone
+        // here because the fixture builds with a zero interval), so
+        // the first active publish fires.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let a1 = m.next();
+        let a2 = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[]);
+        });
+        orch.gc_config.cut_interval = Duration::from_secs(3600);
+        orch.last_cut = std::time::Instant::now() - orch.gc_config.cut_interval;
+        orch.tick_added.push(a1);
+        orch.publish_head_delta(true).await;
+        assert!(
+            read_head_via(&store).await.added.contains(&a1),
+            "first active publish cuts immediately (backdated clock)"
+        );
+
+        plant_confirmed_segment(orch.fork_dir(), a2, &[]);
+        orch.tick_added.push(a2);
+        orch.last_reap =
+            std::time::Instant::now() - orch.gc_config.reaper_cadence() - Duration::from_secs(1);
+        orch.publish_head_delta(true).await;
+        let head = read_head_via(&store).await;
+        assert!(
+            !head.added.contains(&a2),
+            "scratch waits inside the cut window"
+        );
+        assert!(
+            !orch.tick_added.is_empty(),
+            "held scratch survives for the next cut"
+        );
+
+        orch.last_cut =
+            std::time::Instant::now() - orch.gc_config.cut_interval - Duration::from_secs(1);
+        orch.publish_head_delta(true).await;
+        assert!(
+            read_head_via(&store).await.added.contains(&a2),
+            "elapsed window releases the cut"
+        );
+    }
+
     /// Cut consistency oracle (`docs/design/durable-cut.md` *Testing*).
     ///
     /// A simulated guest writes an ordered history of 4 KiB blocks;
@@ -2334,6 +2407,10 @@ mod tests {
                 /// volume process down or the IPC failing, so the tick
                 /// runs with no flush and the WAL keeps its writes.
                 flush_ok: bool,
+                /// Whether `cut_interval` has elapsed by this tick's
+                /// publish; `false` models the ticks inside a cut
+                /// window, where everything waits.
+                cut_due: bool,
             },
             GcPass,
             Snapshot,
@@ -2354,8 +2431,13 @@ mod tests {
                 6 => (
                     proptest::option::weighted(0.35, 0u8..3),
                     proptest::bool::weighted(0.85),
+                    proptest::bool::weighted(0.7),
                 )
-                    .prop_map(|(fail_after, flush_ok)| Op::Tick { fail_after, flush_ok }),
+                    .prop_map(|(fail_after, flush_ok, cut_due)| Op::Tick {
+                        fail_after,
+                        flush_ok,
+                        cut_due,
+                    }),
                 2 => Just(Op::GcPass),
                 1 => Just(Op::Snapshot),
                 1 => Just(Op::CrashCoordinator),
@@ -2654,8 +2736,13 @@ mod tests {
                 self.committed.push(seg);
             }
 
-            async fn tick(&mut self, fail_after: Option<u8>, flush_ok: bool) {
+            async fn tick(&mut self, fail_after: Option<u8>, flush_ok: bool, cut_due: bool) {
                 self.orch.tick_seq += 1;
+                self.orch.last_cut = if cut_due {
+                    Instant::now() - self.orch.gc_config.cut_interval - Duration::from_secs(1)
+                } else {
+                    Instant::now()
+                };
                 if flush_ok {
                     self.seal();
                     self.orch.last_flush_seq = self.orch.tick_seq;
@@ -2850,7 +2937,8 @@ mod tests {
                     Op::Tick {
                         fail_after,
                         flush_ok,
-                    } => self.tick(*fail_after, *flush_ok).await,
+                        cut_due,
+                    } => self.tick(*fail_after, *flush_ok, *cut_due).await,
                     Op::GcPass => self.gc_pass(),
                     Op::Snapshot => self.snapshot().await,
                     Op::CrashCoordinator => self.crash_coordinator(),
@@ -2877,8 +2965,8 @@ mod tests {
             }
             // Close out: a final complete tick, then one more so held
             // supersession edges get their post-pass flush and publish.
-            world.tick(None, true).await;
-            world.tick(None, true).await;
+            world.tick(None, true, true).await;
+            world.tick(None, true, true).await;
         }
 
         /// The oracle's first find, materialised: a GC handoff
@@ -2897,6 +2985,7 @@ mod tests {
                 Op::Tick {
                     fail_after: None,
                     flush_ok: true,
+                    cut_due: true,
                 },
                 Op::GcPass,
                 Op::Snapshot,
@@ -2905,10 +2994,12 @@ mod tests {
                 Op::Tick {
                     fail_after: None,
                     flush_ok: true,
+                    cut_due: true,
                 },
                 Op::Tick {
                     fail_after: None,
                     flush_ok: true,
+                    cut_due: true,
                 },
             ] {
                 world.step(&op).await;
@@ -2932,6 +3023,7 @@ mod tests {
                 Op::Tick {
                     fail_after: None,
                     flush_ok: true,
+                    cut_due: true,
                 },
                 Op::DamageHead { delete: false },
                 Op::Write { lba: 2 },
@@ -2939,6 +3031,7 @@ mod tests {
                 Op::Tick {
                     fail_after: None,
                     flush_ok: false,
+                    cut_due: true,
                 },
             ] {
                 world.step(&op).await;
