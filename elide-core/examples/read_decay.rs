@@ -135,19 +135,26 @@ fn segments(dir: &Path) -> (usize, usize, usize) {
 
 struct Measurement {
     reads_per_sec: f64,
+    reads: u64,
     stats: ReadStatsSnapshot,
     writes: u64,
 }
 
 impl Measurement {
-    fn extents_per_read(&self, reads: u64) -> f64 {
-        self.stats.extents_total as f64 / reads as f64
+    fn extents_per_read(&self) -> f64 {
+        self.stats.extents_total as f64 / self.reads as f64
     }
 }
 
-/// Time `reads` random 8 KiB reads spread uniformly over the volume.
+/// Time `reads` random 8 KiB reads spread uniformly over the volume, divided
+/// evenly across `readers`.
+///
+/// Every reader holds its own descriptor cache, as a ublk backend worker
+/// does, so a volume's descriptor budget is the per-reader capacity times
+/// this count — and readers drawing from one uniform LBA range converge on
+/// the same hot segments, so those budgets hold largely the same files.
 fn measure(
-    reader: &VolumeReader,
+    readers: &mut [VolumeReader],
     handle: &VolumeClient,
     blocks: u64,
     reads: u64,
@@ -155,9 +162,10 @@ fn measure(
     writer: bool,
 ) -> Measurement {
     let pages = blocks / PAGE_BLOCKS;
-    let before = reader.read_stats();
+    let before: Vec<ReadStatsSnapshot> = readers.iter().map(|r| r.read_stats()).collect();
     let stop = AtomicBool::new(false);
     let writes = Arc::new(AtomicU64::new(0));
+    let per_reader = reads.div_ceil(readers.len() as u64);
 
     let elapsed = std::thread::scope(|s| {
         if writer {
@@ -179,21 +187,43 @@ fn measure(
             });
         }
 
-        let mut buf = vec![0u8; BLOCK * PAGE_BLOCKS as usize];
-        let mut lcg = Lcg(seed);
         let start = Instant::now();
-        for _ in 0..reads {
-            let lba = (lcg.next() % pages) * PAGE_BLOCKS;
-            reader.read_into(lba, &mut buf).expect("read");
-        }
+        std::thread::scope(|rs| {
+            for (i, reader) in readers.iter_mut().enumerate() {
+                // Each reader walks its own LBA stream, so they contend for
+                // the same segments without replaying one another's order.
+                let mut lcg = Lcg(seed.wrapping_add(i as u64).wrapping_mul(0x9E37_79B9));
+                rs.spawn(move || {
+                    let mut buf = vec![0u8; BLOCK * PAGE_BLOCKS as usize];
+                    for _ in 0..per_reader {
+                        let lba = (lcg.next() % pages) * PAGE_BLOCKS;
+                        reader.read_into(lba, &mut buf).expect("read");
+                    }
+                });
+            }
+        });
         let elapsed = start.elapsed().as_secs_f64();
         stop.store(true, Ordering::Relaxed);
         elapsed
     });
 
+    let stats = readers
+        .iter()
+        .zip(&before)
+        .fold(ReadStatsSnapshot::default(), |acc, (r, b)| {
+            let d = r.read_stats().since(b);
+            ReadStatsSnapshot {
+                extents_total: acc.extents_total + d.extents_total,
+                fd_hit_total: acc.fd_hit_total + d.fd_hit_total,
+                fd_miss_total: acc.fd_miss_total + d.fd_miss_total,
+            }
+        });
+    let issued = per_reader * readers.len() as u64;
+
     Measurement {
-        reads_per_sec: reads as f64 / elapsed,
-        stats: reader.read_stats().since(&before),
+        reads_per_sec: issued as f64 / elapsed,
+        reads: issued,
+        stats,
         writes: writes.load(Ordering::Relaxed),
     }
 }
@@ -206,14 +236,17 @@ fn main() -> io::Result<()> {
     let promote_every: u64 = env("PROMOTE_EVERY", 1);
     let capacity: usize = env("FD_CAPACITY", FILE_CACHE_CAPACITY);
     let seed: u64 = env("SEED", 0x5eed);
+    let n_readers: usize = env::<usize>("READERS", 1).max(1);
     let writing: bool = env::<u64>("WRITE_DURING", 0) != 0;
     let draining: bool = env::<u64>("DRAIN", 1) != 0;
 
     println!(
         "blocks={blocks} ({} MiB)  rounds={rounds}  overwrites/round={overwrites} pages  \
-         reads/measure={reads}\npromote_every={promote_every}  fd_capacity={capacity}  \
-         write_during={writing}  drain={draining}  seed={seed:#x}",
-        blocks * BLOCK as u64 / (1024 * 1024)
+         reads/measure={reads}\npromote_every={promote_every}  readers={n_readers}  \
+         fd_capacity={capacity} (x{n_readers} = {} descriptors)  write_during={writing}  \
+         drain={draining}  seed={seed:#x}",
+        blocks * BLOCK as u64 / (1024 * 1024),
+        capacity * n_readers
     );
 
     let dir = tempfile::TempDir::new()?;
@@ -235,7 +268,9 @@ fn main() -> io::Result<()> {
     }
     println!("{:.1}s", start.elapsed().as_secs_f64());
 
-    let reader = handle.reader_with_cache_capacity(capacity);
+    let mut readers: Vec<VolumeReader> = (0..n_readers)
+        .map(|_| handle.reader_with_cache_capacity(capacity))
+        .collect();
     println!("\n round  cache/pend/wal    reads/s  vs fresh  extents/read  fd miss  writes");
 
     let report = |round: &str, m: &Measurement, fresh: Option<f64>, dir: &Path| {
@@ -247,13 +282,13 @@ fn main() -> io::Result<()> {
         println!(
             "{round:>6}  {c:>5}/{p:<4}/{w:<3} {:>9.0}  {rel:>8}  {:>12.2}  {:>6.1}%  {:>6}",
             m.reads_per_sec,
-            m.extents_per_read(reads),
+            m.extents_per_read(),
             m.stats.fd_miss_rate() * 100.0,
             m.writes
         );
     };
 
-    let fresh = measure(&reader, &handle, blocks, reads, seed, writing);
+    let fresh = measure(&mut readers, &handle, blocks, reads, seed, writing);
     report("fresh", &fresh, None, dir.path());
     let fresh_tps = fresh.reads_per_sec;
 
@@ -275,7 +310,7 @@ fn main() -> io::Result<()> {
             }
         }
         let m = measure(
-            &reader,
+            &mut readers,
             &handle,
             blocks,
             reads,
