@@ -4857,6 +4857,7 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
     let file_cache = std::cell::RefCell::new(read::FileCache::new(4));
     let dmat_cache: read::DmatCache = Default::default();
     let dmat_stats = Arc::new(crate::dmat::DmatStats::default());
+    let read_stats = read::ReadStats::default();
     let mut out = vec![0u8; 4096];
     let err = read::read_extents(
         0,
@@ -4866,6 +4867,7 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
         &file_cache,
         &dmat_cache,
         &dmat_stats,
+        &read_stats,
         &tmp,
         |_, _, _| Err(io::Error::other("find_segment must not be consulted")),
         |_| Err(io::Error::other("open_delta_body must not be consulted")),

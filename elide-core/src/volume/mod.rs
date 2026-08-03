@@ -72,9 +72,9 @@ pub use jobs::{
     SignSnapshotManifestResult, WorkerJob, WorkerResult,
 };
 use open_state::open_read_state;
-pub use read::DmatCache;
 #[cfg(test)]
 pub(in crate::volume) use read::SegmentLayout;
+pub use read::{DmatCache, FILE_CACHE_CAPACITY, ReadStats, ReadStatsSnapshot};
 pub(crate) use read::{FileCache, find_segment_in_dirs, open_delta_body_in_dirs, read_extents};
 pub use readonly::ReadonlyVolume;
 pub use reclaim::{
@@ -600,6 +600,8 @@ pub struct Volume {
     /// `RefCell` keeps `read` logically non-mutating (`&self`) while allowing
     /// the cache to be updated internally.
     pub(in crate::volume) file_cache: RefCell<FileCache>,
+    /// Descriptor-cache counters for reads served directly off the `Volume`.
+    pub(in crate::volume) read_stats: Arc<read::ReadStats>,
     /// In-memory cache of opened `cache/<ULID>.dmat` sidecars. Populated
     /// lazily on first delta read for each segment; cleared on cache
     /// eviction. See `docs/design/delta-materialisation.md`.
@@ -917,6 +919,7 @@ impl Volume {
             has_new_segments,
             last_segment_ulid,
             file_cache: RefCell::new(FileCache::default()),
+            read_stats: Arc::new(read::ReadStats::default()),
             dmat_cache: read::DmatCache::default(),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
             signer,
@@ -1315,6 +1318,7 @@ impl Volume {
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
+            &self.read_stats,
             &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {

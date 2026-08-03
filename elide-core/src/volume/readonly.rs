@@ -40,6 +40,7 @@ pub struct ReadonlyVolume {
     lbamap: Arc<lbamap::LbaMap>,
     extent_index: Arc<extentindex::ExtentIndex>,
     file_cache: RefCell<FileCache>,
+    read_stats: Arc<super::ReadStats>,
     dmat_cache: DmatCache,
     dmat_stats: Arc<DmatStats>,
     fetcher: Option<BoxFetcher>,
@@ -65,6 +66,7 @@ impl ReadonlyVolume {
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
             file_cache: RefCell::new(FileCache::default()),
+            read_stats: Arc::new(super::ReadStats::default()),
             dmat_cache: DmatCache::default(),
             dmat_stats: Arc::new(DmatStats::default()),
             fetcher: None,
@@ -98,6 +100,7 @@ impl ReadonlyVolume {
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
+            &self.read_stats,
             &cache_dir,
             |id, bss, idx| self.find_segment_file(id, bss, idx),
             |id| {

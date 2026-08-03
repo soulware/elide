@@ -1463,6 +1463,8 @@ pub struct VolumeReader {
     /// Telemetry counters for the dmat cache. Per-reader; aggregate by
     /// summing snapshots across readers if needed.
     dmat_stats: Arc<crate::dmat::DmatStats>,
+    /// Telemetry counters for the descriptor cache, on the same terms.
+    read_stats: Arc<crate::volume::ReadStats>,
     /// Generation of the last snapshot whose segment files this reader's
     /// descriptors were opened against. Compared against
     /// `ReadSnapshot::layout_gen` on every read; if they differ the caches
@@ -1490,8 +1492,19 @@ impl VolumeClient {
             client: self.clone(),
             file_cache: RefCell::new(FileCache::default()),
             dmat_stats: Arc::new(crate::dmat::DmatStats::default()),
+            read_stats: Arc::new(crate::volume::ReadStats::default()),
             last_layout_gen: Cell::new(current_gen),
         }
+    }
+
+    /// Construct a reader whose descriptor cache holds `capacity` files.
+    ///
+    /// The cache is per reader, so a volume's descriptor budget is
+    /// `capacity` times the number of readers its transport starts.
+    pub fn reader_with_cache_capacity(&self, capacity: usize) -> VolumeReader {
+        let mut reader = self.reader();
+        reader.file_cache = RefCell::new(FileCache::new(capacity));
+        reader
     }
 }
 
@@ -1896,6 +1909,7 @@ impl VolumeReader {
             &self.file_cache,
             &self.dmat_cache,
             &self.dmat_stats,
+            &self.read_stats,
             &config.cache_dir,
             |id, bss, idx| {
                 find_segment_in_dirs(
@@ -1932,6 +1946,11 @@ impl VolumeReader {
     /// Snapshot the dmat telemetry counters for this reader.
     pub fn dmat_stats(&self) -> crate::dmat::DmatStatsSnapshot {
         self.dmat_stats.snapshot()
+    }
+
+    /// Snapshot the descriptor-cache counters for this reader.
+    pub fn read_stats(&self) -> crate::volume::ReadStatsSnapshot {
+        self.read_stats.snapshot()
     }
 }
 
@@ -3366,9 +3385,10 @@ fn read_full_extent_body(
     if let Some(ref idata) = loc.inline_data {
         return Ok(loc.codec.decode(Cow::Borrowed(idata))?.into_owned());
     }
+    let home = loc.body_source.home();
     let mut found = None;
     for dir in search_dirs {
-        if let Some(hit) = segment::locate_segment_body(dir, loc.segment_id) {
+        if let Some(hit) = segment::locate_segment_body_from(dir, loc.segment_id, home) {
             found = Some(hit);
             break;
         }
@@ -3952,6 +3972,57 @@ mod tests {
         client.write(0, &block, false).unwrap();
         reader.read_into(0, &mut buf).unwrap();
         assert_eq!(buf, block);
+
+        drop(reader);
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The descriptor-cache counters follow the cache: the first read of a
+    /// segment opens a file, and a second read of the same segment reuses the
+    /// descriptor. A reader sized to hold one file evicts on the second
+    /// segment, so returning to the first opens it again.
+    #[test]
+    fn read_stats_count_descriptor_hits_and_misses() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        client.write(0, &unique_block(1), false).unwrap();
+        client.promote_wal().unwrap();
+        client.write(1, &unique_block(2), false).unwrap();
+        client.promote_wal().unwrap();
+
+        let reader = client.reader_with_cache_capacity(1);
+        let mut buf = vec![0u8; 4096];
+
+        reader.read_into(0, &mut buf).unwrap();
+        let first = reader.read_stats();
+        assert_eq!(first.extents_total, 1);
+        assert_eq!(
+            first.fd_miss_total, 1,
+            "the first read has to open the file"
+        );
+        assert_eq!(first.fd_hit_total, 0);
+
+        reader.read_into(0, &mut buf).unwrap();
+        let second = reader.read_stats().since(&first);
+        assert_eq!(second.fd_hit_total, 1, "the descriptor is still cached");
+        assert_eq!(second.fd_miss_total, 0);
+
+        // A second segment takes the only slot, so the first is evicted.
+        reader.read_into(1, &mut buf).unwrap();
+        let mark = reader.read_stats();
+        reader.read_into(0, &mut buf).unwrap();
+        let evicted = reader.read_stats().since(&mark);
+        assert_eq!(evicted.fd_miss_total, 1, "one slot cannot hold both");
+
+        let total = reader.read_stats();
+        assert_eq!(total.extents_total, 4);
+        assert!((total.fd_miss_rate() - 0.75).abs() < f64::EPSILON);
 
         drop(reader);
         client.shutdown();
