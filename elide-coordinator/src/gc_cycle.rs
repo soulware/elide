@@ -76,15 +76,17 @@ pub struct GcCycleOrchestrator {
     /// always checks; not bumped when the fence returns an outcome,
     /// so a failed halt retries on the very next tick.
     last_fence: Instant,
-    /// Per-tick scratch: ULIDs uploaded (drain) or produced (GC output)
-    /// that must land in HEAD's `Added` set before this tick reports
-    /// success. Cleared at the start of every `run_tick`.
+    /// Publish scratch: ULIDs uploaded (drain) or produced (GC output)
+    /// since the last published cut — the signal that S3 segment state
+    /// changed and a HEAD PUT is due. Kept across ticks until a publish
+    /// lands, so a held or failed cut retries on the next complete
+    /// drain.
     tick_added: Vec<Ulid>,
-    /// Per-tick scratch: GC supersession edges produced this tick —
-    /// `(input, output, since)` — that must land in HEAD's `Superseded`
-    /// set. `since` is captured at handoff completion time per
-    /// `docs/design/segment-index.md` (the GC output ULID is
-    /// history-derived, not wall-clock).
+    /// Publish scratch: GC supersession edges — `(input, output,
+    /// since)` — awaiting their cut. `since` is captured at handoff
+    /// completion time per `docs/design/segment-index.md` (the GC
+    /// output ULID is history-derived, not wall-clock). Kept across
+    /// ticks until a publish lands them in HEAD's `Superseded` set.
     tick_superseded: Vec<(Ulid, Ulid, DateTime<Utc>)>,
     /// `coord-rw` handle for the `names/<name>.latest_snapshot` bump
     /// after a drain uploads a `User` manifest (the retry path for a
@@ -344,44 +346,47 @@ impl GcCycleOrchestrator {
             }
         };
 
-        // Fresh scratch every tick — entries land in HEAD via this
-        // tick's merge-and-publish (`docs/design/segment-index.md`
-        // *Writer state*).
-        self.tick_added.clear();
-        self.tick_superseded.clear();
-
         self.run_volume_compactions().await;
-        let drain_ok = self.run_drain().await;
 
-        if self.last_gc.elapsed() >= self.gc_config.interval {
+        // GC preparation runs before the drain so the checkpoint's WAL
+        // flush lands in `pending/` in time to drain — and so commit —
+        // this same tick: the tick's cut then covers the frontier the
+        // pass was checkpointed at (`docs/design/durable-cut.md` *The
+        // tick anchors at one frontier*).
+        let gc_due = self.last_gc.elapsed() >= self.gc_config.interval;
+        let mut gc_buckets = None;
+        if gc_due {
             // Finalize outstanding bare `gc/<ulid>` files first, independent
-            // of `gc_checkpoint` and `drain_ok`. A bare file is a handoff the
-            // volume already committed (`.staged` → bare) but which the
-            // coordinator has not yet uploaded + promoted. If the coordinator
-            // crashes between those steps on a quiescent volume, the next
-            // `gc_checkpoint` returns `Idle` (WAL empty + no `.staged`), and
-            // gating cleanup behind the checkpoint would strand the bare file
-            // indefinitely — `has_pending_results` would then also block
-            // every future `gc_fork` pass. Always run this.
+            // of `gc_checkpoint` and the drain outcome. A bare file is a
+            // handoff the volume already committed (`.staged` → bare) but
+            // which the coordinator has not yet uploaded + promoted. If the
+            // coordinator crashes between those steps on a quiescent volume,
+            // the next `gc_checkpoint` returns `Idle` (WAL empty + no
+            // `.staged`), and gating cleanup behind the checkpoint would
+            // strand the bare file indefinitely — `has_pending_results`
+            // would then also block every future `gc_fork` pass. Always
+            // run this.
             self.run_handoff_cleanup().await;
-
-            if drain_ok {
-                self.run_gc_pass().await;
-                self.last_gc = Instant::now();
-            }
-            // If !drain_ok: gc_pass is skipped and last_gc is not bumped, so
-            // the next tick retries GC immediately once drain recovers.
+            gc_buckets = self.prepare_gc_pass().await;
         }
 
-        // Publish the post-snapshot delta. All S3 segment operations
-        // for this tick are durable before the HEAD overwrite —
-        // segments-before-HEAD crash ordering (design *Writers and
-        // crash ordering*). An idle tick (no drain, no GC outputs) is
-        // a no-op; only ticks that actually changed S3 segment state
-        // pay the HEAD PUT. A partial drain still publishes the
-        // segments that did upload — they're durable in S3 and would
-        // otherwise be invisible to readers until the next active tick.
-        self.publish_head_delta().await;
+        let drain_ok = self.run_drain().await;
+
+        if gc_due && drain_ok {
+            if let Some(bucket_ulids) = gc_buckets {
+                self.run_gc_pass(bucket_ulids).await;
+            }
+            self.last_gc = Instant::now();
+        }
+        // If !drain_ok: the pass is skipped and last_gc is not bumped, so
+        // the next tick retries GC immediately once drain recovers.
+
+        // Publish this tick's cut. All S3 segment operations for this
+        // tick are durable before the HEAD overwrite — segments-before-
+        // HEAD crash ordering (design *Writers and crash ordering*). An
+        // idle tick (no drain, no GC outputs) is a no-op; only ticks
+        // that actually changed S3 segment state pay the HEAD PUT.
+        self.publish_head_delta(drain_ok).await;
 
         TickOutcome::Continue
     }
@@ -426,11 +431,13 @@ impl GcCycleOrchestrator {
         }
     }
 
-    /// Drain pending segments to S3. Returns whether GC may proceed: a drain
-    /// failure forces this tick's GC to be skipped, since pending segments
-    /// that failed to promote still have no `cache/<ulid>.body` and would
-    /// not appear in the GC candidate set, while their LBAs would be
-    /// invisible to `collect_stats`.
+    /// Drain pending segments to S3. Returns whether the drain completed —
+    /// the gate for both this tick's GC pass and its cut publish. A drain
+    /// failure forces the GC skip because pending segments that failed to
+    /// promote still have no `cache/<ulid>.body` and would not appear in
+    /// the GC candidate set, while their LBAs would be invisible to
+    /// `collect_stats`; it holds the cut because a partial batch must
+    /// never become visible (`docs/design/durable-cut.md`).
     async fn run_drain(&mut self) -> bool {
         if !self.fork_dir.join("pending").exists() {
             return true;
@@ -520,7 +527,11 @@ impl GcCycleOrchestrator {
         }
     }
 
-    /// Apply this tick's drain/GC/reap deltas to HEAD and overwrite.
+    /// Publish this tick's cut: apply drain/GC/reap deltas to HEAD and
+    /// overwrite. Runs only after a complete drain (`drain_ok`) — a
+    /// partial drain publishes nothing, so HEAD only ever names whole
+    /// cuts (`docs/design/durable-cut.md` *HEAD publishes complete
+    /// drains only*); scratch and reap wait for the next complete tick.
     /// The reap step is folded in here (`docs/design/segment-index.md`
     /// *Reaper fold*) so a tick that fires drain + GC + reap still
     /// pays exactly one HEAD PUT.
@@ -535,32 +546,54 @@ impl GcCycleOrchestrator {
     /// its failure paths). A lost HEAD self-heals on the next active
     /// tick's seed: `read` treats a 404 or unparseable body as empty,
     /// and we rewrite from the current truth.
+    /// Every confirmed segment (`index/<ulid>.idx`) with a ULID beyond
+    /// `anchor`. An idx file is written only at promote, after the
+    /// segment object is durable in S3, so this listing enumerates
+    /// exactly the confirmed set — the cut's `added` universe.
+    fn confirmed_beyond(&self, anchor: Option<Ulid>) -> std::io::Result<Vec<Ulid>> {
+        let idx = elide_core::segment::collect_idx_files(&self.fork_dir.join("index"))?;
+        let mut out = Vec::new();
+        for path in idx {
+            let ulid = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| Ulid::from_string(s).ok())
+                .ok_or_else(|| {
+                    std::io::Error::other(format!("bad idx filename {}", path.display()))
+                })?;
+            if anchor.is_none_or(|a| ulid > a) {
+                out.push(ulid);
+            }
+        }
+        Ok(out)
+    }
+
     /// `true` when every confirmed segment (`index/<ulid>.idx`) above
-    /// `anchor` is in this tick's scratch — the shape a legitimately
+    /// `anchor` is in the publish scratch — the shape a legitimately
     /// empty HEAD has on a fresh volume or right after a seal. A
     /// confirmed segment beyond the scratch means the empty body lost
     /// committed entries. A listing error returns `false`, routing the
     /// caller to `segment_head::regenerate`, which reports it.
     fn empty_head_is_legitimate(&self, anchor: Option<Ulid>) -> bool {
-        let idx = match elide_core::segment::collect_idx_files(&self.fork_dir.join("index")) {
+        let confirmed = match self.confirmed_beyond(anchor) {
             Ok(v) => v,
             Err(_) => return false,
         };
         let scratch: std::collections::HashSet<Ulid> = self.tick_added.iter().copied().collect();
-        idx.iter()
-            .filter_map(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok())
-            })
-            .filter(|u| anchor.is_none_or(|a| *u > a))
-            .all(|u| scratch.contains(&u))
+        confirmed.iter().all(|u| scratch.contains(u))
     }
 
-    async fn publish_head_delta(&mut self) {
+    async fn publish_head_delta(&mut self, drain_ok: bool) {
         let reap_due = self.last_reap.elapsed() >= self.gc_config.reaper_cadence();
         let has_scratch = !self.tick_added.is_empty() || !self.tick_superseded.is_empty();
         if !reap_due && !has_scratch {
+            return;
+        }
+        if !drain_ok {
+            info!(
+                "[head {}] drain incomplete; holding this tick's cut",
+                self.vol_ulid
+            );
             return;
         }
 
@@ -613,7 +646,7 @@ impl GcCycleOrchestrator {
             }
         };
 
-        let mut mutated = has_scratch || repaired;
+        let mut mutated = repaired;
         if reap_due {
             if self.reap_expired(&mut head).await {
                 mutated = true;
@@ -621,22 +654,53 @@ impl GcCycleOrchestrator {
             self.last_reap = Instant::now();
         }
 
-        for u in self.tick_added.drain(..) {
-            head.added.insert(u);
+        // The cut's `added` set is derived at publish time: every
+        // confirmed segment beyond the anchor is in it. Segments
+        // confirmed by an earlier held tick, or by an upload whose
+        // process died before publishing, join the cut here
+        // (`docs/design/durable-cut.md` *HEAD publishes complete
+        // drains only*).
+        match self.confirmed_beyond(head.anchor) {
+            Ok(confirmed) => {
+                for u in confirmed {
+                    if head.added.insert(u) {
+                        mutated = true;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[head {}] index scan failed: {e}; holding this tick's cut",
+                    self.vol_ulid
+                );
+                return;
+            }
         }
-        for (input, output, since) in self.tick_superseded.drain(..) {
-            head.superseded
-                .insert(input, segment_head::Supersession { output, since });
+        for (input, output, since) in &self.tick_superseded {
+            let edge = segment_head::Supersession {
+                output: *output,
+                since: *since,
+            };
+            if head.superseded.insert(*input, edge) != Some(edge) {
+                mutated = true;
+            }
         }
 
         if !mutated {
+            self.tick_added.clear();
+            self.tick_superseded.clear();
             *cache = Some(head);
             return;
         }
         match self.volume_data.head().put(&head).await {
-            Ok(()) => *cache = Some(head),
-            // Cache stays empty: the next pass re-reads S3 before
-            // merging, which is what heals the lost overwrite.
+            Ok(()) => {
+                self.tick_added.clear();
+                self.tick_superseded.clear();
+                *cache = Some(head);
+            }
+            // Cache stays empty and the scratch is kept: the next
+            // pass re-reads S3 and re-merges the same deltas, which
+            // heals the lost overwrite.
             Err(e) => warn!(
                 "[head {}] put failed: {e}; \
                  self-heals on the next active tick",
@@ -803,12 +867,15 @@ impl GcCycleOrchestrator {
         true
     }
 
-    async fn run_gc_pass(&mut self) {
+    /// Checkpoint the volume for this tick's GC pass: flush the WAL
+    /// (the flush segment joins `pending/` and drains with this tick's
+    /// cut), run the own-segment divergence check, and apply staged
+    /// handoffs. Returns the pre-minted bucket ULIDs when the pass may
+    /// emit plans this tick.
+    async fn prepare_gc_pass(&mut self) -> Option<Vec<Ulid>> {
         let vol_ulid = self.vol_ulid;
         let max_buckets = self.gc_config.max_buckets_per_tick.max(1);
-        let Some(checkpoint) = control::gc_checkpoint(&self.fork_dir, max_buckets).await else {
-            return;
-        };
+        let checkpoint = control::gc_checkpoint(&self.fork_dir, max_buckets).await?;
         let bucket_ulids = checkpoint.bucket_ulids;
 
         // Divergence check (docs/design/read-state-divergence-check.md):
@@ -854,7 +921,7 @@ impl GcCycleOrchestrator {
                     "[gc {vol_ulid}] apply-gc-handoffs outcome unknown; \
                      skipping plan emission this tick"
                 );
-                return;
+                return None;
             }
         };
         if handoffs_applied > 0 {
@@ -862,9 +929,13 @@ impl GcCycleOrchestrator {
         }
 
         if diverged {
-            return;
+            return None;
         }
+        Some(bucket_ulids)
+    }
 
+    async fn run_gc_pass(&mut self, bucket_ulids: Vec<Ulid>) {
+        let vol_ulid = self.vol_ulid;
         let gc_result = {
             let fork_dir = self.fork_dir.clone();
             let by_id_dir = self.by_id_dir.clone();
@@ -1044,7 +1115,7 @@ mod tests {
     async fn idle_tick_writes_nothing() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (mut orch, _tmp) = orchestrator(store.clone());
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
         // Empty scratch ⇒ no PUT ⇒ no HEAD object in the store.
         let res = store.get(&segment_head::head_key(vol_ulid())).await;
         assert!(
@@ -1056,14 +1127,17 @@ mod tests {
     #[tokio::test]
     async fn drain_only_tick_publishes_added() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
         let a1 = m.next();
         let a2 = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[]);
+            plant_confirmed_segment(fork, a2, &[]);
+        });
         orch.tick_added.push(a1);
         orch.tick_added.push(a2);
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
@@ -1077,17 +1151,19 @@ mod tests {
     #[tokio::test]
     async fn handoff_tick_publishes_added_output_and_superseded_inputs() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
         let input_a = m.next();
         let input_b = m.next();
         let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, output, &[input_a, input_b]);
+        });
         let since = Utc::now();
         orch.tick_added.push(output);
         orch.tick_superseded.push((input_a, output, since));
         orch.tick_superseded.push((input_b, output, since));
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&output));
@@ -1150,16 +1226,100 @@ mod tests {
         let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
             plant_confirmed_segment(fork, prior, &[]);
             plant_confirmed_segment(fork, gc_out, &[gc_input]);
+            plant_confirmed_segment(fork, fresh, &[]);
         });
         orch.tick_added.push(fresh);
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&prior), "lost prior tick's segment");
         assert!(head.added.contains(&gc_out));
         assert!(head.added.contains(&fresh));
         assert_eq!(head.superseded[&gc_input].output, gc_out);
+    }
+
+    #[tokio::test]
+    async fn held_cut_publishes_whole_on_next_complete_drain() {
+        // A tick whose drain came up short publishes nothing — HEAD
+        // only ever names whole cuts. The scratch survives the held
+        // tick, and the next complete drain publishes everything.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let a1 = m.next();
+        let a2 = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[]);
+        });
+        orch.tick_added.push(a1);
+
+        orch.publish_head_delta(false).await;
+
+        let res = store.get(&segment_head::head_key(vol_ulid())).await;
+        assert!(
+            matches!(res, Err(object_store::Error::NotFound { .. })),
+            "a held cut must not touch HEAD"
+        );
+        assert!(!orch.tick_added.is_empty(), "scratch survives a held cut");
+
+        plant_confirmed_segment(orch.fork_dir(), a2, &[]);
+        orch.tick_added.push(a2);
+        orch.publish_head_delta(true).await;
+
+        let head = read_head_via(&store).await;
+        assert!(head.added.contains(&a1));
+        assert!(head.added.contains(&a2));
+    }
+
+    #[tokio::test]
+    async fn confirmed_segments_beyond_scratch_join_the_cut() {
+        // A segment confirmed by a process that died between upload
+        // and publish is in `index/` but in no scratch and no HEAD.
+        // The cut's `added` set is derived from `index/` at publish
+        // time, so the segment joins the next published cut.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut m = UlidMint::new(Ulid::nil());
+        let prior = m.next();
+        let orphan = m.next();
+        let fresh = m.next();
+
+        let mut seed = segment_head::SegmentHead::empty(None);
+        seed.added.insert(prior);
+        put_head_via(&store, &seed).await;
+
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, prior, &[]);
+            plant_confirmed_segment(fork, orphan, &[]);
+            plant_confirmed_segment(fork, fresh, &[]);
+        });
+        orch.tick_added.push(fresh);
+        orch.publish_head_delta(true).await;
+
+        let head = read_head_via(&store).await;
+        assert!(
+            head.added.contains(&orphan),
+            "confirmed but unpublished segment joins the cut"
+        );
+        assert!(head.added.contains(&fresh));
+    }
+
+    #[tokio::test]
+    async fn reap_held_when_drain_incomplete() {
+        // Reap is destructive and rides the cut publish, so it too
+        // waits for a complete drain.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator(store.clone());
+        let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
+        let output = m.next();
+        let key = seed_expired_input(&store, &mut orch, input, output).await;
+
+        orch.publish_head_delta(false).await;
+
+        assert!(store.head(&key).await.is_ok(), "no DELETE on a held tick");
+        let head = read_head_via(&store).await;
+        assert!(head.superseded.contains_key(&input));
+        assert!(head.tombstoned.is_empty());
     }
 
     #[tokio::test]
@@ -1178,9 +1338,11 @@ mod tests {
         seed.added.insert(prior);
         put_head_via(&store, &seed).await;
 
-        let (mut orch, _tmp) = orchestrator(store.clone());
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, new, &[]);
+        });
         orch.tick_added.push(new);
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&prior), "prior entry retained");
@@ -1240,7 +1402,7 @@ mod tests {
         );
         put_head_via(&store, &head).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         // Expired input: S3 object gone, HEAD edge replaced with
         // Tombstoned. Fresh input: untouched on both sides.
@@ -1311,7 +1473,7 @@ mod tests {
         }
         put_head_via(&store, &head).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         assert!(
             store.head(&local_key).await.is_ok(),
@@ -1358,7 +1520,7 @@ mod tests {
             .await
             .unwrap();
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let got = store.get(&key).await.unwrap().bytes().await.unwrap();
         assert_eq!(
@@ -1375,21 +1537,24 @@ mod tests {
         // publish's merge: the sole-writer invariant means the cache
         // is the basis, and no per-pass GET happens once it is warm.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
         let a1 = m.next();
         let foreign = m.next();
         let a2 = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[]);
+        });
 
         orch.tick_added.push(a1);
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let mut planted = segment_head::SegmentHead::empty(None);
         planted.added.insert(foreign);
         put_head_via(&store, &planted).await;
 
+        plant_confirmed_segment(orch.fork_dir(), a2, &[]);
         orch.tick_added.push(a2);
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&a1));
@@ -1407,19 +1572,21 @@ mod tests {
         // behind the writer's back is the tripwire: a per-pass GET
         // would see it and DELETE the input object.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
         let a1 = m.next();
         let input = m.next();
         let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[]);
+        });
 
         orch.tick_added.push(a1);
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let key = seed_expired_input(&store, &mut orch, input, output).await;
         let planted = read_head_via(&store).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         assert!(
             store.head(&key).await.is_ok(),
@@ -1517,7 +1684,8 @@ mod tests {
     #[tokio::test]
     async fn failed_put_empties_cache_and_next_pass_reseeds() {
         // A failed HEAD PUT must leave the cache empty so the next
-        // pass re-reads S3 before merging. The reseed is observable
+        // pass re-reads S3 before merging, and must keep the publish
+        // scratch so the same deltas re-merge. The reseed is observable
         // because a body planted in S3 after the failure IS absorbed
         // by the next merge — the opposite of the warm-cache case.
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1525,14 +1693,23 @@ mod tests {
             inner: Arc::clone(&inner),
             armed: std::sync::atomic::AtomicBool::new(true),
         });
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
+        let input = m.next();
         let a1 = m.next();
         let planted_ulid = m.next();
         let a2 = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, a1, &[input]);
+            plant_confirmed_segment(fork, a2, &[]);
+        });
 
         orch.tick_added.push(a1);
-        orch.publish_head_delta().await;
+        orch.tick_superseded.push((input, a1, Utc::now()));
+        orch.publish_head_delta(true).await;
+        assert!(
+            !orch.tick_superseded.is_empty(),
+            "a failed PUT must keep the scratch for the retry"
+        );
 
         let mut planted = segment_head::SegmentHead::empty(None);
         planted.added.insert(planted_ulid);
@@ -1543,14 +1720,19 @@ mod tests {
             .unwrap();
 
         orch.tick_added.push(a2);
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&inner).await;
         assert!(
             head.added.contains(&planted_ulid),
             "the pass after a failed PUT must reseed from S3"
         );
+        assert!(head.added.contains(&a1), "kept scratch re-merges");
         assert!(head.added.contains(&a2));
+        assert_eq!(
+            head.superseded[&input].output, a1,
+            "kept supersession edges re-merge after a failed PUT"
+        );
     }
 
     /// Seed an expired Superseded edge for `input` (object body
@@ -1601,7 +1783,7 @@ mod tests {
             .unwrap();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         assert!(
             store.head(&key).await.is_ok(),
@@ -1629,7 +1811,7 @@ mod tests {
             .unwrap();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         assert!(
             matches!(
@@ -1653,7 +1835,7 @@ mod tests {
         let output = m.next();
         let key = seed_expired_input(&store, &mut orch, input, output).await;
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         assert!(store.head(&key).await.is_ok());
         let head = read_head_via(&store).await;
@@ -1669,17 +1851,20 @@ mod tests {
         // publish_head_delta and checking the resulting body reflects
         // both.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (mut orch, _tmp) = orchestrator(store.clone());
         let mut m = UlidMint::new(Ulid::nil());
         let drained = m.next();
         let input = m.next();
         let output = m.next();
+        let (mut orch, _tmp) = orchestrator_prepped(store.clone(), None, |fork| {
+            plant_confirmed_segment(fork, drained, &[]);
+            plant_confirmed_segment(fork, output, &[input]);
+        });
         let since = Utc::now();
         orch.tick_added.push(drained);
         orch.tick_added.push(output);
         orch.tick_superseded.push((input, output, since));
 
-        orch.publish_head_delta().await;
+        orch.publish_head_delta(true).await;
 
         let head = read_head_via(&store).await;
         assert!(head.added.contains(&drained));
