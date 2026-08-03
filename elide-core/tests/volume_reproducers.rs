@@ -916,3 +916,69 @@ fn straddling_write_splits_at_the_window_boundary() {
         );
     }
 }
+
+/// A crash inside the repack pipeline leaves `pending/` holding inputs
+/// and outputs side by side (worker phase done, apply never ran), or
+/// outputs plus a partially-removed input set (crash inside
+/// `remove_consumed_inputs`). Both reopen to the pre-crash contents:
+/// the claimant-aware rebuild resolves every LBA through its highest
+/// claimant among whichever files survive. Exercises both bucket kinds
+/// per pass — a data rewrite (dead bytes from an overwrite) and the
+/// journal consolidation (two journal epochs merge).
+#[test]
+fn repack_pipeline_crash_states_recover() {
+    use elide_core::volume::Volume;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+
+    let mut cfg = elide_core::config::VolumeConfig::read(fork_dir).unwrap();
+    cfg.journal = Some(elide_core::config::JournalConfig {
+        ranges: elide_core::journal::JournalRanges::new(vec![(96, 4)]),
+    });
+    cfg.write(fork_dir).unwrap();
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Two epochs, each a data + journal segment pair; the second
+    // overwrites LBA 0, so the first pair's data segment carries dead
+    // bytes and the worker rewrites it.
+    vol.write(0, &common::incompressible_block(1)).unwrap();
+    vol.write(96, &common::incompressible_block(2)).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &common::incompressible_block(3)).unwrap();
+    vol.write(97, &common::incompressible_block(4)).unwrap();
+    vol.flush_wal().unwrap();
+
+    // Crash between the worker phase and apply.
+    assert!(vol.repack_crash_for_test(false, 0).unwrap());
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    for (lba, seed) in [(0, 3), (96, 2), (97, 4)] {
+        assert_eq!(
+            vol.read(lba, 1).unwrap().as_slice(),
+            common::incompressible_block(seed).as_slice(),
+            "lba {lba} wrong after worker-phase crash + rebuild",
+        );
+    }
+    common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
+
+    // Crash partway through input removal after a completed apply.
+    vol.write(1, &common::incompressible_block(5)).unwrap();
+    vol.write(0, &common::incompressible_block(6)).unwrap();
+    vol.flush_wal().unwrap();
+    assert!(vol.repack_crash_for_test(true, 1).unwrap());
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    for (lba, seed) in [(0, 6), (1, 5), (96, 2), (97, 4)] {
+        assert_eq!(
+            vol.read(lba, 1).unwrap().as_slice(),
+            common::incompressible_block(seed).as_slice(),
+            "lba {lba} wrong after mid-removal crash + rebuild",
+        );
+    }
+    common::check_tier_purity(fork_dir).expect("tier purity violated");
+    common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
+}
