@@ -1,6 +1,9 @@
 # Durable cuts
 
-**Status: Proposed.** Builds on [segment-index.md](segment-index.md)
+**Status: Implemented** (#832, #834, #835, #837, #838, #839): the
+publish rules, seal-anchored recovery fallback, cut consistency
+oracle, and the cut cadence knob (`gc.cut_interval`, default 10s) are
+on main. Builds on [segment-index.md](segment-index.md)
 (per-volume HEAD, the manifest ∪ HEAD live set, seal-time truncation)
 and the drain/GC tick in `elide-coordinator/src/gc_cycle.rs`. Fixes
 live consistency holes in today's publish rules and provides the

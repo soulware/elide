@@ -75,7 +75,21 @@ struct MapEntry {
 /// Admission policy for [`LbaMap::register_entry_inner`].
 enum Admission<'a> {
     Unconditional,
+    IfNewer,
     ConsumingInputs(&'a HashSet<Ulid>),
+}
+
+/// Overlap-blocking rule for [`LbaMap::insert_inner_if_newer`].
+enum Blocking<'a> {
+    /// An existing claimant `>=` ours keeps its sub-range.
+    SameOrHigher,
+    /// An existing claimant `>` ours keeps its sub-range; an equal
+    /// claimant is overridden (same-segment re-registration, where
+    /// entry order is authoritative).
+    Higher,
+    /// Structural-commit apply: see the comment in
+    /// [`LbaMap::insert_inner_if_newer`].
+    Consuming(&'a HashSet<Ulid>),
 }
 
 /// The live in-memory LBA map.
@@ -262,7 +276,14 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
     ) {
-        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, None, None);
+        self.insert_inner_if_newer(
+            start_lba,
+            lba_length,
+            hash,
+            claimant,
+            None,
+            Blocking::SameOrHigher,
+        );
     }
 
     /// Delta variant of [`insert_if_newer`]; same conditional-by-claimant
@@ -281,7 +302,7 @@ impl LbaMap {
             hash,
             claimant,
             Some(source_hashes),
-            None,
+            Blocking::SameOrHigher,
         );
     }
 
@@ -310,7 +331,7 @@ impl LbaMap {
             hash,
             claimant,
             None,
-            Some(consumed_inputs),
+            Blocking::Consuming(consumed_inputs),
         );
     }
 
@@ -330,7 +351,7 @@ impl LbaMap {
             hash,
             claimant,
             Some(source_hashes),
-            Some(consumed_inputs),
+            Blocking::Consuming(consumed_inputs),
         );
     }
 
@@ -344,8 +365,9 @@ impl LbaMap {
     /// branch differently from what a fresh rebuild would produce.
     ///
     /// `admission` selects the overlap policy: `Unconditional` installs
-    /// over whatever is there (the rebuild walks visit segments in
-    /// ascending ULID order, so the newest claim wins), while
+    /// over whatever is there, `IfNewer` installs on sub-ranges whose
+    /// current claimant ULID is lower or equal (highest claimant wins
+    /// across segments; entry order wins within one), and
     /// `ConsumingInputs` defers to any overlapping claimant `>=`
     /// `claimant` that is not one of the inputs the apply consumes.
     fn register_entry_inner(
@@ -368,6 +390,14 @@ impl LbaMap {
                     claimant,
                     sources,
                 ),
+                Admission::IfNewer => self.insert_inner_if_newer(
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash,
+                    claimant,
+                    Some(sources),
+                    Blocking::Higher,
+                ),
                 Admission::ConsumingInputs(inputs) => self.insert_delta_consuming_inputs(
                     entry.start_lba,
                     entry.lba_length,
@@ -382,6 +412,14 @@ impl LbaMap {
                 Admission::Unconditional => {
                     self.insert(entry.start_lba, entry.lba_length, entry.hash, claimant)
                 }
+                Admission::IfNewer => self.insert_inner_if_newer(
+                    entry.start_lba,
+                    entry.lba_length,
+                    entry.hash,
+                    claimant,
+                    None,
+                    Blocking::Higher,
+                ),
                 Admission::ConsumingInputs(inputs) => self.insert_consuming_inputs(
                     entry.start_lba,
                     entry.lba_length,
@@ -393,10 +431,23 @@ impl LbaMap {
         }
     }
 
-    /// [`register_entry_inner`](Self::register_entry_inner) with the
-    /// rebuild walk's unconditional admission.
+    /// [`register_entry_inner`](Self::register_entry_inner) with
+    /// unconditional admission.
     pub fn register_entry(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) {
         self.register_entry_inner(entry, claimant, Admission::Unconditional);
+    }
+
+    /// [`register_entry_inner`](Self::register_entry_inner) with
+    /// claimant-aware admission: the entry claims sub-ranges whose
+    /// current claimant ULID is lower or equal, and defers to any
+    /// higher claimant. Cross-segment winners are therefore independent
+    /// of registration order (claimants are distinct segment ULIDs),
+    /// while a segment's own entries apply in order, later overriding
+    /// earlier at the same LBA — the write order a WAL-flush segment
+    /// records. The rebuild walk routes through this, so a rebuild
+    /// computes the same winners the live path maintained.
+    pub fn register_entry_if_newer(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) {
+        self.register_entry_inner(entry, claimant, Admission::IfNewer);
     }
 
     /// [`register_entry_inner`](Self::register_entry_inner) with the
@@ -419,24 +470,29 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
         sources: Option<Arc<[blake3::Hash]>>,
-        consumed_inputs: Option<&HashSet<Ulid>>,
+        blocking: Blocking<'_>,
     ) {
         let new_end = start_lba + lba_length as u64;
-        // With a consumed set, an existing entry blocks the install unless
-        // its claimant is one of the inputs this apply consumes and
-        // deletes, or it holds our hash at a lower ULID. The first is a
-        // claim the rewrite tears down; the second names a segment with
-        // identical bytes sorting below ours, so adopting the higher ULID
-        // matches the rebuild's highest-ULID-wins claim and changes no
-        // read. Distinct content or a higher ULID blocks: that marks a
-        // write the plan did not carry. Without a consumed set, a claimant
-        // `>=` ours blocks.
+        // `Consuming`: an existing entry blocks the install unless its
+        // claimant is one of the inputs this apply consumes and deletes,
+        // or it holds our hash at a lower ULID. The first is a claim the
+        // rewrite tears down; the second names a segment with identical
+        // bytes sorting below ours, so adopting the higher ULID matches
+        // the rebuild's highest-ULID-wins claim and changes no read.
+        // Distinct content or a higher ULID blocks: that marks a write
+        // the plan did not carry. `SameOrHigher`: a claimant `>=` ours
+        // blocks. `Higher`: only a claimant `>` ours blocks — an equal
+        // claimant is this same segment's own earlier entry, and a
+        // segment's entries apply in order (a WAL-flush segment carries
+        // its epoch's writes in write order, later entries overriding
+        // earlier ones at the same LBA).
         let blocks = |existing: Ulid, existing_hash: blake3::Hash| -> bool {
-            match consumed_inputs {
-                Some(set) => {
+            match blocking {
+                Blocking::Consuming(set) => {
                     !(set.contains(&existing) || existing_hash == hash && existing < claimant)
                 }
-                None => existing >= claimant,
+                Blocking::SameOrHigher => existing >= claimant,
+                Blocking::Higher => existing > claimant,
             }
         };
 
@@ -1045,14 +1101,16 @@ fn rebuild_segments_inner(
 
     for (fork_dir, branch_ulid) in layers {
         // `discover_fork_segments` handles the race-safe listing order
-        // (pending → gc → index) and returns segments in the correct
-        // rebuild *processing* order: the committed tier (gc ∪ index) by
-        // ULID ascending, then pending by ULID ascending. Last-write-wins
-        // on overlapping LBAs gives the intended semantics: a bare
-        // `gc/<U>` output (minted above all its inputs' ULIDs) shadows
-        // any older non-input index segment at the same LBA, and pending
-        // writes — always minted after any concurrent GC output — win over
-        // both. See the helper's doc comment.
+        // (pending → gc → index) and returns the committed tier
+        // (gc ∪ index) by ULID ascending, then pending by ULID
+        // ascending. Admission is claimant-aware, so the highest
+        // claimant ULID wins every LBA overlap independent of that
+        // visit order — the segment mint is monotonic, so the highest
+        // claimant is the newest write: a bare `gc/<U>` output shadows
+        // its lower-ULID inputs, and a write minted after a concurrent
+        // GC output wins over it. This is the rule the live map applies
+        // incrementally (`insert_if_newer`), so the rebuild computes
+        // the same winners the live path maintained.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
         if segments.is_empty() {
@@ -1087,7 +1145,7 @@ fn rebuild_segments_inner(
                 Err(e) => return Err(e),
             };
             for entry in entries {
-                map.register_entry(&entry, sref.ulid);
+                map.register_entry_if_newer(&entry, sref.ulid);
             }
         }
     }
@@ -1407,6 +1465,64 @@ mod tests {
         assert_eq!(map.lookup(0), Some((h(1), 0)));
         assert_eq!(map.lookup(4), Some((h(1), 4)));
         // [5, 10) should be from segment 2 (newer wins).
+        assert_eq!(map.lookup(5), Some((h(2), 0)));
+        assert_eq!(map.lookup(9), Some((h(2), 4)));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rebuild_low_ulid_pending_loses_to_higher_committed() {
+        use crate::segment::SegmentEntry;
+
+        let base = temp_dir();
+        let pending = base.join("pending");
+        let index = base.join("index");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::create_dir_all(&index).unwrap();
+        let signer = write_test_pub(&base);
+
+        // Pending segment at the LOW ulid: covers [0, 10) → hash_1. The
+        // rebuild walk visits it last (pending after committed), so under
+        // order-dependent admission it would shadow the committed claim.
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(1),
+                0,
+                10,
+                segment::Codec::None,
+                vec![0u8; 40960],
+            )];
+            segment::write_segment(
+                &pending.join("01AAAAAAAAAAAAAAAAAAAAAAAA"),
+                entries,
+                signer.as_ref(),
+            )
+            .unwrap();
+        }
+
+        // Committed segment at the HIGHER ulid: overwrites [5, 10) → hash_2.
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(2),
+                5,
+                5,
+                segment::Codec::None,
+                vec![0u8; 20480],
+            )];
+            let scratch = base.join("01BBBBBBBBBBBBBBBBBBBBBBBB.seg");
+            segment::write_segment(&scratch, entries, signer.as_ref()).unwrap();
+            segment::extract_idx(&scratch, &index.join("01BBBBBBBBBBBBBBBBBBBBBBBB.idx")).unwrap();
+            std::fs::remove_file(&scratch).unwrap();
+        }
+
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
+
+        // [0, 5): only the pending segment claims it.
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.lookup(4), Some((h(1), 4)));
+        // [5, 10): the higher-ULID committed claim wins even though the
+        // walk visits the pending segment after it.
         assert_eq!(map.lookup(5), Some((h(2), 0)));
         assert_eq!(map.lookup(9), Some((h(2), 4)));
 
