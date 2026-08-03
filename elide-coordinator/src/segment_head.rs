@@ -312,43 +312,64 @@ pub fn live_set(manifest_segments: &BTreeSet<Ulid>, head: &SegmentHead) -> BTree
         .collect()
 }
 
-/// Regenerate the full HEAD body from the owner's local directory.
-///
-/// `anchor` is the latest local user snapshot; `added` is every
-/// confirmed segment (`index/<ulid>.idx`) above it; `superseded`
-/// carries one edge per entry of each such segment's signed `inputs`
-/// table, stamped `since = now`, which restarts that edge's reap
-/// retention clock. Each `.idx` is signature-verified against
-/// `volume.pub` before its inputs are trusted.
-pub fn regenerate(fork_dir: &Path) -> io::Result<SegmentHead> {
-    let anchor = elide_core::volume::latest_snapshot(fork_dir)?;
-    let mut head = SegmentHead::empty(anchor);
+/// Every confirmed segment (`index/<ulid>.idx`) with a ULID beyond
+/// `anchor`, with its idx path. An idx file is written only at
+/// promote, after the segment object is durable in S3, so the listing
+/// enumerates exactly the confirmed set.
+pub fn confirmed_segments(
+    fork_dir: &Path,
+    anchor: Option<Ulid>,
+) -> io::Result<Vec<(Ulid, std::path::PathBuf)>> {
     let idx_files = elide_core::segment::collect_idx_files(&fork_dir.join("index"))?;
-    if idx_files.is_empty() {
-        return Ok(head);
-    }
-    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
-    let now = Utc::now();
+    let mut out = Vec::new();
     for path in idx_files {
         let ulid = path
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| Ulid::from_string(s).ok())
             .ok_or_else(|| io::Error::other(format!("bad idx filename {}", path.display())))?;
-        if anchor.is_some_and(|a| ulid <= a) {
-            continue;
+        if anchor.is_none_or(|a| ulid > a) {
+            out.push((ulid, path));
         }
-        head.added.insert(ulid);
+    }
+    Ok(out)
+}
+
+/// The supersession edges recorded by the confirmed segments beyond
+/// `anchor`: one `(input, output)` per entry of each segment's signed
+/// `inputs` table. Each `.idx` is signature-verified against
+/// `volume.pub` before its inputs are trusted.
+pub fn confirmed_edges(fork_dir: &Path, anchor: Option<Ulid>) -> io::Result<Vec<(Ulid, Ulid)>> {
+    let confirmed = confirmed_segments(fork_dir, anchor)?;
+    if confirmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+    let mut edges = Vec::new();
+    for (output, path) in confirmed {
         let (_, _, inputs) = elide_core::segment::read_and_verify_segment_index(&path, &vk)?;
-        for input in inputs {
-            head.superseded.insert(
-                input,
-                Supersession {
-                    output: ulid,
-                    since: now,
-                },
-            );
-        }
+        edges.extend(inputs.into_iter().map(|input| (input, output)));
+    }
+    Ok(edges)
+}
+
+/// Regenerate the full HEAD body from the owner's local directory.
+///
+/// `anchor` is the latest local user snapshot; `added` is every
+/// confirmed segment (`index/<ulid>.idx`) above it; `superseded`
+/// carries one edge per entry of each such segment's signed `inputs`
+/// table, stamped `since = now`, which restarts that edge's reap
+/// retention clock.
+pub fn regenerate(fork_dir: &Path) -> io::Result<SegmentHead> {
+    let anchor = elide_core::volume::latest_snapshot(fork_dir)?;
+    let mut head = SegmentHead::empty(anchor);
+    for (ulid, _) in confirmed_segments(fork_dir, anchor)? {
+        head.added.insert(ulid);
+    }
+    let now = Utc::now();
+    for (input, output) in confirmed_edges(fork_dir, anchor)? {
+        head.superseded
+            .insert(input, Supersession { output, since: now });
     }
     Ok(head)
 }
