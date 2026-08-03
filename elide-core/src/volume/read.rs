@@ -14,6 +14,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicU64};
 
 use ulid::Ulid;
 
@@ -240,7 +241,74 @@ fn serve_chunked(
 const TABLE_READ_PREFIX: usize = 4096;
 
 /// Default capacity for the segment file handle LRU cache.
-const FILE_CACHE_CAPACITY: usize = 16;
+pub const FILE_CACHE_CAPACITY: usize = 16;
+
+/// Telemetry for the segment-descriptor cache.
+///
+/// One instance per reader, so the counters are uncontended — they are
+/// atomics to match [`crate::dmat::DmatStats`] and to keep the read path on
+/// a shared reference. A miss is what pays for `find_segment_in_dirs` and an
+/// `open`, so the ratio is the number to watch when a read workload slows
+/// down.
+#[derive(Debug, Default)]
+pub struct ReadStats {
+    /// Extents resolved through a segment file. Inline and zero extents
+    /// never reach the cache and are not counted.
+    pub extents_total: AtomicU64,
+    /// The cache held a descriptor for the extent's segment.
+    pub fd_hit_total: AtomicU64,
+    /// The cache did not, so the read resolved a path and opened the file.
+    pub fd_miss_total: AtomicU64,
+}
+
+impl ReadStats {
+    fn record_hit(&self) {
+        self.extents_total.fetch_add(1, atomic::Ordering::Relaxed);
+        self.fd_hit_total.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+
+    fn record_miss(&self) {
+        self.extents_total.fetch_add(1, atomic::Ordering::Relaxed);
+        self.fd_miss_total.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ReadStatsSnapshot {
+        ReadStatsSnapshot {
+            extents_total: self.extents_total.load(atomic::Ordering::Relaxed),
+            fd_hit_total: self.fd_hit_total.load(atomic::Ordering::Relaxed),
+            fd_miss_total: self.fd_miss_total.load(atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// Counter values read together at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadStatsSnapshot {
+    pub extents_total: u64,
+    pub fd_hit_total: u64,
+    pub fd_miss_total: u64,
+}
+
+impl ReadStatsSnapshot {
+    /// Share of segment-file extents that had to open a file, in `0.0..=1.0`.
+    /// Zero when no extent reached the cache.
+    pub fn fd_miss_rate(&self) -> f64 {
+        let looked_up = self.fd_hit_total + self.fd_miss_total;
+        if looked_up == 0 {
+            return 0.0;
+        }
+        self.fd_miss_total as f64 / looked_up as f64
+    }
+
+    /// Counters accumulated between `earlier` and this snapshot.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            extents_total: self.extents_total - earlier.extents_total,
+            fd_hit_total: self.fd_hit_total - earlier.fd_hit_total,
+            fd_miss_total: self.fd_miss_total - earlier.fd_miss_total,
+        }
+    }
+}
 
 /// The on-disk layout of a cached segment file, which determines how body
 /// offsets are interpreted.
@@ -407,6 +475,7 @@ pub(crate) fn read_extents(
     file_cache: &RefCell<FileCache>,
     dmat_cache: &DmatCache,
     dmat_stats: &Arc<dmat::DmatStats>,
+    read_stats: &ReadStats,
     cache_dir: &Path,
     find_segment: impl Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: impl Fn(Ulid) -> io::Result<fs::File>,
@@ -467,6 +536,7 @@ pub(crate) fn read_extents(
                     file_cache,
                     dmat_cache,
                     dmat_stats,
+                    read_stats,
                     cache_dir,
                     &find_segment,
                     &open_delta_body,
@@ -546,9 +616,12 @@ pub(crate) fn read_extents(
         };
         let mut cache = file_cache.borrow_mut();
         if !presence_known_set || cache.get(loc.segment_id).is_none() {
+            read_stats.record_miss();
             let path = find_segment(loc.segment_id, loc.body_section_start, loc.body_source)?;
             let layout = SegmentLayout::from_path(&path);
             cache.insert(loc.segment_id, layout, fs::File::open(&path)?);
+        } else {
+            read_stats.record_hit();
         }
         let (layout, f) = cache
             .get(loc.segment_id)
@@ -695,6 +768,7 @@ fn try_read_delta_extent(
     file_cache: &RefCell<FileCache>,
     dmat_cache: &DmatCache,
     dmat_stats: &Arc<dmat::DmatStats>,
+    read_stats: &ReadStats,
     cache_dir: &Path,
     find_segment: &dyn Fn(Ulid, u64, BodySource) -> io::Result<PathBuf>,
     open_delta_body: &dyn Fn(Ulid) -> io::Result<fs::File>,
@@ -772,6 +846,7 @@ fn try_read_delta_extent(
         };
         let mut cache = file_cache.borrow_mut();
         if !presence_known_set || cache.get(source_loc.segment_id).is_none() {
+            read_stats.record_miss();
             let path = find_segment(
                 source_loc.segment_id,
                 source_loc.body_section_start,
@@ -779,6 +854,8 @@ fn try_read_delta_extent(
             )?;
             let layout = SegmentLayout::from_path(&path);
             cache.insert(source_loc.segment_id, layout, fs::File::open(&path)?);
+        } else {
+            read_stats.record_hit();
         }
         let (layout, f) = cache
             .get(source_loc.segment_id)
@@ -808,9 +885,12 @@ fn try_read_delta_extent(
         } => {
             let mut cache = file_cache.borrow_mut();
             if cache.get(delta_segment_id).is_none() {
+                read_stats.record_miss();
                 let path = find_segment(delta_segment_id, delta_bss, BodySource::Local)?;
                 let layout = SegmentLayout::from_path(&path);
                 cache.insert(delta_segment_id, layout, fs::File::open(&path)?);
+            } else {
+                read_stats.record_hit();
             }
             let (_layout, f) = cache
                 .get(delta_segment_id)
