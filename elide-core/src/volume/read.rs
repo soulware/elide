@@ -257,10 +257,12 @@ const TABLE_READ_PREFIX: usize = 4096;
 /// Default capacity for a volume's shared segment-descriptor cache.
 ///
 /// One cache per volume, so this is the volume's whole descriptor budget
-/// for segment bodies. Sized to cover the live segment count of a churned
-/// volume — misses climb once segments outnumber slots — while staying a
+/// for segment bodies. Sized with headroom over the live segment count of
+/// a churned volume: misses climb steeply once segments outnumber slots,
+/// while spare slots cost only their array entry — descriptors open as
+/// segments are touched, and `get` scans occupied slots. 512 stays a
 /// small fraction of a typical 10240 fd rlimit.
-pub const FILE_CACHE_CAPACITY: usize = 128;
+pub const FILE_CACHE_CAPACITY: usize = 512;
 
 /// Telemetry for the segment-descriptor cache.
 ///
