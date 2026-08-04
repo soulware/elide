@@ -5035,7 +5035,7 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
         pending_ulids(&base).into_iter().collect();
     vol.write(0, &vec![8u8; 4096]).unwrap();
 
-    let job = vol.prepare_repack().unwrap().expect("repack job");
+    let job = vol.prepare_repack_inline().unwrap().expect("repack job");
     let result = crate::actor::execute_repack(job).unwrap();
 
     // Between execute and apply, a promote lands a delta whose only

@@ -44,9 +44,9 @@ use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
-    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, SharedFileCache,
-    SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob, WorkerResult,
-    find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
+    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackPrep, RepackResult,
+    SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob,
+    WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
     read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
 };
 
@@ -785,8 +785,8 @@ impl VolumeActor {
     /// to the worker.  Reply is parked until
     /// [`crate::volume::RepackResult`] arrives and is applied.
     fn start_repack(&mut self, reply: Sender<io::Result<CompactionStats>>) {
-        let job = match self.lock_volume().prepare_repack() {
-            Ok(Some(j)) => j,
+        let prep = match self.lock_volume().prepare_repack() {
+            Ok(Some(p)) => p,
             Ok(None) => {
                 let _ = reply.send(Ok(CompactionStats::default()));
                 return;
@@ -796,11 +796,24 @@ impl VolumeActor {
                 return;
             }
         };
-        // `prepare_repack` flushes the WAL before pre-minting output
-        // ULIDs (mirrors `start_sweep`). The flush
-        // mutates the extent index and may delete the old WAL file —
-        // republish so readers don't resolve hashes through the
-        // pre-flush snapshot into a deleted WAL.
+        let RepackPrep { flush, job } = prep;
+        // The rotated WAL goes first, so its apply lands before the
+        // repack's. `apply_or_defer_repack` holds the repack result
+        // behind in-flight promotes, which is what orders the two.
+        if let Some(flush) = flush {
+            let old_wal_path = flush.old_wal_path.clone();
+            if let Err(e) = self.send_worker_job(WorkerJob::Promote(flush)) {
+                warn!("repack flush dispatch failed: {e}");
+                let _ = reply.send(Err(e));
+                return;
+            }
+            self.pipeline.promotes_in_flight += 1;
+            self.pipeline.promote_gen += 1;
+            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+        }
+        // Prep took the WAL, so the extent index the readers see still
+        // points hashes at it. Republish so a reader picks up the
+        // snapshot the promote's apply will move off.
         self.publish_snapshot();
         if let Err(e) = self.send_worker_job(WorkerJob::Repack(job)) {
             warn!("repack dispatch failed: {e}");
@@ -2667,7 +2680,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         base_dir,
         pending_dir,
         floor,
-        ceiling,
+        seg_paths,
         output_ulids,
         journal_output_ulids,
         lbamap_snapshot,
@@ -2679,7 +2692,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         segment_cache,
     } = job;
 
-    let seg_paths = segment::collect_segment_files(&pending_dir)?;
     // Claims plus the delta-source closure — a claim of a delta-canonical
     // hash (a DedupRef most commonly) attaches no sources to the claim
     // maps, yet reads route through the delta, so the classifier must
@@ -2697,15 +2709,12 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // segments larger than the small threshold (no rewrite, no peer to
     // pack with).
     //
-    // Two ULID gates filter the candidate set:
-    //   - `floor` (snapshot floor) excludes segments frozen by the
-    //     latest snapshot.
-    //   - `ceiling` (= prep-time `u_flush`) excludes segments minted
-    //     after prep — those exist on disk but the prep-time
-    //     `lbamap_snapshot` knows nothing about their entries, so the
-    //     classifier would call them all dead and the apply would
-    //     delete the files plus clobber any lbamap claims they made.
-    //     See `docs/finding-cargo-build-stale-read.md`.
+    // `seg_paths` is the prep-time listing, so the candidate set and
+    // `lbamap_snapshot` describe the same instant. A segment written
+    // while this runs belongs to the next pass, which is what keeps the
+    // classifier from calling entries the snapshot predates dead and the
+    // apply from deleting their files (`docs/finding-cargo-build-stale-read.md`).
+    // The `floor` gate excludes segments frozen by the latest snapshot.
     let mut candidates: Vec<RepackCandidate> = Vec::new();
     let mut journal_candidates: Vec<RepackCandidate> = Vec::new();
     for seg_path in &seg_paths {
@@ -2716,9 +2725,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let seg_ulid =
             Ulid::from_string(seg_filename).map_err(|e| io::Error::other(e.to_string()))?;
         if floor.is_some_and(|f| seg_ulid <= f) {
-            continue;
-        }
-        if seg_ulid > ceiling {
             continue;
         }
 
