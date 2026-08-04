@@ -726,8 +726,12 @@ pub fn simulate_coord_gc_local_ungated(
     let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
     let mut lba_map = lbamap::rebuild_segments(&rebuild_chain).ok()?;
     replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lba_map);
-    let live_hashes = lba_map.lba_referenced_hashes();
     let extent_index = extentindex::rebuild(&rebuild_chain).ok()?;
+    // Claims plus the delta-source closure, mirroring the production
+    // planner's `load_pass_state`.
+    let mut live_hashes = lba_map.claim_referenced_hashes();
+    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
+    live_hashes.extend(delta_sources);
 
     compact_candidates_inner(
         fork_dir,

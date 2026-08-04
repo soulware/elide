@@ -224,13 +224,15 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     // it as a Delta with any live LBA.
     let (lbamap_final, _) = vol.snapshot_maps();
     assert!(
-        !lbamap_final.lba_referenced_hashes().contains(&child_hash),
+        !lbamap_final.claim_referenced_hashes().contains(&child_hash),
         "the old bloated Delta hash must no longer be referenced by any live LBA"
     );
     // ...but the parent source hash still is, via the reclaim outputs'
     // DeltaOption source pins.
     assert!(
-        lbamap_final.lba_referenced_hashes().contains(&parent_hash),
+        lbamap_final
+            .claim_referenced_hashes()
+            .contains(&parent_hash),
         "the parent source hash must remain pinned by the new Delta entries"
     );
 
@@ -276,7 +278,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
 /// When the bloated hash H is a DATA entry that's *already* serving as
 /// a delta source for some other live entry, reclaim emits thin Deltas
 /// pointing back at H instead of fresh Data entries. Rationale:
-/// `lba_referenced_hashes` already pins H, so GC cannot drop H's body —
+/// `claim_referenced_hashes` already pins H, so GC cannot drop H's body —
 /// emitting a Delta against H is a strict win (100s of bytes of delta
 /// blob versus a few KB of fresh body), same retention cost either way.
 /// See `docs/design/extent-reclamation.md § Open questions` for the
@@ -293,7 +295,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
 /// Assertions:
 ///   - Head and tail outputs are thin Delta entries pointing at H.
 ///   - Reads preserve the original content.
-///   - H remains referenced by `lba_referenced_hashes` post-reclaim
+///   - H remains referenced by `claim_referenced_hashes` post-reclaim
 ///     (pinned by both our outputs and the unrelated LBA-50 delta).
 #[test]
 fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
@@ -380,13 +382,14 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
     assert_eq!(vol.read(0, 8).unwrap(), expected);
 
     // Sanity check on the precondition the new branch depends on.
-    let (lbamap_pre, _) = vol.snapshot_maps();
-    assert_eq!(
-        lbamap_pre.delta_source_refcount(&parent_hash),
-        1,
-        "the LBA-50 Delta must contribute one delta-source ref to parent_hash"
+    let (lbamap_pre, index_pre) = vol.snapshot_maps();
+    let pins_pre = index_pre.delta_source_closure(|h| lbamap_pre.claim_refcount(h) > 0);
+    assert!(
+        pins_pre.contains(&parent_hash),
+        "the LBA-50 Delta must pin parent_hash as a delta source"
     );
     drop(lbamap_pre);
+    drop(index_pre);
 
     // Run reclaim.
     let outcome = vol.reclaim_alias_merge(0, 8).unwrap();
@@ -426,9 +429,11 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         );
     }
 
-    // H itself must still be live: referenced both by the LBA-50 Delta
-    // and by our two new outputs.
-    let referenced = lbamap_post.lba_referenced_hashes();
+    // H itself must still be live: pinned through the liveness closure
+    // by the LBA-50 Delta and by our two new outputs.
+    let mut referenced = lbamap_post.claim_referenced_hashes();
+    let closure_sources = extent_index.delta_source_closure(|h| referenced.contains(h));
+    referenced.extend(closure_sources);
     assert!(
         referenced.contains(&parent_hash),
         "H must remain referenced post-reclaim"
@@ -438,11 +443,12 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
         extent_index.lookup(&parent_hash).is_some(),
         "H's DATA location must still be resolvable"
     );
-    // Delta-source refcount rose from 1 (LBA-50 only) to 3 (+ head + tail).
-    assert_eq!(
-        lbamap_post.delta_source_refcount(&parent_hash),
-        3,
-        "H gains two delta-source refs from reclaim outputs"
+    // The reclaim outputs join the LBA-50 Delta in pinning H through
+    // the liveness closure.
+    let pins_post = extent_index.delta_source_closure(|h| lbamap_post.claim_refcount(h) > 0);
+    assert!(
+        pins_post.contains(&parent_hash),
+        "H stays pinned as a delta source by the reclaim outputs"
     );
 }
 
@@ -498,18 +504,19 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
     )
     .unwrap();
 
-    // No Delta entry referencing H. `delta_source_refcount(H)` stays 0.
+    // No Delta entry referencing H, so the liveness closure has no pin on it.
 
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
 
     // Precondition: the pre-snapshot guard is the only signal firing.
-    let (lbamap_pre, _) = vol.snapshot_maps();
-    assert_eq!(
-        lbamap_pre.delta_source_refcount(&parent_hash),
-        0,
-        "fixture must have no pre-existing delta sources"
+    let (lbamap_pre, index_pre) = vol.snapshot_maps();
+    let pins_pre = index_pre.delta_source_closure(|h| lbamap_pre.claim_refcount(h) > 0);
+    assert!(
+        !pins_pre.contains(&parent_hash),
+        "fixture must have no pre-existing delta-source pin on H"
     );
     drop(lbamap_pre);
+    drop(index_pre);
 
     // Split H with a middle overwrite.
     let overwrite = vec![0x77u8; 2 * 4096];
@@ -546,13 +553,13 @@ fn reclaim_emits_delta_when_h_is_snapshot_pinned() {
         );
     }
 
-    // Only our two outputs contribute to H's delta-source refcount —
-    // confirming that the pre-snapshot guard, not the refcount guard,
-    // is what triggered the Delta output shape.
-    assert_eq!(
-        lbamap_post.delta_source_refcount(&parent_hash),
-        2,
-        "only the new reclaim outputs should pin H via delta-source refs"
+    // The outputs pin H through the liveness closure — confirming the
+    // pre-snapshot guard, not an existing delta-source pin, is what
+    // triggered the Delta output shape.
+    let pins_post = extent_index.delta_source_closure(|h| lbamap_post.claim_refcount(h) > 0);
+    assert!(
+        pins_post.contains(&parent_hash),
+        "the new reclaim outputs pin H as a delta source"
     );
 }
 

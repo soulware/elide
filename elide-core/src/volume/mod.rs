@@ -365,17 +365,6 @@ fn apply_promoted_partition(
         inline: extentindex::InlineSource::EntryInline,
     };
     let consumed: std::collections::HashSet<Ulid> = std::iter::once(old_wal_ulid).collect();
-    // Entries apply in write order, so the claim keyed at an LBA belongs
-    // to the epoch's *last* record starting there. A Delta superseded by a
-    // later same-epoch record must not attach its sources to that record's
-    // claim.
-    let mut last_claim_at_start: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::new();
-    for (raw_idx, entry) in entries.iter().enumerate() {
-        if !entry.kind.is_canonical_only() {
-            last_claim_at_start.insert(entry.start_lba, raw_idx);
-        }
-    }
     for (raw_idx, (entry, old_wal_offset)) in entries
         .iter()
         .zip(pre_promote_offsets.iter().copied())
@@ -393,7 +382,11 @@ fn apply_promoted_partition(
             // would. The removal is gated on the WAL still owning the
             // hash, and the registration's admission on no other segment
             // having taken it — a concurrent writer wins both. A Delta
-            // without a token never had a body location.
+            // without a token never had a body location. The delta's
+            // source dependency rides the deltas-map registration:
+            // liveness reaches it through
+            // `ExtentIndex::delta_source_closure`, keyed by hash, so no
+            // per-claim attachment happens here.
             EntryKind::Delta => {
                 if let Some(old_wal_offset) = old_wal_offset {
                     extent_index.remove_if_matches(&entry.hash, old_wal_ulid, old_wal_offset);
@@ -403,20 +396,6 @@ fn apply_promoted_partition(
                         &delta_ctx,
                         &consumed,
                     )?;
-                    // Sources attach only to the claim this delta made:
-                    // the epoch's last claim at this LBA, still owned by
-                    // the flushed WAL. The claimant guard inside rejects a
-                    // concurrent writer's same-hash re-claim.
-                    if last_claim_at_start.get(&entry.start_lba) == Some(&raw_idx) {
-                        let sources: Arc<[blake3::Hash]> =
-                            entry.delta_options.iter().map(|o| o.source_hash).collect();
-                        lbamap.set_delta_sources_if_matches(
-                            entry.start_lba,
-                            entry.hash,
-                            old_wal_ulid,
-                            sources,
-                        );
-                    }
                 }
                 continue;
             }
@@ -1735,6 +1714,16 @@ impl Volume {
 
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
+        // Liveness for the veto is claims plus the delta-source closure:
+        // a claim of a delta-canonical hash (a DedupRef most commonly)
+        // attaches no sources to the claim maps, yet reads route through
+        // the delta, so its base extent must cancel a plan that drops it.
+        let mut live_hashes = self.lbamap.claim_referenced_hashes();
+        let delta_sources = self
+            .extent_index
+            .delta_source_closure(|h| live_hashes.contains(h));
+        live_hashes.extend(delta_sources);
+
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for (hash, _kind, input_ulid) in &input_old_entries {
@@ -1754,7 +1743,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if self.lbamap.is_referenced(hash) {
+            if live_hashes.contains(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
@@ -1940,6 +1929,7 @@ impl Volume {
     /// by sorting drain loops by ULID ascending.
     #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+        self.lbamap.debug_assert_claim_counts();
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -2362,7 +2352,17 @@ impl Volume {
             if self.extent_index.lookup(&hash).is_some() {
                 continue;
             }
-            if self.extent_index.lookup_delta(&hash).is_some() {
+            // A delta-resolved hash is only readable if at least one of
+            // its source options resolves as a DATA/Inline location —
+            // exactly the read path's rule (`try_read_delta_extent`
+            // consults the DATA map only for sources), so a delta whose
+            // every source lacks one is as stranded as a hash with no
+            // location.
+            if self.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+                loc.options
+                    .iter()
+                    .any(|opt| self.extent_index.lookup(&opt.source_hash).is_some())
+            }) {
                 continue;
             }
             found.total += 1;
@@ -3410,11 +3410,19 @@ impl Volume {
                 search_dirs.push(layer.dir.clone());
             }
         }
+        // The resemblance tier's cost filter asks "is this candidate
+        // source worth pinning" against claims plus the delta-source
+        // closure — the same liveness definition every deletion decision
+        // uses, so the filter never skips a source the GC would keep.
+        let referenced = self.lbamap.referenced_hashes(
+            self.extent_index
+                .delta_source_closure(|h| self.lbamap.claim_refcount(h) > 0),
+        );
         let delta = jobs::PromoteDeltaSpec {
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
-            referenced: self.lbamap.referenced_hashes(),
+            referenced,
             prior: latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 snap_ulid,
@@ -3611,11 +3619,16 @@ fn describe_stale_cancel(stale: &[(blake3::Hash, Ulid)], lbamap: &lbamap::LbaMap
             out.push_str("; ");
         }
         let lbas = lbamap.lbas_for_hash(hash);
-        let delta_refcount = lbamap.delta_source_refcount(hash);
+        let claim_refcount = lbamap.claim_refcount(hash);
         let _ = write!(
             out,
-            "hash={} input={input_ulid} lbas={lbas:?} delta_src_refcount={delta_refcount}",
+            "hash={} input={input_ulid} lbas={lbas:?} claim_refcount={claim_refcount}{}",
             hash.to_hex(),
+            if claim_refcount == 0 {
+                " (live as a delta source via the closure)"
+            } else {
+                ""
+            },
         );
     }
     if stale.len() > 3 {

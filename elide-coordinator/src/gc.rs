@@ -377,7 +377,13 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // would reject the handoff in a loop.
     replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lbamap)?;
 
-    let live_hashes = lbamap.lba_referenced_hashes();
+    // Claims alone undercount: a claim of a delta-canonical hash (via a
+    // DedupRef, or a claim whose Delta entry was superseded in its own
+    // segment) attaches no sources, yet reads route through the delta.
+    // The closure keeps those base extents out of the drop set.
+    let mut live_hashes = lbamap.claim_referenced_hashes();
+    let delta_sources = index.delta_source_closure(|h| live_hashes.contains(h));
+    live_hashes.extend(delta_sources);
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
     let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
@@ -2426,7 +2432,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
@@ -2508,7 +2514,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
         assert_eq!(stats.len(), 4, "epoch 3 partitions into a segment pair");
@@ -2594,7 +2600,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
 
@@ -2723,7 +2729,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         // Preconditions — match the scenario assumptions.
         let h1 = blake3::hash(&h1_bytes);
@@ -2846,7 +2852,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         // Preconditions.
         assert_eq!(
@@ -3119,7 +3125,7 @@ mod tests {
         let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-        let live_hashes = lbamap.lba_referenced_hashes();
+        let live_hashes = lbamap.claim_referenced_hashes();
 
         // Preconditions: S2 landed at its LBA with hash w, and at least one
         // LBA in S1's range still resolves to h.

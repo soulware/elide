@@ -318,7 +318,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
     let delta_output_hashes: Vec<blake3::Hash> = {
         let (lbamap, ei) = vol.snapshot_maps();
         lbamap
-            .lba_referenced_hashes()
+            .claim_referenced_hashes()
             .into_iter()
             .filter(|h| {
                 ei.lookup_delta(h)

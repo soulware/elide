@@ -3134,7 +3134,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 use crate::{extentindex, lbamap};
                 let rebuild_chain = vec![(fork_dir.clone(), None)];
                 let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-                let _live_hashes = lba_map.lba_referenced_hashes();
+                let _live_hashes = lba_map.claim_referenced_hashes();
                 let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
 
                 let vk =
@@ -5056,13 +5056,7 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
             }],
         },
     );
-    Arc::make_mut(&mut vol.lbamap).insert_delta(
-        50,
-        1,
-        target_hash,
-        claimant,
-        std::iter::once(source_hash).collect(),
-    );
+    Arc::make_mut(&mut vol.lbamap).insert(50, 1, target_hash, claimant);
 
     let (stats, consumed_inputs) = vol.apply_repack_result(result).unwrap();
 
@@ -5086,22 +5080,15 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
     fs::remove_dir_all(base).unwrap();
 }
 
-/// A same-content rewrite racing the flush's worker must not inherit the
-/// flushed Delta's source list (the pg14 GC livelock, root-caused
-/// 2026-08-03).
-///
-/// The promote apply attaches a flush-minted Delta's sources to the claim
-/// its WAL made. A concurrent writer can re-claim the same LBA with the
-/// same content hash between promote-job build and apply; attaching to
-/// that claim pins an in-memory delta-source refcount that no disk
-/// rebuild reproduces — the phantom keeps the source hash alive in the
-/// volume's liveness view, and the volume then vetoes every GC plan that
-/// (correctly) drops the source. The claimant guard in
-/// `set_delta_sources_if_matches` rejects the foreign claim.
-///
-/// The assert states the invariant: after all WAL state is flushed, the
-/// live map's delta-source refcount for the source hash must equal the
-/// disk rebuild's.
+/// A same-content rewrite racing the flush's worker, interleaved between
+/// promote-job build and apply (the pg14 shape, root-caused 2026-08-03):
+/// the racing claim carries the delta's hash under a newer WAL, the
+/// source body is evicted so the racing flush stays plain Data, and the
+/// apply must leave the live map exactly where a disk rebuild lands —
+/// the raced LBA's claim matches the rebuild and reads back the final
+/// write's bytes. Source liveness is hash-keyed through
+/// `ExtentIndex::delta_source_closure`, so no per-claim state exists for
+/// the race to corrupt.
 /// 64 KiB clears MIN_SKETCH_BYTES so extents sketch and delta-convert.
 const DELTA_EXTENT_BYTES: usize = 64 * 1024;
 
@@ -5121,7 +5108,7 @@ fn prand_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn same_content_rewrite_racing_flush_apply_keeps_source_refcount_consistent() {
+fn same_content_rewrite_racing_flush_apply_matches_rebuild() {
     const EXTENT_BYTES: usize = DELTA_EXTENT_BYTES;
 
     let base = keyed_temp_dir();
@@ -5205,13 +5192,18 @@ fn same_content_rewrite_racing_flush_apply_keeps_source_refcount_consistent() {
          phantom to persist"
     );
 
-    let mem_refcount = vol.lbamap.delta_source_refcount(&h_a);
+    // The source body is evicted and no fetcher is attached, so claim
+    // parity with the disk rebuild is the observable property.
     let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
-    let disk_refcount = rebuilt.delta_source_refcount(&h_a);
     assert_eq!(
-        mem_refcount, disk_refcount,
-        "live map's delta-source refcount for H_A diverged from the disk \
-         rebuild: a phantom reference pins the source and vetoes GC forever"
+        vol.lbamap.hash_at(200),
+        rebuilt.hash_at(200),
+        "live claim at the raced LBA diverged from the disk rebuild"
+    );
+    assert_eq!(
+        vol.lbamap.claimant_at(200),
+        rebuilt.claimant_at(200),
+        "live claimant at the raced LBA diverged from the disk rebuild"
     );
 
     fs::remove_dir_all(base).unwrap();
@@ -5220,18 +5212,16 @@ fn same_content_rewrite_racing_flush_apply_keeps_source_refcount_consistent() {
 /// The same-epoch sibling of the race above: A' → B → A' written within
 /// one WAL epoch. The epoch's final claim at the LBA is the closing
 /// DedupRef — same content hash, same WAL claimant — while the Delta
-/// minted from the first record is superseded inside its own segment. Its
-/// sources must not attach to the DedupRef's claim: a DedupRef entry
-/// never carries sources, so the disk rebuild's final claim has none and
-/// an attach would leave the same phantom refcount as the cross-epoch
-/// race.
+/// minted from the first record is superseded inside its own segment.
+/// The flush apply must leave the live map exactly where a disk rebuild
+/// lands, and the LBA reads back the closing write through the kept
+/// delta canonical.
 #[test]
-fn same_epoch_rewrite_cycle_keeps_source_refcount_consistent() {
+fn same_epoch_rewrite_cycle_matches_rebuild() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
 
     let a = prand_bytes(1, DELTA_EXTENT_BYTES);
-    let h_a = blake3::hash(&a);
     let mut a_prime = a.clone();
     for i in (0..a_prime.len()).step_by(1024) {
         a_prime[i] = a_prime[i].wrapping_add(1);
@@ -5270,13 +5260,18 @@ fn same_epoch_rewrite_cycle_keeps_source_refcount_consistent() {
         "first record must have delta-converted, got {at_200:?}"
     );
 
-    let mem_refcount = vol.lbamap.delta_source_refcount(&h_a);
     let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
-    let disk_refcount = rebuilt.delta_source_refcount(&h_a);
     assert_eq!(
-        mem_refcount, disk_refcount,
-        "live map's delta-source refcount for H_A diverged from the disk \
-         rebuild after a same-epoch rewrite cycle"
+        vol.lbamap.hash_at(200),
+        rebuilt.hash_at(200),
+        "live claim at the cycled LBA diverged from the disk rebuild"
+    );
+    assert_eq!(
+        vol.read(200, (DELTA_EXTENT_BYTES / 4096) as u32)
+            .unwrap()
+            .as_slice(),
+        a_prime.as_slice(),
+        "cycled LBA must read back the closing write's bytes"
     );
 
     fs::remove_dir_all(base).unwrap();

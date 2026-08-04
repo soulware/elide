@@ -20,7 +20,6 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use imbl::{HashMap as ImHashMap, OrdMap};
 use log::warn;
@@ -98,24 +97,15 @@ enum Blocking<'a> {
 /// ranges have no entry (implicitly zero, as the block device presents
 /// unwritten blocks as zeroes).
 ///
-/// Also tracks *delta source hashes* — BLAKE3 hashes referenced as
-/// `source_hash` by any live Delta entry in the segments this map was
-/// built from. These sources are not directly reachable via the normal
-/// `MapEntry.hash` path (a Delta entry's content hash is what's in the
-/// map; the source hash is separate), so they need their own book-keeping
-/// to keep GC's canonical-presence rule honest: a source DATA entry must
-/// stay alive as long as any Delta depends on it for decompression. See
-/// `lba_referenced_hashes()` for the fold.
+/// The map tracks claims only. A hash whose canonical form is
+/// delta-encoded depends on its source extents for decompression, and
+/// the extent index owns canonical forms, so that dependency lives
+/// there: deletion decisions union `ExtentIndex::delta_source_closure`
+/// over `claim_referenced_hashes()`.
 ///
-/// Source tracking is refcounted: `delta_sources_by_lba` records the
-/// source list attached to each Delta LBA entry, and `delta_source_counts`
-/// holds a per-hash refcount equal to the number of live LBA entries
-/// whose source list contains that hash. When an LBA entry is trimmed,
-/// split, or overwritten, the refcounts are updated in lockstep. A hash
-/// with refcount zero is removed from the map, so `lba_referenced_hashes`
-/// never reports stale sources.
-/// Snapshot of which hashes are referenced, taken from a [`LbaMap`] via
-/// [`LbaMap::referenced_hashes`].
+/// Snapshot of which hashes are referenced, composed by the volume from
+/// the claim map plus the delta-source closure
+/// ([`LbaMap::referenced_hashes`]).
 ///
 /// Exists so a worker can ask the liveness question against state captured
 /// on the actor, which is where the delta producer decides whether a
@@ -123,27 +113,18 @@ enum Blocking<'a> {
 #[derive(Clone, Default)]
 pub struct ReferencedHashes {
     claims: ImHashMap<blake3::Hash, u32>,
-    delta_sources: ImHashMap<blake3::Hash, u32>,
+    delta_sources: HashSet<blake3::Hash>,
 }
 
 impl ReferencedHashes {
     pub fn contains(&self, hash: &blake3::Hash) -> bool {
-        self.claims.contains_key(hash) || self.delta_sources.contains_key(hash)
+        self.claims.contains_key(hash) || self.delta_sources.contains(hash)
     }
 }
 
 #[derive(Clone)]
 pub struct LbaMap {
     inner: OrdMap<u64, MapEntry>,
-    /// Source hashes attached to each live Delta LBA entry. A key here
-    /// always corresponds to a key in `inner` whose origin was a Delta
-    /// segment entry; splits of a Delta LBA range share the same `Arc`.
-    delta_sources_by_lba: OrdMap<u64, Arc<[blake3::Hash]>>,
-    /// Refcounts for delta source hashes. Invariant: for every `h` in any
-    /// `delta_sources_by_lba[k]`, `delta_source_counts[h]` exists and
-    /// equals the number of keys in `delta_sources_by_lba` whose value
-    /// contains `h`. Zero-count entries are removed eagerly.
-    delta_source_counts: ImHashMap<blake3::Hash, u32>,
     /// Refcounts for hashes claimed by an LBA. Invariant:
     /// `claim_counts[h]` equals the number of keys in `inner` whose entry
     /// has `hash == h`, and zero-count entries are removed eagerly, so a
@@ -161,23 +142,7 @@ impl LbaMap {
     pub fn new() -> Self {
         Self {
             inner: OrdMap::new(),
-            delta_sources_by_lba: OrdMap::new(),
-            delta_source_counts: ImHashMap::new(),
             claim_counts: ImHashMap::new(),
-        }
-    }
-
-    fn incref(&mut self, h: blake3::Hash) {
-        *self.delta_source_counts.entry(h).or_insert(0) += 1;
-    }
-
-    fn decref(&mut self, h: &blake3::Hash) {
-        match self.delta_source_counts.get_mut(h) {
-            Some(c) if *c == 1 => {
-                self.delta_source_counts.remove(h);
-            }
-            Some(c) => *c -= 1,
-            None => debug_assert!(false, "decref of untracked delta source"),
         }
     }
 
@@ -195,39 +160,26 @@ impl LbaMap {
         }
     }
 
-    /// Remove the entry at `key` from `inner` and decref its claimed hash
-    /// plus any attached Delta sources. Returns the removed entry if one
-    /// existed.
+    /// Remove the entry at `key` from `inner` and decref its claimed
+    /// hash. Returns the removed entry if one existed.
     fn remove_entry(&mut self, key: u64) -> Option<MapEntry> {
         let entry = self.inner.remove(&key)?;
         self.claim_decref(&entry.hash);
-        if let Some(srcs) = self.delta_sources_by_lba.remove(&key) {
-            for h in srcs.iter() {
-                self.decref(h);
-            }
-        }
         Some(entry)
     }
 
-    /// Insert `(key, entry)` into `inner`, optionally attaching Delta
-    /// sources. Increments refcounts for the claimed hash and for each
-    /// source in the list.
-    fn add_entry(&mut self, key: u64, entry: MapEntry, sources: Option<Arc<[blake3::Hash]>>) {
-        // Displacing an occupied key would drop its claim and delta-source
-        // refs without decrefing them. Every caller trims or removes first,
-        // and both refcounts depend on that holding.
+    /// Insert `(key, entry)` into `inner` and increment the claimed
+    /// hash's refcount.
+    fn add_entry(&mut self, key: u64, entry: MapEntry) {
+        // Displacing an occupied key would drop its claim ref without
+        // decrefing it. Every caller trims or removes first, and the
+        // refcount depends on that holding.
         debug_assert!(
             !self.inner.contains_key(&key),
             "add_entry would displace the entry at {key}"
         );
         self.claim_incref(entry.hash);
         self.inner.insert(key, entry);
-        if let Some(srcs) = sources {
-            for h in srcs.iter() {
-                self.incref(*h);
-            }
-            self.delta_sources_by_lba.insert(key, srcs);
-        }
     }
 
     /// Insert an extent `[start_lba, start_lba + lba_length)` → `hash`,
@@ -238,28 +190,7 @@ impl LbaMap {
     /// non-zero offsets arise only in the split/tail entries created internally.
     /// Splits propagate the original entry's claimant unchanged.
     pub fn insert(&mut self, start_lba: u64, lba_length: u32, hash: blake3::Hash, claimant: Ulid) {
-        self.insert_inner(start_lba, lba_length, 0, hash, claimant, None);
-    }
-
-    /// Insert a Delta extent. Same as [`insert`] but attaches `source_hashes`
-    /// to the new LBA entry and refcounts each source. Splits propagate the
-    /// source list (each surviving split contributes to the refcount).
-    pub fn insert_delta(
-        &mut self,
-        start_lba: u64,
-        lba_length: u32,
-        hash: blake3::Hash,
-        claimant: Ulid,
-        source_hashes: Arc<[blake3::Hash]>,
-    ) {
-        self.insert_inner(
-            start_lba,
-            lba_length,
-            0,
-            hash,
-            claimant,
-            Some(source_hashes),
-        );
+        self.insert_inner(start_lba, lba_length, 0, hash, claimant);
     }
 
     /// Insert only on sub-ranges where no overlapping current entry has a
@@ -281,27 +212,6 @@ impl LbaMap {
             lba_length,
             hash,
             claimant,
-            None,
-            Blocking::SameOrHigher,
-        );
-    }
-
-    /// Delta variant of [`insert_if_newer`]; same conditional-by-claimant
-    /// semantics with delta sources attached on the sub-ranges we install.
-    pub fn insert_delta_if_newer(
-        &mut self,
-        start_lba: u64,
-        lba_length: u32,
-        hash: blake3::Hash,
-        claimant: Ulid,
-        source_hashes: Arc<[blake3::Hash]>,
-    ) {
-        self.insert_inner_if_newer(
-            start_lba,
-            lba_length,
-            hash,
-            claimant,
-            Some(source_hashes),
             Blocking::SameOrHigher,
         );
     }
@@ -330,27 +240,6 @@ impl LbaMap {
             lba_length,
             hash,
             claimant,
-            None,
-            Blocking::Consuming(consumed_inputs),
-        );
-    }
-
-    /// Delta variant of [`insert_consuming_inputs`].
-    pub fn insert_delta_consuming_inputs(
-        &mut self,
-        start_lba: u64,
-        lba_length: u32,
-        hash: blake3::Hash,
-        claimant: Ulid,
-        source_hashes: Arc<[blake3::Hash]>,
-        consumed_inputs: &HashSet<Ulid>,
-    ) {
-        self.insert_inner_if_newer(
-            start_lba,
-            lba_length,
-            hash,
-            claimant,
-            Some(source_hashes),
             Blocking::Consuming(consumed_inputs),
         );
     }
@@ -358,11 +247,13 @@ impl LbaMap {
     /// Register one segment entry's LBA claim — the single place that
     /// maps an [`segment::EntryKind`] to its lbamap routing:
     /// CanonicalData / CanonicalInline carry a body for dedup resolution
-    /// but make no LBA claim, `Delta` claims its range with the source
-    /// list attached (refcounting each source), and every other kind
+    /// but make no LBA claim, and every other kind (Delta included)
     /// claims its range → content hash. The rebuild walks and the apply
     /// paths all route through it, so an incremental update cannot
-    /// branch differently from what a fresh rebuild would produce.
+    /// branch differently from what a fresh rebuild would produce. A
+    /// Delta's source dependency is the extent index's business
+    /// (`ExtentIndex::delta_source_closure`), keyed by hash rather than
+    /// by claim.
     ///
     /// `admission` selects the overlap policy: `Unconditional` installs
     /// over whatever is there, `IfNewer` installs on sub-ranges whose
@@ -379,35 +270,7 @@ impl LbaMap {
         if entry.kind.is_canonical_only() {
             return;
         }
-        if entry.kind == segment::EntryKind::Delta {
-            let sources: Arc<[blake3::Hash]> =
-                entry.delta_options.iter().map(|o| o.source_hash).collect();
-            match admission {
-                Admission::Unconditional => self.insert_delta(
-                    entry.start_lba,
-                    entry.lba_length,
-                    entry.hash,
-                    claimant,
-                    sources,
-                ),
-                Admission::IfNewer => self.insert_inner_if_newer(
-                    entry.start_lba,
-                    entry.lba_length,
-                    entry.hash,
-                    claimant,
-                    Some(sources),
-                    Blocking::Higher,
-                ),
-                Admission::ConsumingInputs(inputs) => self.insert_delta_consuming_inputs(
-                    entry.start_lba,
-                    entry.lba_length,
-                    entry.hash,
-                    claimant,
-                    sources,
-                    inputs,
-                ),
-            }
-        } else {
+        {
             match admission {
                 Admission::Unconditional => {
                     self.insert(entry.start_lba, entry.lba_length, entry.hash, claimant)
@@ -417,7 +280,6 @@ impl LbaMap {
                     entry.lba_length,
                     entry.hash,
                     claimant,
-                    None,
                     Blocking::Higher,
                 ),
                 Admission::ConsumingInputs(inputs) => self.insert_consuming_inputs(
@@ -469,27 +331,34 @@ impl LbaMap {
         lba_length: u32,
         hash: blake3::Hash,
         claimant: Ulid,
-        sources: Option<Arc<[blake3::Hash]>>,
         blocking: Blocking<'_>,
     ) {
         let new_end = start_lba + lba_length as u64;
         // `Consuming`: an existing entry blocks the install unless its
         // claimant is one of the inputs this apply consumes and deletes,
-        // or it holds our hash at a lower ULID. The first is a claim the
-        // rewrite tears down; the second names a segment with identical
-        // bytes sorting below ours, so adopting the higher ULID matches
-        // the rebuild's highest-ULID-wins claim and changes no read.
-        // Distinct content or a higher ULID blocks: that marks a write
-        // the plan did not carry. `SameOrHigher`: a claimant `>=` ours
-        // blocks. `Higher`: only a claimant `>` ours blocks — an equal
-        // claimant is this same segment's own earlier entry, and a
-        // segment's entries apply in order (a WAL-flush segment carries
-        // its epoch's writes in write order, later entries overriding
-        // earlier ones at the same LBA).
+        // or it is this same apply's own earlier entry (claimant equals
+        // ours), or it holds our hash at a lower ULID. The first is a
+        // claim the rewrite tears down; the second keeps the segment's
+        // internal write order — a fold output can carry a kept Delta and
+        // the final claim at the same LBA, and the later entry must
+        // override the earlier exactly as the rebuild's `Higher` rule
+        // applies them; the third names a segment with identical bytes
+        // sorting below ours, so adopting the higher ULID matches the
+        // rebuild's highest-ULID-wins claim and changes no read. Distinct
+        // content at a distinct lower ULID, or a higher ULID, blocks:
+        // that marks a write the plan did not carry (a WAL whose flush
+        // promote failed keeps stamping claims below the output ULID).
+        // `SameOrHigher`: a claimant `>=` ours blocks. `Higher`: only a
+        // claimant `>` ours blocks — an equal claimant is this same
+        // segment's own earlier entry, and a segment's entries apply in
+        // order (a WAL-flush segment carries its epoch's writes in write
+        // order, later entries overriding earlier ones at the same LBA).
         let blocks = |existing: Ulid, existing_hash: blake3::Hash| -> bool {
             match blocking {
                 Blocking::Consuming(set) => {
-                    !(set.contains(&existing) || existing_hash == hash && existing < claimant)
+                    !(set.contains(&existing)
+                        || existing == claimant
+                        || existing_hash == hash && existing < claimant)
                 }
                 Blocking::SameOrHigher => existing >= claimant,
                 Blocking::Higher => existing > claimant,
@@ -529,14 +398,14 @@ impl LbaMap {
             if cursor < b_start {
                 let gap_len = (b_start - cursor) as u32;
                 let pbo = (cursor - start_lba) as u32;
-                self.insert_inner(cursor, gap_len, pbo, hash, claimant, sources.clone());
+                self.insert_inner(cursor, gap_len, pbo, hash, claimant);
             }
             cursor = cursor.max(b_end);
         }
         if cursor < new_end {
             let gap_len = (new_end - cursor) as u32;
             let pbo = (cursor - start_lba) as u32;
-            self.insert_inner(cursor, gap_len, pbo, hash, claimant, sources);
+            self.insert_inner(cursor, gap_len, pbo, hash, claimant);
         }
     }
 
@@ -547,7 +416,6 @@ impl LbaMap {
         payload_block_offset: u32,
         hash: blake3::Hash,
         claimant: Ulid,
-        sources: Option<Arc<[blake3::Hash]>>,
     ) {
         let new_end = start_lba + lba_length as u64;
 
@@ -556,7 +424,6 @@ impl LbaMap {
         if let Some((&pred_start, &pred)) = self.inner.range(..start_lba).next_back() {
             let pred_end = pred_start + pred.lba_length as u64;
             if pred_end > start_lba {
-                let pred_sources = self.delta_sources_by_lba.get(&pred_start).cloned();
                 self.remove_entry(pred_start);
                 // Prefix [pred_start, start_lba): same payload_block_offset.
                 self.add_entry(
@@ -567,7 +434,6 @@ impl LbaMap {
                         payload_block_offset: pred.payload_block_offset,
                         claimant_ulid: pred.claimant_ulid,
                     },
-                    pred_sources.clone(),
                 );
                 // Suffix [new_end, pred_end): only present in the "hole punch"
                 // case. payload_block_offset advances by (new_end - pred_start).
@@ -581,7 +447,6 @@ impl LbaMap {
                                 + (new_end - pred_start) as u32,
                             claimant_ulid: pred.claimant_ulid,
                         },
-                        pred_sources,
                     );
                 }
             }
@@ -596,7 +461,6 @@ impl LbaMap {
             .map(|(&k, _)| k)
             .collect();
         for key in overlapping {
-            let e_sources = self.delta_sources_by_lba.get(&key).cloned();
             // Key was found in range query above; remove cannot fail.
             let Some(e) = self.remove_entry(key) else {
                 continue;
@@ -613,7 +477,6 @@ impl LbaMap {
                         payload_block_offset: e.payload_block_offset + (new_end - key) as u32,
                         claimant_ulid: e.claimant_ulid,
                     },
-                    e_sources,
                 );
             }
         }
@@ -626,46 +489,7 @@ impl LbaMap {
                 payload_block_offset,
                 claimant_ulid: claimant,
             },
-            sources,
         );
-    }
-
-    /// Attach (or replace) the Delta source list for the LBA entry starting
-    /// at `start_lba`, but only if the entry's content hash matches
-    /// `expected_hash` **and** its claimant matches `expected_claimant`.
-    /// Returns `true` if updated, `false` if the LBA has no entry or either
-    /// field no longer matches (i.e. a concurrent overwrite raced the
-    /// caller).
-    ///
-    /// Used by the promote apply to attach a flush-minted Delta's sources
-    /// to the claim its WAL made. The claimant check is load-bearing: a
-    /// concurrent writer can re-claim the LBA with the *same* content hash
-    /// (a rewrite that dedups back to the delta's bytes), and attaching to
-    /// that claim would pin a source refcount no disk rebuild reproduces —
-    /// the phantom then vetoes every GC plan that drops the source.
-    pub fn set_delta_sources_if_matches(
-        &mut self,
-        start_lba: u64,
-        expected_hash: blake3::Hash,
-        expected_claimant: Ulid,
-        source_hashes: Arc<[blake3::Hash]>,
-    ) -> bool {
-        let Some(entry) = self.inner.get(&start_lba) else {
-            return false;
-        };
-        if entry.hash != expected_hash || entry.claimant_ulid != expected_claimant {
-            return false;
-        }
-        if let Some(old) = self.delta_sources_by_lba.remove(&start_lba) {
-            for h in old.iter() {
-                self.decref(h);
-            }
-        }
-        for h in source_hashes.iter() {
-            self.incref(*h);
-        }
-        self.delta_sources_by_lba.insert(start_lba, source_hashes);
-        true
     }
 
     /// Promote the claimant ULID to `new_claimant` for every lbamap
@@ -886,54 +710,52 @@ impl LbaMap {
         self.inner.is_empty()
     }
 
-    /// Return the set of all content hashes currently referenced by any LBA
+    /// Return the set of all content hashes currently claimed by any LBA
     /// range, regardless of how the LBA got its hash (DATA write, DedupRef
-    /// write, Delta write, or rebuilt from a segment of any entry kind),
-    /// *plus* every source hash of every live Delta entry (so GC keeps
-    /// the source DATA alive for decompression).
+    /// write, Delta write, or rebuilt from a segment of any entry kind) —
+    /// hence the `claim_` prefix: everything here is known through claims.
     ///
-    /// **Load-bearing for the canonical-presence invariant.** GC and
-    /// `redact_segment` use this to keep a DATA entry alive whenever any
-    /// live LBA references its hash — including LBAs that reference the
-    /// hash via a DedupRef (variant-b correctness; see
-    /// `docs/architecture.md § Dedup`) and Delta entries whose stored
-    /// content is decompressed against a separate `source_hash`. The
-    /// naming is deliberately precise (`lba_`-prefixed) to discourage a
-    /// future "optimisation" to a DATA-only filter: such a filter would
-    /// drop DATA entries whose only live referrer is a sibling DedupRef
-    /// or a Delta source, violating canonical-presence and corrupting
-    /// reads.
-    pub fn lba_referenced_hashes(&self) -> HashSet<blake3::Hash> {
-        let mut out: HashSet<blake3::Hash> = self.claim_counts.keys().copied().collect();
-        out.extend(self.delta_source_counts.keys().copied());
-        out
+    /// **This set alone does not satisfy the canonical-presence
+    /// invariant.** A claimed hash whose canonical form is delta-encoded
+    /// depends on source extents this set knows nothing about. Every
+    /// deletion decision must union in `ExtentIndex::delta_source_closure`
+    /// over this set, or a kept delta loses the base extent it
+    /// decompresses against and the LBA reads "no source option resolved
+    /// in extent index". The GC planner, the plan-apply stale-liveness
+    /// veto, repack, and the index liveness walk all follow that pattern.
+    pub fn claim_referenced_hashes(&self) -> HashSet<blake3::Hash> {
+        self.claim_counts.keys().copied().collect()
     }
 
-    /// Whether `hash` is referenced, by the same definition
-    /// [`Self::lba_referenced_hashes`] uses. Two hash lookups against the
-    /// maintained refcounts, for callers that only ask membership and have
-    /// no use for an owned set.
+    /// Whether any LBA claims `hash` — the same claim-level definition
+    /// [`Self::claim_referenced_hashes`] uses, with the same caveat: a
+    /// deletion decision needs the delta-source closure on top. One hash
+    /// lookup against the maintained refcounts, for callers that only ask
+    /// membership and have no use for an owned set.
     pub fn is_referenced(&self, hash: &blake3::Hash) -> bool {
-        self.claim_counts.contains_key(hash) || self.delta_source_counts.contains_key(hash)
+        self.claim_counts.contains_key(hash)
     }
 
-    /// A detached view answering [`Self::is_referenced`], for a worker that
-    /// needs the question off-lock.
+    /// A detached view of claim membership plus the caller-supplied
+    /// delta-source closure, for a worker that needs the liveness
+    /// question off-lock. The volume composes the closure from its
+    /// extent index (`ExtentIndex::delta_source_closure`) at snapshot
+    /// time.
     ///
-    /// Both maps are persistent, so this shares structure rather than
-    /// copying, and the view is a snapshot: it answers as of the moment it
-    /// was taken.
-    pub fn referenced_hashes(&self) -> ReferencedHashes {
+    /// The claim map is persistent, so this shares structure rather than
+    /// copying, and the view is a snapshot: it answers as of the moment
+    /// it was taken.
+    pub fn referenced_hashes(&self, delta_sources: HashSet<blake3::Hash>) -> ReferencedHashes {
         ReferencedHashes {
             claims: self.claim_counts.clone(),
-            delta_sources: self.delta_source_counts.clone(),
+            delta_sources,
         }
     }
 
     /// Recompute `claim_counts` from `inner`, the definition the maintained
     /// map has to match.
     ///
-    /// This is the walk `lba_referenced_hashes` used to do on every call.
+    /// This is the walk `claim_referenced_hashes` used to do on every call.
     /// It survives as the oracle for [`Self::debug_assert_claim_counts`].
     fn recount_claims(&self) -> ImHashMap<blake3::Hash, u32> {
         let mut out: ImHashMap<blake3::Hash, u32> = ImHashMap::new();
@@ -1012,18 +834,9 @@ impl LbaMap {
             .collect()
     }
 
-    /// Refcount of `target` as a live Delta source hash. Returns 0 when the
-    /// hash is not referenced by any live Delta entry. Used for diagnostics
-    /// alongside [`lbas_for_hash`] to explain why a hash shows up in
-    /// [`lba_referenced_hashes`].
-    pub fn delta_source_refcount(&self, target: &blake3::Hash) -> u32 {
-        self.delta_source_counts.get(target).copied().unwrap_or(0)
-    }
-
-    /// How many LBA entries claim `target`. Returns 0 when no LBA does,
-    /// which for a hash with no delta references means it is dead. The
-    /// count exceeds 1 when a claim was split, or when separate LBA ranges
-    /// dedup to the same content.
+    /// How many LBA entries claim `target`. Returns 0 when no LBA does.
+    /// The count exceeds 1 when a claim was split, or when separate LBA
+    /// ranges dedup to the same content.
     pub fn claim_refcount(&self, target: &blake3::Hash) -> u32 {
         self.claim_counts.get(target).copied().unwrap_or(0)
     }
@@ -1261,16 +1074,14 @@ mod tests {
             map.register_entry(&entry(kind, start, 4, h(i as u8)), u(1));
             assert_eq!(map.lookup(start), Some((h(i as u8), 0)));
         }
-        assert_eq!(map.delta_source_refcount(&h(0)), 0);
     }
 
     #[test]
-    fn register_entry_routes_delta_with_sources() {
+    fn register_entry_routes_delta_to_plain_claim() {
         let mut map = LbaMap::new();
-        let src = h(9);
-        map.register_entry(&delta_entry(0, 4, h(1), src), u(1));
+        map.register_entry(&delta_entry(0, 4, h(1), h(9)), u(1));
         assert_eq!(map.lookup(0), Some((h(1), 0)));
-        assert_eq!(map.delta_source_refcount(&src), 1);
+        assert!(map.is_referenced(&h(1)));
     }
 
     #[test]
@@ -1296,14 +1107,12 @@ mod tests {
     }
 
     #[test]
-    fn register_entry_consuming_inputs_routes_delta_with_sources() {
+    fn register_entry_consuming_inputs_routes_delta_to_plain_claim() {
         let mut map = LbaMap::new();
         map.insert(0, 4, h(1), u(5));
         let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
-        let src = h(9);
-        map.register_entry_consuming_inputs(&delta_entry(0, 4, h(2), src), u(3), &inputs);
+        map.register_entry_consuming_inputs(&delta_entry(0, 4, h(2), h(9)), u(3), &inputs);
         assert_eq!(map.lookup(0), Some((h(2), 0)));
-        assert_eq!(map.delta_source_refcount(&src), 1);
     }
 
     // --- insert / lookup unit tests ---
@@ -1603,11 +1412,11 @@ mod tests {
 
     #[test]
     fn rebuild_registers_delta_source_hashes() {
-        // A segment with a Delta entry must cause its source_hash(es)
-        // to appear in lba_referenced_hashes, even though the LBA map
-        // itself only stores the Delta's content hash. This is the
-        // load-bearing fold that keeps GC from collecting the source
-        // DATA body out from under a live Delta.
+        // A segment with a Delta entry claims its content hash, and the
+        // liveness closure over the rebuilt extent index carries its
+        // source_hash(es). This is the load-bearing fold that keeps GC
+        // from collecting the source DATA body out from under a live
+        // Delta.
         use crate::segment::{DeltaOption, SegmentEntry};
 
         let base = temp_dir();
@@ -1648,148 +1457,30 @@ mod tests {
         .unwrap();
 
         let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
-        let referenced = map.lba_referenced_hashes();
+        let mut referenced = map.claim_referenced_hashes();
 
         // Content hash reachable via the LBA map.
         assert!(
             referenced.contains(&content_hash),
-            "delta content hash missing from lba_referenced_hashes"
+            "delta content hash missing from claim_referenced_hashes"
         );
-        // Both source hashes folded in via insert_delta's refcount.
+        // Both source hashes carried by the closure over the rebuilt
+        // extent index.
+        let index = crate::extentindex::rebuild(&[(base.clone(), None)]).unwrap();
+        let sources = index.delta_source_closure(|h| referenced.contains(h));
+        referenced.extend(sources);
         assert!(
             referenced.contains(&source_a),
-            "delta source A missing from lba_referenced_hashes"
+            "delta source A missing from the liveness closure"
         );
         assert!(
             referenced.contains(&source_b),
-            "delta source B missing from lba_referenced_hashes"
+            "delta source B missing from the liveness closure"
         );
         // Unrelated hash not in the set.
         assert!(!referenced.contains(&unrelated));
 
         std::fs::remove_dir_all(base).unwrap();
-    }
-
-    // --- delta source refcount tests ---
-
-    #[test]
-    fn delta_source_removed_when_lba_overwritten() {
-        let mut map = LbaMap::new();
-        let src = h(11);
-        map.insert_delta(0, 4, h(1), u(1), Arc::from([src]));
-        assert!(map.lba_referenced_hashes().contains(&src));
-
-        // Overwrite the entire Delta range with a plain Data write.
-        map.insert(0, 4, h(2), u(2));
-        let referenced = map.lba_referenced_hashes();
-        assert!(
-            !referenced.contains(&src),
-            "delta source should be removed after the Delta LBA is overwritten"
-        );
-    }
-
-    #[test]
-    fn delta_source_survives_split_and_drops_when_last_half_overwritten() {
-        let mut map = LbaMap::new();
-        let src = h(11);
-        // Delta at [0, 10) with source src.
-        map.insert_delta(0, 10, h(1), u(1), Arc::from([src]));
-        // Hole-punch in the middle: splits into [0, 3) and [5, 10), both still Delta.
-        map.insert(3, 2, h(2), u(2));
-        assert!(
-            map.lba_referenced_hashes().contains(&src),
-            "source must stay live while any split of the Delta remains"
-        );
-        // Overwrite the first half.
-        map.insert(0, 3, h(3), u(3));
-        assert!(
-            map.lba_referenced_hashes().contains(&src),
-            "source must stay live while the other split remains"
-        );
-        // Overwrite the second half.
-        map.insert(5, 5, h(4), u(4));
-        assert!(
-            !map.lba_referenced_hashes().contains(&src),
-            "source must drop once all splits are gone"
-        );
-    }
-
-    #[test]
-    fn delta_source_refcount_tracks_multiple_deltas_per_source() {
-        let mut map = LbaMap::new();
-        let src = h(11);
-        // Two independent Delta LBAs share the same source.
-        map.insert_delta(0, 1, h(1), u(1), Arc::from([src]));
-        map.insert_delta(100, 1, h(2), u(2), Arc::from([src]));
-
-        assert!(map.lba_referenced_hashes().contains(&src));
-        // Overwrite the first Delta — source should remain live (refcount 1).
-        map.insert(0, 1, h(3), u(3));
-        assert!(
-            map.lba_referenced_hashes().contains(&src),
-            "source alive while another Delta still references it"
-        );
-        // Overwrite the second — refcount hits zero.
-        map.insert(100, 1, h(4), u(4));
-        assert!(!map.lba_referenced_hashes().contains(&src));
-    }
-
-    #[test]
-    fn set_delta_sources_if_matches_updates_and_replaces_refcounts() {
-        let mut map = LbaMap::new();
-        let content = h(1);
-        let old_src = h(11);
-        let new_src = h(13);
-
-        // Start with a plain Data entry — no delta sources.
-        map.insert(0, 1, content, u(0));
-        assert!(!map.lba_referenced_hashes().contains(&old_src));
-
-        // Attach an initial source.
-        assert!(map.set_delta_sources_if_matches(0, content, u(0), Arc::from([old_src])));
-        assert!(map.lba_referenced_hashes().contains(&old_src));
-
-        // Replace with a new source list — old must go away, new must appear.
-        assert!(map.set_delta_sources_if_matches(0, content, u(0), Arc::from([new_src])));
-        let referenced = map.lba_referenced_hashes();
-        assert!(!referenced.contains(&old_src));
-        assert!(referenced.contains(&new_src));
-    }
-
-    #[test]
-    fn set_delta_sources_if_matches_rejects_claimant_mismatch() {
-        let mut map = LbaMap::new();
-        let content = h(1);
-        let src = h(11);
-
-        map.insert(0, 1, content, u(0));
-        // A concurrent writer re-claimed the LBA with the same content
-        // hash — the claim is no longer the one the caller's WAL made.
-        map.insert(0, 1, content, u(1));
-
-        assert!(
-            !map.set_delta_sources_if_matches(0, content, u(0), Arc::from([src])),
-            "must reject when the claimant is no longer the caller's WAL"
-        );
-        assert!(!map.lba_referenced_hashes().contains(&src));
-    }
-
-    #[test]
-    fn set_delta_sources_if_matches_rejects_hash_mismatch() {
-        let mut map = LbaMap::new();
-        let content = h(1);
-        let other = h(2);
-        let src = h(11);
-
-        map.insert(0, 1, content, u(0));
-        // Concurrent overwrite changed the hash.
-        map.insert(0, 1, other, u(1));
-
-        assert!(
-            !map.set_delta_sources_if_matches(0, content, u(1), Arc::from([src])),
-            "must reject when LBA hash no longer matches"
-        );
-        assert!(!map.lba_referenced_hashes().contains(&src));
     }
 
     // --- insert_if_newer tests ---
@@ -1940,22 +1631,6 @@ mod tests {
         map.insert_consuming_inputs(0, 4, h(1), u(5), &consumed);
         assert_eq!(map.lookup(0), Some((h(1), 0)));
         assert_eq!(map.claimant_at(0), Some(u(5)));
-    }
-
-    #[test]
-    fn insert_delta_consuming_inputs_adopts_lower_nonconsumed_same_hash_claimant() {
-        // Delta form of the adoption rule: a lower-ULID non-consumed delta
-        // claim with the same composite hash is adopted at the output ULID,
-        // and the source refcount stays at one — the old claim's source is
-        // released as the output's is installed, not double-counted.
-        let src: Arc<[blake3::Hash]> = Arc::from([h(9)]);
-        let mut map = LbaMap::new();
-        map.insert_delta(0, 4, h(1), u(3), Arc::clone(&src));
-        let consumed: HashSet<Ulid> = std::iter::once(u(2)).collect();
-        map.insert_delta_consuming_inputs(0, 4, h(1), u(5), Arc::clone(&src), &consumed);
-        assert_eq!(map.lookup(0), Some((h(1), 0)));
-        assert_eq!(map.claimant_at(0), Some(u(5)));
-        assert_eq!(map.delta_source_refcount(&h(9)), 1);
     }
 
     #[test]
@@ -2191,23 +1866,8 @@ mod tests {
         // The maintained map is exactly the set the old walk produced.
         let walked: HashSet<blake3::Hash> =
             map.iter_entries().map(|(_, _, hash, _)| hash).collect();
-        let mut referenced = map.lba_referenced_hashes();
+        let mut referenced = map.claim_referenced_hashes();
         referenced.retain(|hash| map.claim_refcount(hash) > 0);
         assert_eq!(referenced, walked);
-    }
-
-    #[test]
-    fn a_delta_source_is_referenced_without_being_claimed() {
-        let mut map = LbaMap::new();
-        map.insert_delta(0, 4, h(1), u(1), vec![h(7)].into());
-
-        assert_eq!(map.claim_refcount(&h(7)), 0, "no LBA claims the source");
-        assert_eq!(map.delta_source_refcount(&h(7)), 1);
-        assert!(
-            map.is_referenced(&h(7)),
-            "is_referenced spans both refcounts, as lba_referenced_hashes does"
-        );
-        assert!(map.lba_referenced_hashes().contains(&h(7)));
-        map.debug_assert_claim_counts();
     }
 }

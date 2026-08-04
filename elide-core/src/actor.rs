@@ -2671,7 +2671,13 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     } = job;
 
     let seg_paths = segment::collect_segment_files(&pending_dir)?;
-    let live_hashes = lbamap_snapshot.lba_referenced_hashes();
+    // Claims plus the delta-source closure — a claim of a delta-canonical
+    // hash (a DedupRef most commonly) attaches no sources to the claim
+    // maps, yet reads route through the delta, so the classifier must
+    // count the delta's base extent live.
+    let mut live_hashes = lbamap_snapshot.claim_referenced_hashes();
+    let delta_sources = extent_index_snapshot.delta_source_closure(|h| live_hashes.contains(h));
+    live_hashes.extend(delta_sources);
     let index_dir = base_dir.join("index");
     let cache_dir = base_dir.join("cache");
 
@@ -3153,10 +3159,10 @@ pub(crate) fn execute_sign_snapshot_manifest(
 /// skipped silently to match the prior enumeration behaviour.
 ///
 /// Two passes over the cached `.idx` set:
-/// 1. Build `live_hashes` — the union of `lbamap.lba_referenced_hashes()`
-///    with every live `Delta`'s `source_hash`. A body whose hash is not
-///    in this set has nothing reading it, even if the extent index still
-///    points at it.
+/// 1. Build `live_hashes` — `lbamap.claim_referenced_hashes()` unioned
+///    with `ExtentIndex::delta_source_closure` over it. A body whose
+///    hash is not in this set has nothing reading it, even if the
+///    extent index still points at it.
 /// 2. Apply the predicate with `live_hashes` as the body-reachability
 ///    side condition.
 ///
@@ -3190,35 +3196,15 @@ pub(crate) fn live_index_segments(
         parsed_segments.push((seg_ulid, parsed));
     }
 
-    // Pass 1: live_hashes = LBA-referenced hashes ∪ live-delta source hashes.
-    //
-    // A `Delta` entry is live when some LBA in its range still maps to
-    // `entry.hash`; a claim-less `CanonicalDelta` is live when its hash is
-    // LBA-referenced through a DedupRef. Either way its `source_hash` body
-    // is needed to reconstruct the delta, so the source must be carried
-    // into `live_hashes` even if no LBA references the source directly.
-    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
-    for (_seg_ulid, parsed) in &parsed_segments {
-        for entry in &parsed.entries {
-            if !entry.kind.is_delta() {
-                continue;
-            }
-            let live = if entry.kind.is_canonical_only() {
-                live_hashes.contains(&entry.hash)
-            } else {
-                let end = entry.start_lba + entry.lba_length as u64;
-                lbamap
-                    .extents_in_range(entry.start_lba, end)
-                    .any(|r| r.hash == entry.hash)
-            };
-            if !live {
-                continue;
-            }
-            for opt in &entry.delta_options {
-                live_hashes.insert(opt.source_hash);
-            }
-        }
-    }
+    // Pass 1: live_hashes = claim-referenced hashes ∪ the delta-source
+    // closure. A delta-canonical hash can be referenced through any
+    // claim kind (a DedupRef most commonly, and `CanonicalDelta`
+    // entries make no claim at all), and reads route through the delta,
+    // so its `source_hash` body must count as live even when no LBA
+    // references the source directly.
+    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
+    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
+    live_hashes.extend(delta_sources);
 
     // Pass 2: apply predicate.
     let mut live: Vec<Ulid> = Vec::with_capacity(parsed_segments.len());
@@ -3571,6 +3557,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     // segment's delta body section at write time.
     let mut delta_body: Vec<u8> = Vec::new();
 
+    // Sources already pinned by a live delta canonical: the "H will
+    // stick around" signal the delta-emission decision below consults.
+    let delta_source_pins = job
+        .extent_index_snapshot
+        .delta_source_closure(|h| job.lbamap_snapshot.claim_refcount(h) > 0);
+
     for er in &job.entries {
         if er.hash == crate::volume::ZERO_HASH {
             continue;
@@ -3673,12 +3665,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 //    (segment_id <= snapshot_floor_ulid). Snapshot-
                 //    referenced segments cannot be rewritten or dropped
                 //    for the lifetime of the snapshot — a much stickier
-                //    pin than delta-source refcount, which dynamically
-                //    tracks live Delta LBAs.
-                // 2. H is already serving as a delta source for some
-                //    other live entry (delta_source_refcount > 0).
-                //    `lba_referenced_hashes` keeps H alive as long as
-                //    any such Delta remains on the volume.
+                //    pin than a delta-source pin, which lasts only while
+                //    some delta canonical stays live.
+                // 2. H is already serving as a delta source for a live
+                //    delta canonical (`delta_source_pins`). The liveness
+                //    closure keeps H alive as long as any such Delta
+                //    remains on the volume.
                 //
                 // If neither holds, H would be orphaned by this reclaim
                 // and GC would drop its body on the next pass; pinning
@@ -3697,8 +3689,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     (Some(floor), Some(loc)) => loc.segment_id <= floor,
                     _ => false,
                 };
-                let source_pinned =
-                    pre_snapshot_h || job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0;
+                let source_pinned = pre_snapshot_h || delta_source_pins.contains(&er.hash);
                 if source_pinned {
                     let delta_blob = zstd::bulk::Compressor::with_dictionary(
                         crate::delta_compute::ZSTD_LEVEL,

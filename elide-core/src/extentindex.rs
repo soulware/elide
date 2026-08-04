@@ -22,7 +22,7 @@
 //   index/*.idx for uploaded segments. Volume::open() then inserts WAL Data
 //   records on top via recover_wal().
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -614,6 +614,54 @@ impl ExtentIndex {
     /// present as a direct DATA entry instead).
     pub fn lookup_delta(&self, hash: &blake3::Hash) -> Option<&DeltaLocation> {
         self.deltas.get(hash)
+    }
+
+    /// Source hashes the delta-encoded canonical forms of live hashes
+    /// decompress against. This is the closure step of the liveness
+    /// computation: a claim can reference a delta-canonical hash through
+    /// any entry kind (a DedupRef most commonly), so the claim set alone
+    /// undercounts — every deletion decision must union in this set or a
+    /// kept delta loses its base extent and the LBA reads
+    /// "no source option resolved in extent index".
+    ///
+    /// Iterates the deltas map — far smaller than the claim set — and
+    /// keeps the sources of every delta-canonical hash `is_live` accepts,
+    /// so the cost scales with the number of delta canonicals rather than
+    /// the volume's extent count.
+    ///
+    /// Transitive: a source hash can carry a delta registration alongside
+    /// its DATA location (registration is per-map, and folds carry delta
+    /// canonicals whose hash's DATA form survives elsewhere), so each
+    /// newly-live source is followed through its own delta options too.
+    /// Reads resolve sources through the DATA map only, so the extra hop
+    /// is a conservative over-keep; the visited set bounds the walk.
+    pub fn delta_source_closure(
+        &self,
+        is_live: impl Fn(&blake3::Hash) -> bool,
+    ) -> HashSet<blake3::Hash> {
+        let mut out = HashSet::new();
+        let mut frontier: Vec<blake3::Hash> = Vec::new();
+        for (hash, loc) in self.deltas.iter() {
+            if !is_live(hash) {
+                continue;
+            }
+            for opt in &loc.options {
+                if out.insert(opt.source_hash) {
+                    frontier.push(opt.source_hash);
+                }
+            }
+        }
+        while let Some(hash) = frontier.pop() {
+            let Some(loc) = self.deltas.get(&hash) else {
+                continue;
+            };
+            for opt in &loc.options {
+                if out.insert(opt.source_hash) {
+                    frontier.push(opt.source_hash);
+                }
+            }
+        }
+        out
     }
 
     /// Flip `DeltaBodySource::Full → Cached` for `hash`, but only if
