@@ -566,6 +566,14 @@ impl Volume {
             journal_untouched,
         } = result;
 
+        // Which generation this pass ran over — `open` for the tick's
+        // pass, `upload` for the close pass. Both reach here through
+        // `execute_repack`, so the logs below name it to tell them apart.
+        let generation = pending_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pending");
+
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
         // Rebuilt from what this pass saw: the journal segments it left
         // in place, plus each journal bucket's outcome as the loop below
@@ -631,7 +639,7 @@ impl Volume {
                 .collect();
             if !stale.is_empty() {
                 log::warn!(
-                    "repack [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
+                    "repack {generation} [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
                      hash(es) became referenced after classification, first {}; \
                      dropping output and keeping inputs",
                     stale.len(),
@@ -718,7 +726,7 @@ impl Volume {
                     .collect::<Vec<_>>()
                     .join(", ");
                 log::warn!(
-                    "repack [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
+                    "repack {generation} [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
                      would be unresolvable through the extent index after apply, first {}: \
                      [{detail}]; dropping output and keeping inputs",
                     orphaned.total,
@@ -760,13 +768,13 @@ impl Volume {
             };
             match &bucket.output {
                 Some(out) => log::info!(
-                    "repack: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed)",
+                    "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed)",
                     out.new_ulid,
                     out.out_entries.len(),
                     bucket.bytes_freed,
                 ),
                 None => log::info!(
-                    "repack: [{inputs_fmt}] -> deleted ({tier}{} bytes freed)",
+                    "repack {generation}: [{inputs_fmt}] -> deleted ({tier}{} bytes freed)",
                     bucket.bytes_freed,
                 ),
             }
