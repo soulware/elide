@@ -3134,7 +3134,7 @@ fn proptest_minimal_dedup_overwrite_data_loss() {
                 use crate::{extentindex, lbamap};
                 let rebuild_chain = vec![(fork_dir.clone(), None)];
                 let lba_map = lbamap::rebuild_segments(&rebuild_chain).unwrap();
-                let _live_hashes = lba_map.lba_referenced_hashes();
+                let _live_hashes = lba_map.claim_referenced_hashes();
                 let extent_index = extentindex::rebuild(&rebuild_chain).unwrap();
 
                 let vk =

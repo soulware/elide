@@ -86,7 +86,7 @@ fn assert_manifest_filter_correct(
 
     let (lbamap, extent_index) = vol.snapshot_maps();
 
-    // The maintained claim refcounts back `lba_referenced_hashes`, which the
+    // The maintained claim refcounts back `claim_referenced_hashes`, which the
     // liveness pass below depends on. Checked here because this point is
     // reached after arbitrary write, drain, GC and recovery sequences.
     lbamap.debug_assert_claim_counts();
@@ -101,8 +101,7 @@ fn assert_manifest_filter_correct(
         }
     };
 
-    // Collect parsed entries once; pass 1 needs them for the live-Delta
-    // source-hash augmentation and pass 2 reuses them for the predicate.
+    // Collect parsed entries once for the pass-2 predicate.
     let mut parsed_segments: Vec<(Ulid, Vec<elide_core::segment::SegmentEntry>)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -121,29 +120,11 @@ fn assert_manifest_filter_correct(
         parsed_segments.push((seg_ulid, parsed));
     }
 
-    // Pass 1: live_hashes = lbamap-referenced ∪ live-Delta source hashes.
-    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.lba_referenced_hashes();
-    for (_seg_ulid, parsed) in &parsed_segments {
-        for e in parsed {
-            if !e.kind.is_delta() {
-                continue;
-            }
-            let live = if e.kind.is_canonical_only() {
-                live_hashes.contains(&e.hash)
-            } else {
-                let end = e.start_lba + e.lba_length as u64;
-                lbamap
-                    .extents_in_range(e.start_lba, end)
-                    .any(|r| r.hash == e.hash)
-            };
-            if !live {
-                continue;
-            }
-            for opt in &e.delta_options {
-                live_hashes.insert(opt.source_hash);
-            }
-        }
-    }
+    // Pass 1: live_hashes = claim-referenced ∪ the delta-source closure,
+    // mirroring `live_index_segments`.
+    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
+    let delta_sources = extent_index.delta_source_closure(&live_hashes);
+    live_hashes.extend(delta_sources);
 
     // Pass 2: apply predicate and cross-check against the manifest.
     for (seg_ulid, parsed) in &parsed_segments {
@@ -2325,18 +2306,17 @@ fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
     }
 }
 
-/// OPEN BUG, discovered by the per-LBA source-list oracle: the claim the
-/// cycle leaves at the LBA registers as a DedupRef, so the rebuilt
-/// lbamap attaches no delta sources to it — yet the claimed hash still
-/// resolves through the kept Delta's canonical form, which decompresses
-/// against the base extent. Delta-source liveness is keyed to claims
-/// registered *as* Delta entries, so the fold sees the base extent as
-/// dead and drops it, and every read of the LBA (live and post-crash)
-/// fails with "no source option resolved in extent index". The pre-#853
-/// phantom refcount was the only thing vetoing this fold — as a livelock
-/// rather than a correctness mechanism.
+/// The claim the cycle leaves at the LBA registers as a DedupRef, so
+/// the rebuilt lbamap attaches no delta sources to it — yet the claimed
+/// hash resolves through the kept Delta's canonical form, which
+/// decompresses against the base extent. The planner's liveness
+/// therefore unions the delta-source closure over the claim set
+/// (`ExtentIndex::delta_source_closure`); this pins that the fold keeps
+/// the base extent and the LBA stays readable, live and across a crash
+/// rebuild. Discovered by the per-LBA source-list oracle: without the
+/// closure the fold drops the base extent and every read fails with
+/// "no source option resolved in extent index".
 #[test]
-#[ignore = "delta-source liveness misses DedupRef claims of delta-canonical hashes; fix pending design discussion"]
 fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir_owned = dir.path().join(Ulid::new().to_string());

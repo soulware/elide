@@ -22,7 +22,7 @@
 //   index/*.idx for uploaded segments. Volume::open() then inserts WAL Data
 //   records on top via recover_wal().
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -614,6 +614,40 @@ impl ExtentIndex {
     /// present as a direct DATA entry instead).
     pub fn lookup_delta(&self, hash: &blake3::Hash) -> Option<&DeltaLocation> {
         self.deltas.get(hash)
+    }
+
+    /// Source hashes the delta-encoded canonical forms of `hashes`
+    /// decompress against. This is the closure step of the liveness
+    /// computation: a claim can reference a delta-canonical hash through
+    /// any entry kind (a DedupRef most commonly), so the claim set alone
+    /// undercounts — every deletion decision must union in this set or a
+    /// kept delta loses its base extent and the LBA reads
+    /// "no source option resolved in extent index".
+    ///
+    /// One hop suffices: formation refuses delta-backed sources
+    /// (`read_source_plaintext` resolves through the DATA map only), so a
+    /// source is always plain-Data-canonical. The debug_assert pins that
+    /// assumption where the closure relies on it.
+    ///
+    /// Conservative for a hash that also resolves as plain DATA: its
+    /// delta form's sources are still included, keeping the set safe
+    /// under either resolution order.
+    pub fn delta_source_closure(&self, hashes: &HashSet<blake3::Hash>) -> HashSet<blake3::Hash> {
+        let mut out = HashSet::new();
+        for hash in hashes {
+            let Some(loc) = self.deltas.get(hash) else {
+                continue;
+            };
+            for opt in &loc.options {
+                debug_assert!(
+                    self.deltas.get(&opt.source_hash).is_none(),
+                    "delta source {} is itself delta-canonical; formation excludes delta chains",
+                    opt.source_hash.to_hex()
+                );
+                out.insert(opt.source_hash);
+            }
+        }
+        out
     }
 
     /// Flip `DeltaBodySource::Full → Cached` for `hash`, but only if

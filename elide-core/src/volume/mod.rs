@@ -1735,6 +1735,14 @@ impl Volume {
 
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
+        // Liveness for the veto is claims plus the delta-source closure:
+        // a claim of a delta-canonical hash (a DedupRef most commonly)
+        // attaches no sources to the claim maps, yet reads route through
+        // the delta, so its base extent must cancel a plan that drops it.
+        let mut live_hashes = self.lbamap.claim_referenced_hashes();
+        let delta_sources = self.extent_index.delta_source_closure(&live_hashes);
+        live_hashes.extend(delta_sources);
+
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for (hash, _kind, input_ulid) in &input_old_entries {
@@ -1754,7 +1762,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if self.lbamap.is_referenced(hash) {
+            if live_hashes.contains(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
@@ -2392,7 +2400,15 @@ impl Volume {
             if self.extent_index.lookup(&hash).is_some() {
                 continue;
             }
-            if self.extent_index.lookup_delta(&hash).is_some() {
+            // A delta-resolved hash is only readable if at least one of
+            // its source options resolves too — the read path
+            // decompresses against a source body, so a delta whose every
+            // source is gone is as stranded as a hash with no location.
+            if self.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+                loc.options
+                    .iter()
+                    .any(|opt| self.extent_index.lookup(&opt.source_hash).is_some())
+            }) {
                 continue;
             }
             found.total += 1;

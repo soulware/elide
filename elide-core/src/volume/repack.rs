@@ -297,6 +297,14 @@ impl Volume {
         let pending_dir = segment::pending_open_dir(&self.base_dir);
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
+        // Claims plus the delta-source closure: a claim of a
+        // delta-canonical hash attaches no sources to the claim maps, yet
+        // reads route through the delta, so its base extent must refuse a
+        // bucket that drops it.
+        let mut live_hashes = self.lbamap.claim_referenced_hashes();
+        let delta_sources = self.extent_index.delta_source_closure(&live_hashes);
+        live_hashes.extend(delta_sources);
+
         for bucket in &buckets {
             let carried_hashes = bucket
                 .output
@@ -319,7 +327,7 @@ impl Volume {
             // reference minted since — a dedup claim, or a promoted delta
             // naming an input-owned hash as its source — can make a hash
             // this bucket drops live again. A delta source makes no LBA
-            // claim, so the resolvability gate cannot see it; the refcount
+            // claim, so the resolvability gate cannot see it; the liveness
             // check here is what refuses the bucket.
             let stale: Vec<blake3::Hash> = bucket
                 .inputs
@@ -337,7 +345,7 @@ impl Volume {
                                 .extent_index
                                 .lookup_delta(hash)
                                 .is_some_and(|loc| loc.segment_id == input.input_ulid);
-                        still_at_input && self.lbamap.is_referenced(hash)
+                        still_at_input && live_hashes.contains(hash)
                     })
                 })
                 .copied()

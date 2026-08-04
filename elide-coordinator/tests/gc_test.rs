@@ -1651,9 +1651,9 @@ fn index_delta_count(fork_dir: &std::path::Path) -> usize {
 
 /// A `Delta` entry's body is reconstructed against the body of a *different*
 /// hash — `delta_options[*].source_hash` — so that source must survive GC even
-/// though no LBA maps to it. `live_index_segments` carries live-Delta source
-/// hashes into its live set for exactly this reason; the rewriters build
-/// `live_hashes` from `lba_referenced_hashes()` alone, which does not.
+/// though no LBA maps to it. Every liveness consumer carries such sources by
+/// unioning `ExtentIndex::delta_source_closure` over
+/// `claim_referenced_hashes()`.
 ///
 /// Overwriting an LBA with a near-duplicate leaves the original as the delta
 /// source with no LBA claim of its own, which is the shape that exercises it.

@@ -365,7 +365,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
 /// both redact and GC, because it is the only copy of the hash's bytes
 /// anywhere — dropping it would leave the DedupRef unresolvable.
 ///
-/// This is load-bearing on `lba_map::lba_referenced_hashes()` being sourced
+/// This is load-bearing on `lba_map::claim_referenced_hashes()` being sourced
 /// from the LBA map and *not* from a DATA-only filter. If a future change
 /// narrows the filter, this test fails loudly — see the worked examples in
 /// `docs/architecture.md § Dedup`.

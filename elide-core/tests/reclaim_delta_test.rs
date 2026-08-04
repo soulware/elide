@@ -224,13 +224,15 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
     // it as a Delta with any live LBA.
     let (lbamap_final, _) = vol.snapshot_maps();
     assert!(
-        !lbamap_final.lba_referenced_hashes().contains(&child_hash),
+        !lbamap_final.claim_referenced_hashes().contains(&child_hash),
         "the old bloated Delta hash must no longer be referenced by any live LBA"
     );
     // ...but the parent source hash still is, via the reclaim outputs'
     // DeltaOption source pins.
     assert!(
-        lbamap_final.lba_referenced_hashes().contains(&parent_hash),
+        lbamap_final
+            .claim_referenced_hashes()
+            .contains(&parent_hash),
         "the parent source hash must remain pinned by the new Delta entries"
     );
 
@@ -276,7 +278,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
 /// When the bloated hash H is a DATA entry that's *already* serving as
 /// a delta source for some other live entry, reclaim emits thin Deltas
 /// pointing back at H instead of fresh Data entries. Rationale:
-/// `lba_referenced_hashes` already pins H, so GC cannot drop H's body —
+/// `claim_referenced_hashes` already pins H, so GC cannot drop H's body —
 /// emitting a Delta against H is a strict win (100s of bytes of delta
 /// blob versus a few KB of fresh body), same retention cost either way.
 /// See `docs/design/extent-reclamation.md § Open questions` for the
@@ -293,7 +295,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
 /// Assertions:
 ///   - Head and tail outputs are thin Delta entries pointing at H.
 ///   - Reads preserve the original content.
-///   - H remains referenced by `lba_referenced_hashes` post-reclaim
+///   - H remains referenced by `claim_referenced_hashes` post-reclaim
 ///     (pinned by both our outputs and the unrelated LBA-50 delta).
 #[test]
 fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
@@ -428,7 +430,7 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
 
     // H itself must still be live: referenced both by the LBA-50 Delta
     // and by our two new outputs.
-    let referenced = lbamap_post.lba_referenced_hashes();
+    let referenced = lbamap_post.claim_referenced_hashes();
     assert!(
         referenced.contains(&parent_hash),
         "H must remain referenced post-reclaim"

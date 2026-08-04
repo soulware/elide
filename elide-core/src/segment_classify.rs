@@ -113,7 +113,7 @@ pub struct ClassifyCtx<'a> {
     /// `lookup_delta` (the deltas map) for recipe kinds.
     pub extent_index: &'a ExtentIndex,
     /// Hashes the LBA map references at least once. Built once per
-    /// classification pass via [`LbaMap::lba_referenced_hashes`] and
+    /// classification pass via [`LbaMap::claim_referenced_hashes`] and
     /// reused across every entry — included in the context rather than
     /// recomputed because it's `O(lbamap)` to build.
     pub live_hashes: &'a HashSet<blake3::Hash>,
@@ -167,7 +167,7 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         // some other entry can resolve against its body. `live_hashes`
         // covers both ways that happens (a DedupRef's LBA carries the
         // canonical's hash, and a live Delta's source hashes are
-        // refcounted into the set by `LbaMap::lba_referenced_hashes`), so
+        // refcounted into the set by `LbaMap::claim_referenced_hashes`), so
         // a canonical outside it is reachable by nothing and is garbage.
         //
         // Keeping such an entry is not free: it is body-bearing, so every
