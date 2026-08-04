@@ -145,13 +145,23 @@ bytes under it.
 
 ## Ordering against the open generation and the WAL
 
-The WAL carries no ULID. `mint_gc_checkpoint_ulids` mints its outputs first
-and `u_flush` last, and `flush_wal_to_pending_as(u_flush)` names the WAL's
-segment at flush time. So a reservation minted inside the rotate's critical
-section is below every ULID a later flush can draw, and `pending/open/` is
-empty at that instant, so everything that lands there afterwards outranks
-the sealed generation. The invariant holds without the pass having to
-inspect the WAL at all.
+A WAL file carries its own ULID, minted in `ensure_wal_open` above every
+prior segment and checkpoint ULID, and in-flight claims are staged against
+it. That ULID does not name the segment the WAL becomes. `prepare_promote`
+mints a fresh `segment_ulid` at flush time and the promote job carries the
+WAL's own alongside it as `old_wal_ulid`.
+
+The separation is what makes the ordering hold. A segment landing in
+`pending/open/` after the rotate is named by a ULID minted at its flush,
+so it outranks any reservation minted in the rotate's critical section, and
+the open generation is empty at that instant.
+
+The WAL's own ULID still governs the window between the rotate and the
+apply. An in-flight write's claim sits at that ULID, which may be below a
+reservation, so the apply installs through the consuming-inputs rule rather
+than a strict-newer guard: it takes a sub-range only where the current
+claimant is one of the inputs it consumes, and every other claimant keeps
+its sub-range because it marks a write the pass did not carry.
 
 What needs care is recency. ULID order decides a claim across segments and
 entry order decides it within one (`lbamap.rs`), so both directions of the
