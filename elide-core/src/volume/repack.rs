@@ -61,16 +61,27 @@ pub struct CompactionStats {
 /// about its entries. The worker skips such segments — including them
 /// as bucket inputs would let `apply_repack_result` delete them and
 /// clobber the lbamap claims they made.
+/// What [`Volume::prepare_repack`] hands back: the WAL rotation to
+/// dispatch first, and the repack job itself.
+pub struct RepackPrep {
+    /// The closed WAL, `None` when it held nothing to promote.
+    pub flush: Option<super::PromoteJob>,
+    pub job: RepackJob,
+}
+
 pub struct RepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
     pub floor: Option<Ulid>,
-    pub ceiling: Ulid,
+    /// The candidate segment files, listed at prep. Carrying the list
+    /// pins eligibility to the same instant as `lbamap_snapshot`, so a
+    /// segment landing while the worker runs is outside this pass rather
+    /// than classified against a snapshot that predates its entries.
+    pub seg_paths: Vec<PathBuf>,
     pub output_ulids: Vec<Ulid>,
     /// Output ULIDs reserved for the journal-consolidation merge, minted
     /// after every entry of `output_ulids` so each sorts above every data
-    /// output (and below `ceiling`). Length is
-    /// [`JOURNAL_CONSOLIDATION_ULIDS`].
+    /// output. Length is [`JOURNAL_CONSOLIDATION_ULIDS`].
     pub journal_output_ulids: Vec<Ulid>,
     pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
@@ -136,7 +147,7 @@ impl Volume {
     /// for tests and inline callers; the actor uses the trio directly
     /// to offload the middle phase.
     pub fn repack(&mut self) -> io::Result<CompactionStats> {
-        let Some(job) = self.prepare_repack()? else {
+        let Some(job) = self.prepare_repack_inline()? else {
             return Ok(CompactionStats::default());
         };
         let result = crate::actor::execute_repack(job)?;
@@ -178,7 +189,7 @@ impl Volume {
             apply || remove_inputs == 0,
             "inputs are only removable after apply"
         );
-        let Some(job) = self.prepare_repack()? else {
+        let Some(job) = self.prepare_repack_inline()? else {
             return Ok(false);
         };
         let result = crate::actor::execute_repack(job)?;
@@ -195,37 +206,59 @@ impl Volume {
         Ok(true)
     }
 
+    /// [`Self::prepare_repack`] with the rotated WAL promoted inline, for
+    /// callers without a worker thread. The promote applies before the
+    /// repack job runs, matching the order the actor gets from
+    /// dispatching the flush first.
+    pub(in crate::volume) fn prepare_repack_inline(&mut self) -> io::Result<Option<RepackJob>> {
+        let Some(RepackPrep { flush, job }) = self.prepare_repack()? else {
+            return Ok(None);
+        };
+        if let Some(flush) = flush {
+            match crate::actor::execute_promote(
+                flush,
+                &mut crate::actor::PriorSourceCache::default(),
+            ) {
+                Ok(result) => self.apply_promote(&result)?,
+                Err(failure) => {
+                    self.restore_failed_promote(*failure.job)?;
+                    return Err(failure.error);
+                }
+            }
+        }
+        Ok(Some(job))
+    }
+
     /// Prep phase of `repack` — runs on the actor thread.
     ///
-    /// Pre-mints `u_flush` and one output ULID per pending segment at
-    /// prep time, then flushes the WAL into `pending/<u_flush>`. The
-    /// pre-minted ULIDs are monotonically increasing and all sort
-    /// below the next WAL ULID so subsequent flushes win on rebuild —
-    /// preserves `max(pending) < running_WAL`. Snapshots `lbamap`,
-    /// `extent_index`, `ancestor_layers`, and `fetcher` for the
-    /// worker's classifier and body resolver.
+    /// Pre-mints one output ULID per candidate segment, then the journal
+    /// outputs, then `u_flush`, and closes the WAL into a [`PromoteJob`]
+    /// at `u_flush`. The mint is monotonic, so the flushed segment sorts
+    /// above every output and the next WAL above that. Snapshots
+    /// `lbamap`, `extent_index`, `ancestor_layers`, and `fetcher` for
+    /// the worker's classifier and body resolver.
+    ///
+    /// The segment write itself runs on the worker, so the volume lock
+    /// covers the rotation and the mints alone.
+    ///
+    /// The caller dispatches [`RepackPrep::flush`] before the repack
+    /// job, so the promote's own apply lands first.
     ///
     /// Returns `None` when `pending/` is missing or has no segments.
-    pub fn prepare_repack(&mut self) -> io::Result<Option<RepackJob>> {
+    pub fn prepare_repack(&mut self) -> io::Result<Option<RepackPrep>> {
         let pending_dir = segment::pending_open_dir(&self.base_dir);
-        let segs = match segment::collect_segment_files(&pending_dir) {
+        let seg_paths = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        if segs.is_empty() {
+        if seg_paths.is_empty() {
             return Ok(None);
         }
         let floor = latest_snapshot(&self.base_dir)?;
 
-        // Pre-mint output ULIDs (one per current pending segment plus
-        // one for the WAL-flush peer that prepare creates next) and
-        // u_flush. The WAL-flush peer can itself be hash-dead-bearing
-        // — multiple writes to the same LBA inside one open WAL leave
-        // the earlier hashes dead in the flushed segment — so the
-        // worker may need to rewrite it too.
-        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(segs.len() + 1);
-        for _ in 0..segs.len() + 1 {
+        let mut output_ulids: Vec<Ulid> = Vec::with_capacity(seg_paths.len());
+        for _ in 0..seg_paths.len() {
             output_ulids.push(self.mint.next());
         }
         // Reserve the journal-consolidation output ULID(s) after every data
@@ -238,22 +271,25 @@ impl Volume {
             .map(|_| self.mint.next())
             .collect();
         let u_flush = self.mint.next();
-        self.flush_wal_to_pending_as(u_flush)?;
+        let flush = self.rotate_wal_into_promote(u_flush)?;
 
-        Ok(Some(RepackJob {
-            base_dir: self.base_dir.clone(),
-            pending_dir,
-            floor,
-            ceiling: u_flush,
-            output_ulids,
-            journal_output_ulids,
-            lbamap_snapshot: Arc::clone(&self.lbamap),
-            extent_index_snapshot: Arc::clone(&self.extent_index),
-            ancestor_layers: self.ancestor_layers.clone(),
-            fetcher: self.fetcher.clone(),
-            signer: Arc::clone(&self.signer),
-            verifying_key: self.verifying_key,
-            segment_cache: Arc::clone(&self.segment_cache),
+        Ok(Some(RepackPrep {
+            flush,
+            job: RepackJob {
+                base_dir: self.base_dir.clone(),
+                pending_dir,
+                floor,
+                seg_paths,
+                output_ulids,
+                journal_output_ulids,
+                lbamap_snapshot: Arc::clone(&self.lbamap),
+                extent_index_snapshot: Arc::clone(&self.extent_index),
+                ancestor_layers: self.ancestor_layers.clone(),
+                fetcher: self.fetcher.clone(),
+                signer: Arc::clone(&self.signer),
+                verifying_key: self.verifying_key,
+                segment_cache: Arc::clone(&self.segment_cache),
+            },
         }))
     }
 
@@ -600,7 +636,7 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
         let result = crate::actor::execute_repack(job).unwrap();
         let (stats, consumed) = vol.apply_repack_result(result).unwrap();
 
@@ -648,7 +684,7 @@ mod tests {
         vol.promote_for_test().unwrap();
         vol.write(0, &interim).unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
 
         // Worker window: the recurring content returns as a DedupRef
         // against the repack input.
@@ -1196,7 +1232,7 @@ mod tests {
         vol.write(200, &payload_peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
 
         // Lock-drop window: same LBA, different bytes → different hash.
         vol.write(100, &payload_b).unwrap();
@@ -1223,6 +1259,59 @@ mod tests {
     }
 
     #[test]
+    fn repack_with_wal_open_at_prep_promotes_and_keeps_window_write() {
+        // Prep rotates a non-empty WAL into a promote the caller
+        // dispatches, so the repack job travels alongside one. Covers
+        // that pairing: the rotated content reaches a segment, the
+        // rewrite lands, and a write arriving in the worker window
+        // survives both the apply and a reopen.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        let payload_a = vec![0x11u8; 4096];
+        let peer = vec![0x33u8; 4096];
+        let unpromoted = vec![0x44u8; 4096];
+        let window = vec![0x55u8; 4096];
+
+        // Two pending segments give the bin-pack a non-solo bucket.
+        vol.write(100, &payload_a).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(200, &peer).unwrap();
+        vol.promote_for_test().unwrap();
+
+        // Still in the WAL at prep, so the rotate has something to promote.
+        vol.write(300, &unpromoted).unwrap();
+
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+
+        // Lands on the WAL the rotate left to be opened lazily.
+        vol.write(100, &window).unwrap();
+
+        let result = crate::actor::execute_repack(job).unwrap();
+        let (_stats, consumed) = vol.apply_repack_result(result).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
+
+        assert_eq!(vol.read(100, 1).unwrap(), window);
+        assert_eq!(vol.read(300, 1).unwrap(), unpromoted);
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol2.read(100, 1).unwrap(),
+            window,
+            "window write must survive the rebuild"
+        );
+        assert_eq!(
+            vol2.read(300, 1).unwrap(),
+            unpromoted,
+            "rotated WAL content must survive the rebuild"
+        );
+        assert_eq!(vol2.read(200, 1).unwrap(), peer);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn lock_drop_full_overwrite_multi_block() {
         // Multi-block Keep entry, fully overwritten by three single-block
         // direct writes during the lock-drop window.  Each direct write
@@ -1243,7 +1332,7 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
 
         // Lock-drop window: three single-block direct writes covering the
         // whole [100..103) range.
@@ -1319,7 +1408,7 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
 
         // Lock-drop window: single-block direct write at the middle of the
         // 3-block range.  Splits lbamap into three:
@@ -1391,7 +1480,7 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
 
         for (i, block) in kernel_blocks.iter().enumerate() {
             vol.write(100 + i as u64, block).unwrap();
@@ -1448,7 +1537,7 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
         for (i, block) in kernel_blocks.iter().enumerate() {
             vol.write(100 + i as u64, block).unwrap();
         }
@@ -1514,7 +1603,7 @@ mod tests {
         vol.promote_for_test().unwrap();
         promote_segment_with_blocks(&mut vol, 2, 2, 2);
 
-        let job = vol.prepare_repack().unwrap().expect("repack job");
+        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
         let result = crate::actor::execute_repack(job).unwrap();
 
         let mut saw_inline = false;

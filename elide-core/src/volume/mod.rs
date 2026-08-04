@@ -83,7 +83,8 @@ pub use reclaim::{
     scan_reclaim_candidates,
 };
 pub use repack::{
-    CompactionStats, RepackJob, RepackResult, RepackedBucket, RepackedInput, RepackedOutput,
+    CompactionStats, RepackJob, RepackPrep, RepackResult, RepackedBucket, RepackedInput,
+    RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -3291,6 +3292,26 @@ impl Volume {
         Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
     }
 
+    /// Close the open WAL into a [`PromoteJob`] at `segment_ulid` for the
+    /// caller to dispatch. `None` when the WAL held nothing to promote;
+    /// an empty WAL file is removed.
+    ///
+    /// Callers mint `segment_ulid` after every output ULID their operation
+    /// reserves, so the promoted segment sorts above them. The WAL that
+    /// opens next sits above both — `ensure_wal_open` mints fresh.
+    pub(in crate::volume) fn rotate_wal_into_promote(
+        &mut self,
+        segment_ulid: Ulid,
+    ) -> io::Result<Option<PromoteJob>> {
+        if self.pending.is_empty() {
+            if let Some(open) = self.wal.take() {
+                fs::remove_file(&open.path)?;
+            }
+            return Ok(None);
+        }
+        Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))
+    }
+
     /// Fold one formation's dedup counters into `self.dedup_mint_stats` and log
     /// the running totals.
     fn record_dedup_mint_stats(&mut self, wal_ulid: Ulid, stats: DedupMintStats) {
@@ -3443,23 +3464,11 @@ impl Volume {
     /// a new WAL file when there is nothing to promote.
     pub fn prepare_gc_checkpoint(&mut self, max_buckets: usize) -> io::Result<GcCheckpointPrep> {
         let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(max_buckets);
-
-        if self.pending.is_empty() {
-            // Empty or absent WAL — delete any lingering file, leave wal None.
-            if let Some(open) = self.wal.take() {
-                fs::remove_file(&open.path)?;
-            }
-            return Ok(GcCheckpointPrep {
-                u_buckets,
-                u_flush,
-                job: None,
-            });
-        }
-
+        let job = self.rotate_wal_into_promote(u_flush)?;
         Ok(GcCheckpointPrep {
             u_buckets,
             u_flush,
-            job: Some(self.take_wal_into_promote_job(u_flush)?),
+            job,
         })
     }
 
