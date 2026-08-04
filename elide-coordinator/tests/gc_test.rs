@@ -333,18 +333,11 @@ async fn drain_pending_to_store(
 /// divergence `apply_gc_handoffs` now refuses to fold.
 fn drain_pending(vol: &mut Volume) {
     let pending_dir = elide_core::segment::pending_open_dir(vol.base_dir());
-    let Ok(entries) = fs::read_dir(&pending_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(ulid_str) = name.to_str() else {
-            continue;
-        };
-        if ulid_str.ends_with(".tmp") {
-            continue;
-        }
-        let ulid: ulid::Ulid = ulid_str.parse().unwrap();
+    // ULID-ascending, as production's upload::drain_pending promotes, so
+    // max(committed) < min(pending) holds at every boundary.
+    let ulids = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
+        .unwrap_or_else(|e| panic!("listing {}: {e}", pending_dir.display()));
+    for ulid in ulids {
         vol.promote_segment(ulid).unwrap();
     }
 }
