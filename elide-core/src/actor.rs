@@ -131,6 +131,7 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<Option<u32>>>,
     },
     Repack {
+        trigger: crate::volume::RepackTrigger,
         reply: Sender<io::Result<CompactionStats>>,
     },
     /// Promote the current WAL to a `pending/` segment via the worker
@@ -793,8 +794,12 @@ impl VolumeActor {
     /// Run the repack prep on the actor and dispatch the heavy middle
     /// to the worker.  Reply is parked until
     /// [`crate::volume::RepackResult`] arrives and is applied.
-    fn start_repack(&mut self, reply: Sender<io::Result<CompactionStats>>) {
-        let prep = match self.lock_volume().prepare_repack() {
+    fn start_repack(
+        &mut self,
+        trigger: crate::volume::RepackTrigger,
+        reply: Sender<io::Result<CompactionStats>>,
+    ) {
+        let prep = match self.lock_volume().prepare_repack(trigger) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 let _ = reply.send(Ok(CompactionStats::default()));
@@ -1349,12 +1354,12 @@ impl VolumeActor {
                                 }
                             }
                         }
-                        VolumeRequest::Repack { reply } => {
+                        VolumeRequest::Repack { trigger, reply } => {
                             if self.parked.repack.is_some() {
                                 let _ = reply
                                     .send(Err(io::Error::other("concurrent repack not allowed")));
                             } else {
-                                self.start_repack(reply);
+                                self.start_repack(trigger, reply);
                             }
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
@@ -1776,10 +1781,17 @@ impl VolumeClient {
 
     /// Rewrite every pending segment with any hash-dead body bytes.
     /// Blocks until the actor replies.
-    pub fn repack(&self) -> io::Result<CompactionStats> {
+    ///
+    /// Under [`crate::volume::RepackTrigger::Pressure`] the pass runs
+    /// only once the open generation has accumulated enough since the
+    /// last one, so the caller may tick as often as it likes.
+    pub fn repack(&self, trigger: crate::volume::RepackTrigger) -> io::Result<CompactionStats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Repack { reply: reply_tx })
+            .send(VolumeRequest::Repack {
+                trigger,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -2576,7 +2588,19 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
 /// `stored_length`, so it measures the body in the form its codec names
 /// and an output lands near this size on disk and on S3. GC's
 /// `SWEEP_MATERIALISE_CAP` is the same size in the same unit.
-const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
+pub(crate) const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
+
+/// Live fraction at or above which a settled segment stays out of a
+/// pass over the open generation. Mirrors the coordinator's default
+/// `density_threshold` for committed segments, so both rewriters call
+/// the same shape of segment worth rewriting.
+const REPACK_SETTLED_DENSITY: f64 = 0.70;
+
+/// Whether `seg_ulid` names a segment an earlier pass over the same
+/// directory covered. See [`crate::volume::RepackJob::settled_floor`].
+fn is_settled(seg_ulid: Ulid, settled_floor: Option<Ulid>) -> bool {
+    settled_floor.is_some_and(|w| seg_ulid <= w)
+}
 
 /// Entry-count cap on a packed output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` so packed outputs sit at the same scale as
@@ -2746,6 +2770,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         pending_dir,
         floor,
         seg_paths,
+        settled_floor,
         output_ulids,
         journal_output_ulids,
         lbamap_snapshot,
@@ -2812,6 +2837,36 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .sum();
         let all_live = live_bytes_est == total_bytes;
 
+        // Journal-tier segments are collected apart from the data bin-pack
+        // and merged into one journal-tagged output below. Pending segments
+        // are pure (formation partitions journal content into its own
+        // segment), so any journal-flagged entry means the whole segment is
+        // journal-tier. Every journal segment (live or fully dead) is routed
+        // there so the merge covers all pending journal — the ordering
+        // invariant a data repack relies on (a data repack must lift all
+        // pending journal above its outputs; see the design doc). That
+        // coverage is why the settled gate below leaves journal alone.
+        let is_journal_segment = entries.iter().any(|e| e.journal);
+
+        // A settled segment is one an earlier pass over this directory
+        // already packed. Re-admitting it costs a full classification —
+        // `extents_in_range` per entry — and pays only when its bytes
+        // have died since, so `live_bytes_est` decides: a hash-set probe
+        // per entry against an index the segment cache already holds.
+        //
+        // The estimate counts an entry live whenever its hash resolves
+        // anywhere, so it reads a segment denser than a classification
+        // would and admits a subset of what one would find worth
+        // rewriting. Mortality is monotone, so what it leaves behind is
+        // harvested whole by the pass over the sealed generation.
+        if is_settled(seg_ulid, settled_floor) && !is_journal_segment {
+            let dense = total_bytes == 0
+                || live_bytes_est as f64 >= total_bytes as f64 * REPACK_SETTLED_DENSITY;
+            if dense {
+                continue;
+            }
+        }
+
         let classify_ctx = ClassifyCtx {
             lba_map: &lbamap_snapshot,
             extent_index: &extent_index_snapshot,
@@ -2873,15 +2928,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .map(|e| e.hash)
             .collect();
 
-        // Journal-tier segments are collected apart from the data bin-pack
-        // and merged into one journal-tagged output below. Pending segments
-        // are pure (formation partitions journal content into its own
-        // segment), so any journal-flagged entry means the whole segment is
-        // journal-tier. Every journal segment (live or fully dead) is routed
-        // here so the merge covers all pending journal — the ordering
-        // invariant a data repack relies on (a data repack must lift all
-        // pending journal above its outputs; see the design doc).
-        let is_journal_segment = entries.iter().any(|e| e.journal);
         let candidate = RepackCandidate {
             seg_path: seg_path.clone(),
             seg_ulid,
@@ -4285,7 +4331,9 @@ mod tests {
         // A reader's view captured before the repack.
         let stale = client.snapshot.load_full();
 
-        let stats = client.repack().unwrap();
+        let stats = client
+            .repack(crate::volume::RepackTrigger::Unconditional)
+            .unwrap();
         assert!(
             stats.segments_compacted > 0,
             "setup: repack consumed no segments, race not exercised"

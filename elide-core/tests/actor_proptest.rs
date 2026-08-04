@@ -197,7 +197,7 @@ proptest! {
                     }
                 }
                 ActorOp::SweepPending => {
-                    let _ = handle.repack();
+                    let _ = handle.repack(elide_core::volume::RepackTrigger::Unconditional);
                     // Old pending/ files are deleted; if publish_snapshot() did
                     // not bump flush_gen, handles reuse stale fds and get ENOENT.
                     for (&lba, expected) in &oracle {
@@ -213,7 +213,7 @@ proptest! {
                 ActorOp::Repack => {
                     // Use 0.5 ratio: fires on any segment with >50% dead extents,
                     // which occurs naturally after write-overwrite-flush sequences.
-                    let _ = handle.repack();
+                    let _ = handle.repack(elide_core::volume::RepackTrigger::Unconditional);
                     // Same invariant: repack deletes old files; snapshot must be
                     // republished so handles evict their cached fds.
                     for (&lba, expected) in &oracle {
@@ -518,7 +518,9 @@ fn reclaim_then_sweep_drain_gc_preserves_unrelated_lba() {
     //   has the same entry count and similar inline-body sizes as the
     //   old pending/u_flush_b, so the file length is unchanged — which
     //   matters for the SegmentIndexCache key below.
-    handle.repack().unwrap();
+    handle
+        .repack(elide_core::volume::RepackTrigger::Unconditional)
+        .unwrap();
 
     // Step 8: DrainLocal — promotes remaining pending → index/. This is
     //   where the old bug surfaced: execute_promote_segment consults the

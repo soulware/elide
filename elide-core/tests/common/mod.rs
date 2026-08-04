@@ -53,7 +53,9 @@ pub fn drain_with_repack(vol: &mut elide_core::volume::Volume) {
 
 /// `drain_with_repack` for a `VolumeClient` (actor-mediated).
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
-    handle.repack().unwrap();
+    handle
+        .repack(elide_core::volume::RepackTrigger::Unconditional)
+        .unwrap();
     for ulid in pending_ulids(base_dir) {
         handle.promote_segment(ulid).unwrap();
     }
