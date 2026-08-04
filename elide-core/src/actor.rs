@@ -2947,16 +2947,69 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
     let mut result_buckets: Vec<crate::volume::RepackedBucket> = Vec::new();
 
+    // Phase 2 — bin-pack: first-fit-decreasing into buckets sized to
+    // (REPACK_TARGET_LIVE, REPACK_ENTRY_CAP). Sorting by live_bytes
+    // descending places the largest candidates in their own buckets
+    // first; smaller candidates fill remaining headroom or start fresh
+    // buckets.
+    //
+    // The pack is pure, and it runs before the journal consolidation
+    // writes anything because whether this pass emits a data output is
+    // what decides whether the journal has to move (see below). Phase 3
+    // materialises these buckets after the journal segment is on disk.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.live_bytes));
+
+    struct Bucket {
+        candidate_idxs: Vec<usize>,
+        used_bytes: u64,
+        used_entries: usize,
+    }
+    let mut buckets: Vec<Bucket> = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let mut placed = false;
+        for b in buckets.iter_mut() {
+            if c.live_bytes + b.used_bytes <= REPACK_TARGET_LIVE
+                && c.live_entry_count + b.used_entries <= REPACK_ENTRY_CAP
+            {
+                b.candidate_idxs.push(i);
+                b.used_bytes += c.live_bytes;
+                b.used_entries += c.live_entry_count;
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            buckets.push(Bucket {
+                candidate_idxs: vec![i],
+                used_bytes: c.live_bytes,
+                used_entries: c.live_entry_count,
+            });
+        }
+    }
+    // A bucket of one fully-live candidate is a byte-identical no-op that
+    // phase 3 skips, so it emits nothing.
+    let emits_data_output = buckets
+        .iter()
+        .any(|b| b.candidate_idxs.len() > 1 || !candidates[b.candidate_idxs[0]].all_live);
+
     // Journal consolidation — merge every pending journal segment's live
     // entries into one journal-tagged output at the reserved (highest)
-    // ULID. Runs before the data bin-pack so its segment is written first
-    // and, minted above every data output, sorts above them:
-    // data-before-journal on disk and on upload. A lone all-live journal
-    // segment is left alone — a 1→1 rewrite saves no PUT. The whole live
-    // set is at most one jbd2 ring, so it merges into one uncapped output;
+    // ULID. Runs before the data bin-pack materialises so its segment is
+    // written first and, minted above every data output, sorts above
+    // them: data-before-journal on disk and on upload. The whole live set
+    // is at most one jbd2 ring, so it merges into one uncapped output;
     // there is deliberately no size or entry cap here.
-    let journal_solo_no_op = journal_candidates.len() == 1 && journal_candidates[0].all_live;
-    if !journal_candidates.is_empty() && !journal_solo_no_op {
+    //
+    // A lone all-live journal segment merges into nothing and frees no
+    // bytes, so the 1→1 rewrite exists only to carry it above this pass's
+    // data outputs. Where the pass emits one it is mandatory: data
+    // outputs mint above everything pending, so a journal segment left at
+    // its own ULID lands below the data it commits — the inverted state
+    // uploads make unsafe, since a journal segment reaching S3 would no
+    // longer imply its data did (`journal-pending-consolidation.md`).
+    // Where the pass emits no data output there is nothing to stay above.
+    let journal_carries_itself = journal_candidates.len() == 1 && journal_candidates[0].all_live;
+    if !journal_candidates.is_empty() && (!journal_carries_itself || emits_data_output) {
         journal_candidates.sort_by_key(|c| c.seg_ulid);
 
         let mut outputs: Vec<PlanOutput> = Vec::new();
@@ -3060,41 +3113,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             bytes_freed: journal_bytes_freed,
             journal: true,
         });
-    }
-
-    // Phase 2 — bin-pack: first-fit-decreasing into buckets sized to
-    // (REPACK_TARGET_LIVE, REPACK_ENTRY_CAP). Sorting by live_bytes
-    // descending places the largest candidates in their own buckets
-    // first; smaller candidates fill remaining headroom or start fresh
-    // buckets.
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.live_bytes));
-
-    struct Bucket {
-        candidate_idxs: Vec<usize>,
-        used_bytes: u64,
-        used_entries: usize,
-    }
-    let mut buckets: Vec<Bucket> = Vec::new();
-    for (i, c) in candidates.iter().enumerate() {
-        let mut placed = false;
-        for b in buckets.iter_mut() {
-            if c.live_bytes + b.used_bytes <= REPACK_TARGET_LIVE
-                && c.live_entry_count + b.used_entries <= REPACK_ENTRY_CAP
-            {
-                b.candidate_idxs.push(i);
-                b.used_bytes += c.live_bytes;
-                b.used_entries += c.live_entry_count;
-                placed = true;
-                break;
-            }
-        }
-        if !placed {
-            buckets.push(Bucket {
-                candidate_idxs: vec![i],
-                used_bytes: c.live_bytes,
-                used_entries: c.live_entry_count,
-            });
-        }
     }
 
     // Phase 3 — materialise each bucket. A bucket of one fully-live

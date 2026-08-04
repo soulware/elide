@@ -1445,6 +1445,86 @@ fn formation_chunks_a_body_larger_than_one_chunk() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Partition `pending/open/` into (data ULIDs, journal ULIDs), ascending.
+fn pending_tiers(base: &Path, vk: &ed25519_dalek::VerifyingKey) -> (Vec<Ulid>, Vec<Ulid>) {
+    let mut data = Vec::new();
+    let mut journal = Vec::new();
+    for ulid in pending_ulids(base) {
+        let path = segment::pending_open_dir(base).join(ulid.to_string());
+        let (_, entries, _) = segment::read_and_verify_segment_index(&path, vk).unwrap();
+        if entries.iter().any(|e| e.journal) {
+            journal.push(ulid);
+        } else {
+            data.push(ulid);
+        }
+    }
+    (data, journal)
+}
+
+/// A pass that repacks data mints its outputs above everything pending,
+/// so a journal segment left at its own ULID would land below the data
+/// it commits. Uploads run ULID-ascending, which is what makes "journal
+/// on S3 implies its data is on S3" hold, so the pass has to carry the
+/// journal up even when it is a lone all-live segment with nothing to
+/// merge (`docs/design/journal-pending-consolidation.md`).
+#[test]
+fn a_data_repack_lifts_a_lone_all_live_journal_segment() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(100, &vec![0xC7u8; 4096]).unwrap();
+    vol.write(0, &vec![0xA1u8; 4096]).unwrap();
+    vol.promote_for_test().unwrap();
+
+    // Kill the first data segment's only block, so the pass has a data
+    // output to emit.
+    vol.write(0, &vec![0xA2u8; 4096]).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let (data_before, journal_before) = pending_tiers(&base, &vol.verifying_key);
+    assert_eq!(journal_before.len(), 1, "setup: one journal segment");
+    assert_eq!(data_before.len(), 2, "setup: two data segments");
+
+    vol.repack().unwrap();
+
+    let (data_after, journal_after) = pending_tiers(&base, &vol.verifying_key);
+    assert_eq!(journal_after.len(), 1, "the live ring stays one segment");
+    assert_ne!(
+        journal_after[0], journal_before[0],
+        "the journal segment must move to a fresh ULID"
+    );
+    assert!(
+        data_after.iter().all(|d| *d < journal_after[0]),
+        "every data segment must sit below the journal: {data_after:?} vs {journal_after:?}"
+    );
+
+    assert_eq!(vol.read(0, 1).unwrap(), vec![0xA2u8; 4096]);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// With no data output there is nothing for the journal to stay above,
+/// so a lone all-live journal segment is left where it is.
+#[test]
+fn a_pass_with_no_data_output_leaves_the_journal_segment_alone() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write(100, &vec![0xB1u8; 4096]).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let before = pending_ulids(&base);
+    assert_eq!(before.len(), 1, "setup: journal segment only");
+
+    let stats = vol.repack().unwrap();
+    assert_eq!(stats.new_segments, 0);
+    assert_eq!(pending_ulids(&base), before);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// Journal bytes reap whole with their segment and are never a dedup or
 /// delta source, so they keep lz4 where durable bodies take zstd.
 #[test]

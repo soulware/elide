@@ -114,11 +114,14 @@ This rests on consolidation covering **all** pending journal (≤ ceiling), not 
 subset. A pass that repacks data lifts every data segment to a fresh high ULID, so
 any journal left behind at its original low ULID would then sit *below* that data
 — the inverted, unsafe state, for exactly the epochs whose journal was skipped.
-The default satisfies this for free: the live journal is at most one ring, so a
-single output (no size cap) always holds it and nothing is left behind. It becomes
-a real constraint only if a future size cap or partial/split path could leave
-journal unconsolidated — such a path must either lift all journal (into several
-outputs, all above the data) or suppress data repack for that pass. Stated as an
+Size is one way to leave journal behind and count is the other. The live journal
+is at most one ring, so a single output (no size cap) always holds it; a future
+size cap or partial/split path would have to lift all journal into several
+outputs, all above the data. Count is the case where the pending journal is a
+single segment that is still entirely live: it merges into nothing and frees no
+bytes, so its rewrite buys nothing except position, and position is the whole
+point. `execute_repack` runs it whenever the pass emits a data output and skips
+it when the pass emits none, there being nothing then to stay above. Stated as an
 invariant: **a pass that repacks data must move all pending journal above its data
 outputs.**
 
