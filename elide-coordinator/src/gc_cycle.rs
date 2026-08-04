@@ -439,9 +439,11 @@ impl GcCycleOrchestrator {
             && let Some(closed) = control::close_generation(&self.fork_dir).await
             && closed > 0
         {
+            let (segments, bytes) = Self::upload_generation_size(&self.fork_dir);
             info!(
-                "[head {}] generation closed: {closed} segment(s) to upload",
-                self.vol_ulid
+                "[head {}] generation closed: {closed} segment(s) packed to {segments}, \
+                 {bytes} bytes to upload",
+                self.vol_ulid,
             );
         }
 
@@ -455,6 +457,26 @@ impl GcCycleOrchestrator {
             Ok(mut entries) => entries.next().is_none(),
             Err(_) => true,
         }
+    }
+
+    /// Segments and bytes the sealed generation hands the uploader.
+    /// Read straight after the close, when `pending/upload/` holds the
+    /// pass's outputs and its consumed inputs are already unlinked, and
+    /// before the next tick's drain begins removing files.
+    ///
+    /// The two move independently: a generation the open pass reached
+    /// holds few large packed segments where one it missed holds many
+    /// small flush segments, so neither predicts the other.
+    fn upload_generation_size(fork_dir: &std::path::Path) -> (usize, u64) {
+        let Ok(entries) = std::fs::read_dir(elide_core::segment::pending_upload_dir(fork_dir))
+        else {
+            return (0, 0);
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
     }
 
     /// Whether this tick closes a cut: `cut_interval` has elapsed since
