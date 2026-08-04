@@ -169,10 +169,20 @@ Deferral is the generation layout
 `pending/open/` and the consolidation pass keeps collapsing them there
 — the steady state is the window's ring merging with each new tick's
 journal — and a cut closes the open generation into `pending/upload/`,
-whose drain uploads it whole before the next cut publishes. Journal
-costs one PUT per cut instead of one per tick, and every published cut
-is complete by construction: HEAD only ever names whole generations,
-journal and data at one frontier. The volume's recovery point is the
+whose drain uploads it whole before the next cut publishes. Every
+published cut is complete by construction: HEAD only ever names whole
+generations, journal and data at one frontier.
+
+The consolidation pass runs on the tick, from `run_volume_compactions`,
+and the cut rotates whatever `pending/open/` holds at that instant. So a
+generation ships the pass's output plus every journal segment a WAL
+flush formed since the last tick. Measured on rig pg14 at
+`cut_interval = 120s` under 8-client pgbench, that is about 3.5 journal
+objects per cut, and because each one holds an object slot until the
+jbd2 head laps its last position, the same factor sets the volume's live
+journal population (~60 segments against ~17 for one object per cut).
+`generation-close-pass.md` proposes moving the merge into the close so a
+sealed generation ships one. The volume's recovery point is the
 last cut for every LBA, so the cut interval is the volume's RPO and
 "journal upload cadence" is the same number.
 
