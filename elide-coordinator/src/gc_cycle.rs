@@ -503,8 +503,12 @@ impl GcCycleOrchestrator {
             && s.runs_rewritten > 0
         {
             info!(
-                "[drain {vol_ulid}] reclaim: scanned={} runs={} bytes={} discarded={}",
-                s.candidates_scanned, s.runs_rewritten, s.bytes_rewritten, s.discarded,
+                "[drain {vol_ulid}] reclaim: scanned={} runs={} bytes={} refused={} discarded={}",
+                s.candidates_scanned,
+                s.runs_rewritten,
+                s.bytes_rewritten,
+                s.runs_refused,
+                s.discarded,
             );
         }
         flushed

@@ -142,9 +142,12 @@ pub struct ReclaimReply {
     pub runs_rewritten: u64,
     /// Total bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
-    /// Number of candidates whose phase-3 commit discarded (unrelated
-    /// concurrent mutation). Discarded candidates are not retried here —
-    /// the next tick / call will re-observe them if still bloated.
+    /// Total runs a concurrent write refused across all attempted
+    /// candidates. A refused run is not retried here — the next tick /
+    /// call will re-observe its candidate if still bloated.
+    pub runs_refused: u64,
+    /// Number of candidates where every run was refused, so the pass
+    /// committed nothing and its output was orphan-cleaned.
     pub discarded: u32,
 }
 

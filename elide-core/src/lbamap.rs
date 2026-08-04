@@ -200,20 +200,23 @@ impl LbaMap {
     /// writes whose ULID is higher than the structural op's `new_ulid`. See
     /// `docs/design/lbamap-claimant-tracking.md` and
     /// `gc_output_loses_to_live_write_applied_after_gc`.
+    ///
+    /// Returns the number of LBA blocks installed, which is less than
+    /// `lba_length` when a blocking claimant kept part of the range.
     pub fn insert_if_newer(
         &mut self,
         start_lba: u64,
         lba_length: u32,
         hash: blake3::Hash,
         claimant: Ulid,
-    ) {
+    ) -> u32 {
         self.insert_inner_if_newer(
             start_lba,
             lba_length,
             hash,
             claimant,
             Blocking::SameOrHigher,
-        );
+        )
     }
 
     /// [`insert_if_newer`] variant for rewrite apply paths (GC fold /
@@ -234,14 +237,14 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
         consumed_inputs: &HashSet<Ulid>,
-    ) {
+    ) -> u32 {
         self.insert_inner_if_newer(
             start_lba,
             lba_length,
             hash,
             claimant,
             Blocking::Consuming(consumed_inputs),
-        );
+        )
     }
 
     /// Register one segment entry's LBA claim — the single place that
@@ -261,42 +264,46 @@ impl LbaMap {
     /// across segments; entry order wins within one), and
     /// `ConsumingInputs` defers to any overlapping claimant `>=`
     /// `claimant` that is not one of the inputs the apply consumes.
+    ///
+    /// Returns the number of LBA blocks the claim took, which an apply
+    /// path reads to tell a run that landed from one a blocking
+    /// claimant kept. A canonical-only kind makes no claim and returns
+    /// zero.
     fn register_entry_inner(
         &mut self,
         entry: &segment::SegmentEntry,
         claimant: Ulid,
         admission: Admission<'_>,
-    ) {
+    ) -> u32 {
         if entry.kind.is_canonical_only() {
-            return;
+            return 0;
         }
-        {
-            match admission {
-                Admission::Unconditional => {
-                    self.insert(entry.start_lba, entry.lba_length, entry.hash, claimant)
-                }
-                Admission::IfNewer => self.insert_inner_if_newer(
-                    entry.start_lba,
-                    entry.lba_length,
-                    entry.hash,
-                    claimant,
-                    Blocking::Higher,
-                ),
-                Admission::ConsumingInputs(inputs) => self.insert_consuming_inputs(
-                    entry.start_lba,
-                    entry.lba_length,
-                    entry.hash,
-                    claimant,
-                    inputs,
-                ),
+        match admission {
+            Admission::Unconditional => {
+                self.insert(entry.start_lba, entry.lba_length, entry.hash, claimant);
+                entry.lba_length
             }
+            Admission::IfNewer => self.insert_inner_if_newer(
+                entry.start_lba,
+                entry.lba_length,
+                entry.hash,
+                claimant,
+                Blocking::Higher,
+            ),
+            Admission::ConsumingInputs(inputs) => self.insert_consuming_inputs(
+                entry.start_lba,
+                entry.lba_length,
+                entry.hash,
+                claimant,
+                inputs,
+            ),
         }
     }
 
     /// [`register_entry_inner`](Self::register_entry_inner) with
     /// unconditional admission.
-    pub fn register_entry(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) {
-        self.register_entry_inner(entry, claimant, Admission::Unconditional);
+    pub fn register_entry(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) -> u32 {
+        self.register_entry_inner(entry, claimant, Admission::Unconditional)
     }
 
     /// [`register_entry_inner`](Self::register_entry_inner) with
@@ -308,8 +315,12 @@ impl LbaMap {
     /// earlier at the same LBA — the write order a WAL-flush segment
     /// records. The rebuild walk routes through this, so a rebuild
     /// computes the same winners the live path maintained.
-    pub fn register_entry_if_newer(&mut self, entry: &segment::SegmentEntry, claimant: Ulid) {
-        self.register_entry_inner(entry, claimant, Admission::IfNewer);
+    pub fn register_entry_if_newer(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        claimant: Ulid,
+    ) -> u32 {
+        self.register_entry_inner(entry, claimant, Admission::IfNewer)
     }
 
     /// [`register_entry_inner`](Self::register_entry_inner) with the
@@ -321,8 +332,8 @@ impl LbaMap {
         entry: &segment::SegmentEntry,
         claimant: Ulid,
         inputs: &HashSet<Ulid>,
-    ) {
-        self.register_entry_inner(entry, claimant, Admission::ConsumingInputs(inputs));
+    ) -> u32 {
+        self.register_entry_inner(entry, claimant, Admission::ConsumingInputs(inputs))
     }
 
     fn insert_inner_if_newer(
@@ -332,7 +343,7 @@ impl LbaMap {
         hash: blake3::Hash,
         claimant: Ulid,
         blocking: Blocking<'_>,
-    ) {
+    ) -> u32 {
         let new_end = start_lba + lba_length as u64;
         // `Consuming`: an existing entry blocks the install unless its
         // claimant is one of the inputs this apply consumes and deletes,
@@ -393,12 +404,14 @@ impl LbaMap {
         // carry split around a blocked middle sub-run would lose the
         // trailing gap's offset and reads at the trailing LBAs would
         // resolve to body block 0 of the carry instead of block N.
+        let mut installed = 0u32;
         let mut cursor = start_lba;
         for (b_start, b_end) in blocked {
             if cursor < b_start {
                 let gap_len = (b_start - cursor) as u32;
                 let pbo = (cursor - start_lba) as u32;
                 self.insert_inner(cursor, gap_len, pbo, hash, claimant);
+                installed += gap_len;
             }
             cursor = cursor.max(b_end);
         }
@@ -406,7 +419,9 @@ impl LbaMap {
             let gap_len = (new_end - cursor) as u32;
             let pbo = (cursor - start_lba) as u32;
             self.insert_inner(cursor, gap_len, pbo, hash, claimant);
+            installed += gap_len;
         }
+        installed
     }
 
     fn insert_inner(

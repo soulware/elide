@@ -236,6 +236,7 @@ fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl W
     };
     let mut total_runs: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut total_refused: u64 = 0;
     let mut discarded: u32 = 0;
     let mut io_err: Option<std::io::Error> = None;
     for c in to_process {
@@ -245,20 +246,19 @@ fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl W
         );
         match handle.reclaim_alias_merge(c.start_lba, c.lba_length) {
             Ok(outcome) => {
+                total_runs += outcome.runs_rewritten as u64;
+                total_bytes += outcome.bytes_rewritten;
+                total_refused += outcome.runs_refused as u64;
                 if outcome.discarded {
                     discarded += 1;
-                    debug!(
-                        "[reclaim] candidate lba={} discarded (concurrent mutation)",
-                        c.start_lba
-                    );
-                } else {
-                    total_runs += outcome.runs_rewritten as u64;
-                    total_bytes += outcome.bytes_rewritten;
-                    debug!(
-                        "[reclaim] candidate lba={} committed runs={} bytes={}",
-                        c.start_lba, outcome.runs_rewritten, outcome.bytes_rewritten
-                    );
                 }
+                debug!(
+                    "[reclaim] candidate lba={} committed runs={} bytes={} refused={}",
+                    c.start_lba,
+                    outcome.runs_rewritten,
+                    outcome.bytes_rewritten,
+                    outcome.runs_refused
+                );
             }
             Err(e) => {
                 io_err = Some(e);
@@ -276,12 +276,12 @@ fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl W
     if total_runs > 0 || discarded > 0 {
         info!(
             "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
-             bytes_rewritten={total_bytes} discarded={discarded}"
+             bytes_rewritten={total_bytes} runs_refused={total_refused} discarded={discarded}"
         );
     } else {
         debug!(
             "[reclaim] done: scanned={scanned} runs_rewritten={total_runs} \
-             bytes_rewritten={total_bytes} discarded={discarded}"
+             bytes_rewritten={total_bytes} runs_refused={total_refused} discarded={discarded}"
         );
     }
     let _ = write_envelope(
@@ -290,6 +290,7 @@ fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl W
             candidates_scanned: u32::try_from(scanned).unwrap_or(u32::MAX),
             runs_rewritten: total_runs,
             bytes_rewritten: total_bytes,
+            runs_refused: total_refused,
             discarded,
         }),
     );

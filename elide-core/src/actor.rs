@@ -3823,7 +3823,6 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
 
     if entries.is_empty() {
         return Ok(ReclaimResult {
-            lbamap_snapshot: job.lbamap_snapshot,
             segment_ulid: job.segment_ulid,
             body_section_start: 0,
             body_length: 0,
@@ -3870,7 +3869,6 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         .collect();
 
     Ok(ReclaimResult {
-        lbamap_snapshot: job.lbamap_snapshot,
         segment_ulid: job.segment_ulid,
         body_section_start,
         body_length,

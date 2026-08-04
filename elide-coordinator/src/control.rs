@@ -128,7 +128,9 @@ pub struct ReclaimIpcStats {
     pub runs_rewritten: u64,
     /// Total bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
-    /// Number of candidates whose phase-3 commit discarded.
+    /// Total runs a concurrent write refused across all attempted candidates.
+    pub runs_refused: u64,
+    /// Number of candidates that committed nothing.
     pub discarded: usize,
 }
 
@@ -138,6 +140,7 @@ impl From<ReclaimReply> for ReclaimIpcStats {
             candidates_scanned: r.candidates_scanned as usize,
             runs_rewritten: r.runs_rewritten,
             bytes_rewritten: r.bytes_rewritten,
+            runs_refused: r.runs_refused,
             discarded: r.discarded as usize,
         }
     }

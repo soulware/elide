@@ -1,7 +1,7 @@
 //! Extent-reclamation data types, the candidate scanner, and the
 //! `impl Volume` block that drives the prepare → execute → apply trio.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,10 +19,6 @@ use super::{Volume, ZERO_HASH, latest_snapshot};
 /// compressing, and assembling one segment file — runs on the worker
 /// thread via [`crate::actor::execute_reclaim`]. The actor reclaims no
 /// lock during that window; writes continue to flow through the channel.
-///
-/// `lbamap_snapshot` is kept private on the carried `ReclaimResult`: the
-/// pointer identity is the entire precondition check, and exposing it
-/// would invite accidental aliasing that weakens the guarantee.
 pub struct ReclaimJob {
     pub target_start_lba: u64,
     pub target_lba_length: u32,
@@ -57,11 +53,10 @@ pub struct ReclaimedEntry {
 ///
 /// `segment_written` distinguishes the "nothing to do" case (empty
 /// proposal set, no file on disk) from the "worker committed a segment"
-/// case. Apply must either splice the entries into the live lbamap +
-/// extent index (pointer-equality precondition holds) or delete
-/// `pending/<segment_ulid>` as an orphan (precondition failed).
+/// case. Apply splices each rewritten run into the live lbamap + extent
+/// index on its own admission, and deletes `pending/<segment_ulid>` as
+/// an orphan when no run landed.
 pub struct ReclaimResult {
-    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
     pub segment_ulid: Ulid,
     pub body_section_start: u64,
     /// Sum of `stored_length` for body-section entries in the written
@@ -78,12 +73,16 @@ pub struct ReclaimResult {
 /// Outcome of a complete alias-merge reclaim pass.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReclaimOutcome {
-    /// True if the apply precondition failed (the LBA map was mutated
-    /// between prepare and apply) and nothing was committed.
+    /// True if the pass committed no run at all and its output segment
+    /// was deleted as an orphan.
     pub discarded: bool,
     /// Number of rewrite entries committed (excluding ones the noop-skip
     /// hash check absorbed because the LBA map already records the rewrite).
     pub runs_rewritten: u32,
+    /// Number of rewrite entries a concurrent write refused outright.
+    /// A run partly refused counts as rewritten, and `bytes_rewritten`
+    /// carries only the sub-range that landed.
+    pub runs_refused: u32,
     /// Total uncompressed bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
 }
@@ -330,6 +329,13 @@ impl Volume {
     /// output and shadows it — re-pointing the LBA at a hash whose body
     /// `redact_segment` may have already hole-punched (hash-dead under
     /// the post-reclaim lbamap), producing zero reads.
+    ///
+    /// The same ordering is what makes
+    /// [`Self::apply_reclaim_result`]'s if-newer admission correct: the
+    /// mint runs with no WAL open, so a write arriving during the
+    /// worker's window opens a fresh one at a higher ULID and its claims
+    /// outrank `u_reclaim`. Minting before the flush would silently
+    /// invert that and let the apply overwrite concurrent writes.
     pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimJob> {
         self.flush_wal()?;
 
@@ -344,6 +350,10 @@ impl Volume {
             }
         }
 
+        debug_assert!(
+            self.wal.is_none(),
+            "u_reclaim must be minted with the WAL closed"
+        );
         let segment_ulid = self.mint.next();
         let snapshot_floor_ulid = latest_snapshot(&self.base_dir)?;
 
@@ -364,41 +374,39 @@ impl Volume {
     /// Apply phase of reclaim — runs on the actor thread after the
     /// worker returns.
     ///
-    /// Precondition: `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)`.
-    /// Any mutation between prepare and apply would have called
-    /// `Arc::make_mut` on the volume's `lbamap` Arc (externally visible
-    /// via at least the published snapshot), which reallocates — so the
-    /// pointers differ and this returns cleanly with `discarded: true`,
-    /// deleting the worker's pending segment as an orphan. GC would
-    /// eventually classify it as all-dead, but cleaning up eagerly
-    /// avoids the extra GC round-trip.
+    /// Each rewritten run is admitted on its own. A run is a claim over
+    /// one LBA range, so what invalidates it is a write to that range,
+    /// and `register_entry_if_newer` is what expresses exactly that: it
+    /// installs on the sub-ranges whose current claimant sorts below
+    /// `u_reclaim` and leaves every higher claimant its sub-range.
     ///
-    /// On success, splices the worker's entries into the live lbamap +
-    /// extent index. Runs under the actor lock; no CAS needed because
-    /// the pointer-equality guard above already proved no concurrent
-    /// mutation happened.
+    /// The ULID polarity is what makes if-newer the right rule.
+    /// [`Self::prepare_reclaim`] closes the WAL before minting
+    /// `u_reclaim`, both under the actor lock, so a write arriving
+    /// afterwards opens a fresh WAL at a higher ULID and every
+    /// concurrent-write claimant sorts above the reclaim's outputs.
+    /// Repack's outputs are pre-minted *below* the flushed WAL, which
+    /// is why that path needs a consumed-inputs whitelist to tell a
+    /// claim it tears down from a write it did not carry; reclaim
+    /// consumes no segment and has no such ambiguity.
+    ///
+    /// The extent index takes the same runs under
+    /// `register_entry_consuming_inputs` with an empty consumed set:
+    /// reclaim's live sub-ranges hash fresh, so the normal case is a
+    /// free slot, and a hash a concurrent writer already owns keeps its
+    /// owner. A run whose claim was refused outright registers nothing,
+    /// which keeps "the index names the reclaim segment" and "the
+    /// reclaim landed that run" the same statement.
+    ///
+    /// A pass where no run landed deletes `pending/<segment_ulid>` as an
+    /// orphan. GC would eventually classify it as all-dead; cleaning up
+    /// here avoids the round-trip.
     pub fn apply_reclaim_result(&mut self, result: ReclaimResult) -> io::Result<ReclaimOutcome> {
-        if !Arc::ptr_eq(&result.lbamap_snapshot, &self.lbamap) {
-            // Orphan cleanup: delete the worker's pending/<segment_ulid>.
-            if result.segment_written {
-                let path = result.pending_dir.join(result.segment_ulid.to_string());
-                let _ = std::fs::remove_file(&path);
-            }
-            return Ok(ReclaimOutcome {
-                discarded: true,
-                ..Default::default()
-            });
-        }
-
         if !result.segment_written {
             return Ok(ReclaimOutcome::default());
         }
 
-        self.has_new_segments = true;
-        self.last_segment_ulid = Some(result.segment_ulid);
-
-        let lbamap = Arc::make_mut(&mut self.lbamap);
-        let extent_index = Arc::make_mut(&mut self.extent_index);
+        let no_consumed_inputs = HashSet::new();
         let ctx = extentindex::SegmentRegistrationCtx {
             segment_id: result.segment_ulid,
             body_section_start: result.body_section_start,
@@ -409,16 +417,40 @@ impl Volume {
             }),
             inline: extentindex::InlineSource::EntryInline,
         };
-        for (raw_idx, re) in result.entries.iter().enumerate() {
-            lbamap.register_entry(&re.entry, result.segment_ulid);
-            extent_index.register_entry_unconditional(&re.entry, raw_idx as u32, &ctx)?;
-        }
 
         let mut outcome = ReclaimOutcome::default();
-        for re in &result.entries {
+        let lbamap = Arc::make_mut(&mut self.lbamap);
+        let extent_index = Arc::make_mut(&mut self.extent_index);
+        for (raw_idx, re) in result.entries.iter().enumerate() {
+            let blocks = lbamap.register_entry_if_newer(&re.entry, result.segment_ulid);
+            if blocks == 0 {
+                outcome.runs_refused += 1;
+                continue;
+            }
+            extent_index.register_entry_consuming_inputs(
+                &re.entry,
+                raw_idx as u32,
+                &ctx,
+                &no_consumed_inputs,
+            )?;
             outcome.runs_rewritten += 1;
-            outcome.bytes_rewritten += re.uncompressed_bytes;
+            // Reaching here means `blocks > 0`, so the entry spans at
+            // least one block and the divisor is non-zero. Live bytes
+            // are `lba_length * 4096`, which makes the pro-rate exact
+            // when a concurrent write kept part of the range.
+            outcome.bytes_rewritten +=
+                re.uncompressed_bytes * u64::from(blocks) / u64::from(re.entry.lba_length);
         }
+
+        if outcome.runs_rewritten == 0 {
+            let path = result.pending_dir.join(result.segment_ulid.to_string());
+            let _ = std::fs::remove_file(&path);
+            outcome.discarded = true;
+            return Ok(outcome);
+        }
+
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(result.segment_ulid);
         Ok(outcome)
     }
 }
@@ -524,11 +556,13 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    /// When the LBA map is mutated between prepare and apply, the apply
-    /// phase must discard cleanly — orphan-cleaning the worker's output
-    /// segment — with no state change to the live lbamap.
+    /// A write that overlaps every run the worker rewrote must take all
+    /// of them: the reclaim commits nothing and orphan-cleans its
+    /// output segment. Paired with
+    /// `reclaim_survives_write_to_unrelated_lba`, which covers a write
+    /// that overlaps none.
     #[test]
-    fn reclaim_alias_merge_discards_on_concurrent_mutation() {
+    fn reclaim_alias_merge_defers_to_overlapping_write() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -543,20 +577,24 @@ mod tests {
         assert!(result.segment_written);
         let segment_path = result.pending_dir.join(result.segment_ulid.to_string());
         assert!(segment_path.exists(), "worker segment should be on disk");
+        let rewritten = result.entries.len();
+        assert!(rewritten > 0);
 
-        // Simulate concurrent mutation: any write bumps the lbamap Arc and
-        // breaks the pointer-equality precondition.
-        vol.write(500, &reclaim_payload(0x77, 1)).unwrap();
+        // The worker window: a write covering the whole reclaimed range,
+        // so every rewritten run has a higher claimant at apply.
+        let over = reclaim_payload(0x77, 8);
+        vol.write(200, &over).unwrap();
 
-        // Apply must detect the mutation, discard, and delete the orphan.
         let outcome = vol.apply_reclaim_result(result).unwrap();
         assert!(outcome.discarded);
         assert_eq!(outcome.runs_rewritten, 0);
         assert_eq!(outcome.bytes_rewritten, 0);
+        assert_eq!(outcome.runs_refused, rewritten as u32);
         assert!(
             !segment_path.exists(),
-            "apply must remove the orphan segment on discard"
+            "apply must remove the orphan segment when no run lands"
         );
+        assert_eq!(vol.read(200, 8).unwrap(), over, "the write must win");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -566,17 +604,10 @@ mod tests {
     /// over one LBA range, so a write outside every such range
     /// invalidates none of them.
     ///
-    /// The `Arc::ptr_eq` precondition in `apply_reclaim_result` cannot
-    /// express that: it is a whole-lbamap token, so it fails on any
-    /// write anywhere. Per-run admission — the `insert_consuming_inputs`
-    /// / `register_entry_consuming_inputs` pair every other apply path
-    /// uses — is what makes this hold. Paired with
-    /// `reclaim_alias_merge_discards_on_concurrent_mutation`, which
-    /// covers a write that does overlap.
+    /// Per-run admission is what expresses that. Paired with
+    /// `reclaim_alias_merge_defers_to_overlapping_write`, which covers a
+    /// write that does overlap.
     #[test]
-    #[ignore = "gated on #866: apply_reclaim_result discards on any lbamap mutation, so an \
-                unrelated write costs the whole result. Passes once per-run admission replaces \
-                the Arc::ptr_eq precondition."]
     fn reclaim_survives_write_to_unrelated_lba() {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
