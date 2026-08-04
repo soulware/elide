@@ -123,15 +123,32 @@ anywhere, so it reads a segment denser than a classification would and admits
 a subset of what one would find worth rewriting. Mortality is monotone, so
 what it leaves behind is harvested whole by the close pass.
 
-This is what keeps the cost of a pass proportional to what accumulated rather
+The estimate is cheap per entry but it still needs the segment's parsed
+index, and `SEGMENT_INDEX_CACHE_CAPACITY` holds 64. A sweep over every
+settled segment therefore re-reads and Ed25519-verifies every index in the
+directory once it outgrows the cache — worst under the stalled drain the pass
+exists for. So a pass examines `REPACK_SETTLED_SCAN` settled segments, taken
+in ULID order from `repack_settled_cursor` and wrapping. Successive passes
+cover the whole directory, which is quick against the minutes-scale mortality
+the sweep looks for.
+
+Together these keep the cost of a pass proportional to what accumulated rather
 than to the whole directory, which is what makes the absolute thresholds above
 amortise: work stays proportional to bytes written, whatever the write rate
 and however long a generation stays open.
 
-Journal segments are classified every pass. The consolidation merge has to
-cover all pending journal for the data-before-journal ordering to hold, and
-the live ring is one jbd2 window however deep the backlog, so the exemption
-costs a bounded amount.
+Journal segments are exempt from the cap and classified every pass. The
+consolidation merge has to cover all pending journal for the
+data-before-journal ordering to hold, and the live ring is one jbd2 window
+however deep the backlog, so the exemption costs a bounded amount.
+
+Finding them is what `pending_journal` is for: the cap skips a settled
+segment without parsing it, so the sweep needs journal-tier known in advance.
+Each pass rewrites the set from what it classified — a consolidation output,
+or a journal segment it left in place — which keeps it exact, because a
+segment arriving between passes sits above the watermark and is classified by
+the next one. It starts empty at open, where the absent watermark makes the
+whole directory a candidate.
 
 The volume tracks the boundary as `repack_watermark`, the `u_flush` of the
 last pass. Every candidate that pass listed sits below it, its outputs are

@@ -3009,7 +3009,17 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // longer imply its data did (`journal-pending-consolidation.md`).
     // Where the pass emits no data output there is nothing to stay above.
     let journal_carries_itself = journal_candidates.len() == 1 && journal_candidates[0].all_live;
-    if !journal_candidates.is_empty() && (!journal_carries_itself || emits_data_output) {
+    let journal_lifted =
+        !journal_candidates.is_empty() && (!journal_carries_itself || emits_data_output);
+    // What the pass leaves where it is, which the apply folds into
+    // `Volume::pending_journal` so the next sweep exempts it by name
+    // rather than by parsing its index.
+    let journal_untouched: Vec<Ulid> = if journal_lifted {
+        Vec::new()
+    } else {
+        journal_candidates.iter().map(|c| c.seg_ulid).collect()
+    };
+    if journal_lifted {
         journal_candidates.sort_by_key(|c| c.seg_ulid);
 
         let mut outputs: Vec<PlanOutput> = Vec::new();
@@ -3241,6 +3251,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         stats,
         buckets: result_buckets,
         pending_dir,
+        journal_untouched,
     })
 }
 
