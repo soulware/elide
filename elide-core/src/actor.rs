@@ -1224,7 +1224,19 @@ impl VolumeActor {
                             // onto the fresh WAL, matching how a real block
                             // device keeps accepting commands while a FLUSH
                             // is in flight at the controller.
-                            let fsync_result = self.lock_volume().wal_fsync();
+                            //
+                            // The lock covers taking the file handle; the
+                            // sync itself runs off it, so the ublk writers
+                            // contending for the volume mutex are blocked
+                            // for a pointer clone rather than a disk round
+                            // trip.  Promote dispatch shares this thread,
+                            // so the WAL this handle names stays the one
+                            // the flush must cover.
+                            let handle = self.lock_volume().wal_sync_handle();
+                            let fsync_result = match handle {
+                                Some(file) => file.sync_data(),
+                                None => Ok(()),
+                            };
                             match fsync_result {
                                 Ok(()) => self.park_or_resolve_flush(reply),
                                 Err(e) => {
@@ -4097,6 +4109,79 @@ mod tests {
 
         let recovered = Volume::open(&dir, &dir).unwrap();
         assert_eq!(recovered.read(3, 1).unwrap(), block);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The `Flush` handler takes the WAL's file handle under the volume
+    /// lock and syncs it after releasing, so it has an open-WAL arm and a
+    /// no-WAL arm. Exercise both, plus the rotation that moves one to the
+    /// other: `promote_wal` leaves the volume WAL-less, and the flush that
+    /// follows resolves through the promote pipeline instead of a sync.
+    #[test]
+    fn flush_spans_wal_open_and_wal_absent() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        // No WAL has ever been opened.
+        client.flush().unwrap();
+
+        let block = unique_block(11);
+        client.write(5, &block, false).unwrap();
+        client.flush().unwrap();
+
+        // Promote takes the WAL, so the next flush finds none open.
+        client.promote_wal().unwrap();
+        client.flush().unwrap();
+
+        // A fresh WAL opens lazily under the next write.
+        let after = unique_block(12);
+        client.write(6, &after, false).unwrap();
+        client.flush().unwrap();
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+
+        let recovered = Volume::open(&dir, &dir).unwrap();
+        assert_eq!(recovered.read(5, 1).unwrap(), block);
+        assert_eq!(recovered.read(6, 1).unwrap(), after);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The flush handle is taken under the lock and synced off it, so a
+    /// write can land in between. That write rides the same sync — the
+    /// flush covers more than its caller asked for, and both records
+    /// replay.
+    #[test]
+    fn write_concurrent_with_flush_replays() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        let first = unique_block(21);
+        client.write(0, &first, false).unwrap();
+
+        let writer = {
+            let client = client.clone();
+            let block = unique_block(22);
+            std::thread::spawn(move || {
+                client.write(1, &block, false).unwrap();
+                block
+            })
+        };
+        client.flush().unwrap();
+        let second = writer.join().unwrap();
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+
+        let recovered = Volume::open(&dir, &dir).unwrap();
+        assert_eq!(recovered.read(0, 1).unwrap(), first);
+        assert_eq!(recovered.read(1, 1).unwrap(), second);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -3243,13 +3243,25 @@ impl Volume {
 
     /// Fsync the WAL without promoting. No-op when no WAL is open.
     ///
-    /// Used by the actor's `Flush` handler to satisfy the block-device
-    /// durability contract without blocking on segment serialization.
+    /// Serves the FUA write path, which needs the sync inside the same
+    /// critical section as its append so a promote can't rotate the WAL
+    /// between the two.
     pub fn wal_fsync(&mut self) -> io::Result<()> {
         match self.wal.as_mut() {
             Some(open) => open.wal.fsync(),
             None => Ok(()),
         }
+    }
+
+    /// The open WAL's file, for a caller that fsyncs it after releasing
+    /// the volume lock. `None` when no WAL is open; that state is already
+    /// durable.
+    ///
+    /// Appends landing between this call and the sync ride the same
+    /// barrier. Reaching further than the caller asked for still
+    /// satisfies the caller.
+    pub fn wal_sync_handle(&self) -> Option<Arc<fs::File>> {
+        self.wal.as_ref().map(|open| open.wal.sync_handle())
     }
 
     /// Prep phase of the off-actor promote.  Runs on the actor thread.
