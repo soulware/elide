@@ -40,6 +40,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use bitflags::bitflags;
 
@@ -98,7 +99,9 @@ pub enum LogRecord {
 
 /// An open write log, ready for appending.
 pub struct WriteLog {
-    writer: File,
+    /// `Arc` so [`Self::sync_handle`] can hand the file to a caller that
+    /// outlives the log.
+    writer: Arc<File>,
     /// Current byte size of the log, for flush-threshold checks.
     size: u64,
 }
@@ -108,6 +111,12 @@ impl WriteLog {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// The log's file, for an fsync issued away from the append path.
+    /// The handle holds the inode open on its own.
+    pub fn sync_handle(&self) -> Arc<File> {
+        Arc::clone(&self.writer)
+    }
 }
 
 impl WriteLog {
@@ -115,7 +124,7 @@ impl WriteLog {
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut wl = Self {
-            writer: file,
+            writer: Arc::new(file),
             size: 0,
         };
         wl.write_all_bytes(MAGIC)?;
@@ -127,7 +136,10 @@ impl WriteLog {
     pub fn reopen(path: &Path, size: u64) -> io::Result<Self> {
         let mut file = OpenOptions::new().write(true).open(path)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { writer: file, size })
+        Ok(Self {
+            writer: Arc::new(file),
+            size,
+        })
     }
 
     /// Append a new data extent. `data` must already be compressed if `WalFlags::COMPRESSED` is set.
@@ -213,7 +225,7 @@ impl WriteLog {
     }
 
     fn write_all_bytes(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data)?;
+        (&*self.writer).write_all(data)?;
         self.size += data.len() as u64;
         Ok(())
     }
