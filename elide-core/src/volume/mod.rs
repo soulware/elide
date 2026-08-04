@@ -1459,66 +1459,6 @@ impl Volume {
         self.apply_all_staged_handoffs(&gc_dir)
     }
 
-    /// Scan `gc/` for plan handoff files that need processing.
-    ///
-    /// Sweeps stale volume-owned `<ulid>.tmp` scratch files, applies bare-wins
-    /// shortcuts for `.plan` + bare co-presence, and returns a list of
-    /// `(plan_path, new_ulid)` pairs for the caller to dispatch to the worker.
-    /// Also returns a count of handoffs that were already applied (bare wins).
-    ///
-    /// Coordinator-owned `<ulid>.plan.tmp` scratch is left alone — the coord
-    /// may be actively writing it; the coord sweeps its own stale scratch at
-    /// the start of each GC pass.
-    pub fn scan_plan_handoffs(&self) -> io::Result<(Vec<(PathBuf, Ulid)>, usize)> {
-        let gc_dir = self.base_dir.join("gc");
-        if !gc_dir.try_exists()? {
-            return Ok((Vec::new(), 0));
-        }
-
-        // Pass 1: sweep stale volume-owned `<ulid>.tmp` scratch files.
-        for entry in fs::read_dir(&gc_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(stem) = name.strip_suffix(".tmp") else {
-                continue;
-            };
-            if Ulid::from_string(stem).is_ok() {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-
-        // Pass 2: collect `.plan` files.
-        let mut plans: Vec<(String, Ulid)> = fs::read_dir(&gc_dir)?
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let name = e.file_name().into_string().ok()?;
-                let stem = name.strip_suffix(".plan")?;
-                let ulid = Ulid::from_string(stem).ok()?;
-                Some((name, ulid))
-            })
-            .collect();
-        plans.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut to_process = Vec::new();
-        let mut already_applied = 0usize;
-        for (plan_name, new_ulid) in plans {
-            let plan_path = gc_dir.join(&plan_name);
-            let bare_path = gc_dir.join(new_ulid.to_string());
-
-            // Crash recovery: `.plan` + bare → bare wins, drop `.plan`.
-            if bare_path.try_exists()? {
-                let _ = fs::remove_file(&plan_path);
-                already_applied += 1;
-                continue;
-            }
-
-            to_process.push((plan_path, new_ulid));
-        }
-
-        Ok((to_process, already_applied))
-    }
-
     /// Walk `gc/` for `.plan` entries and apply each via the
     /// self-describing derive-at-apply path.
     ///
@@ -1594,50 +1534,20 @@ impl Volume {
         Ok(count)
     }
 
-    /// Prep phase of GC plan application.
-    ///
-    /// Reads and validates `<ulid>.plan`, builds a [`GcPlanApplyJob`] the
-    /// worker can materialise off-actor. Returns `Ok(None)` when the plan is
-    /// rejected up front (parse failure, ULID mismatch, empty inputs) — the
-    /// plan file is removed inside, and the caller treats it as a cancelled
-    /// handoff.
+    /// Prep phase of GC plan application: snapshot the volume state a
+    /// [`GcPlanApplyJob`] needs, around a `plan` that
+    /// [`read_plan_for_apply`] has already parsed and ULID-matched.
     pub fn prepare_plan_apply(
         &self,
         plan_path: PathBuf,
         new_ulid: Ulid,
-    ) -> io::Result<Option<GcPlanApplyJob>> {
-        let plan = match rewrite_plan::RewritePlan::read(&plan_path) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!(
-                    "plan {new_ulid}: parse failed ({e}); removing {}",
-                    plan_path.display()
-                );
-                let _ = fs::remove_file(&plan_path);
-                return Ok(None);
-            }
-        };
-        if plan.new_ulid != new_ulid {
-            log::warn!(
-                "plan ulid mismatch: filename={new_ulid} plan={}; removing",
-                plan.new_ulid
-            );
-            let _ = fs::remove_file(&plan_path);
-            return Ok(None);
-        }
-        if plan.inputs().is_empty() {
-            log::warn!("plan {new_ulid} has no inputs; removing");
-            let _ = fs::remove_file(&plan_path);
-            return Ok(None);
-        }
-
-        let gc_dir = self.base_dir.join("gc");
-        let index_dir = self.base_dir.join("index");
-        Ok(Some(GcPlanApplyJob {
+        plan: rewrite_plan::RewritePlan,
+    ) -> GcPlanApplyJob {
+        GcPlanApplyJob {
             plan_path,
             new_ulid,
-            gc_dir,
-            index_dir,
+            gc_dir: self.base_dir.join("gc"),
+            index_dir: self.base_dir.join("index"),
             base_dir: self.base_dir.clone(),
             ancestor_layers: self.ancestor_layers.clone(),
             fetcher: self.fetcher.clone(),
@@ -1645,7 +1555,7 @@ impl Volume {
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             plan,
-        }))
+        }
     }
 
     /// Apply phase for a [`GcPlanApplyResult`] returned by the worker.
@@ -2491,10 +2401,10 @@ impl Volume {
         plan_path: &Path,
         new_ulid: Ulid,
     ) -> io::Result<StagedApply> {
-        let job = match self.prepare_plan_apply(plan_path.to_path_buf(), new_ulid)? {
-            Some(j) => j,
-            None => return Ok(StagedApply::Cancelled),
+        let Some(plan) = read_plan_for_apply(plan_path, new_ulid) else {
+            return Ok(StagedApply::Cancelled);
         };
+        let job = self.prepare_plan_apply(plan_path.to_path_buf(), new_ulid, plan);
         let result = crate::actor::execute_gc_plan_apply(job)?;
         self.apply_plan_apply_result(result)
     }
@@ -3550,6 +3460,102 @@ impl Volume {
 }
 
 // --- helpers ---
+
+/// Scan `<base_dir>/gc/` for plan handoff files that need processing.
+///
+/// Sweeps stale volume-owned `<ulid>.tmp` scratch files, applies bare-wins
+/// shortcuts for `.plan` + bare co-presence, and returns a list of
+/// `(plan_path, new_ulid)` pairs for the caller to dispatch to the worker.
+/// Also returns a count of handoffs that were already applied (bare wins).
+///
+/// Coordinator-owned `<ulid>.plan.tmp` scratch is left alone — the coord
+/// may be actively writing it; the coord sweeps its own stale scratch at
+/// the start of each GC pass.
+///
+/// Every decision it makes reads `gc/` alone, so it needs the directory
+/// and none of the volume's in-memory state.
+pub fn scan_plan_handoffs(base_dir: &Path) -> io::Result<(Vec<(PathBuf, Ulid)>, usize)> {
+    let gc_dir = base_dir.join("gc");
+    if !gc_dir.try_exists()? {
+        return Ok((Vec::new(), 0));
+    }
+
+    // Pass 1: sweep stale volume-owned `<ulid>.tmp` scratch files.
+    for entry in fs::read_dir(&gc_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".tmp") else {
+            continue;
+        };
+        if Ulid::from_string(stem).is_ok() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+
+    // Pass 2: collect `.plan` files.
+    let mut plans: Vec<(String, Ulid)> = fs::read_dir(&gc_dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".plan")?;
+            let ulid = Ulid::from_string(stem).ok()?;
+            Some((name, ulid))
+        })
+        .collect();
+    plans.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut to_process = Vec::new();
+    let mut already_applied = 0usize;
+    for (plan_name, new_ulid) in plans {
+        let plan_path = gc_dir.join(&plan_name);
+        let bare_path = gc_dir.join(new_ulid.to_string());
+
+        // Crash recovery: `.plan` + bare → bare wins, drop `.plan`.
+        if bare_path.try_exists()? {
+            let _ = fs::remove_file(&plan_path);
+            already_applied += 1;
+            continue;
+        }
+
+        to_process.push((plan_path, new_ulid));
+    }
+
+    Ok((to_process, already_applied))
+}
+
+/// Read and validate `<ulid>.plan`, ready for [`Volume::prepare_plan_apply`].
+///
+/// `None` means the plan is rejected up front (parse failure, ULID mismatch,
+/// empty inputs); the file is removed here and the caller treats it as a
+/// cancelled handoff.
+pub fn read_plan_for_apply(plan_path: &Path, new_ulid: Ulid) -> Option<rewrite_plan::RewritePlan> {
+    let plan = match rewrite_plan::RewritePlan::read(plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "plan {new_ulid}: parse failed ({e}); removing {}",
+                plan_path.display()
+            );
+            let _ = fs::remove_file(plan_path);
+            return None;
+        }
+    };
+    if plan.new_ulid != new_ulid {
+        log::warn!(
+            "plan ulid mismatch: filename={new_ulid} plan={}; removing",
+            plan.new_ulid
+        );
+        let _ = fs::remove_file(plan_path);
+        return None;
+    }
+    if plan.inputs().is_empty() {
+        log::warn!("plan {new_ulid} has no inputs; removing");
+        let _ = fs::remove_file(plan_path);
+        return None;
+    }
+    Some(plan)
+}
 
 /// Rebuild the lbamap from disk and compare against the live in-memory
 /// lbamap at each cancelled LBA. Logs only; never mutates volume state.

@@ -47,7 +47,7 @@ use crate::volume::{
     ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult, SharedFileCache,
     SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob, WorkerResult,
     find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
-    scan_reclaim_candidates,
+    read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,11 +202,13 @@ pub(crate) enum VolumeRequest {
 /// `VolumeClient` is dropped (channel closes) or when a `Shutdown` message
 /// is received.
 pub struct VolumeActor {
-    /// Shared via `Arc<Mutex<...>>` rather than owned exclusively so a
-    /// future PR can let the ublk transport bypass the request channel
-    /// for hot-path writes by acquiring the same lock directly. Today
-    /// the actor is still the only writer; the lock is uncontended.
+    /// Shared via `Arc<Mutex<...>>` because the ublk transport acquires the
+    /// same lock directly for hot-path writes ([`VolumeClient::write`]),
+    /// bypassing the request channel. Every handler below contends with
+    /// those writers for as long as it holds the guard.
     volume: Arc<Mutex<Volume>>,
+    /// The volume's directory, for control-plane work that reads it directly.
+    base_dir: PathBuf,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
     /// Publication counter.  Bumped under the volume mutex on every snapshot
@@ -707,7 +709,7 @@ impl VolumeActor {
             return;
         }
 
-        let (to_process, already_applied) = match self.lock_volume().scan_plan_handoffs() {
+        let (to_process, already_applied) = match scan_plan_handoffs(&self.base_dir) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(reply) = reply {
@@ -748,25 +750,20 @@ impl VolumeActor {
     /// Returns [`HandoffDispatch::Dispatched`] when a job is on the worker
     /// and the caller should retain `parked` in `self.parked.handoffs`.
     /// Returns [`HandoffDispatch::Finished`] when the batch is done — every
-    /// remaining entry was skipped (`prepare_plan_apply` returned `None`)
+    /// remaining entry was skipped (`read_plan_for_apply` returned `None`)
     /// or a fatal error fired the reply — and the caller must drop `parked`.
     ///
-    /// Skips entries whose `prepare_plan_apply` rejects them (parse failure,
+    /// Skips entries whose plan `read_plan_for_apply` rejects (parse failure,
     /// ULID mismatch, empty inputs) — those plans were already removed
-    /// inside `prepare_plan_apply`, so the batch continues with the next.
+    /// inside it, so the batch continues with the next.
     fn dispatch_next_handoff(&mut self, parked: &mut ParkedGcHandoffs) -> HandoffDispatch {
         while let Some((plan_path, new_ulid)) = parked.remaining.pop() {
-            let job = match self.lock_volume().prepare_plan_apply(plan_path, new_ulid) {
-                Ok(Some(job)) => job,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!("gc plan prepare failed for {new_ulid}: {e}");
-                    if let Some(reply) = parked.reply.take() {
-                        let _ = reply.send(Err(e));
-                    }
-                    return HandoffDispatch::Finished;
-                }
+            let Some(plan) = read_plan_for_apply(&plan_path, new_ulid) else {
+                continue;
             };
+            let job = self
+                .lock_volume()
+                .prepare_plan_apply(plan_path, new_ulid, plan);
             if let Err(e) = self.send_worker_job(WorkerJob::GcPlan(job)) {
                 warn!("gc plan dispatch failed: {e}");
                 if let Some(reply) = parked.reply.take() {
@@ -3333,6 +3330,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
 
     let actor = VolumeActor {
         volume: Arc::clone(&volume),
+        base_dir: config.base_dir.clone(),
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: Arc::clone(&flush_gen),
