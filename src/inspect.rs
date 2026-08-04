@@ -80,33 +80,43 @@ pub fn run(dir: &Path, by_id_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Local bytes not yet uploaded to S3: segment files in `pending/` plus
-/// WAL record payload (file size net of the WAL header, so an idle open
-/// WAL counts as zero).
+/// Local bytes not yet uploaded to S3, by lifecycle stage: WAL record
+/// payload (file size net of the WAL header, so an idle open WAL counts
+/// as zero), the open generation, and the upload generation.
 pub struct PendingSummary {
-    pub pending_files: usize,
-    pub pending_bytes: u64,
+    pub open_files: usize,
+    pub open_bytes: u64,
+    pub upload_files: usize,
+    pub upload_bytes: u64,
     pub wal_bytes: u64,
 }
 
 impl PendingSummary {
     pub fn total_bytes(&self) -> u64 {
-        self.pending_bytes + self.wal_bytes
+        self.open_bytes + self.upload_bytes + self.wal_bytes
     }
 }
 
 pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
-    let pending_paths = elide_core::segment::collect_pending_segment_files(vol_dir)?;
-    let pending_files = pending_paths.len();
-    let mut pending_bytes = 0u64;
-    for p in &pending_paths {
-        match fs::metadata(p) {
-            Ok(m) => pending_bytes += m.len(),
-            // A drain tick can promote (delete) the file between listing and stat.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+    let gen_dir_stats = |dir: &Path| -> io::Result<(usize, u64)> {
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        for p in &segment::collect_segment_files(dir)? {
+            match fs::metadata(p) {
+                Ok(m) => {
+                    files += 1;
+                    bytes += m.len();
+                }
+                // A drain tick can promote (delete) the file between listing and stat.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-    }
+        Ok((files, bytes))
+    };
+    let (upload_files, upload_bytes) =
+        gen_dir_stats(&elide_core::segment::pending_upload_dir(vol_dir))?;
+    let (open_files, open_bytes) = gen_dir_stats(&elide_core::segment::pending_open_dir(vol_dir))?;
     let mut wal_bytes = 0u64;
     for p in &segment::collect_segment_files(&vol_dir.join("wal"))? {
         match fs::metadata(p) {
@@ -116,8 +126,10 @@ pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
         }
     }
     Ok(PendingSummary {
-        pending_files,
-        pending_bytes,
+        open_files,
+        open_bytes,
+        upload_files,
+        upload_bytes,
         wal_bytes,
     })
 }
@@ -127,7 +139,8 @@ pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
 struct NodeInfo {
     is_live: bool,
     wal_files: Vec<WalInfo>,
-    pending: Vec<SegInfo>,
+    open: Vec<SegInfo>,
+    upload: Vec<SegInfo>,
     cache: Vec<CacheInfo>,
     extent_sources: Vec<(String, String)>,
 }
@@ -208,14 +221,16 @@ fn collect_node(dir: &Path, by_id_dir: &Path) -> io::Result<NodeInfo> {
     let is_live = dir.join("wal").is_dir();
 
     let wal_files = collect_wal_dir(&dir.join("wal"))?;
-    let pending = collect_seg_dir(&elide_core::segment::pending_open_dir(dir))?;
+    let open = collect_seg_dir(&elide_core::segment::pending_open_dir(dir))?;
+    let upload = collect_seg_dir(&elide_core::segment::pending_upload_dir(dir))?;
     let cache = collect_cache_dir(dir)?;
     let extent_sources = collect_extent_sources(dir, by_id_dir);
 
     Ok(NodeInfo {
         is_live,
         wal_files,
-        pending,
+        open,
+        upload,
         cache,
         extent_sources,
     })
@@ -354,44 +369,53 @@ fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
             );
         }
     }
-    let journal_segs = t.journal_segs_committed + t.journal_segs_pending;
-    let data_segs = t.data_segs_committed + t.data_segs_pending;
+    let journal_segs_pending = t.journal_segs_open + t.journal_segs_upload;
+    let data_segs_pending = t.data_segs_open + t.data_segs_upload;
+    let journal_segs = t.journal_segs_committed + journal_segs_pending;
+    let data_segs = t.data_segs_committed + data_segs_pending;
     if journal_window_blocks > 0 && journal_segs + data_segs > 0 {
         println!(
-            "  journal: {} seg{}, {} blocks / {} window   ({} committed, {} pending)",
+            "  journal: {} seg{}, {} blocks / {} window   ({} committed, {} upload, {} open)",
             fmt_commas(journal_segs as u64),
             if journal_segs == 1 { "" } else { "s" },
             fmt_commas(t.journal_blocks_committed + t.journal_blocks_pending),
             fmt_commas(journal_window_blocks),
             fmt_commas(t.journal_segs_committed as u64),
-            fmt_commas(t.journal_segs_pending as u64),
+            fmt_commas(t.journal_segs_upload as u64),
+            fmt_commas(t.journal_segs_open as u64),
         );
         println!(
-            "  data:    {} seg{}   ({} committed, {} pending)",
+            "  data:    {} seg{}   ({} committed, {} upload, {} open)",
             fmt_commas(data_segs as u64),
             if data_segs == 1 { "" } else { "s" },
             fmt_commas(t.data_segs_committed as u64),
-            fmt_commas(t.data_segs_pending as u64),
+            fmt_commas(t.data_segs_upload as u64),
+            fmt_commas(t.data_segs_open as u64),
         );
     }
-    if t.wal_files > 0 || t.seg_entries > 0 {
+    if t.wal_files > 0 || p.total_bytes() > 0 {
         println!(
-            "  wal:     {} record{} across {} file{}, {} pending entries ({} stored)",
+            "  upload:  {} segment{}, {} entr{} ({})",
+            p.upload_files,
+            if p.upload_files == 1 { "" } else { "s" },
+            fmt_commas(t.upload_entries as u64),
+            if t.upload_entries == 1 { "y" } else { "ies" },
+            fmt_size(p.upload_bytes),
+        );
+        println!(
+            "  open:    {} segment{}, {} entr{} ({})",
+            p.open_files,
+            if p.open_files == 1 { "" } else { "s" },
+            fmt_commas(t.open_entries as u64),
+            if t.open_entries == 1 { "y" } else { "ies" },
+            fmt_size(p.open_bytes),
+        );
+        println!(
+            "  wal:     {} record{} across {} file{} ({} payload)",
             t.wal_records,
             if t.wal_records == 1 { "" } else { "s" },
             t.wal_files,
             if t.wal_files == 1 { "" } else { "s" },
-            fmt_commas(t.seg_entries as u64),
-            fmt_size(t.body_bytes),
-        );
-    }
-    if p.total_bytes() > 0 {
-        println!(
-            "  not in S3: {} ({} pending segment{} {}, wal {})",
-            fmt_size(p.total_bytes()),
-            p.pending_files,
-            if p.pending_files == 1 { "" } else { "s" },
-            fmt_size(p.pending_bytes),
             fmt_size(p.wal_bytes),
         );
     }
@@ -695,8 +719,6 @@ fn collect_cache_file(cache_dir: &Path, ulid: &str, idx_path: &Path) -> io::Resu
 
 #[derive(Default)]
 struct Totals {
-    seg_entries: usize,
-    body_bytes: u64,
     wal_files: usize,
     wal_records: usize,
     cache_files: usize,
@@ -723,9 +745,13 @@ struct Totals {
     journal_segs_committed: usize,
     journal_blocks_committed: u64,
     data_segs_committed: usize,
-    journal_segs_pending: usize,
+    journal_segs_open: usize,
+    journal_segs_upload: usize,
     journal_blocks_pending: u64,
-    data_segs_pending: usize,
+    data_segs_open: usize,
+    data_segs_upload: usize,
+    open_entries: usize,
+    upload_entries: usize,
 }
 
 fn totals(node: &NodeInfo, ancestors: &[AncestorNode]) -> Totals {
@@ -742,13 +768,21 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
         t.wal_files += 1;
         t.wal_records += w.record_count;
     }
-    for s in node.pending.iter() {
-        t.seg_entries += s.entry_count;
-        t.body_bytes += s.body_bytes;
+    for s in node.upload.iter() {
+        t.upload_entries += s.entry_count;
         if s.is_journal {
-            t.journal_segs_pending += 1;
+            t.journal_segs_upload += 1;
         } else {
-            t.data_segs_pending += 1;
+            t.data_segs_upload += 1;
+        }
+        t.journal_blocks_pending += s.journal_blocks;
+    }
+    for s in node.open.iter() {
+        t.open_entries += s.entry_count;
+        if s.is_journal {
+            t.journal_segs_open += 1;
+        } else {
+            t.data_segs_open += 1;
         }
         t.journal_blocks_pending += s.journal_blocks;
     }
@@ -790,10 +824,25 @@ fn print_node(node: &NodeInfo, latest_snap: Option<&str>) {
     let state = if node.is_live { "writable" } else { "readonly" };
     println!("[{state} root]");
 
+    // Sections follow the data lifecycle oldest to newest: committed
+    // index/, then the upload and open generations, then the WAL.
     let prefix = "  ";
-    print_wal_section(&node.wal_files, prefix, node.is_live, latest_snap);
-    print_seg_section("pending", &node.pending, prefix, node.is_live, latest_snap);
     print_cache_section(&node.cache, prefix, latest_snap, true);
+    print_seg_section(
+        "pending/upload",
+        &node.upload,
+        prefix,
+        node.is_live,
+        latest_snap,
+    );
+    print_seg_section(
+        "pending/open",
+        &node.open,
+        prefix,
+        node.is_live,
+        latest_snap,
+    );
+    print_wal_section(&node.wal_files, prefix, node.is_live, latest_snap);
     print_extent_sources(&node.extent_sources, prefix);
 }
 
@@ -1137,11 +1186,20 @@ mod tests {
         )
         .unwrap();
 
+        fs::create_dir_all(elide_core::segment::pending_upload_dir(&tmp)).unwrap();
+        fs::write(
+            elide_core::segment::pending_upload_dir(&tmp).join("01AAAAAAAAAAAAAAAAAAAAAAAC"),
+            [0u8; 40],
+        )
+        .unwrap();
+
         let p = pending_summary(&tmp).unwrap();
-        assert_eq!(p.pending_files, 1);
-        assert_eq!(p.pending_bytes, 100);
+        assert_eq!(p.open_files, 1);
+        assert_eq!(p.open_bytes, 100);
+        assert_eq!(p.upload_files, 1);
+        assert_eq!(p.upload_bytes, 40);
         assert_eq!(p.wal_bytes, 50);
-        assert_eq!(p.total_bytes(), 150);
+        assert_eq!(p.total_bytes(), 190);
 
         fs::remove_dir_all(tmp).unwrap();
     }
