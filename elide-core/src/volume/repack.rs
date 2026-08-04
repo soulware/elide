@@ -302,7 +302,9 @@ impl Volume {
         // reads route through the delta, so its base extent must refuse a
         // bucket that drops it.
         let mut live_hashes = self.lbamap.claim_referenced_hashes();
-        let delta_sources = self.extent_index.delta_source_closure(&live_hashes);
+        let delta_sources = self
+            .extent_index
+            .delta_source_closure(|h| live_hashes.contains(h));
         live_hashes.extend(delta_sources);
 
         for bucket in &buckets {

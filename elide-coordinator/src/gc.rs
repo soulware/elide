@@ -382,7 +382,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // segment) attaches no sources, yet reads route through the delta.
     // The closure keeps those base extents out of the drop set.
     let mut live_hashes = lbamap.claim_referenced_hashes();
-    let delta_sources = index.delta_source_closure(&live_hashes);
+    let delta_sources = index.delta_source_closure(|h| live_hashes.contains(h));
     live_hashes.extend(delta_sources);
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 

@@ -2676,7 +2676,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // maps, yet reads route through the delta, so the classifier must
     // count the delta's base extent live.
     let mut live_hashes = lbamap_snapshot.claim_referenced_hashes();
-    let delta_sources = extent_index_snapshot.delta_source_closure(&live_hashes);
+    let delta_sources = extent_index_snapshot.delta_source_closure(|h| live_hashes.contains(h));
     live_hashes.extend(delta_sources);
     let index_dir = base_dir.join("index");
     let cache_dir = base_dir.join("cache");
@@ -3203,7 +3203,7 @@ pub(crate) fn live_index_segments(
     // so its `source_hash` body must count as live even when no LBA
     // references the source directly.
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
-    let delta_sources = extent_index.delta_source_closure(&live_hashes);
+    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
     live_hashes.extend(delta_sources);
 
     // Pass 2: apply predicate.
@@ -3557,6 +3557,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     // segment's delta body section at write time.
     let mut delta_body: Vec<u8> = Vec::new();
 
+    // Sources already pinned by a live delta canonical: the "H will
+    // stick around" signal the delta-emission decision below consults.
+    let delta_source_pins = job
+        .extent_index_snapshot
+        .delta_source_closure(|h| job.lbamap_snapshot.claim_refcount(h) > 0);
+
     for er in &job.entries {
         if er.hash == crate::volume::ZERO_HASH {
             continue;
@@ -3659,12 +3665,12 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 //    (segment_id <= snapshot_floor_ulid). Snapshot-
                 //    referenced segments cannot be rewritten or dropped
                 //    for the lifetime of the snapshot — a much stickier
-                //    pin than delta-source refcount, which dynamically
-                //    tracks live Delta LBAs.
-                // 2. H is already serving as a delta source for some
-                //    other live entry (delta_source_refcount > 0).
-                //    `claim_referenced_hashes` keeps H alive as long as
-                //    any such Delta remains on the volume.
+                //    pin than a delta-source pin, which lasts only while
+                //    some delta canonical stays live.
+                // 2. H is already serving as a delta source for a live
+                //    delta canonical (`delta_source_pins`). The liveness
+                //    closure keeps H alive as long as any such Delta
+                //    remains on the volume.
                 //
                 // If neither holds, H would be orphaned by this reclaim
                 // and GC would drop its body on the next pass; pinning
@@ -3683,8 +3689,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     (Some(floor), Some(loc)) => loc.segment_id <= floor,
                     _ => false,
                 };
-                let source_pinned =
-                    pre_snapshot_h || job.lbamap_snapshot.delta_source_refcount(&er.hash) > 0;
+                let source_pinned = pre_snapshot_h || delta_source_pins.contains(&er.hash);
                 if source_pinned {
                     let delta_blob = zstd::bulk::Compressor::with_dictionary(
                         crate::delta_compute::ZSTD_LEVEL,

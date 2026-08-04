@@ -123,7 +123,7 @@ fn assert_manifest_filter_correct(
     // Pass 1: live_hashes = claim-referenced ∪ the delta-source closure,
     // mirroring `live_index_segments`.
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
-    let delta_sources = extent_index.delta_source_closure(&live_hashes);
+    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
     live_hashes.extend(delta_sources);
 
     // Pass 2: apply predicate and cross-check against the manifest.

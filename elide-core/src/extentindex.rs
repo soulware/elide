@@ -616,7 +616,7 @@ impl ExtentIndex {
         self.deltas.get(hash)
     }
 
-    /// Source hashes the delta-encoded canonical forms of `hashes`
+    /// Source hashes the delta-encoded canonical forms of live hashes
     /// decompress against. This is the closure step of the liveness
     /// computation: a claim can reference a delta-canonical hash through
     /// any entry kind (a DedupRef most commonly), so the claim set alone
@@ -624,27 +624,41 @@ impl ExtentIndex {
     /// kept delta loses its base extent and the LBA reads
     /// "no source option resolved in extent index".
     ///
-    /// One hop suffices: formation refuses delta-backed sources
-    /// (`read_source_plaintext` resolves through the DATA map only), so a
-    /// source is always plain-Data-canonical. The debug_assert pins that
-    /// assumption where the closure relies on it.
+    /// Iterates the deltas map — far smaller than the claim set — and
+    /// keeps the sources of every delta-canonical hash `is_live` accepts,
+    /// so the cost scales with the number of delta canonicals rather than
+    /// the volume's extent count.
     ///
-    /// Conservative for a hash that also resolves as plain DATA: its
-    /// delta form's sources are still included, keeping the set safe
-    /// under either resolution order.
-    pub fn delta_source_closure(&self, hashes: &HashSet<blake3::Hash>) -> HashSet<blake3::Hash> {
+    /// Transitive: a source hash can carry a delta registration alongside
+    /// its DATA location (registration is per-map, and folds carry delta
+    /// canonicals whose hash's DATA form survives elsewhere), so each
+    /// newly-live source is followed through its own delta options too.
+    /// Reads resolve sources through the DATA map only, so the extra hop
+    /// is a conservative over-keep; the visited set bounds the walk.
+    pub fn delta_source_closure(
+        &self,
+        is_live: impl Fn(&blake3::Hash) -> bool,
+    ) -> HashSet<blake3::Hash> {
         let mut out = HashSet::new();
-        for hash in hashes {
-            let Some(loc) = self.deltas.get(hash) else {
+        let mut frontier: Vec<blake3::Hash> = Vec::new();
+        for (hash, loc) in self.deltas.iter() {
+            if !is_live(hash) {
+                continue;
+            }
+            for opt in &loc.options {
+                if out.insert(opt.source_hash) {
+                    frontier.push(opt.source_hash);
+                }
+            }
+        }
+        while let Some(hash) = frontier.pop() {
+            let Some(loc) = self.deltas.get(&hash) else {
                 continue;
             };
             for opt in &loc.options {
-                debug_assert!(
-                    self.deltas.get(&opt.source_hash).is_none(),
-                    "delta source {} is itself delta-canonical; formation excludes delta chains",
-                    opt.source_hash.to_hex()
-                );
-                out.insert(opt.source_hash);
+                if out.insert(opt.source_hash) {
+                    frontier.push(opt.source_hash);
+                }
             }
         }
         out
