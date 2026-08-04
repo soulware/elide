@@ -371,6 +371,24 @@ enum SimOp {
     /// SameContentWrite (32..40), WriteMulti (40..52), and
     /// ReadUnwritten (64).
     WriteNearDup { lba: u8, base_seed: u8, tweak: u8 },
+    /// Write the same-epoch rewrite cycle A′ → B → A′ at one LBA: a
+    /// near-duplicate block, a second block with a different tweak, then
+    /// the first block's exact bytes again — all in one WAL epoch. The
+    /// closing write dedups against the epoch's own first record, so the
+    /// next flush mints a segment whose Delta entry (from the first
+    /// record) is superseded at its own LBA by a closing DedupRef. The
+    /// promote apply must leave that DedupRef claim without the Delta's
+    /// source list — attaching it pins a phantom `delta_source_counts`
+    /// refcount no rebuild reproduces, which vetoes every GC plan that
+    /// drops the source (the pg14 livelock, PR #853). The
+    /// `volume-invariants` drift check compares per-LBA source lists
+    /// against the disk rebuild at every flush, so this op arms it.
+    ///
+    /// Shares the WriteNearDup zone (52..56) and `(lba, base_seed)`
+    /// space, so a draw whose base content already sits sealed under a
+    /// snapshot (e.g. after `delta_gc_prefix`) delta-converts its first
+    /// record at flush.
+    DeltaCycleWrite { lba: u8, base_seed: u8, tweak: u8 },
     /// Seal a snapshot manifest over the current `index/` set: pick
     /// the max ULID in `index/` (or a fresh one if empty) and call
     /// `vol.sign_snapshot_manifest`. Writes `snapshots/<ulid>.manifest`
@@ -491,6 +509,13 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             lba,
             base_seed,
             tweak,
+        }),
+        (0u8..4, 0u8..4, any::<u8>()).prop_map(|(lba, base_seed, tweak)| {
+            SimOp::DeltaCycleWrite {
+                lba,
+                base_seed,
+                tweak,
+            }
         }),
         (0u8..8, 2u8..=4, any::<u8>()).prop_map(|(start_lba, lba_count, seed)| {
             SimOp::WriteMulti {
@@ -750,6 +775,32 @@ fn delta_gc_prefix() -> Vec<SimOp> {
     ]
 }
 
+/// A sealed base plus the same-epoch A′ → B → A′ cycle flushed on top:
+/// the flushed segment carries a Delta superseded at its own LBA by a
+/// closing DedupRef, so every run through this prefix drives the
+/// promote apply's source-attachment guards (#853) with the
+/// `volume-invariants` per-LBA source-list drift check hot. The random
+/// suffix then explores GC, crash, and rebuild over the cycle's claim.
+fn delta_cycle_prefix() -> Vec<SimOp> {
+    vec![
+        SimOp::WriteNearDup {
+            lba: 0,
+            base_seed: 0,
+            tweak: 0x01,
+        },
+        SimOp::Flush,
+        SimOp::DrainWithRedact,
+        SimOp::Snapshot,
+        SimOp::SignSnapshot,
+        SimOp::DeltaCycleWrite {
+            lba: 0,
+            base_seed: 0,
+            tweak: 0x02,
+        },
+        SimOp::Flush,
+    ]
+}
+
 fn with_prefix(prefix: Vec<SimOp>, ops: Vec<SimOp>) -> Vec<SimOp> {
     let mut v = prefix;
     v.extend(ops);
@@ -778,6 +829,10 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
         // Live Delta entry in pending: the suffix explores GC folds and
         // reads over it without a reopen.
         arb_sim_ops().prop_map(|ops| with_prefix(delta_gc_prefix(), ops)),
+        // Same-epoch A′→B→A′ cycle flushed: a Delta superseded by its
+        // own segment's closing DedupRef, arming the source-attachment
+        // guards and the per-LBA source-list drift check.
+        arb_sim_ops().prop_map(|ops| with_prefix(delta_cycle_prefix(), ops)),
     ]
 }
 
@@ -1103,6 +1158,18 @@ proptest! {
                 } => {
                     let data = common::variant_block(*base_seed, *tweak);
                     let _ = vol.write(52 + *lba as u64, &data);
+                }
+                SimOp::DeltaCycleWrite {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let a_prime = common::variant_block(*base_seed, *tweak);
+                    let mid = common::variant_block(*base_seed, tweak.wrapping_add(1));
+                    let actual_lba = 52 + *lba as u64;
+                    let _ = vol.write(actual_lba, &a_prime);
+                    let _ = vol.write(actual_lba, &mid);
+                    let _ = vol.write(actual_lba, &a_prime);
                 }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
@@ -1515,6 +1582,21 @@ proptest! {
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
                 }
+                SimOp::DeltaCycleWrite {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let a_prime = common::variant_block(*base_seed, *tweak);
+                    let mid = common::variant_block(*base_seed, tweak.wrapping_add(1));
+                    let actual_lba = 52 + *lba as u64;
+                    let _ = vol.write(actual_lba, &a_prime);
+                    let _ = vol.write(actual_lba, &mid);
+                    let _ = vol.write(actual_lba, &a_prime);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&a_prime);
+                    oracle.insert(actual_lba, block);
+                }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
                     let actual_lba = 32 + *lba as u64;
@@ -1880,6 +1962,21 @@ proptest! {
                     block.copy_from_slice(&data);
                     oracle.insert(actual_lba, block);
                 }
+                SimOp::DeltaCycleWrite {
+                    lba,
+                    base_seed,
+                    tweak,
+                } => {
+                    let a_prime = common::variant_block(*base_seed, *tweak);
+                    let mid = common::variant_block(*base_seed, tweak.wrapping_add(1));
+                    let actual_lba = 52 + *lba as u64;
+                    let _ = vol.write(actual_lba, &a_prime);
+                    let _ = vol.write(actual_lba, &mid);
+                    let _ = vol.write(actual_lba, &a_prime);
+                    let mut block = [0u8; 4096];
+                    block.copy_from_slice(&a_prime);
+                    oracle.insert(actual_lba, block);
+                }
                 SimOp::SameContentWrite { lba, seed } => {
                     let data = [*seed; 4096];
                     let actual_lba = 32 + *lba as u64;
@@ -2122,4 +2219,164 @@ fn delta_gc_prefix_mints_a_delta_entry() {
         expected.as_slice(),
         "delta LBA must read back the post-conversion bytes"
     );
+}
+
+/// Pins the segment shape `delta_cycle_prefix` exists to produce: the
+/// A′ → B → A′ epoch flushes to a segment whose entries at the LBA
+/// include a Delta (the first record, converted against the sealed
+/// base) and close with a DedupRef (the third record, deduped against
+/// the first). The promote apply must leave the DedupRef claim without
+/// the Delta's source list — under `--features volume-invariants` the
+/// flush inside this test also runs the per-LBA source-list drift
+/// check, which is what catches an attach to the wrong claim (#853).
+#[test]
+fn delta_cycle_prefix_mints_a_superseded_delta() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(52, &common::variant_block(0, 0x01)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    let a_prime = common::variant_block(0, 0x02);
+    vol.write(52, &a_prime).unwrap();
+    vol.write(52, &common::variant_block(0, 0x03)).unwrap();
+    vol.write(52, &a_prime).unwrap();
+    vol.flush_wal().unwrap();
+
+    let vk =
+        elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+            .unwrap();
+    let at_52: Vec<elide_core::segment::EntryKind> =
+        std::fs::read_dir(elide_core::segment::pending_open_dir(fork_dir))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_none())
+            .filter_map(|p| elide_core::segment::read_and_verify_segment_index(&p, &vk).ok())
+            .flat_map(|(_, entries, _)| entries)
+            .filter(|e| e.start_lba == 52)
+            .map(|e| e.kind)
+            .collect();
+    assert!(
+        at_52.contains(&elide_core::segment::EntryKind::Delta),
+        "cycle's first record must delta-convert, got {at_52:?}"
+    );
+    assert_eq!(
+        at_52.last(),
+        Some(&elide_core::segment::EntryKind::DedupRef),
+        "cycle must close with a DedupRef at the LBA, got {at_52:?}"
+    );
+
+    assert_eq!(
+        vol.read(52, 1).unwrap().as_slice(),
+        a_prime.as_slice(),
+        "cycle LBA must read back the closing write's bytes"
+    );
+}
+
+/// A GC fold over the flushed cycle segment emits both the kept Delta
+/// and the closing DedupRef at the same LBA under the output's single
+/// ULID. The in-memory apply must let the later entry override the
+/// earlier one exactly as the rebuild's write-order rule does —
+/// `Blocking::Consuming` admits the apply's own claimant for this. With
+/// `--features volume-invariants` the apply runs the per-LBA source-list
+/// drift check, which is what caught the admission mismatch stranding
+/// the Delta's sources on the DedupRef claim.
+#[test]
+fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir_owned = dir.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir_owned).unwrap();
+    let fork_dir = fork_dir_owned.as_path();
+    common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(52, &common::variant_block(0, 0x01)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    let a_prime = common::variant_block(0, 0x02);
+    vol.write(52, &a_prime).unwrap();
+    vol.write(52, &common::variant_block(0, 0x03)).unwrap();
+    vol.write(52, &a_prime).unwrap();
+    vol.flush_wal().unwrap();
+
+    common::drain_with_repack(&mut vol);
+    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let to_delete =
+        if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
+            paths
+        } else {
+            vec![]
+        };
+    let applied = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(applied, 1, "the fold over the cycle segment must apply");
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// OPEN BUG, discovered by the per-LBA source-list oracle: the claim the
+/// cycle leaves at the LBA registers as a DedupRef, so the rebuilt
+/// lbamap attaches no delta sources to it — yet the claimed hash still
+/// resolves through the kept Delta's canonical form, which decompresses
+/// against the base extent. Delta-source liveness is keyed to claims
+/// registered *as* Delta entries, so the fold sees the base extent as
+/// dead and drops it, and every read of the LBA (live and post-crash)
+/// fails with "no source option resolved in extent index". The pre-#853
+/// phantom refcount was the only thing vetoing this fold — as a livelock
+/// rather than a correctness mechanism.
+#[test]
+#[ignore = "delta-source liveness misses DedupRef claims of delta-canonical hashes; fix pending design discussion"]
+fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir_owned = dir.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir_owned).unwrap();
+    let fork_dir = fork_dir_owned.as_path();
+    common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    vol.write(52, &common::variant_block(0, 0x01)).unwrap();
+    vol.flush_wal().unwrap();
+    common::drain_with_repack(&mut vol);
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    let a_prime = common::variant_block(0, 0x02);
+    vol.write(52, &a_prime).unwrap();
+    vol.write(52, &common::variant_block(0, 0x03)).unwrap();
+    vol.write(52, &a_prime).unwrap();
+    vol.flush_wal().unwrap();
+
+    common::drain_with_repack(&mut vol);
+    let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let to_delete =
+        if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
+            paths
+        } else {
+            vec![]
+        };
+    let applied = vol.apply_gc_handoffs().unwrap();
+    assert_eq!(applied, 1);
+    for path in &to_delete {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let live = vol.read(52, 1).expect("live read after the fold");
+    assert_eq!(live.as_slice(), a_prime.as_slice());
+
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let rebuilt = vol.read(52, 1).expect("read after crash rebuild");
+    assert_eq!(rebuilt.as_slice(), a_prime.as_slice());
 }
