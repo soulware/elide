@@ -954,6 +954,37 @@ impl LbaMap {
         );
     }
 
+    /// Recompute `delta_source_counts` from `delta_sources_by_lba`, the
+    /// definition the maintained map has to match. Oracle for
+    /// [`Self::debug_assert_delta_source_counts`].
+    fn recount_delta_sources(&self) -> ImHashMap<blake3::Hash, u32> {
+        let mut out: ImHashMap<blake3::Hash, u32> = ImHashMap::new();
+        for srcs in self.delta_sources_by_lba.values() {
+            for h in srcs.iter() {
+                *out.entry(*h).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
+    /// Assert the incrementally maintained `delta_source_counts` equals a
+    /// fresh recount, and that every `delta_sources_by_lba` key has a live
+    /// entry in `inner`. Compiled out of release builds; call it after
+    /// mutations in tests and at apply boundaries.
+    pub fn debug_assert_delta_source_counts(&self) {
+        debug_assert_eq!(
+            self.delta_source_counts,
+            self.recount_delta_sources(),
+            "delta_source_counts diverged from a recount over delta_sources_by_lba"
+        );
+        debug_assert!(
+            self.delta_sources_by_lba
+                .keys()
+                .all(|k| self.inner.contains_key(k)),
+            "delta_sources_by_lba key without a live inner entry"
+        );
+    }
+
     /// Iterate every entry in the map as
     /// `(start_lba, lba_length, hash, payload_block_offset)`, sorted by
     /// `start_lba`. Used by the extent-reclamation candidate scanner to
@@ -1018,6 +1049,20 @@ impl LbaMap {
     /// [`lba_referenced_hashes`].
     pub fn delta_source_refcount(&self, target: &blake3::Hash) -> u32 {
         self.delta_source_counts.get(target).copied().unwrap_or(0)
+    }
+
+    /// The Delta source list attached to the entry starting exactly at
+    /// `start_lba`, if any. Used by the volume-invariants drift check to
+    /// compare live source attachment against a from-disk rebuild.
+    pub fn delta_sources_at(&self, start_lba: u64) -> Option<&[blake3::Hash]> {
+        self.delta_sources_by_lba.get(&start_lba).map(|a| &**a)
+    }
+
+    /// Every start LBA carrying a Delta source list, ascending. Lets the
+    /// drift check enumerate attachment sites on both maps without
+    /// assuming either satisfies the key-corresponds-to-entry invariant.
+    pub fn delta_source_lbas(&self) -> impl Iterator<Item = u64> + '_ {
+        self.delta_sources_by_lba.keys().copied()
     }
 
     /// How many LBA entries claim `target`. Returns 0 when no LBA does,
@@ -2209,5 +2254,48 @@ mod tests {
         );
         assert!(map.lba_referenced_hashes().contains(&h(7)));
         map.debug_assert_claim_counts();
+    }
+
+    #[test]
+    fn delta_sources_at_reports_the_attached_list_per_surviving_fragment() {
+        let mut map = LbaMap::new();
+        map.insert_delta(0, 10, h(1), u(1), vec![h(7), h(8)].into());
+        assert_eq!(map.delta_sources_at(0), Some(&[h(7), h(8)][..]));
+        assert_eq!(map.delta_sources_at(5), None, "exact-key lookup only");
+
+        // Hole punch: both fragments carry the list, refcounts double.
+        map.insert(3, 1, h(2), u(2));
+        assert_eq!(map.delta_sources_at(0), Some(&[h(7), h(8)][..]));
+        assert_eq!(map.delta_sources_at(4), Some(&[h(7), h(8)][..]));
+        assert_eq!(map.delta_sources_at(3), None, "the punch is not a delta");
+        assert_eq!(map.delta_source_refcount(&h(7)), 2);
+        assert_eq!(
+            map.delta_source_lbas().collect::<Vec<_>>(),
+            vec![0, 4],
+            "attachment sites enumerate ascending"
+        );
+        map.debug_assert_delta_source_counts();
+    }
+
+    #[test]
+    fn delta_source_counts_survive_a_churn_sequence() {
+        // The oracle is the recount over `delta_sources_by_lba`; the churn
+        // drives trims, splits and displacements of delta entries into it.
+        let mut map = LbaMap::new();
+        let mut claimant = 0u8;
+        for step in 0..40u64 {
+            claimant += 1;
+            let start = (step * 7) % 23;
+            let len = 1 + (step % 5) as u32;
+            if step % 3 == 0 {
+                let sources: Arc<[blake3::Hash]> =
+                    vec![h(200 + (step % 4) as u8), h(210 + (step % 3) as u8)].into();
+                map.insert_delta(start, len, h((step % 6) as u8), u(claimant), sources);
+            } else {
+                map.insert(start, len, h((step % 6) as u8), u(claimant));
+            }
+            map.debug_assert_delta_source_counts();
+            map.debug_assert_claim_counts();
+        }
     }
 }

@@ -1920,7 +1920,13 @@ impl Volume {
     /// volume open) so any drift trips at the introducing site, not three
     /// operations later as a stale-cancel or oracle mismatch.
     ///
-    /// Panics on any difference from the rebuild, in content or claimant.
+    /// Panics on any difference from the rebuild, in content, claimant, or
+    /// attached Delta source list. The source-list comparison is what
+    /// catches a phantom `delta_source_counts` refcount — sources attached
+    /// to a claim whose on-disk form carries none survive every internal
+    /// recount (the maps stay mutually consistent) and only show up
+    /// against the rebuild; left undetected, the phantom vetoes every GC
+    /// plan that drops the source (the pg14 stale-cancel livelock).
     /// Apply installs claims by the rebuild's highest-ULID-wins rule (a
     /// same-hash lower-ULID claim is adopted, not preserved — see
     /// `LbaMap::insert_consuming_inputs`), so the two agree by
@@ -1940,6 +1946,8 @@ impl Volume {
     /// by sorting drain loops by ULID ascending.
     #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+        self.lbamap.debug_assert_claim_counts();
+        self.lbamap.debug_assert_delta_source_counts();
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -2006,6 +2014,8 @@ impl Volume {
             disk_hash: Option<blake3::Hash>,
             mem_claimant: Option<Ulid>,
             disk_claimant: Option<Ulid>,
+            mem_sources: Option<Vec<blake3::Hash>>,
+            disk_sources: Option<Vec<blake3::Hash>>,
         }
         let mut diverging: Vec<Diverge> = Vec::new();
         let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -2015,18 +2025,25 @@ impl Volume {
         for (lba, _, _, _) in fresh.iter_entries() {
             all_lbas.insert(lba);
         }
+        all_lbas.extend(self.lbamap.delta_source_lbas());
+        all_lbas.extend(fresh.delta_source_lbas());
         for lba in all_lbas {
             let mem_hash = self.lbamap.hash_at(lba);
             let disk_hash = fresh.hash_at(lba);
             let mem_claimant = self.lbamap.claimant_at(lba);
             let disk_claimant = fresh.claimant_at(lba);
-            if mem_hash != disk_hash || mem_claimant != disk_claimant {
+            let mem_sources = self.lbamap.delta_sources_at(lba);
+            let disk_sources = fresh.delta_sources_at(lba);
+            if mem_hash != disk_hash || mem_claimant != disk_claimant || mem_sources != disk_sources
+            {
                 diverging.push(Diverge {
                     lba,
                     mem_hash,
                     disk_hash,
                     mem_claimant,
                     disk_claimant,
+                    mem_sources: mem_sources.map(|s| s.to_vec()),
+                    disk_sources: disk_sources.map(|s| s.to_vec()),
                 });
                 if diverging.len() >= 8 {
                     break;
@@ -2036,17 +2053,30 @@ impl Volume {
         if !diverging.is_empty() {
             let mut msg = format!(
                 "lbamap drift after [{caller}]: {} LBA(s) diverge from the disk rebuild \
-                 on content or claimant",
+                 on content, claimant, or delta sources",
                 diverging.len()
             );
+            let fmt_sources = |s: &Option<Vec<blake3::Hash>>| match s {
+                Some(list) => format!(
+                    "[{}]",
+                    list.iter()
+                        .map(|h| h.to_hex()[..12].to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                None => "none".to_string(),
+            };
             for d in &diverging {
                 msg.push_str(&format!(
-                    "\n  lba={} in_memory=({:?}, {:?}) disk_rebuild=({:?}, {:?})",
+                    "\n  lba={} in_memory=({:?}, {:?}, sources={}) \
+                     disk_rebuild=({:?}, {:?}, sources={})",
                     d.lba,
                     d.mem_hash.map(|h| h.to_hex().to_string()),
                     d.mem_claimant.map(|u| u.to_string()),
+                    fmt_sources(&d.mem_sources),
                     d.disk_hash.map(|h| h.to_hex().to_string()),
                     d.disk_claimant.map(|u| u.to_string()),
+                    fmt_sources(&d.disk_sources),
                 ));
             }
             panic!("{msg}");
@@ -3480,6 +3510,7 @@ impl Volume {
             );
         }
         self.evict_cached_segment(result.old_wal_ulid);
+        self.assert_volume_invariants("apply_promote");
         Ok(())
     }
 
