@@ -593,8 +593,8 @@ fn pack_stable(
         items.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
 
         let candidates = items.len();
-        let bytes_freed: u64 = items.iter().map(|s| s.reclaimable_stored_bytes()).sum();
-        let live_bytes: u64 = items.iter().map(|s| s.retained_stored_bytes).sum();
+        let reclaimable: u64 = items.iter().map(|s| s.reclaimable_stored_bytes()).sum();
+        let retained: u64 = items.iter().map(|s| s.retained_stored_bytes).sum();
         let materialised: u64 = items.iter().map(|s| s.materialised_bytes).sum();
         let live_entries: usize = items.iter().map(|s| s.live_entries.len()).sum();
         let removed_hashes: usize = items.iter().map(|s| s.removed_hashes.len()).sum();
@@ -604,8 +604,8 @@ fn pack_stable(
             .count();
         let input_ulids: Vec<&str> = items.iter().map(|s| s.ulid_str.as_str()).collect();
         tracing::info!(
-            "[gc] bucket: [{}] inputs={candidates} live_lba={live_bytes} \
-             dead_lba={bytes_freed} materialised={materialised} \
+            "[gc] bucket: [{}] inputs={candidates} retained={retained} \
+             reclaimable={reclaimable} materialised={materialised} \
              live_entries={live_entries} removed_hashes={removed_hashes} \
              dead_folded={dead_cleaned}",
             input_ulids.join(", "),
@@ -614,7 +614,7 @@ fn pack_stable(
         packed_out.push(PackedBucket {
             bucket: items,
             candidates,
-            bytes_freed,
+            bytes_freed: reclaimable,
             dead_cleaned,
         });
     }
