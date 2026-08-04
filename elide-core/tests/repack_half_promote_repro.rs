@@ -1,27 +1,17 @@
-// Deterministic repro for a proptest-surfaced repack + half-promote
-// crash-recovery bug. Discovered on PR #114 (docs-only), so a pre-existing
-// bug that the newly-wired proptest CI first caught.
-//
-// Seed 13787da3531f26212fbb49a9e6aa6b8beec92f9b6daaa302a319dd7a20245531
-// (crash_recovery_oracle) minimised to:
+// Deterministic materialisation of crash_recovery_oracle seed
+// 13787da3531f26212fbb49a9e6aa6b8beec92f9b6daaa302a319dd7a20245531,
+// minimised to:
 //
 //   WriteLarge { lba: 4, seed: 0 }     // LBA 28 <- incompressible_block(0)
 //   WriteLarge { lba: 4, seed: 1 }     // LBA 28 <- incompressible_block(1) (overwrites)
 //   PopulateFetched { lba: 0, seed: 0 } // writes index/<u_gc>.idx + cache/<u_gc>.body for LBA 16
 //   HalfPromotePending                  // writes index/<u_flush>.idx + cache/<u_flush>.body+present
-//                                       //   against the *pre-repack* pending body
-//   Repack                              // rewrites pending/<u_flush> in place,
-//                                       //   dropping the dead hash_0 entry
+//   Repack
 //   Crash
 //
-// Suspected interaction: half-promote wrote sibling index+cache files for
-// `<u_flush>` based on the pre-repack body. Repack then rewrote the pending
-// segment in place without invalidating those sibling files. On crash
-// rebuild some LBA reads back wrong bytes.
-//
-// Marked `#[ignore]` so CI stays green while the fix is pending. Run with
-// `cargo test -p elide-core --test repack_half_promote_repro -- --ignored`
-// to reproduce.
+// Both LBAs must read back their most recent bytes after the crash: LBA 28
+// through the repacked segment, LBA 16 through the demand-fetched one whose
+// sibling promote files the half-promote left half-written.
 
 use elide_core::volume::Volume;
 use tempfile::TempDir;
@@ -67,14 +57,37 @@ fn repack_after_half_promote_preserves_oracle_across_crash() {
     let effective_seed: u8 = 0x80;
     common::populate_cache(fork_dir, u_gc, 16, effective_seed);
 
+    // `populate_cache` writes index/ + cache/ behind the live volume's
+    // back, so drop+reopen to let the rebuild pick the claim at LBA 16
+    // up — the same compensation every other caller of it makes.
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
     // HalfPromotePending — lowest-ULID pending segment is `<u_flush>`.
     // Writes sibling index/<u_flush>.idx + cache/<u_flush>.body+present from
     // the pre-repack pending body. Does NOT delete pending/<u_flush>.
-    common::half_promote_first_pending(fork_dir);
+    let u_flush = common::half_promote_first_pending(fork_dir).unwrap();
 
-    // Repack — rewrites pending/<u_flush> in place, compacting it. The
-    // sibling .idx/.body written by HalfPromotePending above are now stale.
+    // Repack — consumes pending/<u_flush> into a fresh-ULID output,
+    // leaving the half-promote's siblings naming a segment that is gone.
     vol.repack().unwrap();
+
+    // Repack invalidates a consumed input's promote siblings, so the
+    // rebuild below finds no segment `<u_flush>` at all. Reads survive
+    // either way — the output's ULID is minted above the input's, so a
+    // resurrected `<u_flush>` loses every claim it makes — which is why
+    // the oracle assertions further down cannot see this.
+    for sibling in [
+        fork_dir.join("index").join(format!("{u_flush}.idx")),
+        fork_dir.join("cache").join(format!("{u_flush}.body")),
+        fork_dir.join("cache").join(format!("{u_flush}.present")),
+    ] {
+        assert!(
+            !sibling.exists(),
+            "repack must invalidate the promote sibling {}",
+            sibling.display()
+        );
+    }
 
     // Crash + reopen + finish the half-promoted segment.
     drop(vol);

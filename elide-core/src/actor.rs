@@ -2529,10 +2529,16 @@ const REPACK_ENTRY_CAP: usize = 8192;
 /// have left alongside a pending segment whose body is about to be
 /// rewritten.
 ///
-/// Called by `execute_repack` before rewriting or deleting a pending
-/// segment, and by `execute_promote_segment` as a no-op (siblings don't
-/// normally coexist with a committed pending segment). Each file is
-/// removed best-effort — `NotFound` is not an error.
+/// Called by `execute_repack` for every input it consumes, on both the
+/// data and the journal bucket. Each file is removed best-effort —
+/// `NotFound` is not an error, which is the usual case.
+///
+/// Reads survive a surviving sibling on their own: the output ULID is
+/// minted above every input's, so a resurrected input loses each claim
+/// it makes, and bodies are content-addressed. What this holds is that
+/// the segment set a rebuild finds is the one the volume believes it
+/// has, which the extent index reads as a canonical-owner difference
+/// rather than a wrong byte. `repack_half_promote_repro` pins it.
 ///
 /// Fsyncs the parent directories after removal so the absence survives
 /// a crash immediately after return.
