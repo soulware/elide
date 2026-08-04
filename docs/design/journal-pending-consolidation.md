@@ -127,43 +127,34 @@ outputs.**
 
 ## The journal-map rekey and its cost
 
-The disjoint journal tier keys its extent map by `(segment_ulid, hash)`
-(`elide-core/src/extentindex.rs`), unlike the stable map which keys by the pure
-hash. The segment in the key is what stops journal content deduping across
-segments (the stranding cause). It also means consolidation changes the key of
-every entry it moves, and re-points every affected LBA's claimant in the lbamap
-(the read path resolves a journal LBA through `lookup_journal(claimant_ulid,
-hash)`, so the claimant is load-bearing).
+The disjoint journal tier groups its extent map by segment and then by hash
+(`HashMap<Ulid, HashMap<Hash, Location>>` in
+`elide-core/src/extentindex.rs`), unlike the stable map which keys by the pure
+hash. The segment level is what stops journal content deduping across
+segments (the stranding cause). It also means consolidation moves every entry it
+carries to a new segment, and re-points every affected LBA's claimant in the
+lbamap (the read path resolves a journal LBA through
+`lookup_journal(claimant_ulid, hash)`, so the claimant is load-bearing).
 
-The flat `HashMap<(Ulid, Hash), Location>` makes every segment-scoped operation
-O(total map size), and consolidation would run them constantly:
+Grouping by segment first keeps each segment-scoped operation proportional to
+that segment, which matters because consolidation runs them constantly:
 
-- `purge_journal_segment` (`retain` over the whole map) runs on every reap.
-- `promote_journal_segment_to_cache` (`keys().filter()` over the whole map) runs
-  on every drain tick that formed journal.
+- `purge_journal_segment` is one outer `remove`, and runs on every reap.
+- `promote_journal_segment_to_cache` mutates one submap, and runs on every drain
+  tick that formed journal.
+- a whole-segment rename moves one submap to a new key.
+- consolidation builds the output submap from its inputs' submaps, O(merged
+  entries) — inherent to writing the merged body — then drops the input submaps
+  wholesale.
 - `rekey_journal` is a remove+insert per entry, so a K-input merge is O(entries).
 
-**Proposed data structure:** a two-level map
-`HashMap<Ulid, JournalSegment>` where `JournalSegment` holds the segment's
-`body_section_start` once and a `HashMap<Hash, Location>` of its entries. This
-makes the hot paths cheap:
+Both levels are `imbl` persistent maps, so snapshot clones keep sharing
+structure and only the touched submap's path is copied on write. An empty submap
+is dropped as soon as it empties, which keeps `journal_is_empty` a single outer
+check.
 
-- purge a reaped segment is one `remove` at the outer level, O(1).
-- promote-to-cache mutates one submap, O(entries in that segment).
-- renaming a segment (restore under a new identity, or a whole-segment rekey)
-  moves one submap to a new key, O(1) plus a segment-id touch.
-- consolidation builds the output submap from its inputs' submaps, O(merged
-  entries), which is inherent to writing the merged body; it then drops the
-  input submaps wholesale rather than deleting entries one key at a time.
-
-Both levels stay `imbl` persistent maps, so snapshot clones keep sharing
-structure and only the touched submap's path is copied on write. Hoisting
-`body_section_start` to the segment level also removes it from every entry,
-where it is redundant today.
-
-This map lives only in memory and is rebuilt from the on-disk segments and their
-per-entry journal flags, so changing its shape is not an on-disk format change
-and needs no migration.
+The map lives only in memory, rebuilt from the on-disk segments and their
+per-entry journal flags.
 
 ## Journal upload rides the cut
 
