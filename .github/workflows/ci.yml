@@ -89,7 +89,10 @@ jobs:
           - name: core-invariants
             cmd: |
               cargo test -p elide-core --features proptest,volume-invariants --no-fail-fast \
-                --test volume_reproducers
+                --test volume_reproducers \
+                --test reclaim_crash_recovery_repro \
+                --test redact_then_dedup_rebuild_repro \
+                --test repack_half_promote_repro
               cargo test -p elide-core --features volume-invariants --no-fail-fast --lib
 
           # `elide-coordinator/proptest` propagates `elide-core/volume-invariants`,
