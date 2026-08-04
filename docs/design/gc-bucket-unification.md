@@ -11,6 +11,12 @@ outputs. The coordinator-driven GC selector
 (`elide-coordinator/src/gc.rs:325-460`) is still on the pre-unification
 shape:
 
+**This landed, and the pseudocode below records the proposal rather than
+the shipped selector.** Two things differ: the FFD sort key is
+`materialised_bytes`, and eligibility is measured in stored bytes
+(`live_stored_bytes`, `total_stored_bytes`), with
+`SWEEP_SMALL_THRESHOLD` derived as half `SWEEP_MATERIALISE_CAP`.
+
 |              | Selection                                     | Output count | Notes                              |
 |--------------|-----------------------------------------------|--------------|------------------------------------|
 | **Tier 0**   | tombstone-like (`live_lba_bytes == 0`)        | folded free  | contributes to `inputs`, no body   |

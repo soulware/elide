@@ -6,12 +6,14 @@
 // 8192 entries). See `docs/design/gc-bucket-unification.md`.
 //
 //   Eligibility:
-//     * dead input — live_lba_bytes == 0, includable at zero rewrite cost
+//     * dead input — retained_stored_bytes == 0, includable at zero rewrite cost
 //       (contributes to the output's `inputs` list, not its body).
-//     * small     — live_lba_bytes ≤ SWEEP_SMALL_THRESHOLD (16 MiB), any
-//       density. Consolidation candidate.
-//     * sparse    — density < density_threshold AND has dead bytes, any
-//       size. Reclamation candidate.
+//     * small     — retained_stored_bytes ≤ SWEEP_SMALL_THRESHOLD (half the
+//       materialise cap), any density. Consolidation candidate.
+//     * sparse    — density < density_threshold AND has reclaimable bytes,
+//       any size. Reclamation candidate. Density is retained/total, so a
+//       segment whose bodies all survive as canonicals reads dense and is
+//       left alone rather than rewritten to free nothing.
 //     Snapshot-floor and partial-LBA-death-Delta-deferred segments are
 //     ineligible.
 //
@@ -108,10 +110,11 @@ use crate::config::GcConfig;
 /// canonical carries its full body at zero live bytes.
 const SWEEP_MATERIALISE_CAP: u64 = 32 * 1024 * 1024;
 
-/// Live-bytes threshold at or below which a segment is treated as a "small"
-/// sweep candidate. An eligibility test, so it stays in live-LBA units —
-/// distinct from the materialise budget the packing charges.
-const SWEEP_SMALL_THRESHOLD: u64 = 16 * 1024 * 1024;
+/// Stored-bytes threshold at or below which a segment is a "small" sweep
+/// candidate: half a full output, so two smalls fit one bucket. Derived
+/// from the budget the packing charges rather than set independently, so
+/// the two cannot drift into different units again.
+const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_MATERIALISE_CAP / 2;
 
 /// Entry-count cap on the merged GC output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` (volume.rs) so GC outputs sit at the same scale
@@ -472,7 +475,7 @@ fn select_buckets(
 /// First-fit-decreasing bin-pack across the stable pool, capped at
 /// `max_buckets` outputs.
 ///
-/// The classic FFD shape: candidates sort descending by `live_lba_bytes`,
+/// The classic FFD shape: candidates sort descending by `materialised_bytes`,
 /// each placed in the first bucket with enough remaining live + entry
 /// budget; a new bucket is opened up to the cap. Tombstones fold into
 /// the first bucket for free (zero body, zero output entries).
@@ -500,9 +503,10 @@ fn pack_stable(
     // small-with-dead bucket.
     let mut candidates: Vec<SegmentStats> = Vec::new();
     for s in eligible {
-        let is_small = s.live_lba_bytes <= SWEEP_SMALL_THRESHOLD;
-        let is_sparse =
-            s.density() < density_threshold && s.dead_lba_bytes() > 0 && s.has_data_content();
+        let is_small = s.retained_stored_bytes <= SWEEP_SMALL_THRESHOLD;
+        let is_sparse = s.density() < density_threshold
+            && s.reclaimable_stored_bytes() > 0
+            && s.has_data_content();
         if is_small || is_sparse {
             candidates.push(s);
         }
@@ -576,7 +580,7 @@ fn pack_stable(
         // into an identical segment every pass, forever.
         let has_sparse = items
             .iter()
-            .any(|s| s.density() < density_threshold && s.dead_lba_bytes() > 0);
+            .any(|s| s.density() < density_threshold && s.reclaimable_stored_bytes() > 0);
         if !has_dead && !has_sparse && items.len() < 2 {
             // Single dense non-sparse non-tombstone input: pointless
             // rewrite. Drop the bucket.
@@ -589,8 +593,8 @@ fn pack_stable(
         items.sort_by(|a, b| a.ulid_str.cmp(&b.ulid_str));
 
         let candidates = items.len();
-        let bytes_freed: u64 = items.iter().map(|s| s.dead_lba_bytes()).sum();
-        let live_bytes: u64 = items.iter().map(|s| s.live_lba_bytes).sum();
+        let bytes_freed: u64 = items.iter().map(|s| s.reclaimable_stored_bytes()).sum();
+        let live_bytes: u64 = items.iter().map(|s| s.retained_stored_bytes).sum();
         let materialised: u64 = items.iter().map(|s| s.materialised_bytes).sum();
         let live_entries: usize = items.iter().map(|s| s.live_entries.len()).sum();
         let removed_hashes: usize = items.iter().map(|s| s.removed_hashes.len()).sum();
@@ -875,18 +879,22 @@ const BLOCK_BYTES: u64 = 4096;
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
     ulid_str: String,
-    /// Logical live bytes: lba_length * BLOCK_BYTES summed over all live entries
-    /// (DATA, dedup_ref, zero_extent).  Dedup refs and zero extents are included
-    /// so that a segment full of live dedup refs is not treated as density=0.
-    live_lba_bytes: u64,
+    /// Stored bytes a rewrite of this segment would carry into its
+    /// output. Every classification that emits a body counts, including
+    /// a demoted canonical, whose body survives for dedup resolution
+    /// even though no LBA claims it — so this is what the rewrite keeps,
+    /// not what the LBA map still points at. Thin entries (DedupRef,
+    /// Zero) own no body and count zero, so a segment of nothing but
+    /// those measures zero here and in `total_stored_bytes`.
+    retained_stored_bytes: u64,
     /// Bytes the volume must materialise to apply a plan that includes this
     /// input: kept and canonical body bytes plus partial-death run slices.
     /// The packing budget ([`SWEEP_MATERIALISE_CAP`]) charges this, since it
     /// is what bounds both the output segment size and the apply's resident
     /// memory. Thin entries (DedupRef keeps, Zero) contribute nothing.
     materialised_bytes: u64,
-    /// Logical total bytes: lba_length * BLOCK_BYTES summed over all entries.
-    total_lba_bytes: u64,
+    /// Total stored bytes: [`stored_cost`] summed over every entry.
+    total_stored_bytes: u64,
     /// True if the segment contains at least one DATA entry (live, stale, or fully dead).
     /// Used to distinguish zero-only segments (no physical body to reclaim) from
     /// segments with DATA or REF entries that warrant GC even when all entries are dead.
@@ -927,13 +935,18 @@ struct SegmentStats {
 }
 
 impl SegmentStats {
-    fn dead_lba_bytes(&self) -> u64 {
-        self.total_lba_bytes.saturating_sub(self.live_lba_bytes)
+    fn reclaimable_stored_bytes(&self) -> u64 {
+        self.total_stored_bytes
+            .saturating_sub(self.retained_stored_bytes)
     }
 
+    /// Share of the segment's stored bytes a rewrite would carry
+    /// forward. Below `density_threshold` the rewrite pays for itself;
+    /// at 1.0 it frees nothing, which is where a segment of demoted
+    /// canonicals sits.
     fn density(&self) -> f64 {
-        if self.total_lba_bytes > 0 {
-            self.live_lba_bytes as f64 / self.total_lba_bytes as f64
+        if self.total_stored_bytes > 0 {
+            self.retained_stored_bytes as f64 / self.total_stored_bytes as f64
         } else {
             0.0
         }
@@ -971,6 +984,13 @@ impl SegmentStats {
 /// Bytes the volume materialises to carry `entry` into the output unchanged
 /// (a plan `Keep`). Body-owning kinds copy their stored bytes; delta kinds
 /// copy their delta blobs; DedupRef and Zero copy nothing.
+/// Bytes this entry occupies in its segment's body, in the form its
+/// codec names. Thin entries own no body: a DedupRef points at one
+/// elsewhere and a Zero has none, so both are zero.
+fn stored_cost(entry: &SegmentEntry) -> u64 {
+    keep_cost(entry)
+}
+
 fn keep_cost(entry: &SegmentEntry) -> u64 {
     match entry.kind {
         EntryKind::Data
@@ -1052,8 +1072,8 @@ fn collect_stats(
             Vec::new()
         };
 
-        let mut live_lba_bytes: u64 = 0;
-        let mut total_lba_bytes: u64 = 0;
+        let mut retained_stored_bytes: u64 = 0;
+        let mut total_stored_bytes: u64 = 0;
         let mut physical_body_bytes: u64 = 0;
         let mut materialised_bytes: u64 = 0;
         let mut live_entries: Vec<SegmentEntry> = Vec::new();
@@ -1091,8 +1111,7 @@ fn collect_stats(
                     entry.inline = Some(inline_bytes[start..end].into());
                 }
             }
-            let lba_bytes = entry.lba_length as u64 * BLOCK_BYTES;
-            total_lba_bytes += lba_bytes;
+            total_stored_bytes += stored_cost(&entry);
             // Inline/CanonicalInline entries have stored bytes in the
             // inline section (part of .idx, not S3 body). They do not
             // contribute to physical_body_bytes but do participate in
@@ -1105,7 +1124,7 @@ fn collect_stats(
             use elide_core::segment_classify::EntryClassification;
             match elide_core::segment_classify::classify_entry(&entry, &classify_ctx) {
                 EntryClassification::FullyLive => {
-                    live_lba_bytes += lba_bytes;
+                    retained_stored_bytes += stored_cost(&entry);
                     materialised_bytes += keep_cost(&entry);
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
@@ -1114,7 +1133,10 @@ fn collect_stats(
                 EntryClassification::DemoteToCanonical => {
                     // LBA-dead but hash still externally referenced.
                     // Demote so the body survives for dedup resolution
-                    // without making a (now-stale) LBA claim.
+                    // without making a (now-stale) LBA claim. The output
+                    // carries the body either way, so a rewrite frees
+                    // none of it.
+                    retained_stored_bytes += stored_cost(&entry);
                     materialised_bytes += canonical_cost(&entry);
                     live_entries.push(entry.into_canonical());
                     live_entry_indices.push(entry_idx);
@@ -1126,8 +1148,6 @@ fn collect_stats(
                     // overwritten — nothing to emit.
                     for ext in runs {
                         let run_len = (ext.range_end - ext.range_start) as u32;
-                        let run_bytes = run_len as u64 * BLOCK_BYTES;
-                        live_lba_bytes += run_bytes;
                         let mut live = entry.clone();
                         live.start_lba = ext.range_start;
                         live.lba_length = run_len;
@@ -1139,7 +1159,6 @@ fn collect_stats(
                 EntryClassification::PartialDeath { live_runs, .. } => {
                     let live_blocks: u64 =
                         live_runs.iter().map(|r| r.range_end - r.range_start).sum();
-                    live_lba_bytes += live_blocks * BLOCK_BYTES;
                     // Run slices are materialised as uncompressed blocks;
                     // an owned-body entry whose hash is still LBA-live also
                     // emits its full composite as a canonical output.
@@ -1150,6 +1169,12 @@ fn collect_stats(
                     ) && live_hashes.contains(&entry.hash);
                     if emits_canonical {
                         materialised_bytes += canonical_cost(&entry);
+                        // The canonical carries the whole composite, so
+                        // the dead sub-runs inside it are not freed.
+                        retained_stored_bytes += stored_cost(&entry);
+                    } else if entry.lba_length > 0 {
+                        retained_stored_bytes +=
+                            stored_cost(&entry) * live_blocks / entry.lba_length as u64;
                     }
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
@@ -1157,7 +1182,8 @@ fn collect_stats(
                 }
                 EntryClassification::DeferUnresolvableDelta => {
                     // Delta with no resolvable source — defer the segment
-                    // to a later pass.
+                    // to a later pass. The entry is kept as it stands.
+                    retained_stored_bytes += stored_cost(&entry);
                     live_entries.push(entry);
                     live_entry_indices.push(entry_idx);
                     partial_death_runs.push(None);
@@ -1323,9 +1349,9 @@ fn collect_stats(
             ulid_str,
             pool,
             has_body_entries: physical_body_bytes > 0 || has_inline,
-            live_lba_bytes,
+            retained_stored_bytes,
             materialised_bytes,
-            total_lba_bytes,
+            total_stored_bytes,
             live_entries,
             live_entry_indices,
             partial_death_runs,
@@ -1696,18 +1722,18 @@ mod tests {
     /// `live_data_entries` is the number of live `Data` entries the segment
     /// claims to have (each accounted as `BLOCK_BYTES` of live LBA and of
     /// materialised bytes). The total LBA bytes is taken as
-    /// `live_lba_bytes + dead_lba_bytes`.
+    /// `retained_stored_bytes + reclaimable_stored_bytes`.
     ///
     /// `live_data_entries == 0` produces a tombstone-shaped input
     /// (no live entries, no removed hashes).
     fn make_stats(
         ulid: Ulid,
         live_data_entries: usize,
-        dead_lba_bytes: u64,
+        reclaimable_stored_bytes: u64,
         density_below_threshold: bool,
     ) -> SegmentStats {
-        let live_lba_bytes = live_data_entries as u64 * BLOCK_BYTES;
-        let total_lba_bytes = live_lba_bytes + dead_lba_bytes;
+        let retained_stored_bytes = live_data_entries as u64 * BLOCK_BYTES;
+        let total_stored_bytes = retained_stored_bytes + reclaimable_stored_bytes;
         // Block-sized dummy bodies: above INLINE_THRESHOLD (256) so
         // kind = Data, and sized so each entry's materialised cost equals
         // its live LBA bytes.
@@ -1730,18 +1756,18 @@ mod tests {
         // density_below_threshold flips dead-fraction past the default 0.70
         // density threshold by inflating dead bytes if the caller indicated
         // we want a sparse classification but didn't pass enough dead.
-        let total_lba_bytes = if density_below_threshold && live_data_entries > 0 {
+        let total_stored_bytes = if density_below_threshold && live_data_entries > 0 {
             // density = live / total; want < 0.70, so total ≥ live / 0.69
-            let want_total = ((live_lba_bytes as f64) / 0.69).ceil() as u64;
-            total_lba_bytes.max(want_total)
+            let want_total = ((retained_stored_bytes as f64) / 0.69).ceil() as u64;
+            total_stored_bytes.max(want_total)
         } else {
-            total_lba_bytes
+            total_stored_bytes
         };
         SegmentStats {
             ulid_str: ulid.to_string(),
-            live_lba_bytes,
+            retained_stored_bytes,
             materialised_bytes,
-            total_lba_bytes,
+            total_stored_bytes,
             has_body_entries: live_data_entries > 0,
             live_entries,
             live_entry_indices,
@@ -1902,9 +1928,9 @@ mod tests {
         let n = canonicals.len();
         let stats = SegmentStats {
             ulid_str: next().to_string(),
-            live_lba_bytes: 0,
+            retained_stored_bytes: 0,
             materialised_bytes,
-            total_lba_bytes: 0,
+            total_stored_bytes: 0,
             has_body_entries: true,
             live_entries: canonicals,
             live_entry_indices: (0..n as u32).collect(),
@@ -2004,9 +2030,9 @@ mod tests {
         let ulid = Ulid::new();
         let stats = SegmentStats {
             ulid_str: ulid.to_string(),
-            live_lba_bytes: BLOCK_BYTES,
+            retained_stored_bytes: BLOCK_BYTES,
             materialised_bytes: 0,
-            total_lba_bytes: BLOCK_BYTES,
+            total_stored_bytes: BLOCK_BYTES,
             has_body_entries: false,
             live_entries: vec![SegmentEntry::new_dedup_ref(blake3::hash(b"x"), 0, 1)],
             live_entry_indices: vec![0],
@@ -2462,6 +2488,87 @@ mod tests {
     /// A segment goes in the journal pool only when a rewrite would carry
     /// all of it into a journal output. A mixed segment goes in the stable
     /// pool, where the output split sheds its journal content.
+    /// A body whose LBA claim is gone but whose hash is still
+    /// referenced demotes to a canonical, and the rewrite carries it. So
+    /// the segment holding it reads dense and frees nothing — the
+    /// rewrite that would "reclaim" it copies every byte forward.
+    #[test]
+    fn collect_stats_counts_a_demoted_canonical_as_retained() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        // Hash-derived bytes, so the write lands as a body-section Data
+        // entry rather than Inline.
+        let block = |seed: u8| -> Vec<u8> {
+            let mut buf = vec![0u8; 4096];
+            let mut hasher = blake3::Hasher::new_keyed(&[seed; 32]);
+            for (i, chunk) in buf.chunks_mut(32).enumerate() {
+                hasher.update(&(i as u64).to_le_bytes());
+                chunk.copy_from_slice(&hasher.finalize().as_bytes()[..chunk.len()]);
+                hasher.reset();
+            }
+            buf
+        };
+        let pending_ulids = || -> Vec<Ulid> {
+            let mut v: Vec<Ulid> = fs::read_dir(elide_core::segment::pending_open_dir(fork_dir))
+                .unwrap()
+                .flatten()
+                .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
+                .collect();
+            v.sort();
+            v
+        };
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+        // Segment A owns the body for X.
+        let x = block(0x11);
+        vol.write(0, &x).unwrap();
+        vol.flush_wal().unwrap();
+        let a = pending_ulids()[0];
+        // Segment B claims the same content at another LBA, so the hash
+        // outlives A's own claim.
+        vol.write(5, &x).unwrap();
+        vol.flush_wal().unwrap();
+        // Segment C supersedes LBA 0, leaving A's entry LBA-dead.
+        vol.write(0, &block(0x22)).unwrap();
+        vol.flush_wal().unwrap();
+
+        for ulid in pending_ulids() {
+            vol.promote_segment(ulid).unwrap();
+        }
+
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.claim_referenced_hashes();
+        let stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+
+        let a_stats = stats
+            .iter()
+            .find(|s| s.ulid_str == a.to_string())
+            .expect("segment A in stats");
+        assert!(
+            a_stats.total_stored_bytes > 0,
+            "setup: A must own a body section entry"
+        );
+        assert_eq!(
+            a_stats.reclaimable_stored_bytes(),
+            0,
+            "a demoted canonical is carried, so nothing is reclaimable"
+        );
+        assert_eq!(a_stats.density(), 1.0);
+    }
+
     #[test]
     fn collect_stats_pools_journal_flagged_segments_as_journal() {
         let dir = TempDir::new().unwrap();

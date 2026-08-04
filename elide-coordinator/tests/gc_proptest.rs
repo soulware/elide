@@ -134,6 +134,20 @@ fn incompressible_block(seed: u8) -> [u8; 4096] {
     buf
 }
 
+/// `n_blocks` of incompressible bytes, distinct across the whole run so
+/// the payload does not shrink under zstd's window. Used where a test
+/// needs a segment that is large in *stored* bytes.
+fn incompressible_payload(n_blocks: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_blocks * 4096];
+    let mut hasher = blake3::Hasher::new_keyed(&[0x5Au8; 32]);
+    for (i, chunk) in out.chunks_mut(32).enumerate() {
+        hasher.update(&(i as u64).to_le_bytes());
+        chunk.copy_from_slice(&hasher.finalize().as_bytes()[..chunk.len()]);
+        hasher.reset();
+    }
+    out
+}
+
 /// `incompressible_block(base_seed)` with the first 32 bytes replaced
 /// by `tweak`: a near-duplicate whose zstd-dict delta against the base
 /// is tiny, so the delta tier's smaller-than-stored gate passes.
@@ -1256,12 +1270,14 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
     simulate_upload(&mut vol, fork_dir);
 
     // C: a large fully-live write covering LBA 0 (superseding B) plus
-    // enough further blocks to clear SWEEP_SMALL_THRESHOLD (16 MiB). Being
-    // large, dense, and free of dead bytes, C is not an eligible rewrite
-    // candidate, so gc opens no stable bucket — the only remaining work is
-    // the two now-dead segments A and B, which pool into a tombstone-only
-    // bucket and produce a pure zero-entry output.
-    let big = vec![0xC3u8; 4097 * 4096];
+    // enough further blocks to clear SWEEP_SMALL_THRESHOLD. The threshold
+    // is in stored bytes, so the blocks are incompressible — a constant
+    // pattern this size stores as almost nothing and would pool as a
+    // small. Being large, dense, and free of dead bytes, C is not an
+    // eligible rewrite candidate, so gc opens no stable bucket — the only
+    // remaining work is the two now-dead segments A and B, which pool
+    // into a tombstone-only bucket and produce a pure zero-entry output.
+    let big = incompressible_payload(4097);
     vol.write(0, &big).unwrap();
     vol.flush_wal().unwrap();
     simulate_upload(&mut vol, fork_dir);
