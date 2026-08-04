@@ -61,7 +61,7 @@ The last row is a behaviour change from the two-tier design: `blake3::hash([0; N
 
 **Hash collisions.** Same BLAKE3 collision-resistance assumption already baked into the existing extent-index dedup path. No new trust.
 
-**Internal rewrites.** Extent reclamation (`docs/design/extent-reclamation.md`) reuses the write pipeline for rewrites whose incoming bytes equal the existing bytes by construction. The hash check is *correct* for those: re-running reclamation over an already-merged range is supposed to be a no-op, and a hash match expresses exactly that. Reclamation calls a `write_with_hash` entry point that takes a precomputed hash (avoiding a redundant blake3 pass) and returns whether the write committed; both paths run the same skip check.
+**Precomputed hashes.** `Volume::write_precomputed` takes the BLAKE3 hash and the compression decision from the caller, so `VolumeClient::write` runs both passes off the volume mutex and concurrent writers hash in parallel. It reaches the same `commit_or_skip`, so the skip check is the one check on every path that appends to the WAL. Extent reclamation (`docs/design/extent-reclamation.md`) is not one of them: it assembles its output segment on the worker thread and writes it directly, so it never enters this pipeline.
 
 ## Counters
 

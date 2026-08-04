@@ -1630,13 +1630,6 @@ pub struct SegmentLayoutInfo {
     pub delta_length: u32,
 }
 
-impl SegmentLayoutInfo {
-    /// Absolute file offset of the delta body section.
-    pub fn delta_body_offset(&self) -> u64 {
-        self.body_section_start + self.body_length
-    }
-}
-
 /// Read just enough of a segment file header to determine section
 /// offsets. Does not verify the signature; callers that need
 /// verification should use `read_and_verify_segment_index` instead.
@@ -1699,22 +1692,6 @@ pub fn read_inline_section(path: &Path) -> io::Result<Vec<u8>> {
     let inline_start = HEADER_LEN + index_length as u64;
     let mut buf = vec![0u8; inline_length as usize];
     f.read_exact_at(&mut buf, inline_start)?;
-    Ok(buf)
-}
-
-/// Read the delta body section bytes from a full segment file.
-///
-/// Returns an empty `Vec` when `delta_length == 0`. Reads `delta_length`
-/// bytes starting at `body_section_start + body_length`.
-pub fn read_delta_body_section(path: &Path) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-    let layout = read_segment_layout(path)?;
-    if layout.delta_length == 0 {
-        return Ok(Vec::new());
-    }
-    let f = fs::File::open(path)?;
-    let mut buf = vec![0u8; layout.delta_length as usize];
-    f.read_exact_at(&mut buf, layout.delta_body_offset())?;
     Ok(buf)
 }
 
@@ -2829,46 +2806,6 @@ pub fn collect_gc_applied_segment_files(fork_dir: &Path) -> io::Result<Vec<PathB
             }
             Ok(paths)
         }
-    }
-}
-
-/// Punch a hole in `file`, releasing the disk blocks backing `[offset, offset + length)`.
-///
-/// On Linux uses `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`:
-/// file size is preserved, reads of the punched range return zeros, and the
-/// underlying disk blocks are freed. On platforms without a direct equivalent
-/// (macOS, BSDs) the fallback zero-writes the range — reads still return
-/// zeros but the blocks remain allocated.
-pub fn punch_hole(file: &mut fs::File, offset: u64, length: u64) -> io::Result<()> {
-    if length == 0 {
-        return Ok(());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::{FallocateFlags, fallocate};
-        fallocate(
-            file,
-            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            offset as i64,
-            length as i64,
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        file.seek(SeekFrom::Start(offset))?;
-        const CHUNK: usize = 64 * 1024;
-        let chunk_size = CHUNK.min(length as usize);
-        let zeros = vec![0u8; chunk_size];
-        let mut remaining = length;
-        while remaining > 0 {
-            let n = (remaining as usize).min(chunk_size);
-            file.write_all(&zeros[..n])?;
-            remaining -= n as u64;
-        }
-        Ok(())
     }
 }
 

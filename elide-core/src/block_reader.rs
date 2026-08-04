@@ -573,23 +573,6 @@ impl BlockReader {
         Ok(loc.codec.decode(Cow::Owned(buf))?.into_owned())
     }
 
-    /// Read the full plaintext bytes of the extent with content hash `hash`.
-    ///
-    /// Returns the decompressed body of the whole extent — not a 4 KiB slice.
-    /// Fails if `hash` is not known to this reader's extent index, or if the
-    /// underlying body is evicted and no fetcher is configured.
-    ///
-    /// Delta repack uses this to obtain the dictionary source for a prior
-    /// snapshot's extent when building Tier 1 deltas.
-    pub fn read_extent_body(&self, hash: &blake3::Hash) -> io::Result<Vec<u8>> {
-        let loc = self
-            .extent_index
-            .lookup(hash)
-            .ok_or_else(|| io::Error::other(format!("extent {hash} not in index")))?
-            .clone();
-        self.read_extent_body_at(&loc, hash)
-    }
-
     /// Dump every LBA-map entry as `(start_lba, lba_length, hash,
     /// payload_block_offset, claimant)`, sorted by `start_lba`.
     pub fn dump_lbamap(&self) -> Vec<(u64, u32, blake3::Hash, u32, ulid::Ulid)> {

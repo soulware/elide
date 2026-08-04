@@ -1107,27 +1107,6 @@ impl Volume {
             .map(|_| ())
     }
 
-    /// Like [`Volume::write`], but with a caller-supplied hash. Returns
-    /// `Ok(true)` if the write was committed to the WAL, `Ok(false)` if
-    /// the no-op skip short-circuited it.
-    ///
-    /// Used by callers that have already hashed `data` (notably extent
-    /// reclamation, which hashes off-actor in phase 2 and would otherwise
-    /// pay a redundant blake3 pass on the actor thread). The caller-supplied
-    /// `hash` MUST be `blake3::hash(data)`.
-    ///
-    /// See `docs/design/noop-write-skip.md`.
-    pub fn write_with_hash(
-        &mut self,
-        lba: u64,
-        data: &[u8],
-        hash: blake3::Hash,
-    ) -> io::Result<bool> {
-        validate_write_size(data)?;
-        let compressed = maybe_compress(data);
-        self.commit_or_skip(lba, data, hash, compressed.as_deref())
-    }
-
     /// Like [`Volume::write`], but with the BLAKE3 hash *and* the lz4
     /// compression decision precomputed by the caller.
     ///

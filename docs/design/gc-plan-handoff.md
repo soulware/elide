@@ -67,9 +67,10 @@ All body fetching funnels through `BlockReader`:
   `cache/<input>.body` via the reader's existing `find_segment_file` +
   `body_seek` primitives. Delta passthrough keeps the delta blob via
   `read_delta_blob`.
-- **DedupRef partial-death**: `read_extent_body(&hash)` resolves ancestor-aware,
-  decompressed.
-- **Delta partial-death**: `read_extent_body(&base_hash)` + `read_delta_blob` +
+- **DedupRef partial-death**: `resolve_body_by_hash_decompressed(&hash)` resolves
+  ancestor-aware, decompressed.
+- **Delta partial-death**: `resolve_body_by_hash_decompressed(&base_hash)` +
+  `read_delta_blob` +
   `apply_delta`. The volume re-picks the first resolvable `source_hash` from the
   entry's `delta_options` against its own extent index — which is the merged,
   ancestor-aware index, so it always sees at least what the coordinator saw.

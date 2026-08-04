@@ -72,13 +72,6 @@ impl ReadonlyVolume {
         })
     }
 
-    /// Shared handle on the in-memory extent index. The body-prefetch
-    /// pool uses this so its `.present` writes mirror back into the
-    /// same `Arc<SegmentPresence>` reachable from the read path.
-    pub fn extent_index_arc(&self) -> Arc<extentindex::ExtentIndex> {
-        Arc::clone(&self.extent_index)
-    }
-
     /// Return the LBA map and extent index as shared references. Mirrors
     /// `Volume::snapshot_maps`; used by the fetch worker to drive
     /// `full_warm` against a readonly view.
