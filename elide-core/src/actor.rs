@@ -2571,9 +2571,14 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     })
 }
 
-/// Target output segment size for repack, in live bytes. Matches the
-/// WAL `FLUSH_THRESHOLD` so repack outputs sit at the same scale as
-/// freshly-flushed segments.
+/// Target output segment size for repack, in **stored** bytes: a
+/// bucket's budget is spent against `live_bytes`, the sum of
+/// `stored_length`, so it measures the body in the form its codec names
+/// and an output lands near this size on disk and on S3.
+///
+/// The unit differs from the one GC bin-packs by — `live_lba_bytes`,
+/// the sum of `lba_length * BLOCK_BYTES` — so this number and
+/// `SWEEP_SMALL_THRESHOLD` are not comparable as written.
 const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 
 /// Entry-count cap on a packed output. Mirrors the WAL's
