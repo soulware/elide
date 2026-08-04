@@ -327,6 +327,9 @@ pub enum WorkerJob {
     GcPlan(GcPlanApplyJob),
     PromoteSegment(PromoteSegmentJob),
     Repack(RepackJob),
+    /// The pass over a sealed generation. Same job and same
+    /// `execute_repack`, aimed at `pending/upload/`.
+    CloseGeneration(RepackJob),
     SignSnapshotManifest(SignSnapshotManifestJob),
     Reclaim(ReclaimJob),
     /// Test seam: the worker blocks on the receiver, then returns
@@ -346,6 +349,7 @@ pub enum WorkerResult {
         result: io::Result<PromoteSegmentResult>,
     },
     Repack(io::Result<RepackResult>),
+    CloseGeneration(io::Result<RepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),
     /// Test seam: completion of a [`WorkerJob::Barrier`].

@@ -315,6 +315,7 @@ struct ParkedOps {
     /// finished result waits in `deferred_repack`, so concurrent
     /// repack requests are still rejected.
     repack: Option<Sender<io::Result<CompactionStats>>>,
+    close_generation: Option<ParkedCloseGeneration>,
     /// A finished repack result held back until in-flight promotes
     /// have applied. See [`VolumeActor::apply_or_defer_repack`].
     deferred_repack: Option<Box<RepackResult>>,
@@ -331,6 +332,14 @@ struct ParkedOps {
 }
 
 /// State stashed while a `PromoteWal` promote is in flight.
+/// Reply for an in-flight close pass, paired with the sealed
+/// generation's segment count — the value the reply carries, known at
+/// prep and independent of what the pass packs.
+struct ParkedCloseGeneration {
+    reply: Sender<io::Result<Option<u32>>>,
+    rotated: Option<u32>,
+}
+
 struct ParkedPromoteWal {
     segment_ulid: Ulid,
     reply: Sender<io::Result<()>>,
@@ -823,6 +832,34 @@ impl VolumeActor {
         self.parked.repack = Some(reply);
     }
 
+    /// Seal the open generation on the actor, then dispatch the pass
+    /// over it to the worker. The reply is parked until the pass
+    /// applies, so a drain of the sealed generation — which the *next*
+    /// cut starts — cannot begin before its outputs are in place.
+    fn start_close_generation(&mut self, reply: Sender<io::Result<Option<u32>>>) {
+        let prep = match self.lock_volume().prepare_close_generation() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let crate::volume::CloseGenerationPrep { rotated, job } = prep;
+        let Some(job) = job else {
+            let _ = reply.send(Ok(rotated));
+            return;
+        };
+        // The rotate moved the segments readers resolve through, so
+        // republish before the pass starts rewriting them.
+        self.publish_snapshot();
+        if let Err(e) = self.send_worker_job(WorkerJob::CloseGeneration(job)) {
+            warn!("close generation dispatch failed: {e}");
+            let _ = reply.send(Err(e));
+            return;
+        }
+        self.parked.close_generation = Some(ParkedCloseGeneration { reply, rotated });
+    }
+
     /// Run the reclaim prep on the actor and dispatch the heavy middle
     /// (body reads + re-hash + re-compress + segment assembly) to the
     /// worker. Reply is parked until [`crate::volume::ReclaimResult`]
@@ -919,6 +956,7 @@ impl VolumeActor {
             || self.pipeline.promote_segments_in_flight > 0
             || self.parked.handoff_in_flight
             || self.parked.repack.is_some()
+            || self.parked.close_generation.is_some()
             || self.parked.sign_snapshot_manifest.is_some()
             || self.parked.reclaim.is_some()
     }
@@ -1023,6 +1061,19 @@ impl VolumeActor {
                         warn!("worker promote_segment for {ulid} failed: {e}");
                         self.reply_parked_promote_segment(ulid, Err(e));
                     }
+                }
+            }
+            WorkerResult::CloseGeneration(result) => {
+                let parked = self.parked.close_generation.take();
+                let outcome = match result {
+                    Ok(r) => self.apply_repack_and_publish(r).map(|_| ()),
+                    Err(e) => {
+                        warn!("worker close generation failed: {e}");
+                        Err(e)
+                    }
+                };
+                if let Some(p) = parked {
+                    let _ = p.reply.send(outcome.map(|()| p.rotated));
                 }
             }
             WorkerResult::Repack(result) => match result {
@@ -1310,8 +1361,13 @@ impl VolumeActor {
                             self.start_gc_handoffs(Some(reply));
                         }
                         VolumeRequest::CloseGeneration { reply } => {
-                            let r = self.lock_volume().close_generation();
-                            let _ = reply.send(r);
+                            if self.parked.close_generation.is_some() {
+                                let _ = reply.send(Err(io::Error::other(
+                                    "concurrent close_generation not allowed",
+                                )));
+                            } else {
+                                self.start_close_generation(reply);
+                            }
                         }
                         VolumeRequest::GcCheckpoint { max_buckets, reply } => {
                             if self.pipeline.parked_gc.is_some() {
@@ -2020,6 +2076,7 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::PromoteSegment { ulid, result }
             }
             WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
+            WorkerJob::CloseGeneration(job) => WorkerResult::CloseGeneration(execute_repack(job)),
             WorkerJob::SignSnapshotManifest(job) => {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
             }
@@ -2514,9 +2571,14 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
     })
 }
 
-/// Target output segment size for repack, in live bytes. Matches the
-/// WAL `FLUSH_THRESHOLD` so repack outputs sit at the same scale as
-/// freshly-flushed segments.
+/// Target output segment size for repack, in **stored** bytes: a
+/// bucket's budget is spent against `live_bytes`, the sum of
+/// `stored_length`, so it measures the body in the form its codec names
+/// and an output lands near this size on disk and on S3.
+///
+/// The unit differs from the one GC bin-packs by — `live_lba_bytes`,
+/// the sum of `lba_length * BLOCK_BYTES` — so this number and
+/// `SWEEP_SMALL_THRESHOLD` are not comparable as written.
 const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 
 /// Entry-count cap on a packed output. Mirrors the WAL's
@@ -2892,6 +2954,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             let plan_inputs = plan.inputs();
             let ctx = match MaterialiseCtx::new_for_pending(
                 &base_dir,
+                &pending_dir,
                 &plan_inputs,
                 &extent_index_snapshot,
                 &resolver,
@@ -3061,6 +3124,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let plan_inputs = plan.inputs();
         let ctx = match MaterialiseCtx::new_for_pending(
             &base_dir,
+            &pending_dir,
             &plan_inputs,
             &extent_index_snapshot,
             &resolver,
@@ -3115,6 +3179,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     Ok(RepackResult {
         stats,
         buckets: result_buckets,
+        pending_dir,
     })
 }
 

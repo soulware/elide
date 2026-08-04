@@ -837,17 +837,17 @@ impl<'a> MaterialiseCtx<'a> {
         })
     }
 
-    /// Construct a ctx for inputs in `<base_dir>/pending/<u>` (full
-    /// segment files, not just the `.idx` head). Used by redact /
-    /// sweep / repack / delta_repack — synchronous rewriters that
-    /// run on the actor against not-yet-uploaded segments.
+    /// Construct a ctx for inputs in `pending_dir` (full segment files,
+    /// not just the `.idx` head). Used by the rewriters that run against
+    /// not-yet-uploaded segments: the tick's repack over `pending/open/`
+    /// and the close pass over `pending/upload/`.
     pub fn new_for_pending(
         base_dir: &'a Path,
+        pending_dir: &Path,
         inputs: &[Ulid],
         extent_index: &'a ExtentIndex,
         resolver: &'a dyn BodyResolver,
     ) -> Result<Self, MaterialiseOutcome> {
-        let pending_dir = crate::segment::pending_open_dir(base_dir);
         let input_states = load_input_states_from(inputs, |u| pending_dir.join(u.to_string()))?;
         Ok(Self {
             base_dir,

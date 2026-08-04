@@ -1,7 +1,8 @@
 # Design: the close pass over a sealed generation
 
-**Status:** Proposed. Builds on upload generations (`upload-generations.md`)
-and journal consolidation (`journal-pending-consolidation.md`), both
+**Status:** Implemented, sized against `REPACK_TARGET_LIVE` (see *Sizing
+outputs*). Builds on upload generations (`upload-generations.md`) and
+journal consolidation (`journal-pending-consolidation.md`), both
 shipped. Pairs with `open-generation-repack.md`, which covers the pass over
 `pending/open/`.
 
@@ -87,24 +88,24 @@ count while it is held open, which `open-generation-repack.md` covers. The
 close pass runs once, over a fixed set, and its job is the object count and
 object size the fold leaves behind.
 
-## Sizing outputs in compressed bytes
+## Sizing outputs
 
-`REPACK_TARGET_LIVE` is 32 MiB of live plaintext, matching
-`FLUSH_THRESHOLD`. Neither controls the size of the object that reaches S3,
-because the body is compressed at formation and the ratio belongs to the
-workload. Measured on pg14, 32 MiB of plaintext lands at 6 to 9 MiB, just
-above the 5 MiB `DEFAULT_PART_SIZE_BYTES`, so nearly every data segment
-pays multipart for a second part holding a few MiB.
+The bin-pack already measures the units S3 charges for. A candidate's
+`live_bytes` sums `stored_length`, the length of the body in the form its
+codec names, so `REPACK_TARGET_LIVE` is 32 MiB of *stored* bytes and a
+packed output lands near that size on disk and on S3.
 
-The close pass is the one place that can size in the units S3 charges for.
-It compresses as it writes, so it closes an output when the accumulated
-compressed length crosses a target rather than when a plaintext budget runs
-out, and the natural target is the part size, so every object it emits
-uploads as a single PUT.
+What is sized in plaintext is formation. `FLUSH_THRESHOLD` is 32 MiB of
+WAL bytes, and the ratio belongs to the workload, so a flush segment
+arrives at whatever that compresses to — measured on pg14, 2.8 to 4.9 MiB
+alongside the 8 to 10 MiB ones. Those are the objects the close pass packs.
 
-The target is a soft cap, as `FLUSH_THRESHOLD` is. Outputs break on entry
-boundaries, so an entry whose own compressed body exceeds the target
-produces an output that exceeds it too.
+That leaves the target itself as the open question. `REPACK_TARGET_LIVE` is
+six times `DEFAULT_PART_SIZE_BYTES` (5 MiB), so a packed output uploads as
+several parts. Sizing to the part size instead would make every object a
+single PUT, at the cost of more objects per generation, which is the
+population the pass exists to hold down. The two pull opposite ways and the
+trade wants measuring against Tigris request pricing before it is picked.
 
 ## Output ULIDs
 

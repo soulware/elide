@@ -179,7 +179,7 @@ and crash model. `RepackJob` already carries its target as `pending_dir`,
 and `seg_paths` pins the candidate list at prep, which is what the sealed
 generation needs and gets for free.
 
-Three things differ, and they sit in prep rather than in the pass:
+Two things differ, and they sit in prep rather than in the pass:
 
 1. **The WAL flush.** `prepare_repack` closes the running WAL into a fresh
    segment and includes it, because the WAL holds the open generation's
@@ -191,9 +191,6 @@ Three things differ, and they sit in prep rather than in the pass:
    mints inside the rotate's critical section and holds the reservations, so
    they sort above the sealed generation and below everything the next
    generation mints.
-3. **How outputs are sized.** The open pass budgets plaintext against
-   `REPACK_TARGET_LIVE`. The close pass accumulates compressed length
-   against the part size.
 
 ## Cost
 
