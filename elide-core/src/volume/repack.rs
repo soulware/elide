@@ -93,21 +93,6 @@ pub struct CompactionStats {
     pub buckets_refused: usize,
 }
 
-/// Data needed by the worker to repack sparse segments in `pending/`.
-/// Produced by [`super::Volume::prepare_repack`] on the actor thread.
-///
-/// Per-segment output ULIDs are pre-minted in `output_ulids` (one per
-/// pending segment at prep time, monotonically increasing, all below
-/// `u_flush` and the next WAL ULID). The worker assigns them in
-/// input-ULID order and only consumes as many as it actually rewrites.
-///
-/// `ceiling` is the WAL-flush ULID minted at prep time: every output
-/// ULID is below it, so any pending segment with a strictly greater ULID
-/// was minted after prep (e.g. by a `prepare_promote` racing under the
-/// dropped lock) and the prep-time `lbamap_snapshot` knows nothing
-/// about its entries. The worker skips such segments — including them
-/// as bucket inputs would let `apply_repack_result` delete them and
-/// clobber the lbamap claims they made.
 /// What [`Volume::prepare_repack`] hands back: the WAL rotation to
 /// dispatch first, and the repack job itself.
 pub struct RepackPrep {
@@ -128,6 +113,14 @@ pub struct CloseGenerationPrep {
     pub job: Option<RepackJob>,
 }
 
+/// Data needed by the worker to repack sparse segments in a generation
+/// directory. [`Volume::prepare_repack`] produces one over
+/// `pending/open/`, [`Volume::prepare_close_generation`] one over
+/// `pending/upload/`; both run on the actor thread.
+///
+/// `output_ulids` is pre-minted at prep, one per candidate and
+/// monotonically increasing. The worker assigns them in input-ULID order
+/// and consumes as many as it rewrites, discarding the rest.
 pub struct RepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
