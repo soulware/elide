@@ -69,6 +69,18 @@ pub struct RepackPrep {
     pub job: RepackJob,
 }
 
+/// What [`Volume::prepare_close_generation`] hands back: the sealed
+/// generation's segment count, which the cut reports, and the pass over
+/// it.
+pub struct CloseGenerationPrep {
+    /// Segment count of the generation as it was sealed. `None` when
+    /// the open generation was empty and nothing rotated.
+    pub rotated: Option<u32>,
+    /// `None` when nothing rotated, or when the sealed generation holds
+    /// no segment file to pack.
+    pub job: Option<RepackJob>,
+}
+
 pub struct RepackJob {
     pub base_dir: PathBuf,
     pub pending_dir: PathBuf,
@@ -133,6 +145,10 @@ pub struct RepackedOutput {
 pub struct RepackResult {
     pub stats: CompactionStats,
     pub buckets: Vec<RepackedBucket>,
+    /// The generation directory the pass ran over — `pending/open/` for
+    /// the tick's repack, `pending/upload/` for the close pass. Apply
+    /// resolves output paths against it.
+    pub pending_dir: PathBuf,
 }
 
 impl Volume {
@@ -293,6 +309,68 @@ impl Volume {
         }))
     }
 
+    /// Prep phase of the close pass — runs on the actor thread.
+    ///
+    /// Rotates first, so the pass runs over a sealed generation:
+    /// `pending/upload/` takes no new segments, and `seg_paths` pins a
+    /// set nothing can add to rather than one the worker races.
+    ///
+    /// The reserved output ULIDs are minted in the same critical
+    /// section as the rotate, so they land above every segment in the
+    /// generation being sealed and below every segment the next
+    /// generation mints. The running WAL's own ULID sits below them and
+    /// governs the window until the apply, which is why the apply
+    /// installs through the consuming-inputs rule rather than a
+    /// strict-newer guard — the same rule `apply_repack_result` already
+    /// applies for repack.
+    ///
+    /// The WAL holds the *next* generation's content, so the job runs
+    /// with no flush.
+    pub fn prepare_close_generation(&mut self) -> io::Result<CloseGenerationPrep> {
+        let rotated = segment::rotate_open_generation(&self.base_dir)?;
+        self.assert_volume_invariants("close_generation");
+        let Some(rotated) = rotated else {
+            return Ok(CloseGenerationPrep {
+                rotated: None,
+                job: None,
+            });
+        };
+
+        let pending_dir = segment::pending_upload_dir(&self.base_dir);
+        let seg_paths = segment::collect_segment_files(&pending_dir)?;
+        if seg_paths.is_empty() {
+            return Ok(CloseGenerationPrep {
+                rotated: Some(rotated),
+                job: None,
+            });
+        }
+        let floor = latest_snapshot(&self.base_dir)?;
+
+        let output_ulids: Vec<Ulid> = (0..seg_paths.len()).map(|_| self.mint.next()).collect();
+        let journal_output_ulids: Vec<Ulid> = (0..JOURNAL_CONSOLIDATION_ULIDS)
+            .map(|_| self.mint.next())
+            .collect();
+
+        Ok(CloseGenerationPrep {
+            rotated: Some(rotated),
+            job: Some(RepackJob {
+                base_dir: self.base_dir.clone(),
+                pending_dir,
+                floor,
+                seg_paths,
+                output_ulids,
+                journal_output_ulids,
+                lbamap_snapshot: Arc::clone(&self.lbamap),
+                extent_index_snapshot: Arc::clone(&self.extent_index),
+                ancestor_layers: self.ancestor_layers.clone(),
+                fetcher: self.fetcher.clone(),
+                signer: Arc::clone(&self.signer),
+                verifying_key: self.verifying_key,
+                segment_cache: Arc::clone(&self.segment_cache),
+            }),
+        })
+    }
+
     /// Apply phase of `repack` — runs on the actor thread after the
     /// worker returns.
     ///
@@ -328,9 +406,12 @@ impl Volume {
         &mut self,
         result: RepackResult,
     ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
-        let RepackResult { mut stats, buckets } = result;
+        let RepackResult {
+            mut stats,
+            buckets,
+            pending_dir,
+        } = result;
 
-        let pending_dir = segment::pending_open_dir(&self.base_dir);
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
 
         // Claims plus the delta-source closure: a claim of a
@@ -749,6 +830,7 @@ mod tests {
                 bytes_freed: 4096,
                 journal: false,
             }],
+            pending_dir: segment::pending_open_dir(&base),
         };
 
         // LBA 0 still claims the recurring hash, so removing the

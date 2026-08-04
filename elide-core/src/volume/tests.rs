@@ -20,6 +20,41 @@ fn open_is_idempotent() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Formation ships whatever the WAL held at each flush, so a generation
+/// seals holding a run of small segments. The close pass packs them, and
+/// the count the cut reports is the count as sealed.
+#[test]
+fn close_generation_packs_the_sealed_generation() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    let upload_dir = segment::pending_upload_dir(&base);
+
+    for lba in 0..6u64 {
+        vol.write(lba, &vec![0x40u8 + lba as u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+    }
+    assert_eq!(
+        fs::read_dir(segment::pending_open_dir(&base))
+            .unwrap()
+            .count(),
+        6
+    );
+
+    assert_eq!(vol.close_generation().unwrap(), Some(6));
+    let sealed = fs::read_dir(&upload_dir).unwrap().count();
+    assert!(sealed < 6, "close pass left {sealed} segments unpacked");
+
+    for lba in 0..6u64 {
+        assert_eq!(vol.read(lba, 1).unwrap(), vec![0x40u8 + lba as u8; 4096]);
+    }
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    for lba in 0..6u64 {
+        assert_eq!(vol.read(lba, 1).unwrap(), vec![0x40u8 + lba as u8; 4096]);
+    }
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn close_generation_rotates_open_into_upload() {
     let base = keyed_temp_dir();

@@ -83,8 +83,8 @@ pub use reclaim::{
     scan_reclaim_candidates,
 };
 pub use repack::{
-    CompactionStats, RepackJob, RepackPrep, RepackResult, RepackedBucket, RepackedInput,
-    RepackedOutput,
+    CloseGenerationPrep, CompactionStats, RepackJob, RepackPrep, RepackResult, RepackedBucket,
+    RepackedInput, RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -2436,15 +2436,21 @@ impl Volume {
     ///
     /// Ensures `index/` and `cache/` exist so the worker never touches
     /// the directory structure.
-    /// Close the open generation: the upload generation must be fully
-    /// drained (absent or empty). Removes the spent `upload/`, renames
-    /// `open/` into its place, creates a fresh `open/`, and fsyncs
-    /// `pending/` so the boundary survives a crash. Returns the number
-    /// of segments the closed generation carries, `None` when the open
+    /// Close the open generation and pack what it sealed, on the calling
+    /// thread. Returns the segment count of the generation as it was
+    /// sealed, which is what the cut reports, `None` when the open
     /// generation was empty and nothing rotated.
+    ///
+    /// Used by tests and inline callers holding a `&mut Volume`.
+    /// Production goes through the actor, where the pass runs on the
+    /// worker.
     pub fn close_generation(&mut self) -> io::Result<Option<u32>> {
-        let rotated = segment::rotate_open_generation(&self.base_dir)?;
-        self.assert_volume_invariants("close_generation");
+        let CloseGenerationPrep { rotated, job } = self.prepare_close_generation()?;
+        if let Some(job) = job {
+            let result = crate::actor::execute_repack(job)?;
+            let (_, consumed) = self.apply_repack_result(result)?;
+            self.remove_consumed_inputs(&consumed)?;
+        }
         Ok(rotated)
     }
 
