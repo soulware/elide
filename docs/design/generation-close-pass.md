@@ -205,6 +205,58 @@ reservation.
 The execute phase itself carries the existing repack crash model: inputs
 stay in place until the apply, and a retry is idempotent.
 
+## The envelope
+
+What a sealed generation offers is a complete, immutable batch of signed
+segments whose bodies are already compressed, reachable without the read
+path, with a cheap prepare and apply on either side. That is the whole of
+what the pass may assume.
+
+It can:
+
+- **Pack** several inputs into one output, concatenating in ULID order.
+- **Split** an input across several outputs, partitioning in index order.
+- **Size** its outputs against a compressed target, because every input's
+  compressed length is known before a byte is written.
+- **Emit pure-tier outputs**, journal entries into the journal reservation
+  and data into the data ones, keeping tier purity and data-below-journal.
+- **Run off the actor**, holding the volume mutex only to mint and rotate,
+  and again to register and unlink.
+
+It cannot:
+
+- **Reorder inputs.** Recency is carried by ULID order across segments and
+  entry order within one, so a size-greedy bin-pack of the kind
+  `execute_repack` uses would resolve a doubly-claimed LBA to the wrong
+  entry. Packing is a linear scan that closes an output when the next input
+  would take it past the target.
+- **Drop a body on local evidence.** A `DedupRef` or a delta option in
+  `pending/open/` or in the WAL resolves backwards into older bodies, this
+  generation's among them, so the generation's own index files cannot prove
+  a body unreferenced.
+- **Split an entry.** Outputs break on entry boundaries, so a single
+  compressed body above the target produces an output above the target.
+- **Apply with a strict-newer guard.** An in-flight write's claim sits at
+  the WAL's own ULID, which can be below a reservation.
+- **Emit more outputs than prepare reserved.** The reservation count is
+  fixed before the inputs are sized, so over-reserving is what buys the
+  freedom to split.
+- **Return anything to `pending/open/`.** Every reservation sorts below the
+  open generation, and HEAD names whole generations, so a sealed generation
+  ships entire or not at all.
+- **Survive losing its reservation.** A crash before the apply means the
+  generation ships unspliced.
+- **Outlast the generation.** The drain and any seal
+  (`drain_volume_for_seal`) must find the generation settled, so a splice
+  still running when either arrives has to be waited on or abandoned.
+
+The line between the two lists is local information. Everything the pass
+can do follows from the generation's own bytes and index files. Everything
+it cannot do needs live state, either the lbamap or the extent index, and
+consulting those at prepare is precisely what makes a pass a repack rather
+than a splice. That is the choice to make deliberately per tenant, not a
+limit to design around.
+
 ## The pass as a hook
 
 Consolidation is the first tenant, not the purpose. A sealed generation is
