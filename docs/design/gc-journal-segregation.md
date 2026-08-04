@@ -119,8 +119,8 @@ repetitive.
 log wraps over a journal LBA the entry that held it is LBA-dead, but its content
 hash is still referenced by another current journal LBA, so `classify_entry`
 returns `DemoteToCanonical` and keeps the body for dedup resolution. A canonical
-has `start_lba` 0, and `owns_entry` is false for it, so the segment is no longer
-all-journal. The classifier moves it to the stable pool, where a small segment
+makes no LBA claim, so it counts as neither tier's content and the segment is no
+longer all-journal. The classifier moves it to the stable pool, where a small segment
 is an unconditional sweep candidate, and the next pass welds the journal-content
 canonical into a data bucket. A `Delta` follows the same path through
 `CanonicalDelta`.

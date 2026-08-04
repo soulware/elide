@@ -378,11 +378,6 @@ impl ExtentIndex {
         self.segment_presence.get(&segment_id)
     }
 
-    /// Drop the presence bitset for `segment_id`, if present.
-    pub fn remove_segment_presence(&mut self, segment_id: Ulid) {
-        self.segment_presence.remove(&segment_id);
-    }
-
     /// Insert or overwrite the DATA-canonical location for `hash`. Also
     /// clears any stale `deltas` entry for the same hash — DATA
     /// supersedes Delta in the canonical-location ordering used by
