@@ -496,7 +496,7 @@ fn collect_seg_dir(dir: &Path) -> io::Result<Vec<SegInfo>> {
                         .count();
                     let body_bytes: u64 = entries
                         .iter()
-                        .filter(|e| matches!(e.kind, EntryKind::Data | EntryKind::DedupRef))
+                        .filter(|e| e.kind.is_data())
                         .map(|e| e.stored_length as u64)
                         .sum();
                     let lba_blocks: u64 = entries.iter().map(|e| e.lba_length as u64).sum();
