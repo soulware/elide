@@ -475,21 +475,31 @@ impl LbaMap {
         let new_end = start_lba + lba_length as u64;
         // `Consuming`: an existing entry blocks the install unless its
         // claimant is one of the inputs this apply consumes and deletes,
-        // or it holds our hash at a lower ULID. The first is a claim the
-        // rewrite tears down; the second names a segment with identical
-        // bytes sorting below ours, so adopting the higher ULID matches
-        // the rebuild's highest-ULID-wins claim and changes no read.
-        // Distinct content or a higher ULID blocks: that marks a write
-        // the plan did not carry. `SameOrHigher`: a claimant `>=` ours
-        // blocks. `Higher`: only a claimant `>` ours blocks — an equal
-        // claimant is this same segment's own earlier entry, and a
-        // segment's entries apply in order (a WAL-flush segment carries
-        // its epoch's writes in write order, later entries overriding
-        // earlier ones at the same LBA).
+        // or it is this same apply's own earlier entry (claimant equals
+        // ours), or it holds our hash at a lower ULID. The first is a
+        // claim the rewrite tears down; the second keeps the segment's
+        // internal write order — a fold output can carry a kept Delta and
+        // the final claim at the same LBA, and the later entry must
+        // override the earlier exactly as the rebuild's `Higher` rule
+        // applies them (a mismatch strands the Delta's source list on the
+        // final claim: a phantom refcount no rebuild reproduces); the
+        // third names a segment with identical bytes sorting below ours,
+        // so adopting the higher ULID matches the rebuild's
+        // highest-ULID-wins claim and changes no read. Distinct content
+        // at a distinct lower ULID, or a higher ULID, blocks: that marks
+        // a write the plan did not carry (a WAL whose flush promote
+        // failed keeps stamping claims below the output ULID).
+        // `SameOrHigher`: a claimant `>=` ours blocks. `Higher`: only a
+        // claimant `>` ours blocks — an equal claimant is this same
+        // segment's own earlier entry, and a segment's entries apply in
+        // order (a WAL-flush segment carries its epoch's writes in write
+        // order, later entries overriding earlier ones at the same LBA).
         let blocks = |existing: Ulid, existing_hash: blake3::Hash| -> bool {
             match blocking {
                 Blocking::Consuming(set) => {
-                    !(set.contains(&existing) || existing_hash == hash && existing < claimant)
+                    !(set.contains(&existing)
+                        || existing == claimant
+                        || existing_hash == hash && existing < claimant)
                 }
                 Blocking::SameOrHigher => existing >= claimant,
                 Blocking::Higher => existing > claimant,
