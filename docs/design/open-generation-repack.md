@@ -136,11 +136,12 @@ part-sized object the first time.
 Reclaim also shares the per-tick shape this document takes off repack. It
 runs third in `run_volume_compactions`, after `promote_wal` and `repack`,
 under a `cap` of one candidate per tick which bounds per-tick latency the
-way a period bounds repack. On the measured pgbench workload every pass in
-the bench window came back `runs_rewritten=0 discarded=1`, at 118 ms to
-1.07 s per pass against a 5s tick. The scanner finds a candidate, prep
-snapshots and mints, the worker walks the bloat gate, and the candidate is
-discarded.
+way a period bounds repack. Measured on v0.1.46, before per-run admission,
+every pass in the bench window came back `runs_rewritten=0 discarded=1` at
+118 ms to 1.07 s against a 5s tick: the scanner finds a candidate, prep
+snapshots and mints, the worker walks the bloat gate, and the whole-map
+token throws the result away. Per-run admission (#866) removes that token,
+so what the same window costs now is a measurement to retake.
 
 `prepare_reclaim` opens with `flush_wal()`, which reaches
 `flush_wal_to_pending()` and builds the segment inline on the actor thread.
@@ -151,27 +152,24 @@ output. #863 gave `prepare_repack` the shape that keeps this ordering while
 moving the segment build off the lock, dispatching the flush as a
 `PromoteJob` the worker executes, and the same shape applies here (#865).
 
-### Per-run admission comes first
+### Per-run admission came first
 
-Moving reclaim toward the trigger this document proposes depends on #866.
-`apply_reclaim_result` gates on `Arc::ptr_eq` over the whole lbamap and then
-registers unconditionally, so a write anywhere on the volume discards the
-entire result, including runs the reclaim never touched. Every other apply
-path in the system already admits per item, `apply_repack_result` through
-CAS on `current loc.segment_id == input_ulid` and `insert_consuming_inputs`.
+Reclaim's apply admits each rewritten run on its own (#866, landed):
+`register_entry_if_newer` on the lbamap, `register_entry_consuming_inputs`
+with an empty consumed set on the extent index. What decides a run is ULID
+order, which `prepare_reclaim` establishes by closing the WAL before minting
+`u_reclaim`, so a write arriving during the worker's window outranks the
+reclaim on the LBAs it touches and leaves every other run alone.
 
-A whole-map token is what makes reclaim hostile to batching. Larger, less
-frequent passes hold a longer window between prep and apply, which raises
-the chance that one unrelated write throws away a bigger result, so the
-trigger change makes the existing gate worse rather than leaving it neutral.
-Per-run admission turns that into partial success, where the runs a
-concurrent write invalidated are refused individually and the rest land, and
-a longer window costs proportionally rather than wholesale.
+That is what makes reclaim safe to batch. The window between prep and apply
+grows with the size of a pass, and per-run admission prices a longer window
+proportionally: the runs a concurrent write invalidated are refused
+individually and the rest land.
 
-The same gate is what orders #865 behind #866. Dispatching the prep flush to
-the worker puts `apply_promote` and its `Arc::make_mut(&mut self.lbamap)`
-between the reclaim's prep snapshot and its apply, where the current inline
-flush runs before the snapshot is taken.
+It also clears the way for #865, which dispatches the prep flush to the
+worker. That puts `apply_promote` and its `Arc::make_mut(&mut self.lbamap)`
+between the reclaim's prep and its apply, which per-run admission reads as
+an ordinary intervening mutation.
 
 ## What the two passes share, and where they part
 

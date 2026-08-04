@@ -21,7 +21,7 @@ Three phases, of which only the middle is heavy. See `docs/design/noop-write-ski
    - **Bloat.** At least one run of the hash must have `payload_block_offset != 0`, indicating a prior split that left dead bytes inside the stored body.
    Hashes that pass both gates have their stored body fetched via the captured extent-index snapshot (no actor round-trips), sliced to the live sub-range, re-hashed, and compressed. The output is a list of `SegmentEntry` values — Data/Inline for fresh hashes, DedupRef when the new hash is already indexed — written as a single signed segment in `pending/<segment_ulid>` via `segment::write_and_commit`. Delta-bodied hashes are skipped (see open questions).
 
-3. **Apply** (`Volume::apply_reclaim_result`). Back on the actor, check `Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)`. If the pointers differ, something mutated the lbamap while the worker was running — delete the orphan `pending/<segment_ulid>` and return `ReclaimOutcome { discarded: true, .. }`. Otherwise splice the worker's entries into the live lbamap + extent index. The segment rename was the durability commit point, same pattern `repack` uses. The WAL is not touched: reclaim's output is fully derivable from durable state, so a crash before rename leaves nothing to recover and a crash between rename and apply leaves an orphan segment that GC classifies as all-dead on the next pass.
+3. **Apply** (`Volume::apply_reclaim_result`). Back on the actor, splice each rewritten run into the live lbamap under `register_entry_if_newer` and into the extent index under `register_entry_consuming_inputs` with an empty consumed set. A run whose LBAs a concurrent write took keeps no claim and registers no body; the rest land. A pass where no run landed deletes the orphan `pending/<segment_ulid>` and returns `ReclaimOutcome { discarded: true, .. }`. The segment rename was the durability commit point, same pattern `repack` uses. The WAL is not touched: reclaim's output is fully derivable from durable state, so a crash before rename leaves nothing to recover and a crash between rename and apply leaves an orphan segment that GC classifies as all-dead on the next pass.
 
 ### Entry points
 
@@ -37,9 +37,13 @@ Three phases, of which only the middle is heavy. See `docs/design/noop-write-ski
 
 WAL records exist to make writes crash-replayable before they reach a segment. Reclaim rewrites are *derivable* from already-durable state: the source hashes are live in existing segments, and the lbamap change is a pure remap onto a fresh body. If the actor crashes before the rename, there's nothing to recover — the old entries are still there, unchanged. If we crash between rename and lbamap splice, the new segment is an orphan that GC will classify as all-dead and sweep. Same property repack relies on.
 
-### Discard window
+### What a concurrent write costs
 
-`Arc::ptr_eq(result.lbamap_snapshot, self.lbamap)` spans (prepare → worker done → apply). Any concurrent mutation voids the plan and the worker's orphan segment is deleted. Repack has the same property and it hasn't been a problem; the fallback is a clean discard, not a retry-in-place, so the next scheduled pass picks up whatever state now exists.
+A rewritten run is a claim over one LBA range, so a write invalidates exactly the runs whose LBAs it covers, and the apply admits each run on its own. What decides an individual run is ULID order: `prepare_reclaim` closes the WAL before minting `u_reclaim`, both under the actor lock, so a write arriving afterwards opens a fresh WAL at a higher ULID and outranks the reclaim on every LBA it touches. `register_entry_if_newer` reads that order directly.
+
+The polarity is the reverse of repack, whose outputs are pre-minted *below* the flushed WAL segment and which therefore needs a consumed-inputs whitelist to tell a claim its rewrite tears down from a write it did not carry. Reclaim consumes no segment: it emits fresh hashes for the live sub-ranges and leaves the old body to die by GC. Its extent-index consumed set is empty for the same reason, which admits a fresh hash into a free slot and leaves any current owner in place.
+
+A refused run is not retried in place — the next scheduled pass re-observes whatever state now exists.
 
 ### Space reclamation is deferred to GC
 
