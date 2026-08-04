@@ -1108,7 +1108,10 @@ fn main() {
         }
 
         Command::InspectSegment { path } => {
-            inspect_files::inspect_segment(&path).expect("inspect-segment failed");
+            if let Err(e) = inspect_files::inspect_segment(&path) {
+                eprintln!("error: {}: {e}", path.display());
+                std::process::exit(1);
+            }
         }
 
         Command::DumpLbamap { fork_dir } => {
@@ -1172,11 +1175,17 @@ fn main() {
         }
 
         Command::InspectWal { path } => {
-            inspect_files::inspect_wal(&path).expect("inspect-wal failed");
+            if let Err(e) = inspect_files::inspect_wal(&path) {
+                eprintln!("error: {}: {e}", path.display());
+                std::process::exit(1);
+            }
         }
 
         Command::InspectDmat { path } => {
-            inspect_files::inspect_dmat(&path).expect("inspect-dmat failed");
+            if let Err(e) = inspect_files::inspect_dmat(&path) {
+                eprintln!("error: {}: {e}", path.display());
+                std::process::exit(1);
+            }
         }
 
         Command::Ublk { command } => match command {
