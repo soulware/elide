@@ -119,6 +119,38 @@ In a healthy volume, uploads keep up, no backlog accumulates, the open pass
 never fires, and the close pass materialises the generation exactly once
 between a byte being written and that byte reaching S3.
 
+## Reclaim
+
+Reclaim sits upstream of both passes. It rewrites bloated LBA sub-ranges of
+committed content, and `prepare_reclaim` mints its output into
+`segment::pending_open_dir`, so it produces into the open generation exactly
+as formation does. Both passes then consume what it wrote.
+
+The close pass is what gives reclaim's output a sensible shape. A reclaim
+run emits one small segment, historically around 650 KiB of live bytes
+landing near 50 KiB compressed, and today each becomes its own S3 object
+that GC later folds into a larger one, so the same live bytes are written
+and uploaded twice. Packing reclaim output at the seal ships it inside a
+part-sized object the first time.
+
+Reclaim also shares the per-tick shape this document takes off repack. It
+runs third in `run_volume_compactions`, after `promote_wal` and `repack`,
+under a `cap` of one candidate per tick which bounds per-tick latency the
+way a period bounds repack. On the measured pgbench workload every pass in
+the bench window came back `runs_rewritten=0 discarded=1`, at 118 ms to
+1.07 s per pass against a 5s tick. The scanner finds a candidate, prep
+snapshots and mints, the worker walks the bloat gate, and the candidate is
+discarded.
+
+`prepare_reclaim` opens with `flush_wal()`, which reaches
+`flush_wal_to_pending()` and builds the segment inline on the actor thread.
+The flush carries the `u_flush < u_reclaim` ordering invariant, since
+reclaim's new LBA mappings supersede the pre-reclaim WAL entries they
+consume and a rebuild otherwise lets the flushed segment shadow the reclaim
+output. #863 gave `prepare_repack` the shape that keeps this ordering while
+moving the segment build off the lock, dispatching the flush as a
+`PromoteJob` the worker executes, and the same shape applies here.
+
 ## What the two passes share, and where they part
 
 Both are `execute_repack`: the same classifier, bin-pack, journal
