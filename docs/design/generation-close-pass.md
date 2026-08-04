@@ -134,18 +134,31 @@ it. That ULID does not name the segment the WAL becomes. `prepare_promote`
 mints a fresh `segment_ulid` at flush time and the promote job carries the
 WAL's own alongside it as `old_wal_ulid`.
 
-The separation is what makes the ordering hold. A segment landing in
-`pending/open/` after the rotate is named by a ULID minted at its flush, so
-it outranks any reservation minted in the rotate's critical section, and
-the open generation is empty at that instant.
+The separation is what orders a flush that begins after the rotate: its
+segment is named by a ULID minted at that flush, above every reservation.
+A promote prepped *before* the rotate mints earlier, so its segment lands
+in `pending/open/` below the reservations and the sealed generation holds
+the higher ULIDs.
 
-The WAL's own ULID still governs the window between the rotate and the
-apply. An in-flight write's claim sits at that ULID, which can be below a
-reservation, so the apply installs through the consuming-inputs rule rather
-than a strict-newer guard: it takes a sub-range only where the current
-claimant is one of the inputs it consumes, and every other claimant keeps
-its sub-range because it marks a write the pass did not carry. This is what
-`execute_repack`'s apply already does.
+Two rules keep that safe, one per map.
+
+The **classifier** covers the rebuild, which is highest-claimant-wins over
+whatever is on disk and knows nothing of generations. The pass carries an
+entry only where its own segment is the LBA's current claimant, and a
+pre-rotate promote's writes are already staged in the lbamap under the
+WAL's ULID (`write_commit`), so the sealed generation's entries for those
+LBAs classify dead and the output never claims them. An output's fresh
+ULID therefore only ever sits above content the sealed generation still
+owns. Loosening `classify_entry` to match on hash and anchor alone breaks
+this boundary, not only the pass it sits in (#873).
+
+The **consuming-inputs rule** covers the live map across the window
+between the rotate and the apply, where an in-flight write's claim sits at
+the WAL's own ULID, which can be below a reservation. The apply takes a
+sub-range only where the current claimant is one of the inputs it
+consumes; every other claimant keeps its sub-range, because it marks a
+write the pass did not carry. This is what `execute_repack`'s apply
+already does.
 
 ## Cost
 

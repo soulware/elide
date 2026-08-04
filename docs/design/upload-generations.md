@@ -164,13 +164,28 @@ is the tail beyond the knee, and the knee is what the window harvests.
 
 The mint is monotonic by design: a rewrite output sorts above every
 write that existed when it was planned, so concurrent writes always
-win their claims. Generations keep that property untouched. The close
-renames the whole directory, minting nothing, so an upload
-generation's ULIDs — including its final consolidation outputs — all
-predate every open-generation write, and claimant order across the
-boundary is the write order. Re-folding upload-generation content, the one
-operation that would interleave fresh mints above open pending, has no
-expressible form: `upload/` is not a fold source.
+win their claims. The close pass folds `pending/upload/`
+(`generation-close-pass.md`) and mints its outputs from the same mint,
+so a sealed generation can hold the newest ULIDs in the volume while an
+open-generation segment sits below them.
+
+Claimant order still tracks write order, and the classifier is what
+carries it. An entry is live only where its own segment is the LBA's
+current claimant (`segment_classify::classify_entry`), so a close-pass
+output claims an LBA only where the sealed generation still owns it. An
+LBA a concurrent write has taken is dropped from the output and stays
+with that writer, whose ULID may sit below the output's.
+
+Every write the classifier must see is in the snapshot it reads:
+`write_commit` installs the lbamap claim under the WAL's ULID before
+returning, and the close prep snapshots under the volume lock. So a
+write acknowledged before the prep is visible to the classifier, and one
+arriving after mints above the output.
+
+The boundary rests on that claimant gate. Matching an entry on hash and
+anchor alone lets a close-pass output claim LBAs a lower-ULID
+open-generation segment owns — a claim the apply refuses and a rebuild
+grants, which is the divergence #873 closed.
 
 The strict `max(committed) < min(pending)` reading died with journal
 deferral (#844 split it per tier); a GC output minted mid-window still
