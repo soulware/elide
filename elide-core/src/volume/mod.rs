@@ -594,6 +594,20 @@ pub struct Volume {
     /// `None` until the first pass, which makes the whole directory
     /// count as accumulation.
     pub(in crate::volume) repack_watermark: Option<Ulid>,
+    /// Where the bounded settled sweep resumes: the last settled data
+    /// segment a pass examined. Successive passes rotate through the
+    /// settled population from here rather than parsing all of it.
+    pub(in crate::volume) repack_settled_cursor: Option<Ulid>,
+    /// Journal-tier ULIDs in `pending/open/`, as the last pass left it.
+    /// The sweep consults this to keep every journal segment in the
+    /// candidate set without parsing settled indexes to find them.
+    ///
+    /// Each pass rewrites it from what it saw, so it stays exact: a pass
+    /// classifies every journal segment, and a segment arriving between
+    /// passes sits above the watermark and is classified by the next
+    /// one. Empty at open, where the absent watermark makes the whole
+    /// directory a candidate.
+    pub(in crate::volume) pending_journal: std::collections::BTreeSet<Ulid>,
     /// True if at least one segment has been committed since the last snapshot
     /// (or since open, if no snapshot has been taken this session). Used by
     /// `snapshot()` to decide whether a new marker is needed or the latest
@@ -921,6 +935,8 @@ impl Volume {
             wal,
             pending,
             repack_watermark: None,
+            repack_settled_cursor: None,
+            pending_journal: std::collections::BTreeSet::new(),
             has_new_segments,
             last_segment_ulid,
             file_cache: SharedFileCache::default(),

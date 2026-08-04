@@ -38,6 +38,11 @@ const REPACK_PRESSURE_BYTES: u64 = crate::actor::REPACK_TARGET_LIVE;
 /// the count crosses on its own.
 const REPACK_PRESSURE_SEGMENTS: usize = 32;
 
+/// Settled data segments a pass examines. Bounds the sweep's cost to a
+/// constant per pass, where the directory it rotates through grows with
+/// the backlog.
+const REPACK_SETTLED_SCAN: usize = 16;
+
 /// What decides whether [`Volume::prepare_repack`] starts a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepackTrigger {
@@ -203,6 +208,11 @@ pub struct RepackResult {
     /// the tick's repack, `pending/upload/` for the close pass. Apply
     /// resolves output paths against it.
     pub pending_dir: PathBuf,
+    /// Journal-tier candidates the pass classified and left in place,
+    /// which is a lone all-live journal segment the consolidation had
+    /// nothing to merge. Apply folds these with each journal bucket's
+    /// outcome into [`Volume::pending_journal`].
+    pub journal_untouched: Vec<Ulid>,
 }
 
 impl Volume {
@@ -300,6 +310,76 @@ impl Volume {
         Ok(Some(job))
     }
 
+    /// Narrow the directory listing to the candidates this pass covers:
+    /// everything above `settled_floor`, every pending journal segment,
+    /// and [`REPACK_SETTLED_SCAN`] settled data segments taken in ULID
+    /// order from [`Volume::repack_settled_cursor`], wrapping.
+    ///
+    /// The sweep needs each settled segment's parsed index to estimate
+    /// its live fraction, and the segment index cache holds 64, so an
+    /// unbounded sweep re-reads and re-verifies every index in the
+    /// directory once it outgrows the cache — worst under the stalled
+    /// drain the pass exists for. The cursor covers the whole directory
+    /// across successive passes instead, which is quick against the
+    /// minutes-scale mortality the sweep looks for.
+    ///
+    /// Journal segments are never held back. A pass that repacks data
+    /// mints its outputs above everything pending, so a journal segment
+    /// left below them inverts data-before-journal
+    /// (`docs/design/journal-pending-consolidation.md`).
+    /// [`Volume::pending_journal`] names them, which is what lets the
+    /// sweep skip a settled segment without parsing it.
+    fn select_candidates(
+        &mut self,
+        seg_paths: Vec<PathBuf>,
+        settled_floor: Option<Ulid>,
+    ) -> io::Result<Vec<PathBuf>> {
+        let Some(floor) = settled_floor else {
+            return Ok(seg_paths);
+        };
+        let mut listed: Vec<(Ulid, PathBuf)> = seg_paths
+            .into_iter()
+            .map(|p| {
+                let ulid = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| Ulid::from_string(s).ok())
+                    .ok_or_else(|| io::Error::other("bad segment filename"))?;
+                Ok((ulid, p))
+            })
+            .collect::<io::Result<_>>()?;
+        listed.sort_by_key(|(u, _)| *u);
+
+        let mut selected: Vec<(Ulid, PathBuf)> = Vec::with_capacity(listed.len());
+        let mut settled_data: Vec<(Ulid, PathBuf)> = Vec::new();
+        for (ulid, path) in listed {
+            if ulid > floor || self.pending_journal.contains(&ulid) {
+                selected.push((ulid, path));
+            } else {
+                settled_data.push((ulid, path));
+            }
+        }
+
+        if !settled_data.is_empty() {
+            let start = match self.repack_settled_cursor {
+                Some(c) => settled_data
+                    .iter()
+                    .position(|(u, _)| *u > c)
+                    .unwrap_or_default(),
+                None => 0,
+            };
+            let take = REPACK_SETTLED_SCAN.min(settled_data.len());
+            for i in 0..take {
+                let scanned = settled_data[(start + i) % settled_data.len()].clone();
+                self.repack_settled_cursor = Some(scanned.0);
+                selected.push(scanned);
+            }
+        }
+
+        selected.sort_by_key(|(u, _)| *u);
+        Ok(selected.into_iter().map(|(_, p)| p).collect())
+    }
+
     /// Prep phase of `repack` — runs on the actor thread.
     ///
     /// Pre-mints one output ULID per candidate segment, then the journal
@@ -341,6 +421,7 @@ impl Volume {
             }
         }
         let floor = latest_snapshot(&self.base_dir)?;
+        let seg_paths = self.select_candidates(seg_paths, settled_floor)?;
 
         let mut output_ulids: Vec<Ulid> = Vec::with_capacity(seg_paths.len());
         for _ in 0..seg_paths.len() {
@@ -402,6 +483,10 @@ impl Volume {
     /// with no flush.
     pub fn prepare_close_generation(&mut self) -> io::Result<CloseGenerationPrep> {
         let rotated = segment::rotate_open_generation(&self.base_dir)?;
+        // The rotate empties `pending/open/`, so the sweep's view of it
+        // starts over with the next generation's first segments.
+        self.pending_journal.clear();
+        self.repack_settled_cursor = None;
         self.assert_volume_invariants("close_generation");
         let Some(rotated) = rotated else {
             return Ok(CloseGenerationPrep {
@@ -485,9 +570,16 @@ impl Volume {
             mut stats,
             buckets,
             pending_dir,
+            journal_untouched,
         } = result;
 
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
+        // Rebuilt from what this pass saw: the journal segments it left
+        // in place, plus each journal bucket's outcome as the loop below
+        // resolves it — the output for a bucket that landed, the inputs
+        // for one that was refused.
+        let mut pending_journal: std::collections::BTreeSet<Ulid> =
+            journal_untouched.into_iter().collect();
 
         // Claims plus the delta-source closure: a claim of a
         // delta-canonical hash attaches no sources to the claim maps, yet
@@ -555,6 +647,9 @@ impl Volume {
                 stats.buckets_refused += 1;
                 if let Some(out) = &bucket.output {
                     let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
+                }
+                if bucket.journal {
+                    pending_journal.extend(bucket.inputs.iter().map(|i| i.input_ulid));
                 }
                 continue;
             }
@@ -640,6 +735,9 @@ impl Volume {
                 if let Some(out) = &bucket.output {
                     let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
                 }
+                if bucket.journal {
+                    pending_journal.extend(bucket.inputs.iter().map(|i| i.input_ulid));
+                }
                 continue;
             }
 
@@ -650,6 +748,9 @@ impl Volume {
                     self.last_segment_ulid = Some(out.new_ulid);
                 }
                 self.has_new_segments = true;
+                if bucket.journal {
+                    pending_journal.insert(out.new_ulid);
+                }
             }
 
             for input in &bucket.inputs {
@@ -679,6 +780,12 @@ impl Volume {
         }
 
         segment::fsync_dir(&pending_dir)?;
+
+        // A close pass runs over the sealed generation, whose segments
+        // are not the ones the open generation's sweep bounds.
+        if pending_dir == segment::pending_open_dir(&self.base_dir) {
+            self.pending_journal = pending_journal;
+        }
 
         Ok((stats, consumed_inputs))
     }
@@ -758,6 +865,137 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the unconditional trigger runs a pass over whatever is there"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The sweep parses every settled segment it examines, so the count
+    /// it examines has to be bounded independently of how deep the
+    /// directory has got.
+    /// Settle `n` one-block segments without packing them, so the sweep
+    /// has a settled population to bound. A real pass would bin-pack
+    /// segments this small into a single output.
+    fn settled_volume(base: &std::path::Path, n: usize) -> (Volume, Vec<Ulid>) {
+        let mut vol = Volume::open(base, base).unwrap();
+        for lba in 0..n as u64 {
+            vol.write(lba, &incompressible(1)).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        let ulids = pending_open_ulids(base);
+        assert_eq!(ulids.len(), n, "setup: one segment per promote");
+        vol.repack_watermark = ulids.last().copied();
+        (vol, ulids)
+    }
+
+    /// ULIDs of the settled segments a prep put in the candidate set.
+    fn settled_in_pass(vol: &mut Volume, settled: &[Ulid]) -> Vec<Ulid> {
+        let job = vol
+            .prepare_repack(RepackTrigger::Unconditional)
+            .unwrap()
+            .expect("a pass")
+            .job;
+        job.seg_paths
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str()?.parse::<Ulid>().ok())
+            .filter(|u| settled.contains(u))
+            .collect()
+    }
+
+    #[test]
+    fn a_pass_examines_a_bounded_number_of_settled_segments() {
+        let base = keyed_temp_dir();
+        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 3);
+
+        let examined = settled_in_pass(&mut vol, &settled).len();
+        assert_eq!(
+            examined,
+            REPACK_SETTLED_SCAN,
+            "examined {examined} settled segments of {}, cap is {REPACK_SETTLED_SCAN}",
+            settled.len()
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Successive passes rotate through the settled population, so a
+    /// segment the cap skipped is reached by a later pass rather than
+    /// left forever.
+    #[test]
+    fn the_cursor_rotates_through_the_settled_population() {
+        let base = keyed_temp_dir();
+        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 2);
+
+        let mut seen: std::collections::BTreeSet<Ulid> = std::collections::BTreeSet::new();
+        for _ in 0..2 {
+            seen.extend(settled_in_pass(&mut vol, &settled));
+        }
+        assert_eq!(
+            seen.len(),
+            settled.len(),
+            "two passes at {REPACK_SETTLED_SCAN} each must reach all {} settled segments",
+            settled.len()
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A pass that repacks data mints its outputs above everything
+    /// pending, so a journal segment the sweep held back would land
+    /// below them and invert data-before-journal. The memo is what lets
+    /// the sweep skip a settled segment without parsing it, so the two
+    /// have to agree.
+    #[test]
+    fn a_settled_journal_segment_is_never_held_back_by_the_cap() {
+        let base = keyed_temp_dir();
+        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 3);
+
+        // The oldest segment is journal-tier as far as the sweep is
+        // concerned, and the cursor starts at the beginning, so a later
+        // pass is the one that would otherwise reach it.
+        let journal = settled[0];
+        vol.pending_journal.insert(journal);
+
+        for pass in 0..3 {
+            assert!(
+                settled_in_pass(&mut vol, &settled).contains(&journal),
+                "pass {pass} left the journal segment out of the candidate set"
+            );
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The memo is rebuilt by each pass from what it classified, so a
+    /// consolidation output is what the next pass exempts.
+    #[test]
+    fn a_pass_records_the_journal_segments_it_leaves_behind() {
+        let base = keyed_temp_dir();
+        let mut cfg = crate::config::VolumeConfig::read(&base).unwrap();
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: crate::journal::JournalRanges::new(vec![(100, 16)]),
+        });
+        cfg.write(&base).unwrap();
+
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(100, &incompressible(1)).unwrap();
+        vol.write(0, &incompressible(1)).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &incompressible(2)[4096..]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        assert!(vol.pending_journal.is_empty(), "nothing has passed yet");
+        vol.repack().unwrap();
+
+        assert_eq!(
+            vol.pending_journal.len(),
+            1,
+            "the pass must record the pending journal segment it left"
+        );
+        let recorded = *vol.pending_journal.iter().next().unwrap();
+        assert!(
+            pending_open_ulids(&base).contains(&recorded),
+            "the recorded journal ULID must name a segment that is there"
         );
 
         fs::remove_dir_all(base).unwrap();
@@ -1068,6 +1306,7 @@ mod tests {
                 journal: false,
             }],
             pending_dir: segment::pending_open_dir(&base),
+            journal_untouched: Vec::new(),
         };
 
         // LBA 0 still claims the recurring hash, so removing the

@@ -2956,6 +2956,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // set is at most one jbd2 ring, so it merges into one uncapped output;
     // there is deliberately no size or entry cap here.
     let journal_solo_no_op = journal_candidates.len() == 1 && journal_candidates[0].all_live;
+    let journal_untouched: Vec<Ulid> = if journal_solo_no_op {
+        journal_candidates.iter().map(|c| c.seg_ulid).collect()
+    } else {
+        Vec::new()
+    };
     if !journal_candidates.is_empty() && !journal_solo_no_op {
         journal_candidates.sort_by_key(|c| c.seg_ulid);
 
@@ -3223,6 +3228,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         stats,
         buckets: result_buckets,
         pending_dir,
+        journal_untouched,
     })
 }
 
