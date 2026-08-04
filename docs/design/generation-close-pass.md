@@ -2,7 +2,8 @@
 
 **Status:** Proposed. Builds on upload generations (`upload-generations.md`)
 and journal consolidation (`journal-pending-consolidation.md`), both
-shipped.
+shipped. Pairs with `open-generation-repack.md`, which covers the pass over
+`pending/open/`.
 
 ## Problem
 
@@ -77,11 +78,14 @@ closing it: writes continue while the pass runs, so fresh segments land in
 `pending/open/` and the rotate ships them unpacked. That is the behaviour
 being fixed, reintroduced one step later.
 
-Immutable inputs are also what separates this pass from the tick's. Repack
-over `pending/open/` runs against a directory that formation is actively
-adding to, and it earns its keep by harvesting the mortality knee as the
-window fills. The close pass runs once, over a fixed set, and its job is
-the object count the fold leaves behind.
+Immutable inputs are also what separates this pass from the one over
+`pending/open/`, which runs against a directory that formation is actively
+adding to. Mortality is monotone, so a byte superseded mid-window is still
+superseded at the seal and this pass harvests it either way. What a pass
+over the open generation bounds is that directory's footprint and segment
+count while it is held open, which `open-generation-repack.md` covers. The
+close pass runs once, over a fixed set, and its job is the object count and
+object size the fold leaves behind.
 
 ## Sizing outputs in compressed bytes
 
