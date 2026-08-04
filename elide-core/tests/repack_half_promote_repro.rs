@@ -66,11 +66,28 @@ fn repack_after_half_promote_preserves_oracle_across_crash() {
     // HalfPromotePending — lowest-ULID pending segment is `<u_flush>`.
     // Writes sibling index/<u_flush>.idx + cache/<u_flush>.body+present from
     // the pre-repack pending body. Does NOT delete pending/<u_flush>.
-    common::half_promote_first_pending(fork_dir);
+    let u_flush = common::half_promote_first_pending(fork_dir).unwrap();
 
     // Repack — consumes pending/<u_flush> into a fresh-ULID output,
     // leaving the half-promote's siblings naming a segment that is gone.
     vol.repack().unwrap();
+
+    // Repack invalidates a consumed input's promote siblings, so the
+    // rebuild below finds no segment `<u_flush>` at all. Reads survive
+    // either way — the output's ULID is minted above the input's, so a
+    // resurrected `<u_flush>` loses every claim it makes — which is why
+    // the oracle assertions further down cannot see this.
+    for sibling in [
+        fork_dir.join("index").join(format!("{u_flush}.idx")),
+        fork_dir.join("cache").join(format!("{u_flush}.body")),
+        fork_dir.join("cache").join(format!("{u_flush}.present")),
+    ] {
+        assert!(
+            !sibling.exists(),
+            "repack must invalidate the promote sibling {}",
+            sibling.display()
+        );
+    }
 
     // Crash + reopen + finish the half-promoted segment.
     drop(vol);
