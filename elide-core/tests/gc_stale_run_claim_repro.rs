@@ -13,19 +13,13 @@
 // The journal window is [96, 100), so the straddle write splits at 100 and
 // LBA 101 lands in the stable share.
 //
-// A GC plan carries a run at [101, 104) sliced from an input it consumes.
-// By apply time LBA 101 belongs to a segment minted after that input and
-// not in the plan's consumed set, so `insert_consuming_inputs` refuses the
-// sub-range and the live map keeps the older claimant. The output is
-// already committed on disk carrying that claim at a higher ULID, and the
-// lbamap rebuild is highest-claimant-wins, so the rebuild hands [101, 104)
-// to the GC output and the two disagree on both hash and claimant.
-//
-// Reads agree either way: the run's hash covers a re-sliced span of the
-// same bytes, so both claims resolve LBA 101 to the same block. What the
-// divergence costs is that every decision keyed on the claimant — GC
-// classification, stale-liveness — reads a different owner depending on
-// whether it consults the live map or a rebuild.
+// Two segments end up holding the same hash over LBA 101, and only the
+// higher-ULID one holds the claim. The segment without the claim has to
+// classify that entry dead. Reading it live puts an output entry in the
+// plan for LBAs the segment does not own; the apply refuses that claim —
+// `insert_consuming_inputs` sees an owner outside the consumed set — while
+// the committed output keeps it at a higher ULID, so the live map and a
+// rebuild disagree from then on.
 
 use elide_core::volume::Volume;
 
@@ -59,9 +53,6 @@ fn stamp_journal_window(fork_dir: &std::path::Path) {
 }
 
 #[test]
-#[ignore = "open: apply_plan_apply_result refuses a run whose current owner is not a consumed \
-            input, leaving the committed output claiming it at a higher ULID, so the live map \
-            and a rebuild disagree. Passes once the two rules agree."]
 fn gc_run_claim_refused_in_memory_must_not_win_the_rebuild() {
     let tmp = tempfile::TempDir::new().unwrap();
     let fork_dir = tmp.path();

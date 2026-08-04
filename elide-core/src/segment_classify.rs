@@ -205,17 +205,19 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         let delta = r.range_start.checked_sub(entry.start_lba);
         delta == Some(r.payload_block_offset as u64)
     };
-    // A run keeps this entry alive when its hash and anchor agree — and, for a
-    // journal entry, when this segment is still the LBA's claimant. Journal
-    // content is never in `inner`, so `owns_home` is always false and the
-    // hash+anchor match is the only liveness signal; without the claimant gate
-    // a repetitive jbd2 block that a newer segment now claims would keep the
-    // old segment FullyLive forever and it would never reap. Durable entries
-    // are disambiguated by `owns_home`, so the claimant gate does not apply.
+    // A run keeps this entry alive when its hash and anchor agree and this
+    // segment is the LBA's claimant. The claimant decides because a hash
+    // can sit at the same LBAs under two segments — a later one writing
+    // identical bytes, a rewrite carrying content forward — and exactly
+    // one of them holds the claim. Reading the other as live would emit an
+    // output entry for LBAs this segment does not own, which the apply
+    // refuses while the committed output keeps the claim at a higher ULID,
+    // leaving the live map and a rebuild in permanent disagreement.
+    //
+    // `owns_home` names the extent index's body owner and steers only the
+    // fully-dead branch between Drop and DemoteToCanonical.
     let block_is_live = |r: &ExtentRead| -> bool {
-        r.hash == entry.hash
-            && anchor_matches(r)
-            && (!entry.journal || r.claimant_ulid == ctx.segment_id)
+        r.hash == entry.hash && anchor_matches(r) && r.claimant_ulid == ctx.segment_id
     };
     let matching_blocks: u64 = runs
         .iter()
