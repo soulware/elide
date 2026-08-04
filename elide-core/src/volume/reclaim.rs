@@ -561,6 +561,59 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// A write to an LBA the reclaim never looked at must not cost the
+    /// reclaim its result. Each rewritten run is specific to one hash
+    /// over one LBA range, so a write outside every such range
+    /// invalidates none of them.
+    ///
+    /// The `Arc::ptr_eq` precondition in `apply_reclaim_result` cannot
+    /// express that: it is a whole-lbamap token, so it fails on any
+    /// write anywhere. Per-run admission — the `insert_consuming_inputs`
+    /// / `register_entry_consuming_inputs` pair every other apply path
+    /// uses — is what makes this hold. Paired with
+    /// `reclaim_alias_merge_discards_on_concurrent_mutation`, which
+    /// covers a write that does overlap.
+    #[test]
+    #[ignore = "gated on #866: apply_reclaim_result discards on any lbamap mutation, so an \
+                unrelated write costs the whole result. Passes once per-run admission replaces \
+                the Arc::ptr_eq precondition."]
+    fn reclaim_survives_write_to_unrelated_lba() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Bloat a hash over [200, 208): 8 blocks, middle one overwritten.
+        let big = reclaim_payload(0x5E, 8);
+        vol.write(200, &big).unwrap();
+        let hole = [0x11u8; 4096];
+        vol.write(203, &hole).unwrap();
+
+        let mut expected = vec![0u8; 8 * 4096];
+        expected[..3 * 4096].copy_from_slice(&big[..3 * 4096]);
+        expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
+        expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
+
+        let job = vol.prepare_reclaim(200, 8).unwrap();
+        let result = crate::actor::execute_reclaim(job).unwrap();
+        assert!(result.segment_written, "setup: worker proposed no rewrite");
+
+        // The worker window: one write, far outside [200, 208).
+        let unrelated = reclaim_payload(0x77, 1);
+        vol.write(500, &unrelated).unwrap();
+
+        let outcome = vol.apply_reclaim_result(result).unwrap();
+        assert!(
+            !outcome.discarded,
+            "a write at LBA 500 invalidates no run the reclaim rewrote"
+        );
+        assert!(outcome.runs_rewritten > 0);
+
+        // The reclaimed range and the concurrent write both read back.
+        assert_eq!(vol.read(200, 8).unwrap(), expected);
+        assert_eq!(vol.read(500, 1).unwrap(), unrelated);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     /// Worker results cross back to the actor as body-less metas; only
     /// inline entries carry bytes for apply. Mirror of the
     /// repack/promote tests: apply + read-back must succeed on metas
