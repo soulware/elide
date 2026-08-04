@@ -149,7 +149,29 @@ reclaim's new LBA mappings supersede the pre-reclaim WAL entries they
 consume and a rebuild otherwise lets the flushed segment shadow the reclaim
 output. #863 gave `prepare_repack` the shape that keeps this ordering while
 moving the segment build off the lock, dispatching the flush as a
-`PromoteJob` the worker executes, and the same shape applies here.
+`PromoteJob` the worker executes, and the same shape applies here (#865).
+
+### Per-run admission comes first
+
+Moving reclaim toward the trigger this document proposes depends on #866.
+`apply_reclaim_result` gates on `Arc::ptr_eq` over the whole lbamap and then
+registers unconditionally, so a write anywhere on the volume discards the
+entire result, including runs the reclaim never touched. Every other apply
+path in the system already admits per item, `apply_repack_result` through
+CAS on `current loc.segment_id == input_ulid` and `insert_consuming_inputs`.
+
+A whole-map token is what makes reclaim hostile to batching. Larger, less
+frequent passes hold a longer window between prep and apply, which raises
+the chance that one unrelated write throws away a bigger result, so the
+trigger change makes the existing gate worse rather than leaving it neutral.
+Per-run admission turns that into partial success, where the runs a
+concurrent write invalidated are refused individually and the rest land, and
+a longer window costs proportionally rather than wholesale.
+
+The same gate is what orders #865 behind #866. Dispatching the prep flush to
+the worker puts `apply_promote` and its `Arc::make_mut(&mut self.lbamap)`
+between the reclaim's prep snapshot and its apply, where the current inline
+flush runs before the snapshot is taken.
 
 ## What the two passes share, and where they part
 
