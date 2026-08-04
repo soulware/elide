@@ -81,9 +81,14 @@ Working on already-compressed bodies also gives the pass something
 formation cannot have. `FLUSH_THRESHOLD` is 32 MiB of plaintext, so the
 compressed object size it produces is emergent and varies with how
 compressible the workload is. A splice over a sealed generation knows every
-input's exact compressed size before it writes anything, so it can pack to
-a compressed target, and the obvious target is the multipart part size, so
-that every object it emits uploads as a single PUT.
+input's exact compressed size before it writes anything, so it can size its
+outputs in both directions against a compressed target, packing the small
+and splitting the oversize. The obvious target is the multipart part size,
+so that every object it emits uploads as a single PUT.
+
+The target is a soft cap, as `FLUSH_THRESHOLD` is. Splits fall on entry
+boundaries, so an entry whose own compressed body exceeds the target
+produces an output that exceeds it too.
 
 Two things the splice gives up against a rewrite. Entries that were
 superseded within the generation ride along rather than being dropped, and
@@ -128,9 +133,39 @@ Against the next generation, every reservation sorts below everything
 `pending/open/` will hold, so a drained generation never commits a segment
 that outranks one still pending.
 
-The bucket count is not known until the pass classifies its inputs, so
-prepare over-reserves. The mint is a monotonic counter, so unused
-reservations cost nothing and are discarded.
+The output count is not known until the pass sizes its inputs, so prepare
+over-reserves. The mint is a monotonic counter, so unused reservations cost
+nothing and are discarded.
+
+Every output takes a reservation, including the halves of a split. Fresh
+ULIDs are what close the path-aliasing race against concurrent readers, the
+same reason `execute_repack` and GC mint them, since a reader can hold a
+descriptor for a name it already resolved and must never find different
+bytes under it.
+
+## Ordering against the open generation and the WAL
+
+The WAL carries no ULID. `mint_gc_checkpoint_ulids` mints its outputs first
+and `u_flush` last, and `flush_wal_to_pending_as(u_flush)` names the WAL's
+segment at flush time. So a reservation minted inside the rotate's critical
+section is below every ULID a later flush can draw, and `pending/open/` is
+empty at that instant, so everything that lands there afterwards outranks
+the sealed generation. The invariant holds without the pass having to
+inspect the WAL at all.
+
+What needs care is recency. ULID order decides a claim across segments and
+entry order decides it within one (`lbamap.rs`), so both directions of the
+splice must preserve the total order they were given:
+
+- **Packing** concatenates inputs in ULID order, so a later input's claim
+  lands after an earlier one's in the output, and entry-order-wins
+  reproduces exactly what ULID-order-wins decided before.
+- **Splitting** partitions entries in index order, so earlier entries take
+  the lower reservation, and entry order becomes ULID order.
+
+Preserving the order is what lets the splice skip liveness. A pack that
+reordered inputs, or a split that partitioned by size rather than position,
+would resolve a doubly-claimed LBA to the wrong entry.
 
 ## Timing
 
