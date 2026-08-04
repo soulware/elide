@@ -27,6 +27,53 @@ use super::{ResolvabilityGate, Volume, latest_snapshot};
 /// that split path is not yet built.
 pub(crate) const JOURNAL_CONSOLIDATION_ULIDS: usize = 1;
 
+/// Bytes accumulated in `pending/open/` since the last pass that start a
+/// new one on their own. One output target: below this a pass has no
+/// packing to do.
+const REPACK_PRESSURE_BYTES: u64 = crate::actor::REPACK_TARGET_LIVE;
+
+/// Segments accumulated in `pending/open/` since the last pass that start
+/// a new one on their own. Each is a file the read path may probe and a
+/// descriptor the cache may hold, a cost the bytes do not describe, so
+/// the count crosses on its own.
+const REPACK_PRESSURE_SEGMENTS: usize = 32;
+
+/// What decides whether [`Volume::prepare_repack`] starts a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepackTrigger {
+    /// Start a pass once the open generation has accumulated
+    /// [`REPACK_PRESSURE_BYTES`] or [`REPACK_PRESSURE_SEGMENTS`] since
+    /// the last one. Backlog is what accumulates, so the pass fires
+    /// hardest exactly when the directory is growing.
+    Pressure,
+    /// Start a pass over whatever `pending/open/` holds.
+    Unconditional,
+}
+
+/// Bytes and segment count in `pending/open/` above `watermark` — what
+/// has arrived since the last pass covered the directory.
+fn accumulation_since(seg_paths: &[PathBuf], watermark: Option<Ulid>) -> io::Result<(u64, usize)> {
+    let mut bytes = 0u64;
+    let mut count = 0usize;
+    for path in seg_paths {
+        let ulid = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| Ulid::from_string(s).ok())
+            .ok_or_else(|| io::Error::other("bad segment filename"))?;
+        if watermark.is_some_and(|w| ulid <= w) {
+            continue;
+        }
+        match fs::metadata(path) {
+            Ok(m) => bytes += m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        count += 1;
+    }
+    Ok((bytes, count))
+}
+
 /// Results from a single compaction run.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompactionStats {
@@ -90,6 +137,13 @@ pub struct RepackJob {
     /// segment landing while the worker runs is outside this pass rather
     /// than classified against a snapshot that predates its entries.
     pub seg_paths: Vec<PathBuf>,
+    /// Highest ULID an earlier pass over this directory covered. A
+    /// segment at or below it is packed already, so the pass classifies
+    /// it only once the cheap live-hash estimate reads it sparse; a
+    /// segment above it is classified unconditionally. `None` classifies
+    /// every candidate, which is what the close pass over a sealed
+    /// generation does.
+    pub settled_floor: Option<Ulid>,
     pub output_ulids: Vec<Ulid>,
     /// Output ULIDs reserved for the journal-consolidation merge, minted
     /// after every entry of `output_ulids` so each sorts above every data
@@ -227,7 +281,8 @@ impl Volume {
     /// repack job runs, matching the order the actor gets from
     /// dispatching the flush first.
     pub(in crate::volume) fn prepare_repack_inline(&mut self) -> io::Result<Option<RepackJob>> {
-        let Some(RepackPrep { flush, job }) = self.prepare_repack()? else {
+        let Some(RepackPrep { flush, job }) = self.prepare_repack(RepackTrigger::Unconditional)?
+        else {
             return Ok(None);
         };
         if let Some(flush) = flush {
@@ -260,8 +315,15 @@ impl Volume {
     /// The caller dispatches [`RepackPrep::flush`] before the repack
     /// job, so the promote's own apply lands first.
     ///
-    /// Returns `None` when `pending/` is missing or has no segments.
-    pub fn prepare_repack(&mut self) -> io::Result<Option<RepackPrep>> {
+    /// Under [`RepackTrigger::Pressure`] the pass starts on what has
+    /// accumulated above [`Volume::repack_watermark`]. The tick asks at
+    /// its own cadence and the answer is usually `None`, which makes the
+    /// cadence an upper bound on how often the question is posed rather
+    /// than a schedule of work.
+    ///
+    /// Returns `None` when `pending/` is missing, has no segments, or
+    /// holds too little accumulation to be worth a pass.
+    pub fn prepare_repack(&mut self, trigger: RepackTrigger) -> io::Result<Option<RepackPrep>> {
         let pending_dir = segment::pending_open_dir(&self.base_dir);
         let seg_paths = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
@@ -270,6 +332,13 @@ impl Volume {
         };
         if seg_paths.is_empty() {
             return Ok(None);
+        }
+        let settled_floor = self.repack_watermark;
+        if trigger == RepackTrigger::Pressure {
+            let (bytes, count) = accumulation_since(&seg_paths, settled_floor)?;
+            if bytes < REPACK_PRESSURE_BYTES && count < REPACK_PRESSURE_SEGMENTS {
+                return Ok(None);
+            }
         }
         let floor = latest_snapshot(&self.base_dir)?;
 
@@ -288,6 +357,10 @@ impl Volume {
             .collect();
         let u_flush = self.mint.next();
         let flush = self.rotate_wal_into_promote(u_flush)?;
+        // Every candidate listed above sits below `u_flush`, so the pass
+        // covers the directory as far as this ULID and the next one
+        // measures its accumulation from here.
+        self.repack_watermark = Some(u_flush);
 
         Ok(Some(RepackPrep {
             flush,
@@ -296,6 +369,7 @@ impl Volume {
                 pending_dir,
                 floor,
                 seg_paths,
+                settled_floor,
                 output_ulids,
                 journal_output_ulids,
                 lbamap_snapshot: Arc::clone(&self.lbamap),
@@ -358,6 +432,7 @@ impl Volume {
                 pending_dir,
                 floor,
                 seg_paths,
+                settled_floor: None,
                 output_ulids,
                 journal_output_ulids,
                 lbamap_snapshot: Arc::clone(&self.lbamap),
@@ -643,6 +718,168 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
     use std::fs;
+
+    // --- pressure trigger ---
+
+    /// Distinct bytes per block, so a payload survives compression and
+    /// its segment file is the size the writes imply.
+    fn incompressible(n_blocks: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n_blocks * 4096];
+        let mut xof = blake3::Hasher::new_keyed(&[0x5au8; 32]).finalize_xof();
+        xof.fill(&mut buf);
+        buf
+    }
+
+    fn pending_open_ulids(base: &std::path::Path) -> Vec<Ulid> {
+        let mut ulids: Vec<Ulid> = segment::collect_segment_files(&segment::pending_open_dir(base))
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str()?.parse().ok())
+            .collect();
+        ulids.sort();
+        ulids
+    }
+
+    #[test]
+    fn pressure_withholds_a_pass_the_unconditional_trigger_starts() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &incompressible(1)).unwrap();
+        vol.promote_for_test().unwrap();
+
+        assert!(
+            vol.prepare_repack(RepackTrigger::Pressure)
+                .unwrap()
+                .is_none(),
+            "one small segment is below both thresholds"
+        );
+        assert!(
+            vol.prepare_repack(RepackTrigger::Unconditional)
+                .unwrap()
+                .is_some(),
+            "the unconditional trigger runs a pass over whatever is there"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn accumulated_bytes_start_a_pass() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let payload = incompressible((REPACK_PRESSURE_BYTES / 4096) as usize + 1);
+        vol.write(0, &payload).unwrap();
+        vol.promote_for_test().unwrap();
+
+        assert!(
+            vol.prepare_repack(RepackTrigger::Pressure)
+                .unwrap()
+                .is_some(),
+            "one segment over the byte threshold starts a pass on its own"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn accumulated_segments_start_a_pass() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        for lba in 0..REPACK_PRESSURE_SEGMENTS as u64 {
+            vol.write(lba, &incompressible(1)).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        assert!(
+            vol.prepare_repack(RepackTrigger::Pressure)
+                .unwrap()
+                .is_some(),
+            "the segment count crosses on bytes far below the byte threshold"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn accumulation_is_measured_above_the_watermark() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        for lba in 0..REPACK_PRESSURE_SEGMENTS as u64 {
+            vol.write(lba, &incompressible(1)).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+        vol.repack().unwrap();
+
+        assert!(
+            vol.prepare_repack(RepackTrigger::Pressure)
+                .unwrap()
+                .is_none(),
+            "a pass covered the directory, so nothing has accumulated since"
+        );
+
+        vol.write(1024, &incompressible(1)).unwrap();
+        vol.promote_for_test().unwrap();
+        assert!(
+            vol.prepare_repack(RepackTrigger::Pressure)
+                .unwrap()
+                .is_none(),
+            "one segment above the watermark is below both thresholds"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // --- settled admission ---
+
+    #[test]
+    fn a_settled_segment_that_went_sparse_re_enters_the_pass() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        let block = incompressible(1);
+        vol.write(0, &block).unwrap();
+        vol.promote_for_test().unwrap();
+        vol.write(0, &incompressible(2)[4096..]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let ulids = pending_open_ulids(&base);
+        assert_eq!(ulids.len(), 2, "setup: one dead segment, one live");
+        vol.repack_watermark = ulids.last().copied();
+
+        let stats = vol.repack().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 1,
+            "the fully-dead segment is sparse and re-enters; the live one is dense and stays out"
+        );
+        assert!(
+            pending_open_ulids(&base).contains(&ulids[1]),
+            "the dense settled segment keeps its own ULID"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn settled_dense_segments_stay_out_of_the_pass() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        for lba in 0..2u64 {
+            vol.write(lba, &incompressible(1)).unwrap();
+            vol.promote_for_test().unwrap();
+        }
+
+        let ulids = pending_open_ulids(&base);
+        assert_eq!(ulids.len(), 2);
+        vol.repack_watermark = ulids.last().copied();
+
+        let stats = vol.repack().unwrap();
+        assert_eq!(
+            stats.segments_compacted, 0,
+            "two small all-live settled segments would otherwise pack into one bucket"
+        );
+        assert_eq!(pending_open_ulids(&base), ulids);
+
+        fs::remove_dir_all(base).unwrap();
+    }
 
     // --- compaction tests ---
 

@@ -83,8 +83,8 @@ pub use reclaim::{
     scan_reclaim_candidates,
 };
 pub use repack::{
-    CloseGenerationPrep, CompactionStats, RepackJob, RepackPrep, RepackResult, RepackedBucket,
-    RepackedInput, RepackedOutput,
+    CloseGenerationPrep, CompactionStats, RepackJob, RepackPrep, RepackResult, RepackTrigger,
+    RepackedBucket, RepackedInput, RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -587,6 +587,13 @@ pub struct Volume {
     /// file on the next promote(). Populated by `write_commit` and by
     /// `recover_wal`, so body bytes live once — in the WAL and its page cache.
     pub(in crate::volume) pending: Vec<PendingWrite>,
+    /// Highest ULID a repack pass over the open generation has covered.
+    /// Segments at or below it are settled: a pass has already packed
+    /// them, so the pressure gate leaves them out of its accumulation
+    /// and the pass itself re-admits one only once it has gone sparse.
+    /// `None` until the first pass, which makes the whole directory
+    /// count as accumulation.
+    pub(in crate::volume) repack_watermark: Option<Ulid>,
     /// True if at least one segment has been committed since the last snapshot
     /// (or since open, if no snapshot has been taken this session). Used by
     /// `snapshot()` to decide whether a new marker is needed or the latest
@@ -913,6 +920,7 @@ impl Volume {
             sketch_index: Arc::new(sketch_index),
             wal,
             pending,
+            repack_watermark: None,
             has_new_segments,
             last_segment_ulid,
             file_cache: SharedFileCache::default(),

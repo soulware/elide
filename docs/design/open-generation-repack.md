@@ -1,23 +1,22 @@
 # Design: repack on the open generation
 
-**Status:** Proposed. Pairs with `generation-close-pass.md`, which covers the
-sealed generation. Builds on upload generations (`upload-generations.md`) and
-halt-on-failure drain (`durable-cut.md`), both shipped.
+**Status:** Implemented. Pairs with `generation-close-pass.md`, which covers
+the sealed generation. Builds on upload generations (`upload-generations.md`)
+and halt-on-failure drain (`durable-cut.md`), both shipped.
 
 ## Problem
 
-Repack runs from `run_volume_compactions` on every tick, and
-`prepare_repack` starts a pass whenever `pending/open/` holds anything:
+Repack runs from `run_volume_compactions` on every tick:
 
 ```rust
 let flushed = control::promote_wal(&self.fork_dir).await;
 if let Some(s) = control::repack(&self.fork_dir).await
 ```
 
-The tick is `[supervisor] drain_interval`, 5s by default. A cut at 120s
-therefore materialises the open generation about 24 times before any of it
-ships, once per tick, each pass rewriting every surviving byte the previous
-pass just wrote.
+The tick is `[supervisor] drain_interval`, 5s by default. A pass that starts
+whenever `pending/open/` holds anything therefore materialises the open
+generation about 24 times under a 120s cut before any of it ships, once per
+tick, each pass rewriting every surviving byte the previous pass just wrote.
 
 Measured on rig pg15 (2026-08-04, v0.1.46, perf-2x, scale 50 / 8 clients,
 180s benches, config varied across machine restarts):
@@ -101,6 +100,42 @@ Two thresholds, both cheap to evaluate from a `read_dir`:
   capacity against live segment count).
 
 Either crossing starts a pass.
+
+## What a pass covers
+
+A pass classifies the segments that arrived since the last one. Classification
+is the expensive half — `extents_in_range` per entry — and re-running it over
+a segment an earlier pass already packed pays only when that segment's bytes
+have died since.
+
+Whether they have is answered by the estimate the scan already computes, one
+hash-set probe per entry against `live_hashes` off an index the segment cache
+holds:
+
+```rust
+let live_bytes_est = entries.filter(|e| live_hashes.contains(&e.hash)).sum(stored_length);
+```
+
+A settled segment re-enters the pass when that reads below
+`REPACK_SETTLED_DENSITY`, the same 0.70 the coordinator applies to committed
+segments. The estimate counts an entry live whenever its hash resolves
+anywhere, so it reads a segment denser than a classification would and admits
+a subset of what one would find worth rewriting. Mortality is monotone, so
+what it leaves behind is harvested whole by the close pass.
+
+This is what keeps the cost of a pass proportional to what accumulated rather
+than to the whole directory, which is what makes the absolute thresholds above
+amortise: work stays proportional to bytes written, whatever the write rate
+and however long a generation stays open.
+
+Journal segments are classified every pass. The consolidation merge has to
+cover all pending journal for the data-before-journal ordering to hold, and
+the live ring is one jbd2 window however deep the backlog, so the exemption
+costs a bounded amount.
+
+The volume tracks the boundary as `repack_watermark`, the `u_flush` of the
+last pass. Every candidate that pass listed sits below it, its outputs are
+minted below it, and everything a later flush or reclaim writes sorts above.
 
 ## Division of labour
 
@@ -194,8 +229,9 @@ Two things differ, and they sit in prep rather than in the pass:
 
 ## Cost
 
-A pass costs one materialisation of the live bytes it covers. Under the
-pressure trigger the number of passes over a generation's lifetime is
+A pass costs one materialisation of the live bytes it covers, which is what
+accumulated since the last pass plus whatever settled bytes have died. Under
+the pressure trigger the number of passes over a generation's lifetime is
 governed by how far the drain falls behind rather than by how long the
 generation stays open, so a healthy volume pays once at the close and a
 stalled one pays per backlog threshold crossed.

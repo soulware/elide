@@ -137,7 +137,7 @@ fn dispatch(
     match request {
         VolumeRequest::Flush => write_unit(writer, handle.flush()),
         VolumeRequest::PromoteWal => write_unit(writer, handle.promote_wal()),
-        VolumeRequest::Repack => match handle.repack() {
+        VolumeRequest::Repack => match handle.repack(elide_core::volume::RepackTrigger::Pressure) {
             Ok(stats) => {
                 let _ = write_envelope(writer, &Envelope::ok(CompactionReply { stats }));
             }
