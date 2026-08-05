@@ -624,6 +624,10 @@ fn scanner_surfaces_bloated_delta_hash() {
     .unwrap();
 
     let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+    // The scanner's scope is committed content, so promote both
+    // segments: the delta blob moves to `cache/<id>.delta`.
+    vol.promote_segment(parent_ulid).unwrap();
+    vol.promote_segment(delta_ulid).unwrap();
 
     // Split the Delta with a middle overwrite to create bloat.
     let overwrite = vec![0xEEu8; 2 * 4096];

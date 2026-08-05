@@ -160,6 +160,12 @@ pub struct ReclaimCandidate {
 ///
 /// Zero-extents, Inline entries, and hashes absent from both the Data
 /// and Delta tables are skipped.
+///
+/// **Scope:** committed bodies, those resolving through `cache/<id>`.
+/// Pre-upload bloat belongs to the passes that own that stage — repack
+/// slices a partially dead entry into live runs and consumes the input,
+/// and the sealed generation is immutable until it drains — so an extent
+/// rewrite there would emit a second segment for the same end state.
 pub fn scan_reclaim_candidates(
     lbamap: &lbamap::LbaMap,
     extent_index: &extentindex::ExtentIndex,
@@ -225,6 +231,17 @@ pub fn scan_reclaim_candidates(
                 if loc.inline_data.is_some() {
                     continue;
                 }
+                // Committed bodies only. A body still in a full segment
+                // file is pre-upload, where the passes that own that
+                // stage compact it for free: repack slices a partially
+                // dead entry into live runs and consumes the input, and
+                // the sealed generation is immutable until it drains. A
+                // rewrite here would emit a second segment for the same
+                // end state, and against the sealed generation it would
+                // upload the compact copy alongside the bloat.
+                if loc.body_source.home() != segment::BodyHome::Cache {
+                    continue;
+                }
                 match loc.codec {
                     segment::Codec::None => {
                         (loc.body_length as u64 / 4096, false, loc.body_length as u64)
@@ -233,7 +250,10 @@ pub fn scan_reclaim_candidates(
                         (agg.max_offset_end, true, loc.body_length as u64)
                     }
                 }
-            } else if extent_index.lookup_delta(hash).is_some() {
+            } else if extent_index
+                .lookup_delta(hash)
+                .is_some_and(|d| matches!(d.body_source, extentindex::DeltaBodySource::Cached))
+            {
                 // Delta-backed: the logical fragment size is not
                 // recorded on disk (the Delta entry's stored_length
                 // is zero — the delta blob is accessed via the
@@ -474,6 +494,15 @@ mod tests {
         let mut xof = hasher.finalize_xof();
         xof.fill(&mut buf);
         buf
+    }
+
+    /// Move every write into a committed body: flush the WAL to
+    /// `pending/`, then promote each pending segment so its bodies live
+    /// in `cache/`. The scanner's scope is committed content, so this is
+    /// what puts a bloated hash in front of it.
+    fn commit(vol: &mut Volume) {
+        vol.promote_for_test().unwrap();
+        simulate_upload(vol);
     }
 
     fn reclaim_payload(seed: u8, n_blocks: usize) -> Vec<u8> {
@@ -756,6 +785,7 @@ mod tests {
         // Overwrite the middle 2 blocks with unrelated content.
         let hole: Vec<u8> = (0..2).flat_map(|_| [0x77u8; 4096]).collect();
         vol.write(203, &hole).unwrap();
+        commit(&mut vol);
 
         let (lbamap, extent_index) = vol.snapshot_maps();
         let candidates = crate::volume::scan_reclaim_candidates(
@@ -780,6 +810,48 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// The scanner's scope is committed content: the same bloat is
+    /// invisible while the body is still in a pending segment, where
+    /// repack compacts it in place, and visible once it commits.
+    #[test]
+    fn scan_reclaim_candidates_skips_a_body_that_has_not_committed() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(500, &reclaim_payload(0x55, 8)).unwrap();
+        vol.write(503, &[0x88u8; 4096]).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let pending = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert!(
+            pending.is_empty(),
+            "a body still in pending/ belongs to repack, got {pending:?}"
+        );
+        drop(lbamap);
+        drop(extent_index);
+
+        simulate_upload(&mut vol);
+
+        let (lbamap, extent_index) = vol.snapshot_maps();
+        let committed = crate::volume::scan_reclaim_candidates(
+            &lbamap,
+            &extent_index,
+            scanner_thresholds_permissive(),
+        );
+        assert_eq!(
+            committed.len(),
+            1,
+            "the same bloat is reclaim's once the body commits, got {committed:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     /// Thresholds are respected: bumping `min_dead_blocks` above the
     /// actual dead count drops the candidate.
     #[test]
@@ -789,6 +861,7 @@ mod tests {
 
         vol.write(300, &reclaim_payload(0x33, 8)).unwrap();
         vol.write(303, &[0x99u8; 4096]).unwrap(); // 1 block hole
+        commit(&mut vol);
 
         let (lbamap, extent_index) = vol.snapshot_maps();
 
@@ -830,6 +903,7 @@ mod tests {
 
         vol.write(400, &reclaim_payload(0x44, 8)).unwrap();
         vol.write(404, &[0x11u8; 4096]).unwrap();
+        commit(&mut vol);
 
         // Oracle: bytes at [400, 408) after the second write.
         let expected = {
@@ -973,6 +1047,7 @@ mod tests {
             vol.write(base_lba, &reclaim_payload(seed, 8)).unwrap();
             vol.write(base_lba + 3, &[0xFFu8; 4096]).unwrap();
         }
+        commit(&mut vol);
 
         let thresholds = scanner_thresholds_permissive();
 

@@ -193,9 +193,16 @@ and two stragglers of 3.4 KiB.
 
 ## Timing
 
-A cut is drain, publish, close. The generation just sealed is not drained
-until the *next* cut, so the pass has a full cut interval to complete and
-the cut's critical path grows by a mint and a classification.
+A cut tick is drain, publish, close. The drain runs on *every* tick over
+whatever `pending/upload/` holds, so the generation a cut seals uploads on
+the tick after it, and the HEAD naming those segments publishes at the cut
+after that. The pass has one tick interval between sealing a generation and
+its bytes leaving, which is why it packs at the close rather than waiting
+for more of the generation's content to die first.
+
+`close_generation` is awaited inside the tick, so the pass sits on the
+cut's critical path: the cut grows by a mint and a classification, and the
+work that classification takes on is bounded (*Bounding the work*).
 
 The drain of a generation must not begin before that generation's pass has
 applied, and a seal (`drain_volume_for_seal`) must find it settled for the
