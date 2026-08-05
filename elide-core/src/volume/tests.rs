@@ -2006,6 +2006,68 @@ fn journal_consolidation_skips_lone_all_live_segment() {
 }
 
 #[test]
+fn journal_lift_carries_the_input_inode() {
+    // A lone all-live journal segment lifted above a data output is the
+    // input file under a new name: one link, no body copy. The inode is
+    // what discriminates — a rewrite would produce a fresh one.
+    use std::os::unix::fs::MetadataExt;
+
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let d0: Vec<u8> = (0..4096).map(|i| (i * 3 + 1) as u8).collect();
+    let j0: Vec<u8> = (0..4096).map(|i| (i * 5 + 2) as u8).collect();
+    let d1: Vec<u8> = (0..4096).map(|i| (i * 7 + 4) as u8).collect();
+
+    vol.write(0, &d0).unwrap();
+    vol.write(100, &j0).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(1, &d1).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let seg_path = |u: Ulid| segment::pending_open_dir(&base).join(u.to_string());
+    let journal_of = |vol: &Volume| -> Vec<Ulid> {
+        pending_ulids(&base)
+            .into_iter()
+            .filter(|u| seg_all_journal(&base, vol, *u))
+            .collect()
+    };
+
+    assert_eq!(pending_ulids(&base).len(), 3);
+    let before = journal_of(&vol);
+    assert_eq!(before.len(), 1);
+    let ino_before = fs::metadata(seg_path(before[0])).unwrap().ino();
+
+    vol.repack().unwrap();
+
+    let after = journal_of(&vol);
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0] > before[0],
+        "the lift carries the journal segment to a higher ulid"
+    );
+    assert_eq!(
+        fs::metadata(seg_path(after[0])).unwrap().ino(),
+        ino_before,
+        "the lifted segment is the input file linked under the new ulid"
+    );
+    assert!(
+        !seg_path(before[0]).exists(),
+        "the input name is unlinked once the apply publishes"
+    );
+
+    assert_eq!(vol.read(100, 1).unwrap(), j0);
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 1).unwrap(), d0);
+    assert_eq!(vol.read(1, 1).unwrap(), d1);
+    assert_eq!(vol.read(100, 1).unwrap(), j0);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn failed_promote_restore_reparks_both_partitions() {
     let base = keyed_temp_dir();
     set_journal_ranges(&base, vec![(100, 16)]);

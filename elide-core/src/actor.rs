@@ -3022,6 +3022,24 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     if journal_lifted {
         journal_candidates.sort_by_key(|c| c.seg_ulid);
 
+        // One input whose every entry survives whole: the output's bytes
+        // are the input's, so the lift links the file under the new ULID
+        // instead of rewriting it. One inode under two names costs a link
+        // and an unlink, where a rewrite reads every body, re-signs, and
+        // writes the segment again.
+        //
+        // Two names is what makes it safe. A reader resolves a `Local`
+        // body by filename, so a name that stops existing while a
+        // published snapshot still points at it reads as a missing
+        // segment. Linking leaves the input name in place until the apply
+        // publishes and `remove_consumed_inputs` unlinks it, which is the
+        // window every other consumed input already relies on.
+        let verbatim_lift = journal_candidates.len() == 1
+            && journal_candidates[0]
+                .classifications
+                .iter()
+                .all(|c| matches!(c, EntryClassification::FullyLive));
+
         let mut outputs: Vec<PlanOutput> = Vec::new();
         let mut journal_inputs: Vec<crate::volume::RepackedInput> =
             Vec::with_capacity(journal_candidates.len());
@@ -3050,63 +3068,77 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             let new_ulid = *journal_output_ulids
                 .first()
                 .ok_or_else(|| io::Error::other("repack: no reserved journal output ulid"))?;
-            let plan = RewritePlan { new_ulid, outputs };
-            let resolver = WorkerBodyResolver {
-                base_dir: &base_dir,
-                ancestor_layers: &ancestor_layers,
-                fetcher: fetcher.as_ref(),
-                extent_index: &extent_index_snapshot,
-            };
-            let plan_inputs = plan.inputs();
-            let ctx = match MaterialiseCtx::new_for_pending(
-                &base_dir,
-                &pending_dir,
-                &plan_inputs,
-                &extent_index_snapshot,
-                &resolver,
-            ) {
-                Ok(c) => c.allowing_journal(),
-                Err(MaterialiseOutcome::Io(e)) => return Err(e),
-                Err(MaterialiseOutcome::Cancel(e)) => {
-                    return Err(io::Error::other(format!(
-                        "journal consolidation {new_ulid}: materialise prep cancelled: {e}"
-                    )));
-                }
-            };
-            let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
-                Ok(m) => m,
-                Err(MaterialiseOutcome::Io(e)) => return Err(e),
-                Err(MaterialiseOutcome::Cancel(e)) => {
-                    return Err(io::Error::other(format!(
-                        "journal consolidation {new_ulid}: materialise cancelled: {e}"
-                    )));
-                }
-            };
-            drop(ctx);
+            let final_path = pending_dir.join(new_ulid.to_string());
 
-            let Materialised {
-                mut entries,
-                delta_body,
-            } = materialised;
-            // Re-tag every merged entry journal so the output registers into
-            // the disjoint `(segment, hash)` journal map, never `inner`, and
-            // reaps whole. The journal tier carries no deltas.
-            for pe in &mut entries {
-                pe.entry.journal = true;
-            }
-            debug_assert!(
-                delta_body.is_empty(),
-                "journal consolidation output must carry no delta body"
-            );
+            let (new_body_section_start, out_entries) = if verbatim_lift {
+                let input_path = &journal_inputs[0].input_path;
+                let parsed = segment_cache.read_and_verify(input_path, &verifying_key)?;
+                std::fs::hard_link(input_path, &final_path)?;
+                segment::fsync_dir(&final_path)?;
+                (parsed.body_section_start, parsed.entries.clone())
+            } else {
+                let plan = RewritePlan { new_ulid, outputs };
+                let resolver = WorkerBodyResolver {
+                    base_dir: &base_dir,
+                    ancestor_layers: &ancestor_layers,
+                    fetcher: fetcher.as_ref(),
+                    extent_index: &extent_index_snapshot,
+                };
+                let plan_inputs = plan.inputs();
+                let ctx = match MaterialiseCtx::new_for_pending(
+                    &base_dir,
+                    &pending_dir,
+                    &plan_inputs,
+                    &extent_index_snapshot,
+                    &resolver,
+                ) {
+                    Ok(c) => c.allowing_journal(),
+                    Err(MaterialiseOutcome::Io(e)) => return Err(e),
+                    Err(MaterialiseOutcome::Cancel(e)) => {
+                        return Err(io::Error::other(format!(
+                            "journal consolidation {new_ulid}: materialise prep cancelled: {e}"
+                        )));
+                    }
+                };
+                let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
+                    Ok(m) => m,
+                    Err(MaterialiseOutcome::Io(e)) => return Err(e),
+                    Err(MaterialiseOutcome::Cancel(e)) => {
+                        return Err(io::Error::other(format!(
+                            "journal consolidation {new_ulid}: materialise cancelled: {e}"
+                        )));
+                    }
+                };
+                drop(ctx);
 
-            let new_ulid_str = new_ulid.to_string();
-            let final_path = pending_dir.join(&new_ulid_str);
-            let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
-            let _ = std::fs::remove_file(&tmp_path);
-            let (new_body_section_start, out_entries) =
-                segment::write_segment_full(&tmp_path, entries, &delta_body, &[], signer.as_ref())?;
-            std::fs::rename(&tmp_path, &final_path)?;
-            segment::fsync_dir(&final_path)?;
+                let Materialised {
+                    mut entries,
+                    delta_body,
+                } = materialised;
+                // Re-tag every merged entry journal so the output registers
+                // into the disjoint `(segment, hash)` journal map, never
+                // `inner`, and reaps whole. The journal tier carries no deltas.
+                for pe in &mut entries {
+                    pe.entry.journal = true;
+                }
+                debug_assert!(
+                    delta_body.is_empty(),
+                    "journal consolidation output must carry no delta body"
+                );
+
+                let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
+                let _ = std::fs::remove_file(&tmp_path);
+                let written = segment::write_segment_full(
+                    &tmp_path,
+                    entries,
+                    &delta_body,
+                    &[],
+                    signer.as_ref(),
+                )?;
+                std::fs::rename(&tmp_path, &final_path)?;
+                segment::fsync_dir(&final_path)?;
+                written
+            };
             stats.new_segments += 1;
             stats.bytes_freed += journal_bytes_freed;
 
@@ -3124,6 +3156,10 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             journal: true,
         });
     }
+
+    // Phase 3 — materialise each bucket. A bucket of one fully-live
+    // candidate is a byte-identical no-op; skip it. Data buckets append
+    // after the journal bucket already pushed above.
 
     // Phase 3 — materialise each bucket. A bucket of one fully-live
     // candidate is a byte-identical no-op; skip it. Data buckets append
