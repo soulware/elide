@@ -34,6 +34,11 @@ pub enum TickOutcome {
 /// fence halts and rehomes it.
 const FENCE_HEARTBEAT: Duration = Duration::from_secs(60);
 
+/// How often the GC pass logs its density-versus-age census. The
+/// distribution answers a question about segment lifetimes, so it moves
+/// on the scale of minutes while the pass runs on `gc.interval`.
+const CENSUS_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Result of re-reading `names/<name>` against this fork's ULID. The
 /// two consumers dispose of the non-`Bound` cases differently — the
 /// tick-top fence stays conservative (only `Displaced` fences), the
@@ -83,6 +88,11 @@ pub struct GcCycleOrchestrator {
     /// always checks; not bumped when the fence returns an outcome,
     /// so a failed halt retries on the very next tick.
     last_fence: Instant,
+    /// Cross-tick: last time the density census was logged. The pass
+    /// builds one every time it loads its state, which is far more
+    /// often than the distribution moves, so the log runs on
+    /// [`CENSUS_INTERVAL`] instead of per pass.
+    last_census: Instant,
     /// Publish scratch: ULIDs uploaded (drain) or produced (GC output)
     /// since the last published cut — the signal that S3 segment state
     /// changed and a HEAD PUT is due. Kept across ticks until a publish
@@ -202,6 +212,7 @@ impl GcCycleOrchestrator {
             gc_was_active: true,
             last_reap,
             last_fence,
+            last_census: now.checked_sub(CENSUS_INTERVAL).unwrap_or(now),
             last_cut,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
@@ -1232,6 +1243,13 @@ impl GcCycleOrchestrator {
             Ok(stats) => stats.reclaim_targets.clone(),
             Err(_) => Vec::new(),
         };
+        if self.last_census.elapsed() >= CENSUS_INTERVAL
+            && let Ok(stats) = &gc_result
+            && let Some(census) = &stats.census
+        {
+            census.log(vol_ulid);
+            self.last_census = Instant::now();
+        }
         match gc_result {
             Ok(gc::GcStats {
                 strategy: gc::GcStrategy::Compact,
