@@ -1731,6 +1731,7 @@ impl Volume {
                 // a durable input it is a no-op.
                 for old_ulid in &consumed {
                     index.purge_journal_segment(*old_ulid);
+                    index.purge_segment_delta_sources(*old_ulid);
                 }
             }
 
