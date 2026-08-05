@@ -8,8 +8,6 @@
 //   Eligibility:
 //     * dead input — retained_stored_bytes == 0, includable at zero rewrite cost
 //       (contributes to the output's `inputs` list, not its body).
-//     * small     — retained_stored_bytes ≤ SWEEP_SMALL_THRESHOLD (half the
-//       materialise cap), any density. Consolidation candidate.
 //     * sparse    — density < density_threshold AND has reclaimable bytes,
 //       any size. Reclamation candidate. Density is retained/total, so a
 //       segment whose bodies all survive as canonicals reads dense and is
@@ -111,12 +109,6 @@ use crate::config::GcConfig;
 /// canonical carries its full body at zero live bytes.
 const SWEEP_MATERIALISE_CAP: u64 = 32 * 1024 * 1024;
 
-/// Stored-bytes threshold at or below which a segment is a "small" sweep
-/// candidate: half a full output, so two smalls fit one bucket. Derived
-/// from the budget the packing charges rather than set independently, so
-/// the two cannot drift into different units again.
-const SWEEP_SMALL_THRESHOLD: u64 = SWEEP_MATERIALISE_CAP / 2;
-
 /// Entry-count cap on the merged GC output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` (volume.rs) so GC outputs sit at the same scale
 /// as freshly-flushed segments — packing stops when either this cap or
@@ -203,7 +195,7 @@ impl GcStats {
 /// Run one GC pass for a single fork.
 ///
 /// Selects up to `bucket_ulids.len()` independent buckets of eligible
-/// segments (dead | small | sparse, filtered to cache-resident candidates)
+/// segments (dead | sparse, filtered to cache-resident candidates)
 /// via FFD bin-packing, and emits one plan per bucket under the
 /// corresponding `bucket_ulids[i]`. Returns `GcStrategy::None(reason)` if
 /// nothing was eligible; the reason distinguishes genuine idle
@@ -613,23 +605,21 @@ fn pack_stable(
 
     let density_threshold = config.density_threshold;
 
-    // Keep the candidates whose rewrite is worth pursuing and drop the
-    // rest here — a dense large input with no dead bytes never warrants a
-    // rewrite, regardless of bucket headroom. `has_data_content` excludes
-    // pure DedupRef/Zero/Inline segments where rewriting reclaims no
-    // physical body — they pack only as part of a tombstone-fold or a
-    // small-with-dead bucket.
+    // Keep the candidates whose rewrite frees bytes and drop the rest
+    // here. Sparsity is the whole test: a rewrite that carries every
+    // entry through returns the same bytes under one fewer name, and
+    // packing that pays is repack's, upstream of the upload, where it
+    // costs no S3 traffic. `has_data_content` excludes pure
+    // DedupRef/Zero/Inline segments, which own no physical body to
+    // reclaim; they reach a bucket by the tombstone fold.
     let mut candidates: Vec<SegmentStats> = Vec::new();
     for s in eligible {
-        let is_small = s.retained_stored_bytes <= SWEEP_SMALL_THRESHOLD;
         let is_sparse = s.density() < density_threshold
             && s.reclaimable_stored_bytes() > 0
             && s.has_data_content();
-        if is_small || is_sparse {
+        if is_sparse {
             candidates.push(s);
         }
-        // Else: dense-large with no dead bytes (or no body content) —
-        // rewriting it never pays for itself. Leave for retention.
     }
 
     // FFD: descending by materialised_bytes. Ties broken by ULID for
@@ -2017,15 +2007,31 @@ mod tests {
     }
 
     #[test]
-    fn select_buckets_packs_smalls_into_one_bucket_when_they_fit() {
-        // Two smalls, plenty of headroom in a single bucket.
+    fn select_buckets_declines_dense_inputs_however_small() {
+        // Two dense segments with nothing to reclaim. Merging them would
+        // carry every entry through and return the same bytes under one
+        // fewer name.
         let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
         let mint = std::sync::Mutex::new(mint);
         let next = || mint.lock().unwrap().next();
         let a = make_stats(next(), 4, 0, false); // 16 KiB live, dense
         let b = make_stats(next(), 4, 0, false);
         let buckets = select_buckets(vec![a, b], &make_config(0.70), 4);
-        assert_eq!(buckets.len(), 1, "small pair fits in a single bucket");
+        assert!(
+            buckets.is_empty(),
+            "a rewrite that frees nothing is not worth its upload"
+        );
+    }
+
+    #[test]
+    fn select_buckets_packs_sparse_inputs_into_one_bucket_when_they_fit() {
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let a = make_stats(next(), 4, 8 * BLOCK_BYTES, true);
+        let b = make_stats(next(), 4, 8 * BLOCK_BYTES, true);
+        let buckets = select_buckets(vec![a, b], &make_config(0.70), 4);
+        assert_eq!(buckets.len(), 1, "sparse pair fits in a single bucket");
         assert_eq!(buckets[0].candidates, 2);
     }
 
@@ -2085,17 +2091,17 @@ mod tests {
         let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
         let mint = std::sync::Mutex::new(mint);
         let next = || mint.lock().unwrap().next();
-        let small_a = make_stats(next(), 2, 0, false);
-        let small_b = make_stats(next(), 2, 0, false);
+        let sparse_a = make_stats(next(), 2, 4 * BLOCK_BYTES, true);
+        let sparse_b = make_stats(next(), 2, 4 * BLOCK_BYTES, true);
         let tomb_a = make_stats(next(), 0, 4 * BLOCK_BYTES, false);
         let tomb_b = make_stats(next(), 0, 8 * BLOCK_BYTES, false);
         let buckets = select_buckets(
-            vec![small_a, small_b, tomb_a, tomb_b],
+            vec![sparse_a, sparse_b, tomb_a, tomb_b],
             &make_config(0.70),
             4,
         );
         assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].candidates, 4, "two smalls + two tombstones");
+        assert_eq!(buckets[0].candidates, 4, "two sparse + two tombstones");
         assert_eq!(
             buckets[0].dead_cleaned, 2,
             "tombstones counted as dead-cleaned"
@@ -2422,8 +2428,10 @@ mod tests {
         let content = [0xAAu8; 4096];
 
         // Step 1: write [0xAA; 4096] to lba 0, flush, redact, drain.
-        // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]).
+        // Produces S1: DATA(lba=0, hash=H_aa, body=[0xAA; 4096]), paired
+        // with an entry a later write kills so the segment sweeps.
         vol.write(0, &content).unwrap();
+        vol.write(10, &[0x01u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
@@ -2431,17 +2439,20 @@ mod tests {
         // Same hash H_aa → the write path emits DedupRef(lba=1, H_aa) in S2,
         // carried through unchanged by the thin-DedupRef format.
         vol.write(1, &content).unwrap();
+        vol.write(11, &[0x02u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // The overwrites stay in pending/, which the LBA map reads at
+        // highest priority, leaving both committed segments sparse.
+        vol.write(10, &[0x03u8; 4096]).unwrap();
+        vol.write(11, &[0x04u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
 
         drop(vol);
 
         // Step 3: run the real coordinator GC.
-        // density_threshold=0.0 admits all segments to sweep; the test
-        // segments are well below SWEEP_SMALL_THRESHOLD so they pack into
-        // tier 1 directly.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -2507,14 +2518,23 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
-        // Two distinct payloads so each drain produces its own segment.
+        // Each committed segment pairs an entry that survives with one a
+        // later write kills, so both are sparse enough to sweep.
         vol.write(0, &[0x11u8; 4096]).unwrap();
+        vol.write(10, &[0xAAu8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         vol.write(1, &[0x22u8; 4096]).unwrap();
+        vol.write(11, &[0xBBu8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // The overwrites stay in pending/, which the LBA map reads at
+        // highest priority, so index/ holds exactly the two swept inputs.
+        vol.write(10, &[0xCCu8; 4096]).unwrap();
+        vol.write(11, &[0xDDu8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
         drop(vol);
 
         // Capture the input segment ULIDs from index/ before GC runs — those
@@ -2537,9 +2557,7 @@ mod tests {
             expected_inputs.len()
         );
 
-        // Sweep both under a permissive density threshold.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -3601,12 +3619,22 @@ mod tests {
             delta_length: delta_blob.len() as u32,
             delta_hash: blake3::hash(&delta_blob),
         };
-        let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
-            child_hash,
-            100,
-            4,
-            vec![opt],
-        ))];
+        // The filler beside it is killed outright below, which is what
+        // gives this segment reclaimable bytes and so a reason to sweep.
+        let mut filler_bytes = vec![0u8; 4096];
+        for (i, b) in filler_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(91).wrapping_add(7);
+        }
+        let delta_entries = vec![
+            PendingEntry::from_entry(SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])),
+            SegmentEntry::new_data(
+                blake3::hash(&filler_bytes),
+                150,
+                1,
+                elide_core::segment::Codec::None,
+                filler_bytes,
+            ),
+        ];
         write_segment_with_delta_body(&delta_pending, delta_entries, &delta_blob, signer.as_ref())
             .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
@@ -3628,11 +3656,14 @@ mod tests {
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
+        // Kill the delta segment's filler, leaving it sparse.
+        vol.write(150, &[0x55u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
         drop(vol);
 
         // ── Run coordinator GC. Must NOT defer the Delta segment.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -3849,7 +3880,6 @@ mod tests {
 
         // ── Consequence: with parent_b dropped, S4 defers on every pass.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -3915,6 +3945,16 @@ mod tests {
         let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
         let owner_ulid = mint.next();
         let dup_ulid = mint.next();
+        // Each segment also carries a plain DATA entry that a later write
+        // kills outright, which is what gives the segment reclaimable
+        // bytes and so a reason to sweep. The demoting Delta rides along.
+        let filler = |seed: u8| -> Vec<u8> {
+            let mut buf = vec![0u8; 4096];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(seed).wrapping_add(seed);
+            }
+            buf
+        };
         for (ulid, start_lba) in [(owner_ulid, 100u64), (dup_ulid, 200u64)] {
             let pending = elide_core::segment::pending_open_dir(dir).join(ulid.to_string());
             let opt = DeltaOption {
@@ -3923,12 +3963,22 @@ mod tests {
                 delta_length: delta_blob.len() as u32,
                 delta_hash: blake3::hash(&delta_blob),
             };
-            let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
-                child_hash,
-                start_lba,
-                4,
-                vec![opt],
-            ))];
+            let filler_bytes = filler(start_lba as u8 | 1);
+            let entries = vec![
+                PendingEntry::from_entry(SegmentEntry::new_delta(
+                    child_hash,
+                    start_lba,
+                    4,
+                    vec![opt],
+                )),
+                SegmentEntry::new_data(
+                    blake3::hash(&filler_bytes),
+                    start_lba + 50,
+                    1,
+                    elide_core::segment::Codec::None,
+                    filler_bytes,
+                ),
+            ];
             write_segment_with_delta_body(&pending, entries, &delta_blob, signer.as_ref()).unwrap();
             let bytes = fs::read(&pending).unwrap();
             store
@@ -3950,10 +4000,14 @@ mod tests {
         vol.write(100, &overwrite_bytes).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // Kill the owner's filler outright, leaving it sparse. The write
+        // stays in pending/, which the LBA map reads at highest priority.
+        vol.write(150, &[0xEEu8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
         drop(vol);
 
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -4056,12 +4110,22 @@ mod tests {
             delta_length: delta_blob.len() as u32,
             delta_hash: blake3::hash(&delta_blob),
         };
-        let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
-            child_hash,
-            100,
-            4,
-            vec![opt],
-        ))];
+        // The filler beside it is killed outright below, which is what
+        // gives this segment reclaimable bytes and so a reason to sweep.
+        let mut filler_bytes = vec![0u8; 4096];
+        for (i, b) in filler_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(91).wrapping_add(7);
+        }
+        let delta_entries = vec![
+            PendingEntry::from_entry(SegmentEntry::new_delta(child_hash, 100, 4, vec![opt])),
+            SegmentEntry::new_data(
+                blake3::hash(&filler_bytes),
+                150,
+                1,
+                elide_core::segment::Codec::None,
+                filler_bytes,
+            ),
+        ];
         write_segment_with_delta_body(&delta_pending, delta_entries, &delta_blob, signer.as_ref())
             .unwrap();
         let bytes = fs::read(&delta_pending).unwrap();
@@ -4083,10 +4147,13 @@ mod tests {
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
+        // Kill the delta segment's filler, leaving it sparse.
+        vol.write(150, &vec![0x55u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+
         drop(vol);
 
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
@@ -4140,23 +4207,32 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
 
-        // All-same-byte block compresses to ~20 bytes → inline.
+        // All-same-byte block compresses to ~20 bytes → inline. Each
+        // segment carries a second entry a later write kills, so both are
+        // sparse enough to sweep.
         let block = [0xBBu8; 4096];
         vol.write(0, &block).unwrap();
+        vol.write(10, &[0xB1u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
 
         // Write a second segment so GC has ≥2 candidates to sweep.
         let block2 = [0xCCu8; 4096];
         vol.write(1, &block2).unwrap();
+        vol.write(11, &[0xC1u8; 4096]).unwrap();
         vol.flush_wal().unwrap();
         drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+
+        // The overwrites stay in pending/, which the LBA map reads at
+        // highest priority, leaving both committed segments sparse.
+        vol.write(10, &[0xB2u8; 4096]).unwrap();
+        vol.write(11, &[0xC2u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
 
         drop(vol);
 
         // GC: compact both segments.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };

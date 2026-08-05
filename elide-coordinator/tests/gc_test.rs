@@ -286,10 +286,9 @@ fn simulate_coord_cache_evict(fork_dir: &std::path::Path) {
 }
 
 fn make_gc_config() -> GcConfig {
-    // density_threshold=0.0 admits every segment to sweep; the test segments
-    // are well below SWEEP_SMALL_THRESHOLD so they pack via tier 1.
+    // The production density threshold, which is what admits a segment now
+    // that sparsity is the whole eligibility test.
     GcConfig {
-        density_threshold: 0.0,
         interval: Duration::ZERO,
         ..GcConfig::default()
     }
@@ -1044,10 +1043,13 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
         stats.total_segments
     );
 
-    // S1 is 100% dead — GC should compact it (repack or sweep).
-    assert!(
-        stats.candidates >= 1,
-        "S1 is 100% dead and should be a GC candidate"
+    // S1's LBA claim is dead but its body still serves S2's DedupRef, so
+    // the entry demotes to a canonical and the segment reads dense. A
+    // rewrite would carry the same body into a new segment and free
+    // nothing, so the pass leaves it where it is.
+    assert_eq!(
+        stats.candidates, 0,
+        "a segment whose body survives as a canonical frees nothing"
     );
 }
 
@@ -1683,12 +1685,18 @@ fn gc_keeps_live_delta_source() {
     let a = incompressible_block(1);
     let b = variant_block(1, 0x7E);
 
+    // Each segment carries a filler LBA that a later write kills, which
+    // is what leaves it sparse enough to sweep. Without one, A reads
+    // dense as a delta-source canonical and B is fully live, so neither
+    // would be a candidate and the liveness path would go untested.
     vol.write(0, &a).unwrap();
+    vol.write(10, &incompressible_block(2)).unwrap();
     vol.snapshot().unwrap();
 
     // B overwrites A's LBA, so A keeps no LBA claim of its own. The delta
     // tier runs during formation, inside promote — not in `flush_wal`.
     vol.write(0, &b).unwrap();
+    vol.write(11, &incompressible_block(3)).unwrap();
     vol.promote_for_test().unwrap();
     assert!(
         pending_delta_count(fork_dir) > 0,
@@ -1711,6 +1719,12 @@ fn gc_keeps_live_delta_source() {
             fs::remove_file(&p).unwrap();
         }
     }
+
+    // Kill both fillers. The writes stay in pending/, which the LBA map
+    // reads at highest priority, so both committed segments turn sparse.
+    vol.write(10, &incompressible_block(4)).unwrap();
+    vol.write(11, &incompressible_block(5)).unwrap();
+    vol.flush_wal().unwrap();
 
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
     let st = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
@@ -1925,10 +1939,15 @@ fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
     let w3 = prand_bytes(3, EXTENT_BYTES);
 
     // Committed segment S1 holds A at lba 0; S2 overwrites it. H_A is
-    // LBA-dead on disk, so the pass below plans to drop it.
+    // LBA-dead on disk, so the pass below plans to drop it. S1 also
+    // carries a filler at lba 300 that S2 kills outright: once the
+    // window below makes H_A a delta source, A's entry demotes to a
+    // canonical and the filler is what still leaves S1 sparse.
     vol.write(0, &a).unwrap();
+    vol.write(300, &prand_bytes(4, EXTENT_BYTES)).unwrap();
     vol.flush_wal().unwrap();
     vol.write(0, &overwrite).unwrap();
+    vol.write(300, &prand_bytes(5, EXTENT_BYTES)).unwrap();
     vol.flush_wal().unwrap();
     rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
 

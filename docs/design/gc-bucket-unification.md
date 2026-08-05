@@ -12,10 +12,12 @@ outputs. The coordinator-driven GC selector
 shape:
 
 **This landed, and the pseudocode below records the proposal rather than
-the shipped selector.** Two things differ: the FFD sort key is
-`materialised_bytes`, and eligibility is measured in stored bytes
-(`live_stored_bytes`, `total_stored_bytes`), with
-`SWEEP_SMALL_THRESHOLD` derived as half `SWEEP_MATERIALISE_CAP`.
+the shipped selector.** Three things differ. The FFD sort key is
+`materialised_bytes`. Eligibility is measured in stored bytes
+(`live_stored_bytes`, `total_stored_bytes`). And sparsity is the whole
+eligibility test: a segment is admitted only when a rewrite frees bytes,
+so size alone never admits one. Packing that pays happens pre-upload in
+the close pass, where it costs no S3 traffic.
 
 |              | Selection                                     | Output count | Notes                              |
 |--------------|-----------------------------------------------|--------------|------------------------------------|
@@ -288,8 +290,9 @@ packing.
 
 - **Keep `density_threshold` as the rewrite gate.** Pending dropped
   it because local rewrites are cheap; GC rewrites cost S3 bandwidth.
-  Dense-large segments without enough dead bytes still don't get
-  rewritten just for consolidation, even under bin-packing.
+  A dense segment is left where it is at any size: carrying every entry
+  through returns the same bytes under one fewer name, and the
+  replacement has to be uploaded to get there.
 - **Bucket-level skip-check, not pass-level.** Each emitted bucket
   must justify itself (≥1 tombstone, ≥1 sparse, or ≥2 inputs). Today's
   pass-level check carries over per-bucket; a tick that produces zero

@@ -422,7 +422,6 @@ fn snapshot_after_gc_apply_covers_fold_output() {
         .build()
         .unwrap();
     let gc_config = GcConfig {
-        density_threshold: 0.0,
         interval: Duration::ZERO,
         ..GcConfig::default()
     };
@@ -452,11 +451,10 @@ proptest! {
     /// Segment cleanup: after GC runs, every consumed input segment must be
     /// deleted from segments/.
     ///
-    /// With density_threshold=0.0 every segment is admitted to sweep; the
-    /// proptest writes are short enough that all segments fit under
-    /// SWEEP_SMALL_THRESHOLD, so the sweep pass packs them all into one
-    /// output when ≥2 exist. After apply_done_handoffs, segments/ must
-    /// contain ≤1 file.
+    /// The pass reports what it consumed and what it emitted, so the
+    /// count after a sweep is bounded by the count before it minus the
+    /// inputs it took plus the outputs it produced. An input that
+    /// survives its own consumption breaks that bound.
     ///
     /// Catches Bug A: DEDUP_REF-only segments were never deleted because
     /// compact_segments emitted no handoff line for them.
@@ -476,19 +474,12 @@ proptest! {
             .unwrap();
 
         let gc_config = GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..GcConfig::default()
         };
 
         let cache_dir = fork_dir.join("cache");
         let index_dir = fork_dir.join("index");
-
-        // Segments sealed by the most recent SnapshotSign sit below the
-        // GC floor and are excluded from compaction — they stay in
-        // index/ and cache/ across sweeps, so the post-sweep bounds
-        // below must admit them.
-        let mut frozen: usize = 0;
 
         for op in &ops {
             match op {
@@ -509,9 +500,6 @@ proptest! {
                     if let Ok(snap) = vol.snapshot() {
                         let _ = vol.sign_snapshot_manifest(snap);
                     }
-                    frozen = fs::read_dir(&index_dir)
-                        .map(|d| d.flatten().count())
-                        .unwrap_or(0);
                 }
                 SimOp::PromoteWal => {
                     let _ = vol.flush_wal();
@@ -532,9 +520,6 @@ proptest! {
                     if let Ok(snap) = vol.snapshot() {
                         let _ = vol.sign_snapshot_manifest(snap);
                     }
-                    frozen = fs::read_dir(&index_dir)
-                        .map(|d| d.flatten().count())
-                        .unwrap_or(0);
                     let _ = vol.write(*lba_a as u64, &variant_block(sa, *tweak));
                     let _ = vol.write(*lba_b as u64, &variant_block(sb, *tweak));
                 }
@@ -605,23 +590,14 @@ proptest! {
                     // promote_segment directly on the volume.
                     simulate_upload(&mut vol, fork_dir);
 
-                    // Count idx files before gc_checkpoint so we can detect
-                    // any new segments it writes (WAL flush).  Those segments
-                    // land in pending/ without a cache body, so collect_stats
-                    // skips them — they will not be compacted this sweep and
-                    // legitimately remain in index/ after GC.
-                    let idx_pre_checkpoint: usize = fs::read_dir(&index_dir)
-                        .map(|d| d.flatten().count())
-                        .unwrap_or(0);
-
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
+                    // Counted after the checkpoint's WAL flush, so the
+                    // segments it wrote are part of the baseline the pass
+                    // is measured against.
                     let idx_before: usize = fs::read_dir(&index_dir)
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
-                    // Segments added by gc_checkpoint (WAL flush) are excluded
-                    // from this GC pass and survive into the next tick.
-                    let checkpoint_extra = idx_before.saturating_sub(idx_pre_checkpoint);
 
                     let gc_stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
 
@@ -646,15 +622,14 @@ proptest! {
                     if let Ok(stats) = gc_stats
                         && !matches!(stats.strategy, GcStrategy::None(_))
                     {
-                        // After GC, index/ should have ≤1 .idx file from
-                        // the compacted set, plus any segments that
-                        // gc_checkpoint wrote this tick (they were excluded
-                        // from compaction because their cache body is not
-                        // yet present and will be drained next tick), plus
-                        // any segments held back by the partial-LBA-death
-                        // deferral (see docs/design/gc-overlap-correctness.md —
-                        // bloated multi-LBA entries stay on disk at their
-                        // original ULID).
+                        // Every input the pass consumed is deleted, and
+                        // every bucket it emitted adds at most one file —
+                        // a tombstone-only bucket produces a zero-entry
+                        // output with no `.idx` at all. Segments the pass
+                        // declined are already inside `idx_before`, which
+                        // covers the ones gc_checkpoint wrote this tick,
+                        // the partial-LBA-death deferrals, and everything
+                        // sealed below the GC floor.
                         let idx_after_names: Vec<String> = fs::read_dir(&index_dir)
                             .map(|d| {
                                 d.flatten()
@@ -663,26 +638,28 @@ proptest! {
                             })
                             .unwrap_or_default();
                         let idx_after = idx_after_names.len();
-                        let idx_max = 1 + checkpoint_extra + stats.deferred + frozen;
+                        let idx_max = idx_before
+                            .saturating_sub(stats.candidates)
+                            + stats.buckets_emitted;
                         prop_assert!(
                             idx_after <= idx_max,
                             "after GcSweep on {} segments, {} .idx files remain \
-                             (expected ≤{}: 1 GC output + {} checkpoint segment(s) \
-                             + {} deferred + {} sealed below the GC floor); \
-                             files=[{}]; strategy={:?} candidates={}",
+                             (expected ≤{}: {} before - {} consumed + {} output(s)); \
+                             files=[{}]; strategy={:?} deferred={}",
                             idx_before,
                             idx_after,
                             idx_max,
-                            checkpoint_extra,
-                            stats.deferred,
-                            frozen,
+                            idx_before,
+                            stats.candidates,
+                            stats.buckets_emitted,
                             idx_after_names.join(", "),
                             stats.strategy,
-                            stats.candidates,
+                            stats.deferred,
                         );
-                        // cache/ .body files: 1 GC output + any deferred
-                        // segments (their bodies are still in cache/) +
-                        // sealed segments below the GC floor.
+                        // Cache bodies track committed segments, so the
+                        // same accounting bounds them: a consumed input's
+                        // body is evicted with it, and each emitted bucket
+                        // leaves at most one behind.
                         let bodies_after: usize = fs::read_dir(&cache_dir)
                             .map(|d| {
                                 d.flatten()
@@ -693,13 +670,14 @@ proptest! {
                             })
                             .unwrap_or(0);
                         prop_assert!(
-                            bodies_after <= 1 + stats.deferred + frozen,
+                            bodies_after <= idx_max,
                             "after GcSweep, {} .body files remain in cache/ \
-                             (expected ≤{}: 1 GC output + {} deferred + {} sealed)",
+                             (expected ≤{}: {} before - {} consumed + {} output(s))",
                             bodies_after,
-                            1 + stats.deferred + frozen,
-                            stats.deferred,
-                            frozen,
+                            idx_max,
+                            idx_before,
+                            stats.candidates,
+                            stats.buckets_emitted,
                         );
                     }
                 }
@@ -738,7 +716,6 @@ proptest! {
             .unwrap();
 
         let gc_config = GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..GcConfig::default()
         };
@@ -1003,7 +980,6 @@ fn gc_oracle_repro_bug_h() {
         .unwrap();
 
     let gc_config = GcConfig {
-        density_threshold: 0.0,
         interval: Duration::ZERO,
         ..GcConfig::default()
     };
@@ -1136,8 +1112,8 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
 }
 
 /// Deterministic regression for a proptest failure under the plan-based
-/// GC handoff: after two `GcSweep` passes the `index/` directory should
-/// hold exactly 1 .idx (the final GC output) — but the test was finding 3.
+/// GC handoff: inputs the second sweep consumed were surviving their own
+/// consumption, leaving more `.idx` behind than the pass accounted for.
 ///
 /// Minimal input from proptest shrinking:
 ///   MultiLbaDedupRefOverwrite { span: 2, overlap_off: 0, seed_big: 0, seed_small: 0 }
@@ -1160,7 +1136,6 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         .build()
         .unwrap();
     let gc_config = GcConfig {
-        density_threshold: 0.0,
         interval: Duration::ZERO,
         ..GcConfig::default()
     };
@@ -1201,6 +1176,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
         "index/ before sweep 2: [{}]",
         list_dir(&index_dir).join(", ")
     );
+    let idx_before_2 = list_dir(&index_dir).len();
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
     let stats_2 = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
     eprintln!(
@@ -1216,9 +1192,13 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     let final_idx = list_dir(&index_dir);
     eprintln!("index/ final: [{}]", final_idx.join(", "));
 
+    let idx_max = idx_before_2.saturating_sub(stats_2.candidates) + stats_2.buckets_emitted;
     assert!(
-        final_idx.len() <= 1,
-        "expected ≤1 .idx after two sweeps, got {}: [{}]",
+        final_idx.len() <= idx_max,
+        "expected ≤{idx_max} .idx after the second sweep \
+         ({idx_before_2} before - {} consumed + {} output(s)), got {}: [{}]",
+        stats_2.candidates,
+        stats_2.buckets_emitted,
         final_idx.len(),
         final_idx.join(", "),
     );
@@ -1250,7 +1230,6 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
         .build()
         .unwrap();
     let gc_config = GcConfig {
-        density_threshold: 0.0,
         interval: Duration::ZERO,
         ..GcConfig::default()
     };
@@ -1269,14 +1248,11 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
     vol.flush_wal().unwrap();
     simulate_upload(&mut vol, fork_dir);
 
-    // C: a large fully-live write covering LBA 0 (superseding B) plus
-    // enough further blocks to clear SWEEP_SMALL_THRESHOLD. The threshold
-    // is in stored bytes, so the blocks are incompressible — a constant
-    // pattern this size stores as almost nothing and would pool as a
-    // small. Being large, dense, and free of dead bytes, C is not an
-    // eligible rewrite candidate, so gc opens no stable bucket — the only
-    // remaining work is the two now-dead segments A and B, which pool
-    // into a tombstone-only bucket and produce a pure zero-entry output.
+    // C: a fully-live write covering LBA 0 (superseding B). Being dense
+    // and free of dead bytes, C is not an eligible rewrite candidate, so
+    // gc opens no stable bucket — the only remaining work is the two
+    // now-dead segments A and B, which pool into a tombstone-only bucket
+    // and produce a pure zero-entry output.
     let big = incompressible_payload(4097);
     vol.write(0, &big).unwrap();
     vol.flush_wal().unwrap();
