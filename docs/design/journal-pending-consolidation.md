@@ -119,11 +119,27 @@ is at most one ring, so a single output (no size cap) always holds it; a future
 size cap or partial/split path would have to lift all journal into several
 outputs, all above the data. Count is the case where the pending journal is a
 single segment that is still entirely live: it merges into nothing and frees no
-bytes, so its rewrite buys nothing except position, and position is the whole
-point. `execute_repack` runs it whenever the pass emits a data output and skips
-it when the pass emits none, there being nothing then to stay above. Stated as an
+bytes, so what it buys is position, and position is the whole point.
+`execute_repack` runs it whenever the pass emits a data output and skips it when
+the pass emits none, there being nothing then to stay above. Stated as an
 invariant: **a pass that repacks data must move all pending journal above its data
 outputs.**
+
+That lift moves one segment whose every entry survives whole, so the output's
+bytes are the input's and `execute_repack` links the file under the new ULID
+rather than materialising it — one inode, two names, no body copy and no
+re-signing. Nothing on disk names a segment but its own filename, so the two
+names are the same segment at two ULIDs until the input unlinks.
+
+Two names is also what keeps the lift safe to serve reads through. A reader
+resolves a `Local` body by walking `wal/` → `pending/` → `gc/` → `cache/` for the
+filename its snapshot names, and snapshots publish through an `ArcSwap` that a
+read in flight may still hold from before the apply. Keeping the input name until
+`remove_consumed_inputs` runs — after the apply's snapshot publishes — is the
+window every consumed input already relies on, and a rename would have no
+equivalent: it destroys the old name at the instant it creates the new one. The
+link also leaves the refusal path intact, since deleting the output link leaves
+the segment reachable through its input name.
 
 ## The journal-map rekey and its cost
 
