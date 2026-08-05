@@ -2685,6 +2685,68 @@ struct RepackCandidate {
 /// `PlanOutput` records for a rewrite plan. Shared by the data bin-pack
 /// buckets and the journal-consolidation merge — both keep every live
 /// entry (whole, run-sliced, or canonicalised) and drop the dead ones.
+/// A repack candidate as the scan measured it, before any entry of it is
+/// classified.
+struct ScannedSegment {
+    seg_path: PathBuf,
+    seg_ulid: Ulid,
+    stored_bytes: u64,
+    journal: bool,
+    all_live: bool,
+}
+
+/// What [`admit_within_budget`] decided, with the counts the pass logs.
+struct Admission {
+    admitted: Vec<ScannedSegment>,
+    spent: u64,
+    turned_away: usize,
+    turned_away_bytes: u64,
+}
+
+/// Split the scanned segments into what the pass takes on and what it
+/// leaves for the drain to upload as-is.
+///
+/// Data is admitted smallest-first while the budget lasts. Each segment
+/// admitted folds away the same single object whatever its size, so the
+/// smallest buy the most per byte of work; and one too large to share a
+/// bucket is skipped at materialise anyway, so passing over it gives up
+/// nothing that would have been packed.
+///
+/// Journal is admitted before the budget is consulted. A pass that
+/// repacks data must carry all pending journal above its outputs, so a
+/// journal segment left behind is an ordering violation rather than a
+/// saving.
+fn admit_within_budget(scanned: Vec<ScannedSegment>, budget: Option<u64>) -> Admission {
+    let Some(budget) = budget else {
+        return Admission {
+            admitted: scanned,
+            spent: 0,
+            turned_away: 0,
+            turned_away_bytes: 0,
+        };
+    };
+    let (journal, mut data): (Vec<ScannedSegment>, Vec<ScannedSegment>) =
+        scanned.into_iter().partition(|s| s.journal);
+    data.sort_by_key(|s| s.stored_bytes);
+
+    let mut out = Admission {
+        admitted: journal,
+        spent: 0,
+        turned_away: 0,
+        turned_away_bytes: 0,
+    };
+    for s in data {
+        if out.spent + s.stored_bytes <= budget {
+            out.spent += s.stored_bytes;
+            out.admitted.push(s);
+        } else {
+            out.turned_away += 1;
+            out.turned_away_bytes += s.stored_bytes;
+        }
+    }
+    out
+}
+
 fn emit_plan_outputs(
     seg_ulid: Ulid,
     classifications: &[crate::segment_classify::EntryClassification],
@@ -2771,6 +2833,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         floor,
         seg_paths,
         settled_floor,
+        work_budget,
         output_ulids,
         journal_output_ulids,
         lbamap_snapshot,
@@ -2794,8 +2857,10 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
     let mut stats = CompactionStats::default();
 
-    // Phase 1 — scan: parse + verify every non-floor segment, classify
-    // every entry, compute live/dead/entry counts.
+    // Phase 1a — scan: parse + verify every non-floor segment and measure
+    // it. Parsing is what identifies the journal tier, so every candidate
+    // is read here; classification, the per-entry lbamap probe, waits for
+    // the admission below.
     //
     // `seg_paths` is the prep-time listing, so the candidate set and
     // `lbamap_snapshot` describe the same instant. A segment written
@@ -2803,8 +2868,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // classifier from calling entries the snapshot predates dead and the
     // apply from deleting their files (`docs/finding-cargo-build-stale-read.md`).
     // The `floor` gate excludes segments frozen by the latest snapshot.
-    let mut candidates: Vec<RepackCandidate> = Vec::new();
-    let mut journal_candidates: Vec<RepackCandidate> = Vec::new();
+    let mut scanned: Vec<ScannedSegment> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
             .file_name()
@@ -2843,7 +2907,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         // there so the merge covers all pending journal — the ordering
         // invariant a data repack relies on (a data repack must lift all
         // pending journal above its outputs; see the design doc). That
-        // coverage is why the settled gate below leaves journal alone.
+        // coverage is why the gates below leave journal alone.
         let is_journal_segment = entries.iter().any(|e| e.journal);
 
         // A settled segment is one an earlier pass over this directory
@@ -2865,11 +2929,58 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             }
         }
 
+        scanned.push(ScannedSegment {
+            seg_path: seg_path.clone(),
+            seg_ulid,
+            stored_bytes: total_bytes,
+            journal: is_journal_segment,
+            all_live,
+        });
+    }
+
+    // Admission — a budget on the work the pass takes on, spent
+    // smallest-first across the data segments. Each one admitted folds
+    // away the same single object whatever its size, so the smallest buy
+    // the most per byte of work, and what the budget turns away uploads
+    // as its own object. A segment too large to share a bucket is skipped
+    // at materialise anyway, so spending the budget on smaller peers
+    // gives up nothing that would have been packed.
+    //
+    // Journal is admitted before the budget is consulted. A pass that
+    // repacks data must carry all pending journal above its outputs, so a
+    // journal segment left behind is an ordering violation rather than a
+    // saving.
+    let Admission {
+        admitted,
+        spent,
+        turned_away,
+        turned_away_bytes,
+    } = admit_within_budget(scanned, work_budget);
+    if turned_away > 0 {
+        let budget = work_budget.unwrap_or_default();
+        log::info!(
+            "repack: {spent} bytes of data segments admitted against a {budget} byte budget, \
+             {turned_away} segment(s) upload as-is ({turned_away_bytes} bytes)"
+        );
+    }
+
+    // Phase 1b — classify every entry of each admitted segment, for the
+    // live/dead/entry counts the pack and the rewrite plans are built on.
+    let mut candidates: Vec<RepackCandidate> = Vec::new();
+    let mut journal_candidates: Vec<RepackCandidate> = Vec::new();
+    for scan in admitted {
+        let parsed = match segment_cache.read_and_verify(&scan.seg_path, &verifying_key) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let entries = &parsed.entries;
+
         let classify_ctx = ClassifyCtx {
             lba_map: &lbamap_snapshot,
             extent_index: &extent_index_snapshot,
             live_hashes: &live_hashes,
-            segment_id: seg_ulid,
+            segment_id: scan.seg_ulid,
         };
         let classifications: Vec<EntryClassification> = entries
             .iter()
@@ -2927,16 +3038,16 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .collect();
 
         let candidate = RepackCandidate {
-            seg_path: seg_path.clone(),
-            seg_ulid,
+            seg_path: scan.seg_path,
+            seg_ulid: scan.seg_ulid,
             classifications,
             live_bytes,
             dead_bytes,
             live_entry_count,
             owned_hashes,
-            all_live,
+            all_live: scan.all_live,
         };
-        if is_journal_segment {
+        if scan.journal {
             journal_candidates.push(candidate);
         } else {
             candidates.push(candidate);
@@ -4055,6 +4166,56 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
 mod tests {
     use super::*;
     use crate::volume::Volume;
+
+    fn scanned(stored_bytes: u64, journal: bool) -> ScannedSegment {
+        ScannedSegment {
+            seg_path: PathBuf::from(format!("seg-{stored_bytes}-{journal}")),
+            seg_ulid: Ulid::new(),
+            stored_bytes,
+            journal,
+            all_live: false,
+        }
+    }
+
+    fn admitted_bytes(a: &Admission) -> Vec<u64> {
+        a.admitted.iter().map(|s| s.stored_bytes).collect()
+    }
+
+    #[test]
+    fn admission_without_a_budget_takes_every_segment() {
+        let a = admit_within_budget(vec![scanned(9, false), scanned(1, true)], None);
+        assert_eq!(admitted_bytes(&a), vec![9, 1]);
+        assert_eq!(a.turned_away, 0);
+    }
+
+    #[test]
+    fn admission_spends_the_budget_on_the_smallest_segments() {
+        // A budget of 10 over 8, 3 and 2: smallest-first fits two segments
+        // and folds two objects away, where taking them in the order given
+        // would fit 8 and 2 and fold one.
+        let a = admit_within_budget(
+            vec![scanned(8, false), scanned(3, false), scanned(2, false)],
+            Some(10),
+        );
+        assert_eq!(admitted_bytes(&a), vec![2, 3]);
+        assert_eq!(a.spent, 5);
+        assert_eq!(a.turned_away, 1);
+        assert_eq!(a.turned_away_bytes, 8);
+    }
+
+    #[test]
+    fn admission_takes_journal_whatever_the_budget() {
+        // The lift has to carry all pending journal above the pass's data
+        // outputs, so the budget governs data alone.
+        let a = admit_within_budget(
+            vec![scanned(64, true), scanned(32, true), scanned(4, false)],
+            Some(1),
+        );
+        assert_eq!(admitted_bytes(&a), vec![64, 32]);
+        assert_eq!(a.spent, 0, "journal spends none of the budget");
+        assert_eq!(a.turned_away, 1);
+        assert_eq!(a.turned_away_bytes, 4);
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

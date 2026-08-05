@@ -43,6 +43,12 @@ const REPACK_PRESSURE_SEGMENTS: usize = 32;
 /// the backlog.
 const REPACK_SETTLED_SCAN: usize = 16;
 
+/// Stored bytes of data segments the close pass takes on. A sealed
+/// generation is normally a cut's worth and fits whole; a generation that
+/// grew while the drain was down does not, and the excess ships as its own
+/// objects rather than holding the next cut behind one long job.
+const REPACK_CLOSE_WORK_BYTES: u64 = 4 * crate::actor::REPACK_TARGET_LIVE;
+
 /// What decides whether [`Volume::prepare_repack`] starts a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepackTrigger {
@@ -142,6 +148,10 @@ pub struct RepackJob {
     /// every candidate, which is what the close pass over a sealed
     /// generation does.
     pub settled_floor: Option<Ulid>,
+    /// Stored bytes of data segments the pass takes on, spent
+    /// smallest-first. What it turns away uploads as its own object.
+    /// `None` admits every candidate. See [`REPACK_CLOSE_WORK_BYTES`].
+    pub work_budget: Option<u64>,
     pub output_ulids: Vec<Ulid>,
     /// Output ULIDs reserved for the journal-consolidation merge, minted
     /// after every entry of `output_ulids` so each sorts above every data
@@ -444,6 +454,7 @@ impl Volume {
                 floor,
                 seg_paths,
                 settled_floor,
+                work_budget: None,
                 output_ulids,
                 journal_output_ulids,
                 lbamap_snapshot: Arc::clone(&self.lbamap),
@@ -511,6 +522,7 @@ impl Volume {
                 floor,
                 seg_paths,
                 settled_floor: None,
+                work_budget: Some(REPACK_CLOSE_WORK_BYTES),
                 output_ulids,
                 journal_output_ulids,
                 lbamap_snapshot: Arc::clone(&self.lbamap),
@@ -969,6 +981,34 @@ mod tests {
 
     /// The memo is rebuilt by each pass from what it classified, so a
     /// consolidation output is what the next pass exempts.
+    #[test]
+    fn the_close_pass_carries_a_work_budget_and_the_tick_pass_does_not() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+        vol.write(0, &incompressible(1)).unwrap();
+        vol.promote_for_test().unwrap();
+
+        let prep = vol
+            .prepare_repack(RepackTrigger::Unconditional)
+            .unwrap()
+            .expect("the unconditional trigger starts a pass");
+        assert_eq!(
+            prep.job.work_budget, None,
+            "the tick pass covers the open generation whole"
+        );
+
+        let prep = vol.prepare_close_generation().unwrap();
+        assert_eq!(
+            prep.job
+                .expect("a pass over the sealed generation")
+                .work_budget,
+            Some(REPACK_CLOSE_WORK_BYTES),
+            "the close pass bounds the work one sealed generation costs"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn a_pass_records_the_journal_segments_it_leaves_behind() {
         let base = keyed_temp_dir();
