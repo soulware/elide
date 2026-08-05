@@ -343,6 +343,23 @@ pub struct ExtentIndex {
     /// empty submap is always removed, so [`journal_is_empty`](Self::journal_is_empty)
     /// stays a single outer check. See `docs/design/gc-journal-segregation.md`.
     journal: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, ExtentLocation>>,
+    /// Source hashes named by every Delta encoding on disk, keyed by the
+    /// segment holding the encoding and then by the composite hash.
+    ///
+    /// `deltas` keeps one location per hash, so an encoding that loses the
+    /// home contributes no sources there while its entry still names them:
+    /// a second encoding of the same composite against a different base, or
+    /// any encoding of a hash `inner` already owns. Liveness reads this tier
+    /// so a source stays live for as long as some entry names it.
+    ///
+    /// Sources here never route a read. `DeltaOption`'s offsets address the
+    /// delta body of the segment the entry came from, so an encoding's
+    /// options are meaningful only alongside that segment — merging them
+    /// into a `DeltaLocation` would point reads at the wrong blob.
+    ///
+    /// Segment-outer for the same reason as `journal`: retiring an input is
+    /// one `remove`.
+    delta_sources: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, Arc<[blake3::Hash]>>>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -357,6 +374,7 @@ impl ExtentIndex {
             inner: Blake3HamtMap::default(),
             deltas: Blake3HamtMap::default(),
             journal: imbl::HashMap::new(),
+            delta_sources: imbl::HashMap::new(),
             segment_presence: HashMap::new(),
         }
     }
@@ -627,29 +645,51 @@ impl ExtentIndex {
         &self,
         is_live: impl Fn(&blake3::Hash) -> bool,
     ) -> HashSet<blake3::Hash> {
+        // Every encoding of a hash contributes, so fold the segment-outer
+        // tier into one hash-keyed view for the walk.
+        let mut by_hash: HashMap<blake3::Hash, Vec<blake3::Hash>> = HashMap::new();
+        for per_hash in self.delta_sources.values() {
+            for (hash, sources) in per_hash.iter() {
+                by_hash
+                    .entry(*hash)
+                    .or_default()
+                    .extend(sources.iter().copied());
+            }
+        }
+
         let mut out = HashSet::new();
         let mut frontier: Vec<blake3::Hash> = Vec::new();
-        for (hash, loc) in self.deltas.iter() {
+        for (hash, sources) in by_hash.iter() {
             if !is_live(hash) {
                 continue;
             }
-            for opt in &loc.options {
-                if out.insert(opt.source_hash) {
-                    frontier.push(opt.source_hash);
+            for source in sources {
+                if out.insert(*source) {
+                    frontier.push(*source);
                 }
             }
         }
         while let Some(hash) = frontier.pop() {
-            let Some(loc) = self.deltas.get(&hash) else {
+            let Some(sources) = by_hash.get(&hash) else {
                 continue;
             };
-            for opt in &loc.options {
-                if out.insert(opt.source_hash) {
-                    frontier.push(opt.source_hash);
+            for source in sources {
+                if out.insert(*source) {
+                    frontier.push(*source);
                 }
             }
         }
         out
+    }
+
+    /// Drop every Delta-source record contributed by `segment`.
+    ///
+    /// The removal dual of the recording in
+    /// [`register_entry`](Self::register_entry): once the segment file is
+    /// unlinked its entries name nothing, and a rebuild walks only the
+    /// segments that remain.
+    pub fn purge_segment_delta_sources(&mut self, segment: Ulid) {
+        self.delta_sources.remove(&segment);
     }
 
     /// Flip `DeltaBodySource::Full → Cached` for `hash`, but only if
@@ -795,6 +835,20 @@ impl ExtentIndex {
                         Some(loc) => inputs.contains(&loc.segment_id),
                     },
                 };
+                // Recorded whether or not the encoding takes the home: the
+                // entry names these sources either way, and a rewrite of it
+                // has to reconstruct against one of them.
+                if !entry.delta_options.is_empty() {
+                    let sources: Arc<[blake3::Hash]> = entry
+                        .delta_options
+                        .iter()
+                        .map(|opt| opt.source_hash)
+                        .collect();
+                    self.delta_sources
+                        .entry(ctx.segment_id)
+                        .or_default()
+                        .insert(entry.hash, sources);
+                }
                 if admitted {
                     self.deltas.insert(
                         entry.hash,

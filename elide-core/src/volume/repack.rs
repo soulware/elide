@@ -694,6 +694,7 @@ impl Volume {
                     // journal segment is only ever folded as a whole-dead
                     // tombstone; no-op for a durable input).
                     index.purge_journal_segment(input.input_ulid);
+                    index.purge_segment_delta_sources(input.input_ulid);
                 }
 
                 // Register carried entries against the new bucket

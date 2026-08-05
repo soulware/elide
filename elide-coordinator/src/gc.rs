@@ -3689,6 +3689,183 @@ mod tests {
         );
     }
 
+    /// A source body named only by a Delta entry that does not own the
+    /// deltas-map home for its hash must still count as live.
+    ///
+    /// `delta_source_closure` walks `ExtentIndex::deltas`, which holds one
+    /// location per hash, and pulls in the sources *that* location names.
+    /// `classify_entry` gates a partially-dead Delta on the sources the
+    /// entry in hand names. The same composite can be encoded against
+    /// different bases in different segments, so the two sets diverge: the
+    /// non-home encoding's source is protected by nothing, GC drops it as
+    /// unreferenced, and the segment holding that encoding classifies
+    /// `DeferUnresolvableDelta` on this pass and every later one.
+    ///
+    /// Both encodings carry hash `child`. S3 mints first, so it owns the
+    /// deltas-map home and its base (`parent_a`) is protected. S4's base
+    /// (`parent_b`) is named only by the non-home encoding.
+    #[tokio::test]
+    async fn gc_keeps_a_source_named_only_by_a_non_home_delta() {
+        use elide_core::segment::{DeltaOption, PendingEntry, write_segment_with_delta_body};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let signer =
+            elide_core::signing::load_signer(dir, elide_core::signing::VOLUME_KEY_FILE).unwrap();
+        let vk = elide_core::signing::load_verifying_key(dir, elide_core::signing::VOLUME_PUB_FILE)
+            .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Two distinct high-entropy bases, and one child close enough to
+        // both that a zstd-dict delta against either stays small.
+        let mut parent_a = vec![0u8; 4 * 4096];
+        for (i, b) in parent_a.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let mut parent_b = vec![0u8; 4 * 4096];
+        for (i, b) in parent_b.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(53).wrapping_add(17);
+        }
+        let mut child = parent_a.clone();
+        for b in &mut child[0..256] {
+            *b = 0xCC;
+        }
+        let parent_a_hash = blake3::hash(&parent_a);
+        let parent_b_hash = blake3::hash(&parent_b);
+        let child_hash = blake3::hash(&child);
+        assert_ne!(parent_a_hash, parent_b_hash, "test precondition");
+        assert_ne!(child_hash, parent_a_hash, "test precondition");
+
+        let overwrite = vec![0xFFu8; 4096];
+
+        // ── S1/S2: both bases via the normal write path.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &parent_a).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        vol.write(10, &parent_b).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        // ── S3/S4: the same composite encoded against each base. Minted in
+        //    order so S3 deterministically wins the deltas-map home.
+        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let write_delta_segment =
+            |source_hash: blake3::Hash, source_bytes: &[u8], start_lba: u64, ulid: Ulid| {
+                let mut compressor =
+                    zstd::bulk::Compressor::with_dictionary(3, source_bytes).unwrap();
+                let blob = compressor.compress(&child).unwrap();
+                let pending = elide_core::segment::pending_open_dir(dir).join(ulid.to_string());
+                let opt = DeltaOption {
+                    source_hash,
+                    delta_offset: 0,
+                    delta_length: blob.len() as u32,
+                    delta_hash: blake3::hash(&blob),
+                };
+                let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+                    child_hash,
+                    start_lba,
+                    4,
+                    vec![opt],
+                ))];
+                write_segment_with_delta_body(&pending, entries, &blob, signer.as_ref()).unwrap();
+            };
+
+        let s3_ulid = mint.next();
+        write_delta_segment(parent_a_hash, &parent_a, 100, s3_ulid);
+        let s4_ulid = mint.next();
+        write_delta_segment(parent_b_hash, &parent_b, 200, s4_ulid);
+        assert!(s3_ulid < s4_ulid, "S3 must mint below S4");
+
+        // Hand-written segments bypass Volume::write, so reopen to fold
+        // their entries into the lbamap before promote.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.promote_segment(s3_ulid).unwrap();
+        vol.promote_segment(s4_ulid).unwrap();
+
+        // ── Retire parent_b's own LBAs, and partially overwrite S4's
+        //    encoding so it reaches the partial-death branch.
+        vol.write(10, &overwrite).unwrap();
+        vol.write(11, &overwrite).unwrap();
+        vol.write(12, &overwrite).unwrap();
+        vol.write(13, &overwrite).unwrap();
+        vol.write(202, &overwrite).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        // ── Compose liveness exactly as `load_pass_state` does.
+        let rebuild_chain = vec![(dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let mut live_hashes = lbamap.claim_referenced_hashes();
+        let delta_sources = index.delta_source_closure(|h| live_hashes.contains(h));
+        live_hashes.extend(delta_sources);
+
+        // Preconditions: S3 owns the home, both encodings still claim LBAs,
+        // and parent_b holds no LBA of its own.
+        assert_eq!(
+            index.lookup_delta(&child_hash).map(|l| l.segment_id),
+            Some(s3_ulid),
+            "S3 must own the deltas-map home for the shared hash"
+        );
+        assert!(
+            live_hashes.contains(&child_hash),
+            "the shared composite must still be claimed"
+        );
+        assert_ne!(
+            lbamap.hash_at(10),
+            Some(parent_b_hash),
+            "parent_b LBA retired"
+        );
+        assert_eq!(
+            lbamap.hash_at(200),
+            Some(child_hash),
+            "S4's encoding must keep a live LBA"
+        );
+
+        // The home encoding's base is protected by the closure.
+        assert!(
+            live_hashes.contains(&parent_a_hash),
+            "parent_a is named by the home encoding and must be live"
+        );
+
+        // ── The bug: parent_b is named by S4's live encoding, and reads of
+        //    LBA 200 route through it, but the closure never visits S4's
+        //    options so nothing holds parent_b alive.
+        assert!(
+            live_hashes.contains(&parent_b_hash),
+            "parent_b is named by a live Delta entry and must be live"
+        );
+
+        // ── Consequence: with parent_b dropped, S4 defers on every pass.
+        let config = crate::config::GcConfig {
+            density_threshold: 0.0,
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
+        gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()]).unwrap();
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        assert!(
+            index.lookup(&parent_b_hash).is_some(),
+            "parent_b must survive the pass that keeps the entry naming it"
+        );
+        let stats = collect_stats(dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        assert!(
+            !stats.iter().any(|s| s.has_partial_death),
+            "no segment may be left permanently undeferrable"
+        );
+    }
+
     /// A fully-LBA-dead Delta whose hash is still claimed by a duplicate
     /// encoding in another segment must demote to a thin CanonicalDelta:
     /// the output carries the delta blob (no materialised composite), the
