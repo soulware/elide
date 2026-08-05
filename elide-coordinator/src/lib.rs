@@ -7,6 +7,7 @@ pub mod dev_link;
 pub mod eligibility;
 pub mod event_journal;
 pub mod gc;
+pub mod gc_census;
 pub mod gc_cycle;
 pub mod identity;
 pub mod ipc;

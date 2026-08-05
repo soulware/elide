@@ -85,6 +85,8 @@ use anyhow::{Context, Result};
 use object_store::ObjectStore;
 use ulid::Ulid;
 
+use crate::gc_census::DensityCensus;
+
 use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
@@ -174,6 +176,10 @@ pub struct GcStats {
     /// wasteful first. The volume reclaims these; see
     /// `docs/design/extent-reclamation.md`.
     pub reclaim_targets: Vec<ReclaimTarget>,
+    /// Density-versus-age distribution over every segment this pass
+    /// classified. Present once the pass loads its state; the tick loop
+    /// owns how often it is logged.
+    pub census: Option<DensityCensus>,
 }
 
 impl GcStats {
@@ -188,6 +194,7 @@ impl GcStats {
             buckets_emitted: 0,
             deferred_cold: 0,
             reclaim_targets: Vec::new(),
+            census: None,
         }
     }
 }
@@ -248,6 +255,7 @@ pub fn gc_fork(
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
     let bloat = std::mem::take(&mut pass.bloat);
+    let census = pass.census.take();
 
     // Cache-residency filter: drop candidates whose bodies aren't fully
     // resolvable from local cache. Cold candidates wait for organic
@@ -278,6 +286,7 @@ pub fn gc_fork(
             buckets_emitted: 0,
             deferred_cold,
             reclaim_targets: reclaim_targets_for_declined(bloat, &HashSet::new()),
+            census,
         });
     }
 
@@ -310,6 +319,7 @@ pub fn gc_fork(
         buckets_emitted,
         deferred_cold,
         reclaim_targets,
+        census,
     })
 }
 
@@ -361,6 +371,7 @@ struct PassState {
     /// holding them. Which of these reach the volume depends on what
     /// the packer selects — see [`reclaim_targets_for_declined`].
     bloat: Vec<(String, Vec<BloatedExtent>)>,
+    census: Option<DensityCensus>,
 }
 
 /// An extent whose body carries dead interior blocks, as
@@ -492,6 +503,14 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .context("collecting segment stats")?;
     let total_segments = all_stats.len();
 
+    // Every segment above the snapshot floor has just been classified, so
+    // its density is already known; grouping them by age costs one pass
+    // over the segment list.
+    let mut census = DensityCensus::now();
+    for s in &all_stats {
+        census.record(s.ulid, s.pool, s.density(), s.total_stored_bytes);
+    }
+
     // Segments with a partial-LBA-death Delta entry whose sources don't
     // resolve this pass are ineligible for compaction: there's no base
     // body to reconstruct the composite against. They sit out this pass
@@ -527,6 +546,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         total_segments,
         deferred_count,
         bloat,
+        census: Some(census),
     })
 }
 
@@ -542,7 +562,7 @@ struct PackedBucket {
 /// `collect_stats` returns, and assigned once, so no later stage
 /// re-derives it. See `docs/design/gc-journal-segregation.md`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SegmentPool {
+pub enum SegmentPool {
     /// Holds live content outside the journal window, or a mix of both.
     /// The only pool GC packs.
     Stable,
@@ -986,6 +1006,7 @@ const BLOCK_BYTES: u64 = 4096;
 
 /// Per-segment stats computed during the scan phase.
 struct SegmentStats {
+    ulid: Ulid,
     ulid_str: String,
     /// Stored bytes a rewrite of this segment would carry into its
     /// output. Every classification that emits a body counts, including
@@ -1454,6 +1475,7 @@ fn collect_stats(
         };
 
         result.push(SegmentStats {
+            ulid: seg_ulid,
             ulid_str,
             pool,
             has_body_entries: physical_body_bytes > 0 || has_inline,
@@ -1872,6 +1894,7 @@ mod tests {
             total_stored_bytes
         };
         SegmentStats {
+            ulid,
             ulid_str: ulid.to_string(),
             retained_stored_bytes,
             materialised_bytes,
@@ -1924,6 +1947,7 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         SegmentStats {
+            ulid,
             ulid_str: ulid.to_string(),
             retained_stored_bytes: stored_bytes as u64,
             materialised_bytes: stored_bytes as u64,
@@ -2157,8 +2181,10 @@ mod tests {
             .collect();
         let materialised_bytes: u64 = canonicals.iter().map(keep_cost).sum();
         let n = canonicals.len();
+        let seg_ulid = next();
         let stats = SegmentStats {
-            ulid_str: next().to_string(),
+            ulid: seg_ulid,
+            ulid_str: seg_ulid.to_string(),
             retained_stored_bytes: 0,
             materialised_bytes,
             total_stored_bytes: 0,
@@ -2260,6 +2286,7 @@ mod tests {
 
         let ulid = Ulid::new();
         let stats = SegmentStats {
+            ulid,
             ulid_str: ulid.to_string(),
             retained_stored_bytes: BLOCK_BYTES,
             materialised_bytes: 0,
