@@ -122,7 +122,7 @@ const _: () = assert!(
 
 /// Trait for signing segment files at promotion time.
 ///
-/// The signing input is `BLAKE3(header[0..32] || index_section_bytes)`.
+/// The signing input is `BLAKE3(header[0..36] || index_section_bytes)`.
 /// Returning a 64-byte Ed25519 signature. Implementations must be infallible
 /// — a missing or corrupt key should be caught at startup, not per-segment.
 pub trait SegmentSigner: Send + Sync {
@@ -305,20 +305,15 @@ const DELTA_OPTION_LEN: u32 = 77;
 /// Size of one delta table entry header: entry_index(4) + delta_count(1) = 5 bytes.
 const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
 
-/// Extents at or below this byte size are stored inline in the inline section.
-/// 0 = disabled until S3 integration.
-/// Extents with stored data (after compression) strictly below this size go
-/// into the segment's inline section rather than the body section.  Inline
-/// data survives cache eviction (it lives in the `.idx` file and in-memory
-/// `ExtentLocation::inline_data`), eliminating S3 demand-fetch for small writes.
+/// Extents whose stored (compressed) size is strictly below this go into the
+/// segment's inline section rather than the body section. Inline data lives in
+/// the `.idx` file and in `ExtentLocation::inline_data`, so it survives cache
+/// eviction and reads without an S3 demand-fetch.
 ///
-/// Extents with stored (compressed) size below this go in the inline section
-/// of the `.idx` file.  Only genuinely tiny data should inline — the `.idx` is
-/// fetched by every host, so bloating it with compressed block data defeats
-/// demand-fetch and delta compression.
-///
-/// 256 bytes captures mostly-zero blocks, tiny config files, and sparse
-/// metadata while keeping real data in the body section.
+/// Only genuinely tiny data should inline — the `.idx` is fetched by every
+/// host, so bloating it with compressed block data defeats demand-fetch and
+/// delta compression. 256 bytes captures mostly-zero blocks, tiny config files,
+/// and sparse metadata while keeping real data in the body section.
 const INLINE_THRESHOLD: usize = 256;
 
 /// True if a stored payload of this length would be classified as
