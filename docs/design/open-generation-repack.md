@@ -194,14 +194,24 @@ snapshots and mints, the worker walks the bloat gate, and the whole-map
 token throws the result away. Per-run admission (#866) removes that token,
 so what the same window costs now is a measurement to retake.
 
-`prepare_reclaim` opens with `flush_wal()`, which reaches
-`flush_wal_to_pending()` and builds the segment inline on the actor thread.
-The flush carries the `u_flush < u_reclaim` ordering invariant, since
-reclaim's new LBA mappings supersede the pre-reclaim WAL entries they
-consume and a rebuild otherwise lets the flushed segment shadow the reclaim
-output. #863 gave `prepare_repack` the shape that keeps this ordering while
-moving the segment build off the lock, dispatching the flush as a
-`PromoteJob` the worker executes, and the same shape applies here (#865).
+`prepare_reclaim` mints `u_flush`, closes the WAL into a `PromoteJob` at
+that ULID, and hands it back as `ReclaimPrep { flush, job }` for the caller
+to dispatch ahead of the reclaim (#865, the shape #863 gave
+`prepare_repack`). The rotation carries the `u_flush < u_reclaim` ordering
+invariant, since reclaim's new LBA mappings supersede the pre-reclaim WAL
+entries they consume and a rebuild otherwise lets the flushed segment shadow
+the reclaim output. The volume lock now covers the rotation and the mints,
+and the worker builds both segments.
+
+Prep takes its snapshots while that promote is still in flight, so they
+resolve the rotated WAL's hashes to the WAL file the promote's apply then
+deletes. Prep therefore drops from the pass every extent the rotated WAL
+still claims, which the claimant names exactly — a durable write and a
+journal-window write both stake their claim at the WAL's ULID. Those extents
+are the next pass's work, and the rotation is what puts them where the next
+pass reads them. A hash becomes a reclaim candidate by being partially
+overwritten over time, so the extents this defers are the ones least likely
+to be bloated yet.
 
 ### Per-run admission came first
 
@@ -217,10 +227,11 @@ grows with the size of a pass, and per-run admission prices a longer window
 proportionally: the runs a concurrent write invalidated are refused
 individually and the rest land.
 
-It also clears the way for #865, which dispatches the prep flush to the
-worker. That puts `apply_promote` and its `Arc::make_mut(&mut self.lbamap)`
-between the reclaim's prep and its apply, which per-run admission reads as
-an ordinary intervening mutation.
+It is also what lets #865 dispatch the prep flush to the worker. That puts
+`apply_promote` and its `Arc::make_mut(&mut self.lbamap)` between the
+reclaim's prep and its apply, which per-run admission reads as an ordinary
+intervening mutation — so the two applies stay in dispatch order with no
+deferral machinery between them.
 
 ## What the two passes share, and where they part
 

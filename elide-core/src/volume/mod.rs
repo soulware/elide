@@ -79,8 +79,8 @@ pub(crate) use read::{
 };
 pub use readonly::ReadonlyVolume;
 pub use reclaim::{
-    ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimResult, ReclaimThresholds, ReclaimedEntry,
-    scan_reclaim_candidates,
+    ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult, ReclaimThresholds,
+    ReclaimedEntry, scan_reclaim_candidates,
 };
 pub use repack::{
     CloseGenerationPrep, CompactionStats, RepackJob, RepackPrep, RepackResult, RepackTrigger,

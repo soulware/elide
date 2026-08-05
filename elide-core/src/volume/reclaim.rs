@@ -40,6 +40,14 @@ pub struct ReclaimJob {
     pub snapshot_floor_ulid: Option<Ulid>,
 }
 
+/// What [`super::Volume::prepare_reclaim`] hands back: the WAL rotation
+/// to dispatch first, and the reclaim job itself.
+pub struct ReclaimPrep {
+    /// The closed WAL, `None` when it held nothing to promote.
+    pub flush: Option<super::PromoteJob>,
+    pub job: ReclaimJob,
+}
+
 /// A rewritten entry placed in the reclaim output segment, paired with
 /// the uncompressed byte count it represents (so outcome accounting
 /// reflects logical size rather than stored length after compression).
@@ -296,7 +304,19 @@ impl Volume {
         start_lba: u64,
         lba_length: u32,
     ) -> io::Result<ReclaimOutcome> {
-        let job = self.prepare_reclaim(start_lba, lba_length)?;
+        let ReclaimPrep { flush, job } = self.prepare_reclaim(start_lba, lba_length)?;
+        if let Some(flush) = flush {
+            match crate::actor::execute_promote(
+                flush,
+                &mut crate::actor::PriorSourceCache::default(),
+            ) {
+                Ok(result) => self.apply_promote(&result)?,
+                Err(failure) => {
+                    self.restore_failed_promote(*failure.job)?;
+                    return Err(failure.error);
+                }
+            }
+        }
         let result = crate::actor::execute_reclaim(job)?;
         self.apply_reclaim_result(result)
     }
@@ -316,32 +336,51 @@ impl Volume {
     ///
     /// ## Ordering invariant: `u_flush < u_reclaim`
     ///
-    /// Flushes any open WAL to `pending/<u_flush>` before minting the
-    /// reclaim output ULID `u_reclaim`. Mirrors the `u_gc < u_flush`
-    /// invariant documented on `GcCheckpointUlids`, but with reversed
-    /// polarity: reclaim outputs must sort *above* the flushed-WAL
-    /// segment, because reclaim's new LBA mappings supersede the
-    /// pre-reclaim WAL entries they consumed.
+    /// Mints `u_flush` and closes any open WAL into a [`PromoteJob`] at
+    /// that ULID before minting the reclaim output ULID `u_reclaim`.
+    /// Mirrors the `u_gc < u_flush` invariant documented on
+    /// `GcCheckpointUlids`, but with reversed polarity: reclaim outputs
+    /// must sort *above* the flushed-WAL segment, because reclaim's new
+    /// LBA mappings supersede the pre-reclaim WAL entries they consumed.
     ///
-    /// Without this flush, a WAL entry for an LBA that reclaim rewrites
-    /// survives to `pending/<u_flush>` where `u_flush > u_reclaim`. On
-    /// crash rebuild the flushed segment applies after the reclaim
-    /// output and shadows it — re-pointing the LBA at a hash whose body
-    /// `redact_segment` may have already hole-punched (hash-dead under
-    /// the post-reclaim lbamap), producing zero reads.
+    /// Without this rotation, a WAL entry for an LBA that reclaim
+    /// rewrites survives to a later `pending/<u_flush>` where
+    /// `u_flush > u_reclaim`. On crash rebuild the flushed segment
+    /// applies after the reclaim output and shadows it — re-pointing the
+    /// LBA at a hash whose body `redact_segment` may have already
+    /// hole-punched (hash-dead under the post-reclaim lbamap), producing
+    /// zero reads.
     ///
     /// The same ordering is what makes
     /// [`Self::apply_reclaim_result`]'s if-newer admission correct: the
     /// mint runs with no WAL open, so a write arriving during the
     /// worker's window opens a fresh one at a higher ULID and its claims
-    /// outrank `u_reclaim`. Minting before the flush would silently
+    /// outrank `u_reclaim`. Minting before the rotation would silently
     /// invert that and let the apply overwrite concurrent writes.
-    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimJob> {
-        self.flush_wal()?;
+    ///
+    /// The segment write itself runs on the worker, so the volume lock
+    /// covers the rotation and the mints alone. The caller dispatches
+    /// [`ReclaimPrep::flush`] before the reclaim job, so the promote's
+    /// own apply lands first; per-run admission reads that apply as an
+    /// ordinary intervening mutation.
+    pub fn prepare_reclaim(&mut self, start_lba: u64, lba_length: u32) -> io::Result<ReclaimPrep> {
+        let u_flush = self.mint.next();
+        let flush = self.rotate_wal_into_promote(u_flush)?;
 
         let end_lba = start_lba + lba_length as u64;
-        let entries: Vec<lbamap::ExtentRead> =
-            self.lbamap.extents_in_range(start_lba, end_lba).collect();
+        // The snapshots below are taken while the rotated WAL's promote
+        // is still in flight, so they resolve its hashes to the WAL file
+        // itself — which the promote's apply then deletes. An extent
+        // still claimed by that WAL belongs to the next pass, which
+        // reads it from `pending/<u_flush>`. The claimant is the exact
+        // discriminator here: a durable write and a journal-window write
+        // both stake their claim at the WAL's ULID.
+        let rotated_wal = flush.as_ref().map(|f| f.old_wal_ulid);
+        let entries: Vec<lbamap::ExtentRead> = self
+            .lbamap
+            .extents_in_range(start_lba, end_lba)
+            .filter(|e| Some(e.claimant_ulid) != rotated_wal)
+            .collect();
 
         let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
         for layer in &self.ancestor_layers {
@@ -357,17 +396,20 @@ impl Volume {
         let segment_ulid = self.mint.next();
         let snapshot_floor_ulid = latest_snapshot(&self.base_dir)?;
 
-        Ok(ReclaimJob {
-            target_start_lba: start_lba,
-            target_lba_length: lba_length,
-            entries,
-            lbamap_snapshot: Arc::clone(&self.lbamap),
-            extent_index_snapshot: Arc::clone(&self.extent_index),
-            search_dirs,
-            pending_dir: segment::pending_open_dir(&self.base_dir),
-            segment_ulid,
-            signer: Arc::clone(&self.signer),
-            snapshot_floor_ulid,
+        Ok(ReclaimPrep {
+            flush,
+            job: ReclaimJob {
+                target_start_lba: start_lba,
+                target_lba_length: lba_length,
+                entries,
+                lbamap_snapshot: Arc::clone(&self.lbamap),
+                extent_index_snapshot: Arc::clone(&self.extent_index),
+                search_dirs,
+                pending_dir: segment::pending_open_dir(&self.base_dir),
+                segment_ulid,
+                signer: Arc::clone(&self.signer),
+                snapshot_floor_ulid,
+            },
         })
     }
 
@@ -484,6 +526,24 @@ mod tests {
         out
     }
 
+    /// Settle the volume's writes into `pending/` so a reclaim pass
+    /// covers them. A pass leaves whatever the open WAL still claims to
+    /// its successor, so a test that wants its writes reclaimed puts
+    /// them in a segment first.
+    fn settle(vol: &mut Volume) {
+        vol.flush_wal().unwrap();
+    }
+
+    /// Prep against settled writes, in the order the actor dispatches:
+    /// the rotation happens at prep and its promote applies before the
+    /// reclaim job runs.
+    fn prep_reclaim(vol: &mut Volume, start_lba: u64, lba_length: u32) -> ReclaimJob {
+        settle(vol);
+        let ReclaimPrep { flush, job } = vol.prepare_reclaim(start_lba, lba_length).unwrap();
+        assert!(flush.is_none(), "settle emptied the WAL");
+        job
+    }
+
     /// Write a single 8-block entry, overwrite the middle 2 blocks with a
     /// smaller (1-block) entry so the original is split prefix/tail, then
     /// run alias-merge over the whole range. The split-tail entry has
@@ -513,6 +573,7 @@ mod tests {
         assert_eq!(vol.lbamap_len(), 3);
 
         // Sync prep+execute+apply via the in-process wrapper.
+        settle(&mut vol);
         let outcome = vol.reclaim_alias_merge(100, 8).unwrap();
         // Two rewrites: prefix run [100,103) and tail run [104,108). The
         // middle [103,104) is a clean single-block entry with offset=0 —
@@ -526,6 +587,7 @@ mod tests {
 
         // Second pass is an idempotent no-op: hashes are now stable, every
         // rewrite the worker would propose hits the lbamap noop-skip.
+        settle(&mut vol);
         let outcome2 = vol.reclaim_alias_merge(100, 8).unwrap();
         assert!(!outcome2.discarded);
         assert_eq!(outcome2.runs_rewritten, 0);
@@ -549,6 +611,7 @@ mod tests {
         // Query only the tail half — H's first 25 blocks live outside.
         // Containment fails: H has a run [100, 150) which starts at 100,
         // outside the query [125, 150). Nothing to rewrite.
+        settle(&mut vol);
         let outcome = vol.reclaim_alias_merge(125, 25).unwrap();
         assert!(!outcome.discarded);
         assert_eq!(outcome.runs_rewritten, 0);
@@ -571,7 +634,7 @@ mod tests {
         let hole = [0x11u8; 4096];
         vol.write(203, &hole).unwrap();
 
-        let job = vol.prepare_reclaim(200, 8).unwrap();
+        let job = prep_reclaim(&mut vol, 200, 8);
         let result = crate::actor::execute_reclaim(job).unwrap();
         // The worker must have produced at least one rewrite.
         assert!(result.segment_written);
@@ -623,7 +686,7 @@ mod tests {
         expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
         expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
 
-        let job = vol.prepare_reclaim(200, 8).unwrap();
+        let job = prep_reclaim(&mut vol, 200, 8);
         let result = crate::actor::execute_reclaim(job).unwrap();
         assert!(result.segment_written, "setup: worker proposed no rewrite");
 
@@ -641,6 +704,45 @@ mod tests {
         // The reclaimed range and the concurrent write both read back.
         assert_eq!(vol.read(200, 8).unwrap(), expected);
         assert_eq!(vol.read(500, 1).unwrap(), unrelated);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Prep rotates the open WAL and hands its promote to the caller,
+    /// so the snapshots the worker gets still resolve that WAL's hashes
+    /// to the WAL file the promote then deletes. Those extents are the
+    /// next pass's work, and the rotation is what puts them where the
+    /// next pass can read them.
+    #[test]
+    fn reclaim_leaves_the_open_wals_extents_to_the_next_pass() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // Bloat a hash over [700, 708) and leave it unsettled, so every
+        // run in the range is claimed by the open WAL.
+        let big = reclaim_payload(0x9D, 8);
+        vol.write(700, &big).unwrap();
+        let hole = [0x22u8; 4096];
+        vol.write(703, &hole).unwrap();
+
+        let mut expected = vec![0u8; 8 * 4096];
+        expected[..3 * 4096].copy_from_slice(&big[..3 * 4096]);
+        expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
+        expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
+
+        let first = vol.reclaim_alias_merge(700, 8).unwrap();
+        assert_eq!(
+            first.runs_rewritten, 0,
+            "extents the rotated WAL still claims wait for the next pass"
+        );
+        assert_eq!(vol.read(700, 8).unwrap(), expected);
+
+        // The rotation the first pass performed settled them into a
+        // segment, which is what makes them this pass's work.
+        let second = vol.reclaim_alias_merge(700, 8).unwrap();
+        assert_eq!(second.runs_rewritten, 2);
+        assert_eq!(second.bytes_rewritten, (3 + 4) * 4096);
+        assert_eq!(vol.read(700, 8).unwrap(), expected);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -664,7 +766,7 @@ mod tests {
         expected[3 * 4096..4 * 4096].copy_from_slice(&hole);
         expected[4 * 4096..].copy_from_slice(&big[4 * 4096..]);
 
-        let job = vol.prepare_reclaim(400, 8).unwrap();
+        let job = prep_reclaim(&mut vol, 400, 8);
         let result = crate::actor::execute_reclaim(job).unwrap();
         assert!(result.segment_written);
         let mut saw_data = false;
@@ -700,6 +802,8 @@ mod tests {
         // treat that as "bloat" for any non-zero hash, but ZERO_HASH is
         // always skipped.
         vol.write(304, &[0xABu8; 4096]).unwrap();
+
+        settle(&mut vol);
 
         let outcome = vol.reclaim_alias_merge(300, 10).unwrap();
         assert!(!outcome.discarded);
@@ -856,6 +960,8 @@ mod tests {
         drop(lbamap);
         drop(extent_index);
 
+        settle(&mut vol);
+
         let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
         assert!(!outcome.discarded);
         assert!(outcome.runs_rewritten > 0);
@@ -886,6 +992,8 @@ mod tests {
         let base = keyed_temp_dir();
         let mut vol = Volume::open(&base, &base).unwrap();
         vol.write(400, &reclaim_payload(0x7A, 4)).unwrap();
+
+        settle(&mut vol);
 
         let outcome = vol.reclaim_alias_merge(400, 4).unwrap();
         assert_eq!(outcome.runs_rewritten, 0);
@@ -933,6 +1041,8 @@ mod tests {
         expected.extend_from_slice(&big[..6 * 4096]);
         expected.extend_from_slice(&tail);
         assert_eq!(vol.read(600, 8).unwrap(), expected);
+
+        settle(&mut vol);
 
         let outcome = vol.reclaim_alias_merge(600, 8).unwrap();
         assert!(!outcome.discarded);
@@ -1000,6 +1110,7 @@ mod tests {
                 break;
             }
             let c = candidates.remove(0);
+            settle(&mut vol);
             let outcome = vol.reclaim_alias_merge(c.start_lba, c.lba_length).unwrap();
             assert!(!outcome.discarded);
             assert!(outcome.runs_rewritten > 0);
