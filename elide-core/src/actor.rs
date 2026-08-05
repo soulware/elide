@@ -2795,9 +2795,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     let mut stats = CompactionStats::default();
 
     // Phase 1 — scan: parse + verify every non-floor segment, classify
-    // every entry, compute live/dead/entry counts. Skip fully-live
-    // segments larger than the small threshold (no rewrite, no peer to
-    // pack with).
+    // every entry, compute live/dead/entry counts.
     //
     // `seg_paths` is the prep-time listing, so the candidate set and
     // `lbamap_snapshot` describe the same instant. A segment written
@@ -3156,10 +3154,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             journal: true,
         });
     }
-
-    // Phase 3 — materialise each bucket. A bucket of one fully-live
-    // candidate is a byte-identical no-op; skip it. Data buckets append
-    // after the journal bucket already pushed above.
 
     // Phase 3 — materialise each bucket. A bucket of one fully-live
     // candidate is a byte-identical no-op; skip it. Data buckets append
