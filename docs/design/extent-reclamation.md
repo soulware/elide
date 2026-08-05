@@ -31,6 +31,8 @@ Three phases, of which only the middle is heavy. See `docs/design/noop-write-ski
 
 `scan_reclaim_candidates` walks the live lbamap and extent index and produces `ReclaimCandidate { start_lba, lba_length, dead_blocks, live_blocks, stored_bytes }` entries for hashes with detectable bloat (controlled by `ReclaimThresholds`, all defaults placeholder values).
 
+The scanner's scope is committed bodies — those resolving through `cache/<id>` rather than a full segment file. Bloat that has not yet uploaded belongs to the passes that own that stage: repack slices a partially dead entry into live runs and consumes the input, so it compacts the same bytes for one fewer object; and the sealed generation in `pending/upload/` is immutable until it drains, so rewriting an extent out of it would upload the compact copy alongside the bloat it replaces. That leaves reclaim the case only it reaches — a bloated body inside a committed segment dense enough that GC will not rewrite it.
+
 `elide volume reclaim <name>` calls the scanner, then calls the primitive once per candidate. It exists so the primitive can be exercised end-to-end — this is not a customer-facing operation.
 
 ### Why bypassing the WAL is safe
