@@ -113,12 +113,14 @@ pub struct GcCycleOrchestrator {
     /// process holds edges until its first confirmed flush covers
     /// whatever a pre-crash pass saw.
     last_plan_pass_seq: u64,
-    /// One-shot per process: fold supersession edges missing from
-    /// HEAD back in from the confirmed outputs' signed `inputs`
-    /// tables, at the first edge-eligible publish. Held edges live in
-    /// `tick_superseded` between cleanup and publish, so a crash in
-    /// that window loses them from memory; the signed tables are the
-    /// durable authority they re-derive from.
+    /// Set until the first edge-eligible publish: fold supersession
+    /// edges missing from HEAD back in from the confirmed outputs'
+    /// signed `inputs` tables. While the barrier holds the edges, the
+    /// fold puts just their inputs into `added`, keeping the consumed
+    /// claims in the cut. Held edges live in `tick_superseded` between
+    /// cleanup and publish, so a crash in that window loses them from
+    /// memory; the signed tables are the durable authority they
+    /// re-derive from.
     reconcile_edges: bool,
     /// `coord-rw` handle for the `names/<name>.latest_snapshot` bump
     /// after a drain uploads a `User` manifest (the retry path for a
@@ -856,30 +858,42 @@ impl GcCycleOrchestrator {
                 return false;
             }
         }
-        if edges_eligible {
-            if self.reconcile_edges {
-                match segment_head::confirmed_edges(&self.fork_dir, head.anchor) {
-                    Ok(edges) => {
-                        let now = Utc::now();
-                        for (input, output) in edges {
-                            if head.tombstoned.contains(&input)
-                                || head.superseded.contains_key(&input)
-                            {
-                                continue;
-                            }
+        if self.reconcile_edges {
+            match segment_head::confirmed_edges(&self.fork_dir, head.anchor) {
+                Ok(edges) => {
+                    let now = Utc::now();
+                    for (input, output) in edges {
+                        if head.tombstoned.contains(&input) || head.superseded.contains_key(&input)
+                        {
+                            continue;
+                        }
+                        if edges_eligible {
                             head.superseded
                                 .insert(input, segment_head::Supersession { output, since: now });
                             edges_new += 1;
                             mutated = true;
+                        } else if head.anchor.is_none_or(|a| input > a) && head.added.insert(input)
+                        {
+                            // Below the barrier the fold names only the
+                            // inputs: their idx markers went with the
+                            // handoff, so the confirmed listing misses
+                            // them, and `added` is what keeps their
+                            // claims reachable until the edges commit.
+                            added_new += 1;
+                            mutated = true;
                         }
+                    }
+                    if edges_eligible {
                         self.reconcile_edges = false;
                     }
-                    Err(e) => warn!(
-                        "[head {}] edge reconcile failed: {e}; retrying next publish",
-                        self.vol_ulid
-                    ),
                 }
+                Err(e) => warn!(
+                    "[head {}] edge reconcile failed: {e}; retrying next publish",
+                    self.vol_ulid
+                ),
             }
+        }
+        if edges_eligible {
             // An edge is publishable only when its output sits above
             // the anchor. A handoff that straddled a seal has an
             // output at or below the new anchor — permanently
@@ -915,6 +929,20 @@ impl GcCycleOrchestrator {
                 }
             }
         } else if !self.tick_superseded.is_empty() {
+            // A held edge's input keeps its place in the cut: the
+            // handoff retired its idx marker, so the confirmed listing
+            // misses it, and the input carries its claims until the
+            // edge commits.
+            for (input, _, _) in &self.tick_superseded {
+                if head.anchor.is_none_or(|a| *input > a)
+                    && !head.tombstoned.contains(input)
+                    && !head.superseded.contains_key(input)
+                    && head.added.insert(*input)
+                {
+                    added_new += 1;
+                    mutated = true;
+                }
+            }
             info!(
                 "[head {}] holding {} supersession edge(s) for a post-pass WAL flush",
                 self.vol_ulid,
@@ -3208,6 +3236,78 @@ mod tests {
                 "consumed input stays in the regenerated cut"
             );
             assert!(head.added.contains(&output));
+        }
+
+        /// The oracle's third find (#892): a segment confirmed inside a
+        /// cut window (no publish names it), consumed by a GC handoff,
+        /// its idx retired — then the next cut derives `added` from the
+        /// idx listing alone. The held supersession edge keeps the edge
+        /// out of `superseded`, but nothing puts the input into `added`,
+        /// so its claims vanish from the remote while their killer sits
+        /// in the WAL.
+        #[tokio::test]
+        async fn a_cut_between_pass_and_flush_keeps_consumed_inputs_visible() {
+            let mut world = World::new();
+            for op in [
+                Op::Snapshot,
+                Op::Write { lba: 1 },
+                Op::Write { lba: 2 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                    cut_due: false,
+                },
+                Op::Write { lba: 1 },
+                Op::GcPass,
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: false,
+                    cut_due: true,
+                },
+            ] {
+                world.step(&op).await;
+            }
+        }
+
+        /// Crash-window variant of the same hole: the coordinator dies
+        /// between handoff cleanup and the next cut, losing the held
+        /// edges from memory. The next publish seeds from a non-empty
+        /// S3 HEAD (trusted as-is, so no regeneration), and the idx
+        /// listing again omits the consumed input.
+        #[tokio::test]
+        async fn crash_between_cleanup_and_cut_keeps_consumed_inputs_visible() {
+            let mut world = World::new();
+            for op in [
+                Op::Write { lba: 5 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                    cut_due: true,
+                },
+                Op::Write { lba: 1 },
+                Op::Write { lba: 2 },
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: true,
+                    cut_due: false,
+                },
+                Op::Write { lba: 1 },
+                Op::GcPass,
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: false,
+                    cut_due: false,
+                },
+                Op::CrashCoordinator,
+                Op::Reap,
+                Op::Tick {
+                    fail_after: None,
+                    flush_ok: false,
+                    cut_due: true,
+                },
+            ] {
+                world.step(&op).await;
+            }
         }
 
         proptest! {
