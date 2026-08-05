@@ -44,10 +44,10 @@ use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
-    ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackPrep, RepackResult,
-    SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob,
-    WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
-    read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
+    ReclaimPrep, ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackPrep,
+    RepackResult, SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume,
+    WorkerJob, WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs,
+    read_extents, read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -875,19 +875,32 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let job = match self.lock_volume().prepare_reclaim(start_lba, lba_length) {
-            Ok(j) => j,
+        let prep = match self.lock_volume().prepare_reclaim(start_lba, lba_length) {
+            Ok(p) => p,
             Err(e) => {
                 let _ = reply.send(Err(e));
                 return;
             }
         };
-        // `prepare_reclaim` flushes the WAL before minting the reclaim
-        // output ULID (see the `u_flush < u_reclaim` invariant on
-        // `Volume::prepare_reclaim`). That mutates the extent index
-        // (WAL-relative offsets → segment-relative) and deletes the old
-        // WAL file. Republish so readers don't resolve hashes through
-        // the pre-flush snapshot into a deleted WAL.
+        let ReclaimPrep { flush, job } = prep;
+        // The rotated WAL goes first, so `apply_promote` lands before the
+        // reclaim's apply. Per-run admission (`register_entry_if_newer`)
+        // reads that as an ordinary intervening mutation, which is what
+        // lets the two applies stay in dispatch order with no deferral.
+        if let Some(flush) = flush {
+            let old_wal_path = flush.old_wal_path.clone();
+            if let Err(e) = self.send_worker_job(WorkerJob::Promote(flush)) {
+                warn!("reclaim flush dispatch failed: {e}");
+                let _ = reply.send(Err(e));
+                return;
+            }
+            self.pipeline.promotes_in_flight += 1;
+            self.pipeline.promote_gen += 1;
+            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+        }
+        // Prep took the WAL, so the extent index the readers see still
+        // points hashes at it. Republish so a reader picks up the
+        // snapshot the promote's apply will move off.
         self.publish_snapshot();
         if let Err(e) = self.send_worker_job(WorkerJob::Reclaim(job)) {
             warn!("reclaim dispatch failed: {e}");
