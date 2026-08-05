@@ -3880,7 +3880,6 @@ mod tests {
 
         // ── Consequence: with parent_b dropped, S4 defers on every pass.
         let config = crate::config::GcConfig {
-            density_threshold: 0.0,
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
