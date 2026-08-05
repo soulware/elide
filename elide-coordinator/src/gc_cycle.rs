@@ -537,24 +537,34 @@ impl GcCycleOrchestrator {
             );
         }
 
-        // Alias-merge extent reclamation: rewrites LBA sub-ranges of bloated
-        // hashes (partial-overwrite survivors) into fresh compact entries.
-        // One candidate per tick caps per-tick latency; the scanner sorts
-        // most-wasteful-first, so sustained bloat converges across ticks.
-        // Default scanner thresholds gate tiny / weakly-bloated hashes out.
-        if let Some(s) = control::reclaim(&self.fork_dir, Some(1)).await
+        flushed
+    }
+
+    /// Reclaim the bloated extents the GC pass left alone, most wasteful
+    /// first, one per pass.
+    ///
+    /// The targets come from the pass's own classification, which walks
+    /// every committed segment entry by entry — so identifying them costs
+    /// nothing here. One per pass bounds the rewrite, which reads the live
+    /// runs, recompresses them and writes a segment on the volume's
+    /// worker; the rest are re-observed next pass.
+    async fn run_reclaim(&self, targets: Vec<elide_core::volume_ipc::ReclaimTarget>) {
+        if !self.fork_dir.join("control.sock").exists()
+            || self.fork_dir.join("volume.readonly").exists()
+        {
+            return;
+        }
+        let vol_ulid = self.vol_ulid;
+        let proposed = targets.len();
+        if let Some(s) = control::reclaim(&self.fork_dir, Some(1), targets).await
             && s.runs_rewritten > 0
         {
             info!(
-                "[drain {vol_ulid}] reclaim: scanned={} runs={} bytes={} refused={} discarded={}",
-                s.candidates_scanned,
-                s.runs_rewritten,
-                s.bytes_rewritten,
-                s.runs_refused,
-                s.discarded,
+                "[gc {vol_ulid}] reclaim: proposed={proposed} runs={} bytes={} \
+                 refused={} discarded={}",
+                s.runs_rewritten, s.bytes_rewritten, s.runs_refused, s.discarded,
             );
         }
-        flushed
     }
 
     /// Drain the upload generation to S3. Returns whether the drain
@@ -1190,6 +1200,10 @@ impl GcCycleOrchestrator {
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
         };
+        let reclaim_targets = match &gc_result {
+            Ok(stats) => stats.reclaim_targets.clone(),
+            Err(_) => Vec::new(),
+        };
         match gc_result {
             Ok(gc::GcStats {
                 strategy: gc::GcStrategy::Compact,
@@ -1239,6 +1253,10 @@ impl GcCycleOrchestrator {
                 self.last_plan_pass_seq = self.tick_seq;
                 error!("[gc {vol_ulid}] error: {e:#}");
             }
+        }
+
+        if !reclaim_targets.is_empty() {
+            self.run_reclaim(reclaim_targets).await;
         }
     }
 }

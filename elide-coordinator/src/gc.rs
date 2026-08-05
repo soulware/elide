@@ -91,7 +91,8 @@ use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
-use elide_core::volume::latest_snapshot;
+use elide_core::volume::{ReclaimThresholds, latest_snapshot};
+use elide_core::volume_ipc::ReclaimTarget;
 
 use crate::config::GcConfig;
 
@@ -177,6 +178,10 @@ pub struct GcStats {
     /// "GC is idle but lots of dead bytes on disk" — typically means
     /// the volume hasn't read the relevant segments yet.
     pub deferred_cold: usize,
+    /// Bloated extents in segments this pass declined to rewrite, most
+    /// wasteful first. The volume reclaims these; see
+    /// `docs/design/extent-reclamation.md`.
+    pub reclaim_targets: Vec<ReclaimTarget>,
 }
 
 impl GcStats {
@@ -190,6 +195,7 @@ impl GcStats {
             total_segments,
             buckets_emitted: 0,
             deferred_cold: 0,
+            reclaim_targets: Vec::new(),
         }
     }
 }
@@ -246,9 +252,10 @@ pub fn gc_fork(
     // any existing stale scratch.
     cleanup_staging_files(&gc_dir);
 
-    let pass = load_pass_state(fork_dir, by_id_dir)?;
+    let mut pass = load_pass_state(fork_dir, by_id_dir)?;
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
+    let bloat = std::mem::take(&mut pass.bloat);
 
     // Cache-residency filter: drop candidates whose bodies aren't fully
     // resolvable from local cache. Cold candidates wait for organic
@@ -278,8 +285,15 @@ pub fn gc_fork(
             total_segments,
             buckets_emitted: 0,
             deferred_cold,
+            reclaim_targets: reclaim_targets_for_declined(bloat, &HashSet::new()),
         });
     }
+
+    let selected: HashSet<String> = buckets
+        .iter()
+        .flat_map(|p| p.bucket.iter().map(|s| s.ulid_str.clone()))
+        .collect();
+    let reclaim_targets = reclaim_targets_for_declined(bloat, &selected);
 
     let mut total_candidates = 0usize;
     let mut total_bytes_freed = 0u64;
@@ -303,6 +317,7 @@ pub fn gc_fork(
         total_segments,
         buckets_emitted,
         deferred_cold,
+        reclaim_targets,
     })
 }
 
@@ -350,6 +365,98 @@ struct PassState {
     live_hashes: HashSet<blake3::Hash>,
     total_segments: usize,
     deferred_count: usize,
+    /// Bloated extents this pass classified, keyed by the segment
+    /// holding them. Which of these reach the volume depends on what
+    /// the packer selects — see [`reclaim_targets_for_declined`].
+    bloat: Vec<(String, Vec<BloatedExtent>)>,
+}
+
+/// An extent whose body carries dead interior blocks, as
+/// `classify_entry` saw it: the LBA range tightly covering its surviving
+/// runs, plus the numbers [`ReclaimThresholds`] gates on.
+///
+/// The dead count is exact here. The volume-side scanner works from the
+/// stored body length and falls back to a lower bound for a compressed
+/// payload; this counts LBAs, which the entry records on disk whatever
+/// its codec.
+struct BloatedExtent {
+    target: ReclaimTarget,
+    dead_blocks: u64,
+    dead_ratio: f64,
+}
+
+/// The bloated extents in one segment, as this pass already classified
+/// them. `partial_death_runs[i]` is the live sub-run list for
+/// `live_entries[i]`, so an entry is bloated exactly when that is
+/// `Some` and the runs cover fewer LBAs than the entry spans.
+fn bloated_extents(stats: &SegmentStats, thresholds: &ReclaimThresholds) -> Vec<BloatedExtent> {
+    let mut out = Vec::new();
+    for (entry, runs) in stats
+        .live_entries
+        .iter()
+        .zip(stats.partial_death_runs.iter())
+    {
+        let Some(runs) = runs else { continue };
+        if runs.is_empty() || !entry.kind.has_body_bytes() {
+            continue;
+        }
+        let live_blocks: u64 = runs.iter().map(|r| r.range_end - r.range_start).sum();
+        let total_blocks = entry.lba_length as u64;
+        if total_blocks == 0 || live_blocks >= total_blocks {
+            continue;
+        }
+        let dead_blocks = total_blocks - live_blocks;
+        let dead_ratio = dead_blocks as f64 / total_blocks as f64;
+        let stored_bytes = entry.stored_length as u64;
+        if dead_blocks < u64::from(thresholds.min_dead_blocks)
+            || dead_ratio < thresholds.min_dead_ratio
+            || stored_bytes < thresholds.min_stored_bytes
+        {
+            continue;
+        }
+        // Tightly cover the surviving runs, matching what the volume's
+        // own scanner proposes: the primitive's per-hash containment
+        // check needs every run of the hash inside the range.
+        let start_lba = runs.iter().map(|r| r.range_start).min().unwrap_or(0);
+        let end_lba = runs.iter().map(|r| r.range_end).max().unwrap_or(0);
+        let Ok(lba_length) = u32::try_from(end_lba - start_lba) else {
+            continue;
+        };
+        out.push(BloatedExtent {
+            target: ReclaimTarget {
+                start_lba,
+                lba_length,
+            },
+            dead_blocks,
+            dead_ratio,
+        });
+    }
+    out
+}
+
+/// The reclaim targets among `bloat` that GC left alone, most wasteful
+/// first.
+///
+/// A bloated extent inside a segment the packer selected is GC's: the
+/// rewrite slices its live runs into the output. What is left belongs to
+/// reclaim, whose unit is the extent rather than the segment, and which
+/// is the only pass that reaches a bloated body in a segment dense
+/// enough that GC declines it.
+fn reclaim_targets_for_declined(
+    bloat: Vec<(String, Vec<BloatedExtent>)>,
+    selected: &HashSet<String>,
+) -> Vec<ReclaimTarget> {
+    let mut extents: Vec<BloatedExtent> = bloat
+        .into_iter()
+        .filter(|(ulid_str, _)| !selected.contains(ulid_str))
+        .flat_map(|(_, extents)| extents)
+        .collect();
+    extents.sort_unstable_by(|a, b| {
+        b.dead_blocks
+            .cmp(&a.dead_blocks)
+            .then_with(|| b.dead_ratio.total_cmp(&a.dead_ratio))
+    });
+    extents.into_iter().map(|e| e.target).collect()
 }
 
 fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
@@ -400,6 +507,16 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // Data/Inline/DedupRef partial death, and Delta with at least one
     // resolvable source, are all handled in-band via `expand_partial_death`.
     // See `docs/design/gc-partial-death-compaction.md`.
+    // Every committed segment has just been classified entry by entry,
+    // so the bloat is already measured; collecting it here is what saves
+    // reclaim its own walk of the volume.
+    let reclaim_thresholds = ReclaimThresholds::default();
+    let bloat: Vec<(String, Vec<BloatedExtent>)> = all_stats
+        .iter()
+        .map(|s| (s.ulid_str.clone(), bloated_extents(s, &reclaim_thresholds)))
+        .filter(|(_, extents)| !extents.is_empty())
+        .collect();
+
     let (deferred, eligible_stats): (Vec<SegmentStats>, Vec<SegmentStats>) =
         all_stats.into_iter().partition(|s| s.has_partial_death);
     let deferred_count = deferred.len();
@@ -417,6 +534,7 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         live_hashes,
         total_segments,
         deferred_count,
+        bloat,
     })
 }
 
@@ -1782,6 +1900,113 @@ mod tests {
                 SegmentPool::Stable
             },
         }
+    }
+
+    /// A segment holding one Data entry that spans `lba_length` blocks
+    /// with `live` surviving sub-runs — the shape a partial overwrite
+    /// leaves behind. `stored_bytes` decides whether the entry clears
+    /// `ReclaimThresholds::min_stored_bytes`.
+    fn make_bloated_stats(
+        ulid: Ulid,
+        start_lba: u64,
+        lba_length: u32,
+        live: &[(u64, u64)],
+        stored_bytes: usize,
+    ) -> SegmentStats {
+        let hash = blake3::hash(&ulid.to_bytes());
+        let entry = SegmentEntry::new_data(
+            hash,
+            start_lba,
+            lba_length,
+            elide_core::segment::Codec::None,
+            vec![0u8; stored_bytes],
+        )
+        .entry;
+        let runs: Arc<[lbamap::ExtentRead]> = live
+            .iter()
+            .map(|(from, to)| lbamap::ExtentRead {
+                hash,
+                range_start: *from,
+                range_end: *to,
+                payload_block_offset: (*from - start_lba) as u32,
+                claimant_ulid: ulid,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        SegmentStats {
+            ulid_str: ulid.to_string(),
+            retained_stored_bytes: stored_bytes as u64,
+            materialised_bytes: stored_bytes as u64,
+            total_stored_bytes: stored_bytes as u64,
+            has_body_entries: true,
+            live_entries: vec![entry],
+            live_entry_indices: vec![0],
+            removed_hashes: Vec::new(),
+            partial_death_runs: vec![Some(runs)],
+            has_partial_death: false,
+            pool: SegmentPool::Stable,
+        }
+    }
+
+    /// The pass already knows how much of each entry died, so the dead
+    /// count is the gap between the entry's span and its live runs, and
+    /// the target tightly covers those runs.
+    #[test]
+    fn bloated_extents_measure_the_gap_between_an_entry_and_its_live_runs() {
+        let stats = make_bloated_stats(Ulid::new(), 100, 32, &[(100, 103), (120, 132)], 96 * 1024);
+        let found = bloated_extents(&stats, &ReclaimThresholds::default());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dead_blocks, 17, "32 spanned, 15 live");
+        assert_eq!(found[0].target.start_lba, 100);
+        assert_eq!(found[0].target.lba_length, 32);
+    }
+
+    /// The thresholds are the volume scanner's, so trivial waste is
+    /// proposed to nobody.
+    #[test]
+    fn bloated_extents_gate_on_the_reclaim_thresholds() {
+        // One block dead in sixteen: under both min_dead_blocks and
+        // min_dead_ratio.
+        let small_hole = make_bloated_stats(Ulid::new(), 0, 16, &[(0, 15)], 96 * 1024);
+        assert!(bloated_extents(&small_hole, &ReclaimThresholds::default()).is_empty());
+
+        // Plenty dead, but the body is too small to be worth a rewrite.
+        let tiny_body = make_bloated_stats(Ulid::new(), 0, 16, &[(0, 4)], 4096);
+        assert!(bloated_extents(&tiny_body, &ReclaimThresholds::default()).is_empty());
+    }
+
+    /// Bloat inside a segment the packer selected is GC's — the rewrite
+    /// slices the live runs into its output. What GC declined is
+    /// reclaim's, which is the only pass whose unit is the extent.
+    #[test]
+    fn reclaim_targets_cover_only_what_gc_declined() {
+        let mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let mint = std::sync::Mutex::new(mint);
+        let next = || mint.lock().unwrap().next();
+        let selected_ulid = next();
+        let declined_ulid = next();
+
+        let bloat = vec![
+            (
+                selected_ulid.to_string(),
+                bloated_extents(
+                    &make_bloated_stats(selected_ulid, 0, 16, &[(0, 8)], 96 * 1024),
+                    &ReclaimThresholds::default(),
+                ),
+            ),
+            (
+                declined_ulid.to_string(),
+                bloated_extents(
+                    &make_bloated_stats(declined_ulid, 200, 16, &[(200, 208)], 96 * 1024),
+                    &ReclaimThresholds::default(),
+                ),
+            ),
+        ];
+
+        let selected: HashSet<String> = [selected_ulid.to_string()].into_iter().collect();
+        let targets = reclaim_targets_for_declined(bloat, &selected);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].start_lba, 200);
     }
 
     fn make_config(density_threshold: f64) -> crate::config::GcConfig {
