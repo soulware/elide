@@ -107,10 +107,16 @@ artefact:
 The tick currently runs promote-WAL → repack → reclaim → drain → GC,
 with `gc_checkpoint` flushing the WAL again mid-GC, so the pass
 classifies against state *newer* than what the tick drains. Under
-cuts the tick fixes its frontier first: one WAL flush at tick start,
-and every sub-step — repack, reclaim, drain, GC candidate selection —
-operates on state at or below that frontier. Writes arriving during
-the tick land beyond the frontier and belong to the next cut.
+cuts the tick fixes its frontier first, and every sub-step — repack,
+reclaim, drain, GC candidate selection — operates on state at or below
+that frontier. Writes arriving during the tick land beyond the
+frontier and belong to the next cut.
+
+The frontier is set by a WAL flush at tick start on the ticks that ask
+for one: a cut is due, or a plan pass is holding edges that need a
+flush to postdate it (`GcOrchestrator::flush_due`). On the rest, the
+frontier is wherever the volume's own `FLUSH_THRESHOLD` rotation and
+the repack and reclaim preps last left it.
 
 ### HEAD publishes complete drains only
 
