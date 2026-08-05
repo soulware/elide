@@ -168,6 +168,29 @@ entries. Materialising that is a decompress and a zstd-3 recompress, near
 between ticks. The generation's bodies are all local, so the pass issues no
 S3 GETs to do it.
 
+## Bounding the work
+
+A generation that grew while the drain was down is larger than a cut's
+worth, and the pass runs on the single worker thread that every promote
+also queues behind. So what a close takes on is bounded by work rather
+than by segment count: `REPACK_CLOSE_WORK_BYTES`, four output targets of
+stored data bytes, spent smallest-first.
+
+Smallest-first is what the budget buys the most with. Admitting a segment
+folds away one object whatever its size, so the cheapest ones return the
+most per byte of work. A segment above `REPACK_TARGET_LIVE` cannot share a
+bucket, so it lands solo and materialise skips it as a byte-identical
+no-op — passing over it gives up nothing that would have been packed. What
+the budget turns away drains as its own object, and the pass logs the
+count and bytes it left.
+
+Journal is admitted before the budget is consulted. A pass that repacks
+data must carry all pending journal above its outputs
+(`journal-pending-consolidation.md`), so a journal segment left behind
+inverts the ordering rather than saving work. It is cheap to take whole:
+the measured generation's journal was one 380 KiB consolidation output
+and two stragglers of 3.4 KiB.
+
 ## Timing
 
 A cut is drain, publish, close. The generation just sealed is not drained
