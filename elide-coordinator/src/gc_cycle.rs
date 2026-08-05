@@ -385,7 +385,11 @@ impl GcCycleOrchestrator {
         };
 
         self.tick_seq += 1;
-        if self.run_volume_compactions().await {
+        let cut_clock_due = self.cut_due();
+        if self
+            .run_volume_compactions(self.flush_due(cut_clock_due))
+            .await
+        {
             self.last_flush_seq = self.tick_seq;
         }
 
@@ -433,7 +437,7 @@ impl GcCycleOrchestrator {
         // *Writers and crash ordering*). The close runs only after the
         // cut lands: a failed HEAD PUT leaves the window stretched
         // rather than queueing a second generation.
-        let cut_due = self.cut_due() && Self::upload_generation_drained(&self.fork_dir);
+        let cut_due = cut_clock_due && Self::upload_generation_drained(&self.fork_dir);
         let cut_landed = self.publish_head_delta(drain_ok, cut_due).await;
         if cut_landed
             && let Some(closed) = control::close_generation(&self.fork_dir).await
@@ -481,9 +485,24 @@ impl GcCycleOrchestrator {
 
     /// Whether this tick closes a cut: `cut_interval` has elapsed since
     /// the last published cut. Sampled once per tick (`run_tick`) so the
-    /// drain mode and the publish gate see the same answer.
+    /// flush gate and the publish gate see the same answer.
     fn cut_due(&self) -> bool {
         self.last_cut.elapsed() >= self.gc_config.cut_interval
+    }
+
+    /// Whether this tick asks the volume for a WAL flush.
+    ///
+    /// Two things need one. The supersession barrier admits an edge only
+    /// once a confirmed flush postdates the pass that emitted it, so a
+    /// pass at or above `last_flush_seq` holds its edges until the next
+    /// flush. And a cut bounds how long an acknowledged write stays
+    /// outside S3, which makes the cut cadence a flush cadence too.
+    ///
+    /// On the ticks in between, the WAL rotates on `FLUSH_THRESHOLD` and
+    /// on whatever the `repack` and `reclaim` preps find open when they
+    /// run, so each rotation carries a full WAL.
+    fn flush_due(&self, cut_due: bool) -> bool {
+        cut_due || self.last_plan_pass_seq >= self.last_flush_seq
     }
 
     /// Volume-side compactions (best-effort; skipped silently if the control
@@ -496,8 +515,10 @@ impl GcCycleOrchestrator {
     /// Returns whether the WAL flush was confirmed — a successful
     /// `promote_wal` round trip, which replies only once the flush
     /// segment is in `pending/` (or the WAL was empty). The tick loop
-    /// feeds this into the supersession barrier.
-    async fn run_volume_compactions(&self) -> bool {
+    /// feeds this into the supersession barrier. A tick that asks for no
+    /// flush (`flush_due`) reports `false` and leaves the barrier where
+    /// it stands.
+    async fn run_volume_compactions(&self, flush_due: bool) -> bool {
         if !self.fork_dir.join("control.sock").exists()
             || self.fork_dir.join("volume.readonly").exists()
         {
@@ -505,7 +526,7 @@ impl GcCycleOrchestrator {
         }
 
         let vol_ulid = self.vol_ulid;
-        let flushed = control::promote_wal(&self.fork_dir).await;
+        let flushed = flush_due && control::promote_wal(&self.fork_dir).await;
 
         if let Some(s) = control::repack(&self.fork_dir).await
             && s.segments_compacted > 0
@@ -1642,6 +1663,34 @@ mod tests {
         assert!(head.added.contains(&output));
         assert!(head.superseded.is_empty());
         assert!(!orch.tick_superseded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_due_covers_the_barrier_and_the_cut() {
+        // The two consumers of a confirmed flush, and the tick that has
+        // neither.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut orch, _tmp) = orchestrator_prepped(store, None, |_| {});
+
+        // A fresh process has both counters at zero: the barrier cannot
+        // tell whether a pre-crash pass emitted edges, so it asks.
+        assert!(orch.flush_due(false), "fresh process asks for a flush");
+
+        // A pass at or above the last flush leaves its edges waiting.
+        orch.last_flush_seq = 7;
+        orch.last_plan_pass_seq = 7;
+        assert!(orch.flush_due(false), "same-tick pass still needs a flush");
+        orch.last_plan_pass_seq = 8;
+        assert!(orch.flush_due(false), "later pass needs a flush");
+
+        // A flush that already postdates the pass settles the barrier.
+        orch.last_flush_seq = 9;
+        orch.last_plan_pass_seq = 8;
+        assert!(!orch.flush_due(false), "barrier satisfied, no flush");
+
+        // The cut asks regardless, so a write's stay in the WAL is
+        // bounded by `cut_interval`.
+        assert!(orch.flush_due(true), "a due cut always asks for a flush");
     }
 
     #[tokio::test]

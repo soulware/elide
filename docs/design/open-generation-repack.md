@@ -9,7 +9,6 @@ and halt-on-failure drain (`durable-cut.md`), both shipped.
 Repack runs from `run_volume_compactions` on every tick:
 
 ```rust
-let flushed = control::promote_wal(&self.fork_dir).await;
 if let Some(s) = control::repack(&self.fork_dir).await
 ```
 
@@ -255,7 +254,7 @@ stalled one pays per backlog threshold crossed.
 
 ## Non-goals
 
-- No change to the tick cadence itself, which continues to drive
-  `promote_wal`, drain, GC and the cut.
+- No change to the tick cadence itself, which continues to drive drain,
+  GC and the cut.
 - No change to what a generation means or how HEAD names it.
 - No change to the segment format or the S3 object layout.
