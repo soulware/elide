@@ -149,8 +149,13 @@ impl From<ReclaimReply> for ReclaimIpcStats {
 /// Run an alias-merge extent reclamation pass on the volume.
 ///
 /// `cap` bounds how many candidates the handler will process this call.
-pub async fn reclaim(fork_dir: &Path, cap: Option<u32>) -> Option<ReclaimIpcStats> {
-    let reply: ReclaimReply = call_typed(fork_dir, &VolumeRequest::Reclaim { cap }).await?;
+pub async fn reclaim(
+    fork_dir: &Path,
+    cap: Option<u32>,
+    targets: Vec<elide_core::volume_ipc::ReclaimTarget>,
+) -> Option<ReclaimIpcStats> {
+    let reply: ReclaimReply =
+        call_typed(fork_dir, &VolumeRequest::Reclaim { cap, targets }).await?;
     Some(reply.into())
 }
 

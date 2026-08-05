@@ -22,7 +22,7 @@ use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::ReclaimThresholds;
 use elide_core::volume_ipc::{
     ApplyGcHandoffsReply, CloseGenerationReply, CompactionReply, ConnectedReply, GcCheckpointReply,
-    ReclaimReply, VolumeRequest,
+    ReclaimReply, ReclaimTarget, VolumeRequest,
 };
 
 /// Start the control socket server for `fork_dir`.
@@ -207,7 +207,7 @@ fn dispatch(
                 );
             }
         },
-        VolumeRequest::Reclaim { cap } => dispatch_reclaim(cap, handle, writer),
+        VolumeRequest::Reclaim { cap, targets } => dispatch_reclaim(cap, targets, handle, writer),
         VolumeRequest::Connected => {
             let connected = client_connected.load(Ordering::Relaxed);
             let _ = write_envelope(writer, &Envelope::ok(ConnectedReply { connected }));
@@ -216,19 +216,39 @@ fn dispatch(
     }
 }
 
-fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl Write) {
-    // End-to-end alias-merge pass over the whole volume:
-    //   1. Scan the current snapshot for bloated-hash candidates.
-    //   2. Reclaim each candidate (most-wasteful-first) via the
-    //      three-phase primitive.
+fn dispatch_reclaim(
+    cap: Option<u32>,
+    targets: Vec<ReclaimTarget>,
+    handle: &VolumeClient,
+    writer: &mut impl Write,
+) {
+    // Reclaim each target (most-wasteful-first) through the three-phase
+    // primitive, `cap` bounding how many this call takes on: None →
+    // unlimited, Some(n) → at most n.
     //
-    // `cap`: None → unlimited; Some(n) → process at most n.
-    let candidates = handle.reclaim_candidates(ReclaimThresholds::default());
+    // The caller names the targets. The coordinator's GC pass classifies
+    // every committed segment entry by entry, so it already knows which
+    // extents carry dead interior blocks and which segments it declined
+    // to rewrite. Scanning here is the fallback for a caller that has no
+    // such pass behind it — `elide volume reclaim` — and costs a walk of
+    // the whole LBA map.
+    let candidates: Vec<ReclaimTarget> = if targets.is_empty() {
+        handle
+            .reclaim_candidates(ReclaimThresholds::default())
+            .into_iter()
+            .map(|c| ReclaimTarget {
+                start_lba: c.start_lba,
+                lba_length: c.lba_length,
+            })
+            .collect()
+    } else {
+        targets
+    };
     let scanned = candidates.len();
     if scanned > 0 {
-        info!("[reclaim] scan found {scanned} candidate(s), cap={cap:?}");
+        info!("[reclaim] {scanned} candidate(s), cap={cap:?}");
     } else {
-        debug!("[reclaim] scan found 0 candidate(s), cap={cap:?}");
+        debug!("[reclaim] 0 candidates, cap={cap:?}");
     }
     let to_process: Vec<_> = match cap {
         Some(n) => candidates.into_iter().take(n as usize).collect(),
@@ -241,8 +261,8 @@ fn dispatch_reclaim(cap: Option<u32>, handle: &VolumeClient, writer: &mut impl W
     let mut io_err: Option<std::io::Error> = None;
     for c in to_process {
         debug!(
-            "[reclaim] candidate lba={} len={} dead_blocks={} live_blocks={} stored_bytes={}",
-            c.start_lba, c.lba_length, c.dead_blocks, c.live_blocks, c.stored_bytes,
+            "[reclaim] candidate lba={} len={}",
+            c.start_lba, c.lba_length
         );
         match handle.reclaim_alias_merge(c.start_lba, c.lba_length) {
             Ok(outcome) => {

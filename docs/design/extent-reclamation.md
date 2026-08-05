@@ -1,6 +1,6 @@
 # Extent reclamation
 
-**Status:** Primitive, scanner, CLI, and per-tick coordinator scheduling are landed. Threshold tuning is empirical work still pending. Do not cite anything in this doc when solving an unrelated correctness problem.
+**Status:** Primitive, scanner, CLI, and GC-driven coordinator scheduling are landed. Threshold tuning is empirical work still pending. Do not cite anything in this doc when solving an unrelated correctness problem.
 
 ## What exists today
 
@@ -53,9 +53,15 @@ A successful reclaim pass updates the lbamap to point at fresh compact entries a
 
 ## Coordinator wiring
 
-Wired in `elide-coordinator/src/tasks.rs` alongside `sweep_pending` / `repack` / `delta_repack_post_snapshot`. Each drain tick calls `control::reclaim(&fork_dir, Some(1))`: the volume runs the scanner, takes the top-scoring candidate, and reclaims it. The cap of 1 per tick bounds per-tick latency; sustained bloat converges across ticks because the scanner sorts most-wasteful-first. Orphaned bodies from the reclaim output become ordinary sparse-segment candidates on the next GC tick. Skipped for readonly volumes and during import-serve phases (control.sock owned by the import process).
+The GC pass names the targets. `collect_stats` classifies every committed segment entry by entry, and `EntryClassification::PartialDeath` carries the surviving runs of a partially dead entry — the same fact the volume-side scanner rediscovers by walking the whole LBA map. `gc_fork` collects those extents, drops the ones inside segments the packer selected, and returns the rest as `GcStats::reclaim_targets`, most wasteful first; `run_gc_pass` hands them to the volume as `control::reclaim(fork_dir, Some(1), targets)`.
 
-The pre-drain placement was picked over a post-snapshot hook because it needs no new event path, is symmetric with existing maintenance ops, and a single per-tick knob controls cadence.
+Dropping the selected ones is what splits the work by unit. A bloated extent inside a segment GC is about to rewrite is GC's — the rewrite slices its live runs into the output. What is left sits in a segment GC declined as dense enough to leave alone, which is the case only an extent-unit pass reaches.
+
+The dead count taken this way is exact: the gap between the entry's `lba_length` and its live runs, both recorded on disk whatever the body's codec. The scanner works from the stored body length and falls back to a lower bound for a compressed payload.
+
+One target per pass bounds the rewrite, which reads the live runs, recompresses them, and writes a segment on the volume's worker; the rest are re-observed next pass. Orphaned bodies from the output become ordinary sparse-segment candidates on a later GC pass. Skipped for readonly volumes and while `control.sock` belongs to an import.
+
+The scanner stays the entry point for a caller with no pass behind it — `elide volume reclaim` — which is what an empty `targets` list selects.
 
 ### Concurrency constraint
 

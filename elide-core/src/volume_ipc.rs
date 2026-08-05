@@ -52,9 +52,17 @@ pub enum VolumeRequest {
     FinalizeGcHandoff { gc_ulid: Ulid },
     /// Run an alias-merge extent reclamation pass; with `cap = Some(n)`,
     /// process at most `n` candidates this call.
+    ///
+    /// `targets` names the ranges to reclaim. The coordinator's GC pass
+    /// classifies every committed segment already, so it knows which
+    /// extents carry dead interior blocks and which segments it declined
+    /// to rewrite; an empty list asks the volume to find its own, which
+    /// is what `elide volume reclaim` does.
     Reclaim {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         cap: Option<u32>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        targets: Vec<ReclaimTarget>,
     },
     /// Close the open generation into `pending/upload/`; the upload
     /// generation must already be drained.
@@ -129,6 +137,15 @@ pub struct CloseGenerationReply {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ApplyGcHandoffsReply {
     pub processed: u32,
+}
+
+/// One LBA range to reclaim, tightly covering the live runs of a single
+/// bloated hash — the shape [`crate::volume::ReclaimCandidate`] carries,
+/// reduced to what the primitive is addressed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReclaimTarget {
+    pub start_lba: u64,
+    pub lba_length: u32,
 }
 
 /// Reply for [`VolumeRequest::Reclaim`]. Mirrors the historical
