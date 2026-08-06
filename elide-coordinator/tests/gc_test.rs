@@ -1647,7 +1647,7 @@ fn index_delta_count(fork_dir: &std::path::Path) -> usize {
 /// A `Delta` entry's body is reconstructed against the body of a *different*
 /// hash — `delta_options[*].source_hash` — so that source must survive GC even
 /// though no LBA maps to it. Every liveness consumer carries such sources by
-/// unioning `ExtentIndex::delta_source_closure` over
+/// unioning `ExtentIndex::named_delta_sources` with
 /// `claim_referenced_hashes()`.
 ///
 /// Overwriting an LBA with a near-duplicate leaves the original as the delta

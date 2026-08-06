@@ -384,9 +384,9 @@ fn apply_promoted_partition(
             // hash, and the registration's admission on no other segment
             // having taken it — a concurrent writer wins both. A Delta
             // without a token never had a body location. The delta's
-            // source dependency rides the deltas-map registration:
+            // source dependency rides the delta-source records:
             // liveness reaches it through
-            // `ExtentIndex::delta_source_closure`, keyed by hash, so no
+            // `ExtentIndex::named_delta_sources`, keyed by hash, so no
             // per-claim attachment happens here.
             EntryKind::Delta => {
                 if let Some(old_wal_offset) = old_wal_offset {
@@ -1628,15 +1628,11 @@ impl Volume {
 
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
-        // Liveness for the veto is claims plus the delta-source closure:
-        // a claim of a delta-canonical hash (a DedupRef most commonly)
-        // attaches no sources to the claim maps, yet reads route through
-        // the delta, so its base extent must cancel a plan that drops it.
+        // Liveness for the veto is claims plus every named delta source:
+        // a base body must stay resolvable while any registered encoding
+        // names it, so its extent must cancel a plan that drops it.
         let mut live_hashes = self.lbamap.claim_referenced_hashes();
-        let delta_sources = self
-            .extent_index
-            .delta_source_closure(|h| live_hashes.contains(h));
-        live_hashes.extend(delta_sources);
+        live_hashes.extend(self.extent_index.named_delta_sources());
 
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
@@ -3364,13 +3360,12 @@ impl Volume {
             }
         }
         // The resemblance tier's cost filter asks "is this candidate
-        // source worth pinning" against claims plus the delta-source
-        // closure — the same liveness definition every deletion decision
+        // source worth pinning" against claims plus every named delta
+        // source — the same liveness definition every deletion decision
         // uses, so the filter never skips a source the GC would keep.
-        let referenced = self.lbamap.referenced_hashes(
-            self.extent_index
-                .delta_source_closure(|h| self.lbamap.claim_refcount(h) > 0),
-        );
+        let referenced = self
+            .lbamap
+            .referenced_hashes(self.extent_index.named_delta_sources());
         let delta = jobs::PromoteDeltaSpec {
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),

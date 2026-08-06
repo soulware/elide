@@ -594,15 +594,11 @@ impl Volume {
         let mut pending_journal: std::collections::BTreeSet<Ulid> =
             journal_untouched.into_iter().collect();
 
-        // Claims plus the delta-source closure: a claim of a
-        // delta-canonical hash attaches no sources to the claim maps, yet
-        // reads route through the delta, so its base extent must refuse a
-        // bucket that drops it.
+        // Claims plus every named delta source: a base body must stay
+        // resolvable while any registered encoding names it, so its
+        // extent must refuse a bucket that drops it.
         let mut live_hashes = self.lbamap.claim_referenced_hashes();
-        let delta_sources = self
-            .extent_index
-            .delta_source_closure(|h| live_hashes.contains(h));
-        live_hashes.extend(delta_sources);
+        live_hashes.extend(self.extent_index.named_delta_sources());
 
         for bucket in &buckets {
             let carried_hashes = bucket
