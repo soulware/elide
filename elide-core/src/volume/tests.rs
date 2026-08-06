@@ -5264,7 +5264,7 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
 /// apply must leave the live map exactly where a disk rebuild lands —
 /// the raced LBA's claim matches the rebuild and reads back the final
 /// write's bytes. Source liveness is hash-keyed through
-/// `ExtentIndex::delta_source_closure`, so no per-claim state exists for
+/// `ExtentIndex::named_delta_sources`, so no per-claim state exists for
 /// the race to corrupt.
 /// 64 KiB clears MIN_SKETCH_BYTES so extents sketch and delta-convert.
 const DELTA_EXTENT_BYTES: usize = 64 * 1024;

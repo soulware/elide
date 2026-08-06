@@ -145,6 +145,146 @@ fn delta_entry_end_to_end_decompression() {
     assert_eq!(parent_read, parent_bytes);
 }
 
+/// The resurrection read shape from issue #893: a composite's claims
+/// all die while its encoding keeps the deltas-map home, and a later
+/// encoding of the same hash is refused the home at registration —
+/// the incumbent wins, matching the rebuild walk's lowest-ULID rule.
+/// The new claims therefore resolve through the OLD encoding, and the
+/// read must return the composite bytes, live and across a reopen.
+/// Safe because every registered encoding's sources stay pinned
+/// (`ExtentIndex::named_delta_sources`), so the incumbent always
+/// decodes, and content addressing makes its bytes identical to the
+/// refused encoding's.
+#[test]
+fn refused_duplicate_encoding_reads_through_the_incumbent_home() {
+    use elide_core::volume::Volume;
+
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+
+    let structured = |seed: u8, n_blocks: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocks * 4096);
+        for block in 0..n_blocks {
+            for i in 0..4096 {
+                out.push(seed.wrapping_add(block as u8).wrapping_add((i >> 5) as u8));
+            }
+        }
+        out
+    };
+    let parent_bytes = structured(0xA0, 8);
+    let parent_hash = blake3::hash(&parent_bytes);
+    let child_bytes = structured(0xA1, 8);
+    let child_hash = blake3::hash(&child_bytes);
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent_bytes).unwrap();
+    let delta_blob = compressor.compress(&child_bytes).unwrap();
+    let delta_option = || DeltaOption {
+        source_hash: parent_hash,
+        delta_offset: 0,
+        delta_length: delta_blob.len() as u32,
+        delta_hash: blake3::hash(&delta_blob),
+    };
+
+    // ── P: parent DATA at [0, 8). X: the child's delta encoding at
+    //    [10, 18), which takes the deltas-map home.
+    let mut mint = UlidMint::new(Ulid::nil());
+    let p_ulid = mint.next();
+    write_segment(
+        &elide_core::segment::pending_open_dir(&vol_dir).join(p_ulid.to_string()),
+        vec![SegmentEntry::new_data(
+            parent_hash,
+            0,
+            8,
+            Codec::None,
+            parent_bytes.clone(),
+        )],
+        signer.as_ref(),
+    )
+    .unwrap();
+    let x_ulid = mint.next();
+    write_segment_with_delta_body(
+        &elide_core::segment::pending_open_dir(&vol_dir).join(x_ulid.to_string()),
+        vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            10,
+            8,
+            vec![delta_option()],
+        ))],
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+
+    let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+    vol.promote_segment(p_ulid).unwrap();
+    vol.promote_segment(x_ulid).unwrap();
+
+    // ── Kill every claim on the child. The encoding and its home
+    //    persist untouched — the retained-dedup-target state.
+    let overwrite = structured(0xB7, 8);
+    vol.write(10, &overwrite).unwrap();
+    let (lbamap, _) = vol.snapshot_maps();
+    assert!(
+        !lbamap.claim_referenced_hashes().contains(&child_hash),
+        "precondition: the child must be fully claim-dead"
+    );
+    drop(lbamap);
+
+    // ── Y: a second encoding of the same hash claims fresh LBAs. Its
+    //    registration is refused — X keeps the home. Hand-written
+    //    segments bypass Volume::write, so reopen to fold Y's claims
+    //    into the lbamap before promoting it.
+    drop(vol);
+    let y_ulid = mint.next();
+    write_segment_with_delta_body(
+        &elide_core::segment::pending_open_dir(&vol_dir).join(y_ulid.to_string()),
+        vec![PendingEntry::from_entry(SegmentEntry::new_delta(
+            child_hash,
+            30,
+            8,
+            vec![delta_option()],
+        ))],
+        &delta_blob,
+        signer.as_ref(),
+    )
+    .unwrap();
+    let mut vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+    vol.promote_segment(y_ulid).unwrap();
+
+    let (lbamap, ei) = vol.snapshot_maps();
+    assert!(
+        lbamap.claim_referenced_hashes().contains(&child_hash),
+        "Y's claims must resurrect the hash"
+    );
+    assert_eq!(
+        ei.lookup_delta(&child_hash).unwrap().segment_id,
+        x_ulid,
+        "the incumbent encoding must keep the deltas-map home"
+    );
+    drop(lbamap);
+    drop(ei);
+
+    // ── Reads of Y's LBAs route through X's encoding.
+    assert_eq!(
+        vol.read(30, 8).unwrap(),
+        child_bytes,
+        "the resurrected claims must read back through the incumbent home"
+    );
+    assert_eq!(vol.read(10, 8).unwrap(), overwrite);
+    drop(vol);
+
+    // ── A rebuild produces the same routing: lowest ULID keeps the home.
+    let vol = Volume::open(&vol_dir, &vol_dir).unwrap();
+    let (_lbamap, ei) = vol.snapshot_maps();
+    assert_eq!(
+        ei.lookup_delta(&child_hash).unwrap().segment_id,
+        x_ulid,
+        "rebuild must give the home to the lowest-ULID encoding"
+    );
+    drop(ei);
+    assert_eq!(vol.read(30, 8).unwrap(), child_bytes);
+    assert_eq!(vol.read(10, 8).unwrap(), overwrite);
+}
+
 /// Drained-cache regression for Phase B2/C: after both segments
 /// are promoted into the `index/` + `cache/` three-file shape and
 /// `pending/` is cleared, the Delta LBA must still round-trip via

@@ -120,11 +120,10 @@ fn assert_manifest_filter_correct(
         parsed_segments.push((seg_ulid, parsed));
     }
 
-    // Pass 1: live_hashes = claim-referenced ∪ the delta-source closure,
+    // Pass 1: live_hashes = claim-referenced ∪ the named delta sources,
     // mirroring `live_index_segments`.
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
-    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
-    live_hashes.extend(delta_sources);
+    live_hashes.extend(extent_index.named_delta_sources());
 
     // Pass 2: apply predicate and cross-check against the manifest.
     for (seg_ulid, parsed) in &parsed_segments {
@@ -2310,11 +2309,11 @@ fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
 /// the rebuilt lbamap attaches no delta sources to it — yet the claimed
 /// hash resolves through the kept Delta's canonical form, which
 /// decompresses against the base extent. The planner's liveness
-/// therefore unions the delta-source closure over the claim set
-/// (`ExtentIndex::delta_source_closure`); this pins that the fold keeps
+/// therefore unions the named delta sources with the claim set
+/// (`ExtentIndex::named_delta_sources`); this pins that the fold keeps
 /// the base extent and the LBA stays readable, live and across a crash
 /// rebuild. Discovered by the per-LBA source-list oracle: without the
-/// closure the fold drops the base extent and every read fails with
+/// pin set the fold drops the base extent and every read fails with
 /// "no source option resolved in extent index".
 #[test]
 fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {

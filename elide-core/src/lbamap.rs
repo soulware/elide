@@ -100,11 +100,11 @@ enum Blocking<'a> {
 /// The map tracks claims only. A hash whose canonical form is
 /// delta-encoded depends on its source extents for decompression, and
 /// the extent index owns canonical forms, so that dependency lives
-/// there: deletion decisions union `ExtentIndex::delta_source_closure`
-/// over `claim_referenced_hashes()`.
+/// there: deletion decisions union `ExtentIndex::named_delta_sources`
+/// with `claim_referenced_hashes()`.
 ///
 /// Snapshot of which hashes are referenced, composed by the volume from
-/// the claim map plus the delta-source closure
+/// the claim map plus the named delta sources
 /// ([`LbaMap::referenced_hashes`]).
 ///
 /// Exists so a worker can ask the liveness question against state captured
@@ -255,7 +255,7 @@ impl LbaMap {
     /// paths all route through it, so an incremental update cannot
     /// branch differently from what a fresh rebuild would produce. A
     /// Delta's source dependency is the extent index's business
-    /// (`ExtentIndex::delta_source_closure`), keyed by hash rather than
+    /// (`ExtentIndex::named_delta_sources`), keyed by hash rather than
     /// by claim.
     ///
     /// `admission` selects the overlap policy: `Unconditional` installs
@@ -733,18 +733,18 @@ impl LbaMap {
     /// **This set alone does not satisfy the canonical-presence
     /// invariant.** A claimed hash whose canonical form is delta-encoded
     /// depends on source extents this set knows nothing about. Every
-    /// deletion decision must union in `ExtentIndex::delta_source_closure`
-    /// over this set, or a kept delta loses the base extent it
-    /// decompresses against and the LBA reads "no source option resolved
-    /// in extent index". The GC planner, the plan-apply stale-liveness
-    /// veto, repack, and the index liveness walk all follow that pattern.
+    /// deletion decision must union in `ExtentIndex::named_delta_sources`,
+    /// or a kept delta loses the base extent it decompresses against and
+    /// the LBA reads "no source option resolved in extent index". The GC
+    /// planner, the plan-apply stale-liveness veto, repack, and the index
+    /// liveness walk all follow that pattern.
     pub fn claim_referenced_hashes(&self) -> HashSet<blake3::Hash> {
         self.claim_counts.keys().copied().collect()
     }
 
     /// Whether any LBA claims `hash` — the same claim-level definition
     /// [`Self::claim_referenced_hashes`] uses, with the same caveat: a
-    /// deletion decision needs the delta-source closure on top. One hash
+    /// deletion decision needs the named delta sources on top. One hash
     /// lookup against the maintained refcounts, for callers that only ask
     /// membership and have no use for an owned set.
     pub fn is_referenced(&self, hash: &blake3::Hash) -> bool {
@@ -752,10 +752,9 @@ impl LbaMap {
     }
 
     /// A detached view of claim membership plus the caller-supplied
-    /// delta-source closure, for a worker that needs the liveness
-    /// question off-lock. The volume composes the closure from its
-    /// extent index (`ExtentIndex::delta_source_closure`) at snapshot
-    /// time.
+    /// delta-source pin set, for a worker that needs the liveness
+    /// question off-lock. The volume composes the set from its extent
+    /// index (`ExtentIndex::named_delta_sources`) at snapshot time.
     ///
     /// The claim map is persistent, so this shares structure rather than
     /// copying, and the view is a snapshot: it answers as of the moment
@@ -1428,7 +1427,7 @@ mod tests {
     #[test]
     fn rebuild_registers_delta_source_hashes() {
         // A segment with a Delta entry claims its content hash, and the
-        // liveness closure over the rebuilt extent index carries its
+        // named-source set over the rebuilt extent index carries its
         // source_hash(es). This is the load-bearing fold that keeps GC
         // from collecting the source DATA body out from under a live
         // Delta.
@@ -1479,18 +1478,17 @@ mod tests {
             referenced.contains(&content_hash),
             "delta content hash missing from claim_referenced_hashes"
         );
-        // Both source hashes carried by the closure over the rebuilt
-        // extent index.
+        // Both source hashes carried by the named-source set over the
+        // rebuilt extent index.
         let index = crate::extentindex::rebuild(&[(base.clone(), None)]).unwrap();
-        let sources = index.delta_source_closure(|h| referenced.contains(h));
-        referenced.extend(sources);
+        referenced.extend(index.named_delta_sources());
         assert!(
             referenced.contains(&source_a),
-            "delta source A missing from the liveness closure"
+            "delta source A missing from the named delta sources"
         );
         assert!(
             referenced.contains(&source_b),
-            "delta source B missing from the liveness closure"
+            "delta source B missing from the named delta sources"
         );
         // Unrelated hash not in the set.
         assert!(!referenced.contains(&unrelated));

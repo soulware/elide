@@ -490,13 +490,11 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
     // would reject the handoff in a loop.
     replay_wal_into_lbamap(&fork_dir.join("wal"), &mut lbamap)?;
 
-    // Claims alone undercount: a claim of a delta-canonical hash (via a
-    // DedupRef, or a claim whose Delta entry was superseded in its own
-    // segment) attaches no sources, yet reads route through the delta.
-    // The closure keeps those base extents out of the drop set.
+    // Claims alone undercount: a base body must stay resolvable while
+    // any registered encoding names it, claim-live or not. The named
+    // source set keeps those extents out of the drop set.
     let mut live_hashes = lbamap.claim_referenced_hashes();
-    let delta_sources = index.delta_source_closure(|h| live_hashes.contains(h));
-    live_hashes.extend(delta_sources);
+    live_hashes.extend(index.named_delta_sources());
     let floor: Option<Ulid> = latest_snapshot(fork_dir)?;
 
     let all_stats = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, floor)
@@ -3750,14 +3748,13 @@ mod tests {
     /// A source body named only by a Delta entry that does not own the
     /// deltas-map home for its hash must still count as live.
     ///
-    /// `delta_source_closure` walks `ExtentIndex::deltas`, which holds one
-    /// location per hash, and pulls in the sources *that* location names.
-    /// `classify_entry` gates a partially-dead Delta on the sources the
-    /// entry in hand names. The same composite can be encoded against
-    /// different bases in different segments, so the two sets diverge: the
-    /// non-home encoding's source is protected by nothing, GC drops it as
-    /// unreferenced, and the segment holding that encoding classifies
-    /// `DeferUnresolvableDelta` on this pass and every later one.
+    /// The same composite can be encoded against different bases in
+    /// different segments, and `classify_entry` gates a partially-dead
+    /// Delta on the sources the entry in hand names. Every encoding's
+    /// sources must therefore be pinned (`named_delta_sources`), or the
+    /// non-home encoding's base drops as unreferenced and the segment
+    /// holding that encoding classifies `DeferUnresolvableDelta` on
+    /// every pass.
     ///
     /// Both encodings carry hash `child`. S3 mints first, so it owns the
     /// deltas-map home and its base (`parent_a`) is protected. S4's base
@@ -3866,8 +3863,7 @@ mod tests {
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
         let mut live_hashes = lbamap.claim_referenced_hashes();
-        let delta_sources = index.delta_source_closure(|h| live_hashes.contains(h));
-        live_hashes.extend(delta_sources);
+        live_hashes.extend(index.named_delta_sources());
 
         // Preconditions: S3 owns the home, both encodings still claim LBAs,
         // and parent_b holds no LBA of its own.
@@ -3897,9 +3893,8 @@ mod tests {
             "parent_a is named by the home encoding and must be live"
         );
 
-        // ── The bug: parent_b is named by S4's live encoding, and reads of
-        //    LBA 200 route through it, but the closure never visits S4's
-        //    options so nothing holds parent_b alive.
+        // ── parent_b is named by S4's live encoding, and reads of
+        //    LBA 200 route through it, so the pin set must hold it.
         assert!(
             live_hashes.contains(&parent_b_hash),
             "parent_b is named by a live Delta entry and must be live"
@@ -3920,6 +3915,182 @@ mod tests {
         assert!(
             !stats.iter().any(|s| s.has_partial_death),
             "no segment may be left permanently undeferrable"
+        );
+    }
+
+    /// A source body stays resolvable while a claim-dead encoding still
+    /// names it (issue #893).
+    ///
+    /// A thin dead Delta beside a large live entry keeps its segment
+    /// above the density threshold, so the segment — and its
+    /// delta-source record — survives pass after pass while the
+    /// source's own segment goes claim-dead and collectable. The pin
+    /// must come from the record: a claim-gated pin lets the source
+    /// drop, and the surviving encoding is then undecodable the moment
+    /// a later identical write re-claims its hash. The pin lapses with
+    /// the record — once the encoding's segment goes fully dead and is
+    /// collected, the next pass drops the source.
+    #[tokio::test]
+    async fn gc_keeps_a_source_named_by_a_claim_dead_encoding() {
+        use elide_core::segment::{DeltaOption, PendingEntry, write_segment_with_delta_body};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let signer =
+            elide_core::signing::load_signer(dir, elide_core::signing::VOLUME_KEY_FILE).unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut parent = vec![0u8; 4 * 4096];
+        for (i, b) in parent.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let mut child = parent.clone();
+        for b in &mut child[0..256] {
+            *b = 0xCC;
+        }
+        // Large incompressible filler: the live weight that keeps the
+        // encoding's segment above the density threshold once the thin
+        // delta beside it dies.
+        let mut filler = vec![0u8; 16 * 4096];
+        for (i, b) in filler.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(101).wrapping_add(29);
+        }
+        let parent_hash = blake3::hash(&parent);
+        let child_hash = blake3::hash(&child);
+        let overwrite = vec![0xFFu8; 4096];
+
+        // ── P: the source body via the normal write path.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &parent).unwrap();
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        // ── X: the child encoded against the source, plus the filler.
+        let mut mint = elide_core::ulid_mint::UlidMint::new(Ulid::nil());
+        let x_ulid = mint.next();
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &parent).unwrap();
+        let blob = compressor.compress(&child).unwrap();
+        let opt = DeltaOption {
+            source_hash: parent_hash,
+            delta_offset: 0,
+            delta_length: blob.len() as u32,
+            delta_hash: blake3::hash(&blob),
+        };
+        let entries = vec![
+            PendingEntry::from_entry(elide_core::segment::SegmentEntry::new_delta(
+                child_hash,
+                100,
+                4,
+                vec![opt],
+            )),
+            elide_core::segment::SegmentEntry::new_data(
+                blake3::hash(&filler),
+                300,
+                16,
+                elide_core::segment::Codec::None,
+                filler.clone(),
+            ),
+        ];
+        let pending = elide_core::segment::pending_open_dir(dir).join(x_ulid.to_string());
+        write_segment_with_delta_body(&pending, entries, &blob, signer.as_ref()).unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.promote_segment(x_ulid).unwrap();
+
+        // ── Retire the source's and the child's claims; the filler stays
+        //    live, so X is not worth collecting.
+        for lba in [0u64, 1, 2, 3, 100, 101, 102, 103] {
+            vol.write(lba, &overwrite).unwrap();
+        }
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        // ── The regression: liveness must pin the source purely through
+        //    X's record, with zero claims on either hash.
+        let rebuild_chain = vec![(dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let claims = lbamap.claim_referenced_hashes();
+        assert!(
+            !claims.contains(&child_hash),
+            "the child must be claim-dead"
+        );
+        assert!(
+            !claims.contains(&parent_hash),
+            "the source must be claim-dead"
+        );
+        assert!(
+            index.lookup(&parent_hash).is_some(),
+            "precondition: the source body resolves before the pass"
+        );
+        assert!(
+            index.named_delta_sources().contains(&parent_hash),
+            "the claim-dead encoding's record must pin the source"
+        );
+        let config = crate::config::GcConfig {
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        };
+        // One GC cycle as the coordinator drives it: plan + apply, then the
+        // promote and finalize legs for every bare `gc/<new>` handoff.
+        let mut out_mint = elide_core::ulid_mint::UlidMint::new(Ulid::new());
+        let mut pass = |n: usize| {
+            let ulids: Vec<Ulid> = (0..n).map(|_| out_mint.next()).collect();
+            gc_fork(dir, dir.parent().unwrap(), &config, ulids).unwrap();
+            let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+            vol.apply_gc_handoffs().unwrap();
+            let bare: Vec<Ulid> = std::fs::read_dir(dir.join("gc"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| Ulid::from_string(e.file_name().to_str()?).ok())
+                .collect();
+            for u in bare {
+                vol.promote_segment(u).unwrap();
+                vol.finalize_gc_handoff(u).unwrap();
+            }
+        };
+
+        // ── Pass 1 collects the source's dead segment; the record must
+        //    hold the body resolvable through it.
+        pass(4);
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        assert!(
+            index.lookup(&parent_hash).is_some(),
+            "the source must survive while X's record names it"
+        );
+
+        // ── Cleanup: kill the filler, so X reaps and its record purges;
+        //    with nothing naming the source, it drops within two passes.
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        for lba in 300u64..316 {
+            vol.write(lba, &overwrite).unwrap();
+        }
+        vol.flush_wal().unwrap();
+        drain_with_repack(&mut vol, dir, Ulid::nil(), &store).await;
+        drop(vol);
+
+        for _ in 0..3 {
+            pass(4);
+        }
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        assert!(
+            index.lookup(&parent_hash).is_none(),
+            "an unnamed, unclaimed source must reap once the record is gone"
+        );
+        assert!(
+            index.named_delta_sources().is_empty(),
+            "no record may outlive its segment"
         );
     }
 

@@ -622,61 +622,26 @@ impl ExtentIndex {
         self.deltas.get(hash)
     }
 
-    /// Source hashes the delta-encoded canonical forms of live hashes
-    /// decompress against. This is the closure step of the liveness
-    /// computation: a claim can reference a delta-canonical hash through
-    /// any entry kind (a DedupRef most commonly), so the claim set alone
-    /// undercounts — every deletion decision must union in this set or a
-    /// kept delta loses its base extent and the LBA reads
-    /// "no source option resolved in extent index".
+    /// Every source hash named by a registered delta encoding, live or
+    /// not. This is the pin set of the liveness computation: every
+    /// deletion decision unions it with the claim set, so a source body
+    /// drops only once nothing on disk names it.
     ///
-    /// Iterates the deltas map — far smaller than the claim set — and
-    /// keeps the sources of every delta-canonical hash `is_live` accepts,
-    /// so the cost scales with the number of delta canonicals rather than
-    /// the volume's extent count.
+    /// The pin covers claim-dead encodings too. They stay registered as
+    /// dedup/resolution targets until their segment is rewritten, and a
+    /// later identical write can re-claim the hash, so their sources
+    /// must outlive the claims. Seeding from every record subsumes the
+    /// transitive hop — a source's own encodings contribute their
+    /// sources directly.
     ///
-    /// Transitive: a source hash can carry a delta registration alongside
-    /// its DATA location (registration is per-map, and folds carry delta
-    /// canonicals whose hash's DATA form survives elsewhere), so each
-    /// newly-live source is followed through its own delta options too.
-    /// Reads resolve sources through the DATA map only, so the extra hop
-    /// is a conservative over-keep; the visited set bounds the walk.
-    pub fn delta_source_closure(
-        &self,
-        is_live: impl Fn(&blake3::Hash) -> bool,
-    ) -> HashSet<blake3::Hash> {
-        // Every encoding of a hash contributes, so fold the segment-outer
-        // tier into one hash-keyed view for the walk.
-        let mut by_hash: HashMap<blake3::Hash, Vec<blake3::Hash>> = HashMap::new();
-        for per_hash in self.delta_sources.values() {
-            for (hash, sources) in per_hash.iter() {
-                by_hash
-                    .entry(*hash)
-                    .or_default()
-                    .extend(sources.iter().copied());
-            }
-        }
-
+    /// Iterates the delta-source records — far smaller than the claim
+    /// set — so the cost scales with the number of delta encodings
+    /// rather than the volume's extent count.
+    pub fn named_delta_sources(&self) -> HashSet<blake3::Hash> {
         let mut out = HashSet::new();
-        let mut frontier: Vec<blake3::Hash> = Vec::new();
-        for (hash, sources) in by_hash.iter() {
-            if !is_live(hash) {
-                continue;
-            }
-            for source in sources {
-                if out.insert(*source) {
-                    frontier.push(*source);
-                }
-            }
-        }
-        while let Some(hash) = frontier.pop() {
-            let Some(sources) = by_hash.get(&hash) else {
-                continue;
-            };
-            for source in sources {
-                if out.insert(*source) {
-                    frontier.push(*source);
-                }
+        for per_hash in self.delta_sources.values() {
+            for sources in per_hash.values() {
+                out.extend(sources.iter().copied());
             }
         }
         out
@@ -1737,6 +1702,44 @@ mod tests {
         index.rekey_journal(from, to, h(1), data_loc(to));
         assert!(index.lookup_journal(to, &h(1)).is_none());
         assert!(index.lookup_journal(from, &h(1)).is_none());
+    }
+
+    /// The pin set carries every registered encoding's sources — the
+    /// home encoding's, a refused duplicate's, and those of an encoding
+    /// whose hash nothing claims — and a segment's contribution lapses
+    /// exactly when its records purge.
+    #[test]
+    fn named_delta_sources_covers_every_encoding_and_lapses_on_purge() {
+        let mut index = ExtentIndex::new();
+        let home = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(11)]);
+        let dup = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(13)]);
+        let consumed = std::collections::HashSet::new();
+        index
+            .register_entry_consuming_inputs(&home, 0, &reg_ctx(useg(3)), &consumed)
+            .unwrap();
+        index
+            .register_entry_consuming_inputs(&dup, 0, &reg_ctx(useg(5)), &consumed)
+            .unwrap();
+        assert_eq!(
+            index.lookup_delta(&h(1)).unwrap().segment_id,
+            useg(3),
+            "the duplicate encoding must have been refused the home"
+        );
+
+        let sources = index.named_delta_sources();
+        assert!(sources.contains(&h(11)), "home encoding's source is named");
+        assert!(
+            sources.contains(&h(13)),
+            "refused encoding's source is named"
+        );
+
+        index.purge_segment_delta_sources(useg(5));
+        let sources = index.named_delta_sources();
+        assert!(sources.contains(&h(11)));
+        assert!(
+            !sources.contains(&h(13)),
+            "a purged segment's records pin nothing"
+        );
     }
 
     #[test]

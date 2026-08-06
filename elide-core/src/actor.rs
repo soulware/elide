@@ -2858,13 +2858,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         segment_cache,
     } = job;
 
-    // Claims plus the delta-source closure — a claim of a delta-canonical
-    // hash (a DedupRef most commonly) attaches no sources to the claim
-    // maps, yet reads route through the delta, so the classifier must
-    // count the delta's base extent live.
+    // Claims plus every named delta source — a base body must stay
+    // resolvable while any registered encoding names it, so the
+    // classifier counts all of them live.
     let mut live_hashes = lbamap_snapshot.claim_referenced_hashes();
-    let delta_sources = extent_index_snapshot.delta_source_closure(|h| live_hashes.contains(h));
-    live_hashes.extend(delta_sources);
+    live_hashes.extend(extent_index_snapshot.named_delta_sources());
     let index_dir = base_dir.join("index");
     let cache_dir = base_dir.join("cache");
 
@@ -3472,9 +3470,9 @@ pub(crate) fn execute_sign_snapshot_manifest(
 ///
 /// Two passes over the cached `.idx` set:
 /// 1. Build `live_hashes` — `lbamap.claim_referenced_hashes()` unioned
-///    with `ExtentIndex::delta_source_closure` over it. A body whose
-///    hash is not in this set has nothing reading it, even if the
-///    extent index still points at it.
+///    with `ExtentIndex::named_delta_sources`. A body whose hash is
+///    not in this set has nothing reading it, even if the extent
+///    index still points at it.
 /// 2. Apply the predicate with `live_hashes` as the body-reachability
 ///    side condition.
 ///
@@ -3508,15 +3506,12 @@ pub(crate) fn live_index_segments(
         parsed_segments.push((seg_ulid, parsed));
     }
 
-    // Pass 1: live_hashes = claim-referenced hashes ∪ the delta-source
-    // closure. A delta-canonical hash can be referenced through any
-    // claim kind (a DedupRef most commonly, and `CanonicalDelta`
-    // entries make no claim at all), and reads route through the delta,
-    // so its `source_hash` body must count as live even when no LBA
+    // Pass 1: live_hashes = claim-referenced hashes ∪ every named delta
+    // source. A source body must stay resolvable while any registered
+    // encoding names it, so all of them count as live even when no LBA
     // references the source directly.
     let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
-    let delta_sources = extent_index.delta_source_closure(|h| live_hashes.contains(h));
-    live_hashes.extend(delta_sources);
+    live_hashes.extend(extent_index.named_delta_sources());
 
     // Pass 2: apply predicate.
     let mut live: Vec<Ulid> = Vec::with_capacity(parsed_segments.len());
@@ -3870,11 +3865,10 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     // segment's delta body section at write time.
     let mut delta_body: Vec<u8> = Vec::new();
 
-    // Sources already pinned by a live delta canonical: the "H will
-    // stick around" signal the delta-emission decision below consults.
-    let delta_source_pins = job
-        .extent_index_snapshot
-        .delta_source_closure(|h| job.lbamap_snapshot.claim_refcount(h) > 0);
+    // Sources already pinned by a registered delta encoding: the "H
+    // will stick around" signal the delta-emission decision below
+    // consults.
+    let delta_source_pins = job.extent_index_snapshot.named_delta_sources();
 
     for er in &job.entries {
         if er.hash == crate::volume::ZERO_HASH {
