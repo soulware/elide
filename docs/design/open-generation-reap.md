@@ -80,13 +80,10 @@ Three rules govern which segments the reap may take.
 On the actor, with the volume mutex held for the state mutation and dropped for
 the filesystem work.
 
-Thread choice is close to irrelevant to the guest, because the two paths are
-blocked by different things. A read is `ArcSwap::load()` of the published
-snapshot and takes no lock at all, so nothing the reap does can block one. A
-write takes the volume mutex directly from the ublk queue thread in
-`VolumeClient::write`, so the only thing that blocks the write path is mutex
-hold time. The actor being busy does not block a write; the actor holding the
-mutex does.
+Thread choice is close to irrelevant to the guest. Reads are lock-free off the
+published snapshot and writes take the volume mutex directly from the ublk
+queue thread, so mutex hold time is the whole question and the actor being busy
+is not part of it (`architecture.md` *Concurrency and locking*).
 
 The worker is the wrong home for a different reason. It is one thread that
 every promote queues behind, so a reap dispatched there delays the promote a
@@ -202,10 +199,9 @@ rather than guessed.
 
 ## The apply window
 
-A read takes no lock, and a write takes the volume mutex from the ublk queue
-thread, so every mutex window in the pipeline is a window in which writes wait.
-The apply is the longest of them, and what makes it long is not the entries it
-registers.
+Every mutex window is a window in which writes wait (`architecture.md`
+*Concurrency and locking*). The apply is the longest of them, and what makes it
+long is not the entries it registers.
 
 `apply_repack_result` runs `mutate_gated_on_resolvability` once per bucket, and
 that gate ends in `unresolvable_lbamap_hashes`, which walks **every** LBA-map
