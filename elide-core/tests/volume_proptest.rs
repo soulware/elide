@@ -1027,7 +1027,7 @@ proptest! {
                     }
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                 }
                 SimOp::CutAndDrain => {
                     common::cut_and_drain(&mut vol);
@@ -1045,7 +1045,7 @@ proptest! {
                     pending_gc = None;
                     // Match production sequencing: `tasks.rs` runs drain →
                     // GC sequentially within each tick.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     // Core invariant: the volume mint must have advanced past the
                     // GC output ULID, so the next WAL flush produces a segment that
@@ -1092,7 +1092,7 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -1180,7 +1180,7 @@ proptest! {
                     // because the demand-fetch path uses S3-minted (lower)
                     // ULIDs, not freshly-minted ones; this is a test-helper
                     // artifact.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
 
                     // gc_checkpoint flushes the WAL (may create a pending segment) then
                     // mints two fresh ULIDs; we use the first for the cache file.  All
@@ -1500,7 +1500,7 @@ proptest! {
                     }
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                 }
                 SimOp::CutAndDrain => {
                     common::cut_and_drain(&mut vol);
@@ -1511,7 +1511,7 @@ proptest! {
                     pending_gc = None;
                     // Match production: drain → GC sequentially per tick
                     // (see ulid_monotonicity's CoordGcLocal for rationale).
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -1529,7 +1529,7 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -1645,7 +1645,7 @@ proptest! {
                     // pending segment with a lower ULID would violate
                     // pending-above-committed. See the matching comment in
                     // crash_recovery_oracle.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
 
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
@@ -1949,7 +1949,7 @@ proptest! {
                     }
                 }
                 SimOp::DrainWithRedact => {
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                 }
                 SimOp::CutAndDrain => {
                     common::cut_and_drain(&mut vol);
@@ -1960,7 +1960,7 @@ proptest! {
                     pending_gc = None;
                     // Match production: drain → GC sequentially per tick
                     // (see ulid_monotonicity's CoordGcLocal for rationale).
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
                     let to_delete = if let Some((_, _, paths)) =
                         common::simulate_coord_gc_local(fork_dir, gc_ulid, *n)
@@ -1978,7 +1978,7 @@ proptest! {
                 }
                 SimOp::GcCheckpoint => {
                     // Match production: drain → gc_checkpoint sequentially.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
                     pending_gc = Some(u_gc);
                 }
@@ -2072,7 +2072,7 @@ proptest! {
                     // pending segment with a lower ULID would violate
                     // pending-above-committed. See the matching comment in
                     // crash_recovery_oracle.
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
 
                     // effective_seed always has bit 7 set (128..=255) so it never
                     // collides with Write/DedupWrite seeds (0..=127, bit 7 clear).
@@ -2292,7 +2292,7 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 ReclaimOp::DrainWithRedact => {
-                    common::drain_with_repack(&mut vol);
+                    common::drain_with_reap(&mut vol);
                 }
                 ReclaimOp::SweepPending => {
                     let _ = vol.repack_open_for_test();
@@ -2345,7 +2345,7 @@ fn delta_gc_prefix_mints_a_delta_entry() {
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let snap = vol.snapshot().unwrap();
     vol.sign_snapshot_manifest(snap).unwrap();
 
@@ -2395,7 +2395,7 @@ fn delta_cycle_prefix_mints_a_superseded_delta() {
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let snap = vol.snapshot().unwrap();
     vol.sign_snapshot_manifest(snap).unwrap();
 
@@ -2456,7 +2456,7 @@ fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let snap = vol.snapshot().unwrap();
     vol.sign_snapshot_manifest(snap).unwrap();
 
@@ -2466,7 +2466,7 @@ fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
     vol.write(52, &a_prime).unwrap();
     vol.flush_wal().unwrap();
 
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
@@ -2503,7 +2503,7 @@ fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let snap = vol.snapshot().unwrap();
     vol.sign_snapshot_manifest(snap).unwrap();
 
@@ -2513,7 +2513,7 @@ fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
     vol.write(52, &a_prime).unwrap();
     vol.flush_wal().unwrap();
 
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {

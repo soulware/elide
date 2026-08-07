@@ -314,14 +314,14 @@ fn plan_emitted_during_inflight_apply_is_safe() {
         oracle.insert(lba, data);
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     for lba in 4u64..8 {
         let data = incompressible_block(0x40 + lba as u8);
         vol.write(lba, &data).unwrap();
         oracle.insert(lba, data);
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     assert!(common::capture_and_evict_cache_body(&vol, &fork_dir, &store_dir).is_some());
     assert!(common::capture_and_evict_cache_body(&vol, &fork_dir, &store_dir).is_some());
 

@@ -1,6 +1,6 @@
 // Shared simulation helpers for proptest files.
 //
-// `drain_with_repack` and `simulate_coord_gc_local` mirror the real
+// `drain_with_reap` and `simulate_coord_gc_local` mirror the real
 // coordinator's drain-pending and GC logic without requiring an object store.
 // Both proptest suites (volume_proptest and actor_proptest) use these to drive
 // the same coordinator-side simulation.
@@ -42,16 +42,17 @@ pub fn write_test_keypair(dir: &Path) {
     .unwrap();
 }
 
-/// Mirror the production drain (no S3 upload): repack, then promote
-/// every remaining pending segment in ULID-ascending order.
-pub fn drain_with_repack(vol: &mut elide_core::volume::Volume) {
-    vol.repack_open_for_test().unwrap();
+/// Mirror the production drain (no S3 upload): reap what died, then
+/// promote every remaining pending segment in ULID-ascending order.
+/// Packing belongs to the close, which [`cut_and_drain`] drives.
+pub fn drain_with_reap(vol: &mut elide_core::volume::Volume) {
+    vol.reap_open_generation().unwrap();
     for ulid in pending_ulids(vol.base_dir()) {
         vol.promote_segment(ulid).unwrap();
     }
 }
 
-/// `drain_with_repack` for a `VolumeClient` (actor-mediated): reap what
+/// `drain_with_reap` for a `VolumeClient` (actor-mediated): reap what
 /// died, then promote what survives.
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
     handle.reap().unwrap();

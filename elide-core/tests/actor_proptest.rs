@@ -55,13 +55,18 @@ enum ActorOp {
     /// through the actor channel.  Verifies that the snapshot is republished
     /// and all oracle LBAs remain readable via the handle.
     CoordGcLocal { n: usize },
-    /// Sweep small pending segments via the actor channel.  After the call,
-    /// old pending/ files are deleted; publish_snapshot() must have bumped
-    /// flush_gen so handles evict stale cached fds before the next read.
-    SweepPending,
-    /// Repack sparse pending segments via the actor channel.  Same invariant
-    /// as SweepPending: old files deleted, snapshot must be republished.
-    Repack,
+    /// The open generation's reap through the actor channel: the sweep
+    /// runs off the mutex against the published snapshot, the apply
+    /// revalidates under it, then a publish precedes the unlinks. After
+    /// the call the reaped files are gone, so a handle whose cached fd
+    /// survived the publish reads ENOENT.
+    Reap,
+    /// Manufacture a whole-dead open segment and reap it through the
+    /// actor: write an LBA, flush it to a segment of its own, overwrite
+    /// it, flush again, then reap. Generated state reaches a segment
+    /// whose entries are all dead only by chance, so a bare `Reap`
+    /// mostly finds nothing to take.
+    ReapCycle { lba: u8, seed_a: u8, seed_b: u8 },
     /// Simulate a crash: shut down the actor, reopen the Volume (triggering
     /// WAL recovery), and assert all oracle LBAs are still readable.
     Crash,
@@ -85,8 +90,17 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
         2 => Just(ActorOp::Flush),
         2 => Just(ActorOp::DrainLocal),
         1 => (2usize..=5).prop_map(|n| ActorOp::CoordGcLocal { n }),
-        1 => Just(ActorOp::SweepPending),
-        1 => Just(ActorOp::Repack),
+        1 => Just(ActorOp::Reap),
+        // `delta` is non-zero mod 128, so the overwrite always changes
+        // content — an identical second write is skipped, and the first
+        // segment would stay live.
+        2 => (0u8..4, 0u8..128u8, 1u8..128u8).prop_map(|(lba, seed_a, delta)| {
+            ActorOp::ReapCycle {
+                lba,
+                seed_a,
+                seed_b: seed_a.wrapping_add(delta) % 128,
+            }
+        }),
         1 => Just(ActorOp::Crash),
         1 => (0u8..8, 1u8..8u8)
             .prop_map(|(start_lba, lba_count)| ActorOp::Reclaim { start_lba, lba_count }),
@@ -196,32 +210,38 @@ proptest! {
                         );
                     }
                 }
-                ActorOp::SweepPending => {
+                ActorOp::Reap => {
                     let _ = handle.reap();
-                    // Old pending/ files are deleted; if publish_snapshot() did
+                    // Reaped files are deleted; if publish_snapshot() did
                     // not bump flush_gen, handles reuse stale fds and get ENOENT.
                     for (&lba, expected) in &oracle {
                         let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
-                            "lba {} wrong after sweep_pending via actor",
+                            "lba {} wrong after reap via actor",
                             lba
                         );
                     }
                 }
-                ActorOp::Repack => {
-                    // Use 0.5 ratio: fires on any segment with >50% dead extents,
-                    // which occurs naturally after write-overwrite-flush sequences.
+                ActorOp::ReapCycle {
+                    lba,
+                    seed_a,
+                    seed_b,
+                } => {
+                    let actual_lba = 32 + *lba as u64;
+                    let _ = handle.write(actual_lba, &[*seed_a; 4096], false);
+                    let _ = handle.promote_wal();
+                    let _ = handle.write(actual_lba, &[*seed_b; 4096], false);
+                    let _ = handle.promote_wal();
                     let _ = handle.reap();
-                    // Same invariant: repack deletes old files; snapshot must be
-                    // republished so handles evict their cached fds.
+                    oracle.insert(actual_lba, [*seed_b; 4096]);
                     for (&lba, expected) in &oracle {
                         let actual = handle.reader().read(lba, 1).unwrap();
                         prop_assert_eq!(
                             actual.as_slice(),
                             expected.as_slice(),
-                            "lba {} wrong after repack via actor",
+                            "lba {} wrong after reap cycle via actor",
                             lba
                         );
                     }

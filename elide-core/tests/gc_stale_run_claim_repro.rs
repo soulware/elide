@@ -81,7 +81,7 @@ fn gc_run_claim_refused_in_memory_must_not_win_the_rebuild() {
     oracle.insert(52, a_prime.clone());
 
     // CoordGcLocal { n: 2 }
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
@@ -110,7 +110,7 @@ fn gc_run_claim_refused_in_memory_must_not_win_the_rebuild() {
     oracle.insert(100, dup.clone());
 
     // CoordGcLocal { n: 2 }
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, paths)| paths)
