@@ -26,6 +26,7 @@
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1700,12 +1701,22 @@ impl Volume {
             delta_body_source,
             inline: extentindex::InlineSource::Section(&handoff_inline),
         };
+        // Every hash whose resolvability this apply can change: the
+        // output's entries (registered in the index, merged as claims),
+        // the input-owned hashes it removes, and the journal-tier
+        // hashes of the segments it purges.
+        let mut footprint: HashSet<blake3::Hash> = entries.iter().map(|e| e.hash).collect();
+        footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
+        for input in &consumed {
+            footprint.extend(self.extent_index.journal_hashes(*input));
+        }
+
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
         // path.
         let pre_apply_index = Arc::clone(&self.extent_index);
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
-        let gate = self.mutate_gated_on_resolvability(|vol| {
+        let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
             {
                 let index = Arc::make_mut(&mut vol.extent_index);
                 for (i, e) in entries.iter().enumerate() {
@@ -2235,19 +2246,19 @@ impl Volume {
     /// count, two HashMap lookups per entry. Catches the bug class
     /// "lbamap retains a hash claim while extent_index lost the body
     /// location" — typically an apply path that removed from
-    /// extent_index without also pruning the lbamap claim. Backs both
-    /// the pre-commit refusal in `apply_plan_apply_result` and the
-    /// stress invariant below.
+    /// extent_index without also pruning the lbamap claim. Backs the
+    /// stress invariant below; the production gate checks its declared
+    /// footprint through [`Self::unresolvable_footprint_hashes`], and
+    /// this whole-map walk is the oracle that catches a mutation
+    /// reaching outside its declaration.
     ///
     /// The scan runs to completion rather than stopping once the sample
     /// is full: `total` is what separates a handful of stranded claims
-    /// (the concurrent-dedup race the gate exists to absorb) from a
-    /// systemic loss, and the clean case — every hash resolving — walks
-    /// every entry anyway, so the count is free on the path that runs
-    /// constantly.
+    /// from a systemic loss.
     ///
     /// `ZERO_HASH` is a sentinel meaning "this LBA reads as all zeros";
     /// it never resolves through extent_index by design. Skipped here.
+    #[cfg(feature = "volume-invariants")]
     fn unresolvable_lbamap_hashes(&self, sample_limit: usize) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
         for (lba, _len, hash, _anchor, claimant) in self.lbamap.iter_entries_with_claimant() {
@@ -2284,22 +2295,76 @@ impl Volume {
         found
     }
 
+    /// Resolvability of the hashes in `footprint`, by the same rules as
+    /// [`Self::unresolvable_lbamap_hashes`] and counted per stranded
+    /// claim like it. An unclaimed hash resolves vacuously; a claimed
+    /// one resolves for every claimant at once through `inner` or a
+    /// delta with a resolving source, and otherwise per claim through
+    /// the claimant's journal map — the one tier whose resolution is
+    /// claimant-keyed, reached by walking the map for the hash's runs.
+    /// That walk is linear, and it runs only for a claimed footprint
+    /// hash the durable tiers cannot resolve — a hash the gate is about
+    /// to refuse anyway, or one claimed journal-tier.
+    fn unresolvable_footprint_hashes(
+        &self,
+        footprint: &HashSet<blake3::Hash>,
+        sample_limit: usize,
+    ) -> UnresolvableHashes {
+        let mut found = UnresolvableHashes::default();
+        for &hash in footprint {
+            if hash == ZERO_HASH || self.lbamap.claim_refcount(&hash) == 0 {
+                continue;
+            }
+            if self.extent_index.lookup(&hash).is_some() {
+                continue;
+            }
+            if self.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+                loc.options
+                    .iter()
+                    .any(|opt| self.extent_index.lookup(&opt.source_hash).is_some())
+            }) {
+                continue;
+            }
+            for (lba, _len, _off) in self.lbamap.runs_for_hash(&hash) {
+                let resolves = self.lbamap.claimant_at(lba).is_some_and(|claimant| {
+                    self.extent_index.lookup_journal(claimant, &hash).is_some()
+                });
+                if !resolves {
+                    found.total += 1;
+                    if found.sample.len() < sample_limit {
+                        found.sample.push((lba, hash));
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Run an in-memory extent-index/lbamap mutation behind the
     /// resolvability gate shared by the structural rewriters (GC fold
     /// apply, repack apply): snapshot both maps, run `mutate`, then
-    /// require every lbamap-referenced hash to resolve through the
+    /// require every claimed hash in `footprint` to resolve through the
     /// extent index — the read path's lookup. A miss means committing
     /// the mutation would strand an LBA claim with no body location
     /// (permanent read EIO that a rebuild reproduces once the inputs
     /// are unlinked), so both maps are restored and the orphans
-    /// returned for the caller to log and refuse. A claim can arrive
-    /// concurrently with the rewrite worker — e.g. a dedup ref minted
-    /// against an input-owned hash, which by design never re-points
-    /// the extent index — so only this post-mutation check sees it;
-    /// worker-side classification reads a prep-time snapshot. Both
-    /// maps are also restored when `mutate` itself errors.
+    /// returned for the caller to log and refuse. Both maps are also
+    /// restored when `mutate` itself errors.
+    ///
+    /// `footprint` is the caller's declaration of every hash whose
+    /// resolvability the mutation can change: each hash it removes or
+    /// registers in either map, each hash whose lbamap claim it merges,
+    /// and each journal-tier hash of a segment it purges. A claim over
+    /// an undeclared hash can only strand through a mutation reaching
+    /// outside its declaration; the `volume-invariants` build re-checks
+    /// the whole map after every structural op, which is where that
+    /// class is caught. Checking the declaration rather than the map is
+    /// what takes the gate from O(lbamap) per call to O(footprint) —
+    /// the difference between millions of lookups under the write mutex
+    /// and thousands (#902).
     pub(in crate::volume) fn mutate_gated_on_resolvability(
         &mut self,
+        footprint: &HashSet<blake3::Hash>,
         mutate: impl FnOnce(&mut Self) -> io::Result<()>,
     ) -> io::Result<ResolvabilityGate> {
         let pre_index = Arc::clone(&self.extent_index);
@@ -2309,7 +2374,7 @@ impl Volume {
             self.lbamap = pre_lbamap;
             return Err(e);
         }
-        let orphaned = self.unresolvable_lbamap_hashes(REFUSAL_SAMPLE_LIMIT);
+        let orphaned = self.unresolvable_footprint_hashes(footprint, REFUSAL_SAMPLE_LIMIT);
         if orphaned.total == 0 {
             return Ok(ResolvabilityGate::Applied);
         }

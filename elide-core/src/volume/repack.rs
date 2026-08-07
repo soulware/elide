@@ -672,8 +672,23 @@ impl Volume {
                 None => None,
             };
 
+            // Every hash whose resolvability this bucket can change: the
+            // inputs' owned hashes it removes, the journal-tier hashes
+            // of the segments it purges, and the output's entries.
+            let mut footprint: std::collections::HashSet<blake3::Hash> = bucket
+                .inputs
+                .iter()
+                .flat_map(|input| input.owned_hashes.iter().copied())
+                .collect();
+            for input in &bucket.inputs {
+                footprint.extend(self.extent_index.journal_hashes(input.input_ulid));
+            }
+            if let Some(out) = &bucket.output {
+                footprint.extend(out.out_entries.iter().map(|e| e.hash));
+            }
+
             let mut extents_removed = 0usize;
-            let gate = self.mutate_gated_on_resolvability(|vol| {
+            let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
                 let index = Arc::make_mut(&mut vol.extent_index);
 
                 // Per-input CAS-remove for hashes the bucket's output
