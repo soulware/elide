@@ -73,6 +73,42 @@ Three rules govern which segments the reap may take.
   excludes those segments is published, the discipline
   `remove_consumed_inputs` already carries.
 
+### Where the reap runs
+
+On the actor, with the volume mutex held for the state mutation and dropped for
+the filesystem work.
+
+Thread choice is close to irrelevant to the guest, because the two paths are
+blocked by different things. A read is `ArcSwap::load()` of the published
+snapshot and takes no lock at all, so nothing the reap does can block one. A
+write takes the volume mutex directly from the ublk queue thread in
+`VolumeClient::write`, so the only thing that blocks the write path is mutex
+hold time. The actor being busy does not block a write; the actor holding the
+mutex does.
+
+The worker is the wrong home for a different reason. It is one thread that
+every promote queues behind, so a reap dispatched there delays the promote a
+`needs_promote` signal just asked for and lets the WAL run past
+`FLUSH_THRESHOLD`. That reaches the write path by a longer route than the one
+it avoids.
+
+The reap also has little to move. Where repack has classification, body reads,
+recompression and signing, the reap has a census read, a set of index removals,
+a snapshot publish and a batch of unlinks. The first three need the mutex to be
+consistent. The unlinks do not: publish-before-unlink is what makes the names
+safe to remove, and after the publish nothing references them. The actor is
+single-threaded, so no other volume operation runs alongside them either way.
+So the mutex covers the census read, the index removals and the publish, and
+the unlinks run without it, batched behind one `fsync_dir` as
+`remove_consumed_inputs` already does.
+
+What that leaves is the backlog case. The first pass after a long stall can
+face thousands of dead segments, and both the index removals and the unlinks
+are O(N) in it. So a pass takes at most a fixed number of segments and the rest
+wait for the next tick, the bound GC already carries as `max_buckets_per_tick`.
+The reap is cheap enough per segment that a few passes clear a large backlog,
+and the cap holds the mutex window flat whatever the backlog is.
+
 Journal consolidation moves entirely to the close. The reap is what makes that
 safe: superseded ring segments leave as they die, so what survives to the seal
 is at most one live ring, which is the population
@@ -239,14 +275,15 @@ crash model, and runs from one caller.
 
 ## Open questions
 
-- Whether the reap runs on the actor or is dispatched to the worker. It is an
-  unlink and an index removal, so the actor is the simple form, and the question
-  is what a large backlog's worth of unlinks does to actor latency.
 - How the elastic budget is shaped. Dead fraction against a floor and a ceiling
   is the obvious form; what the ceiling is wants measuring against how long a
   close may sit on the cut's critical path.
 - Whether the proptest simulation model needs a reap operation of its own or
   reads it as a variant of the existing repack op.
+- The reap's per-pass segment cap. It wants to be large enough that a stall
+  backlog clears in a few ticks and small enough that the mutex window stays
+  under a guest write's tolerance, which is a measurement rather than a
+  derivation.
 - What `quiet_cut_after` should be on the soak rig. 20s is reasoned from the
   mortality knee rather than measured, and the workload that would settle it is
   a bursty one, which the current pgbench soaks are not.
