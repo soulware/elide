@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::thread;
 
-use elide_core::actor::spawn;
+use elide_core::actor::{ReapStop, spawn};
 use elide_core::volume::Volume;
 use proptest::prelude::*;
 
@@ -67,6 +67,18 @@ enum ActorOp {
     /// whose entries are all dead only by chance, so a bare `Reap`
     /// mostly finds nothing to take.
     ReapCycle { lba: u8, seed_a: u8, seed_b: u8 },
+    /// `ReapCycle`, with the pass stopped inside the
+    /// publish-before-unlink discipline and the crash taken there.
+    /// `before_publish` picks the window: the apply's removals held
+    /// only in memory, or those removals published with the files
+    /// still on disk. Both are states a process death reaches and
+    /// nothing else does.
+    HalfReapCycle {
+        lba: u8,
+        seed_a: u8,
+        seed_b: u8,
+        before_publish: bool,
+    },
     /// Simulate a crash: shut down the actor, reopen the Volume (triggering
     /// WAL recovery), and assert all oracle LBAs are still readable.
     Crash,
@@ -101,6 +113,14 @@ fn arb_actor_op() -> impl Strategy<Value = ActorOp> {
                 seed_b: seed_a.wrapping_add(delta) % 128,
             }
         }),
+        2 => (0u8..4, 0u8..128u8, 1u8..128u8, any::<bool>()).prop_map(
+            |(lba, seed_a, delta, before_publish)| ActorOp::HalfReapCycle {
+                lba,
+                seed_a,
+                seed_b: seed_a.wrapping_add(delta) % 128,
+                before_publish,
+            },
+        ),
         1 => Just(ActorOp::Crash),
         1 => (0u8..8, 1u8..8u8)
             .prop_map(|(start_lba, lba_count)| ActorOp::Reclaim { start_lba, lba_count }),
@@ -297,6 +317,50 @@ proptest! {
                             expected.as_slice(),
                             "lba {} wrong after sign_snapshot_manifest via actor",
                             lba
+                        );
+                    }
+                }
+                ActorOp::HalfReapCycle {
+                    lba,
+                    seed_a,
+                    seed_b,
+                    before_publish,
+                } => {
+                    let actual_lba = 32 + *lba as u64;
+                    let _ = handle.write(actual_lba, &[*seed_a; 4096], false);
+                    let _ = handle.promote_wal();
+                    let _ = handle.write(actual_lba, &[*seed_b; 4096], false);
+                    let _ = handle.promote_wal();
+                    oracle.insert(actual_lba, [*seed_b; 4096]);
+                    let stop = if *before_publish {
+                        ReapStop::BeforePublish
+                    } else {
+                        ReapStop::BeforeUnlink
+                    };
+                    let _ = handle.reap_stopping(stop);
+                    // A stopped pass leaves the volume mid-transaction,
+                    // so the op takes its crash immediately.
+                    handle.shutdown();
+                    if let Some(t) = actor_thread.take() {
+                        let _ = t.join();
+                    }
+                    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    let (new_actor, new_handle) = spawn(vol);
+                    actor_thread = Some(
+                        thread::Builder::new()
+                            .name("volume-actor".into())
+                            .spawn(move || new_actor.run())
+                            .unwrap(),
+                    );
+                    handle = new_handle;
+                    for (&lba, expected) in &oracle {
+                        let actual = handle.reader().read(lba, 1).unwrap();
+                        prop_assert_eq!(
+                            actual.as_slice(),
+                            expected.as_slice(),
+                            "lba {} wrong after a reap crash at {:?}",
+                            lba,
+                            stop
                         );
                     }
                 }

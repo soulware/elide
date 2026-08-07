@@ -111,6 +111,25 @@ pub struct ReadSnapshot {
     pub layout_gen: u64,
 }
 
+/// Where a reap pass stops. Production runs every pass to
+/// [`ReapStop::Never`]; the crash tests stop one inside the
+/// publish-before-unlink discipline and take the crash there, which is
+/// the only way those windows are reachable — the phases run back to
+/// back under the actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapStop {
+    /// Run the pass to completion.
+    Never,
+    /// Stop after the apply. The live maps have dropped the reaped
+    /// entries while the published snapshot still resolves readers
+    /// through the segments, whose files are still on disk.
+    BeforePublish,
+    /// Stop after the publish. No published snapshot names the reaped
+    /// segments and their files are still on disk, so a rebuild
+    /// restores the entries the apply dropped.
+    BeforeUnlink,
+}
+
 // ---------------------------------------------------------------------------
 // Channel message type
 // ---------------------------------------------------------------------------
@@ -132,6 +151,7 @@ pub(crate) enum VolumeRequest {
         reply: Sender<io::Result<Option<u32>>>,
     },
     Reap {
+        stop: ReapStop,
         reply: Sender<io::Result<crate::volume::ReapStats>>,
     },
     /// Promote the current WAL to a `pending/` segment via the worker
@@ -897,13 +917,17 @@ impl VolumeActor {
     /// mutex, then revalidate, remove, publish and unlink
     /// (`docs/design/open-generation-reap.md`).
     ///
+    /// `stop` is [`ReapStop::Never`] for every production pass; the
+    /// crash tests stop one inside the publish-before-unlink discipline
+    /// and take the crash there.
+    ///
     /// Skipped whole while a promote is in flight: the promote's worker
     /// may be composing a delta against a claim-dead source this pass
     /// would remove, and its source pin is recorded only when its apply
     /// lands — the same ordering that holds a GC plan apply behind
     /// in-flight promotes. The pass runs every tick, so a skip costs one
     /// interval.
-    fn handle_reap(&mut self) -> io::Result<crate::volume::ReapStats> {
+    fn handle_reap(&mut self, stop: ReapStop) -> io::Result<crate::volume::ReapStats> {
         if self.pipeline.promotes_in_flight > 0 {
             return Ok(crate::volume::ReapStats::default());
         }
@@ -923,11 +947,15 @@ impl VolumeActor {
             return Ok(crate::volume::ReapStats::default());
         }
         let (stats, unlink) = self.lock_volume(LockSite::ReapApply).apply_reap(parsed);
-        if !unlink.is_empty() {
-            self.publish_snapshot();
-            self.lock_volume(LockSite::ReapUnlink)
-                .remove_consumed_inputs(&unlink)?;
+        if unlink.is_empty() || stop == ReapStop::BeforePublish {
+            return Ok(stats);
         }
+        self.publish_snapshot();
+        if stop == ReapStop::BeforeUnlink {
+            return Ok(stats);
+        }
+        self.lock_volume(LockSite::ReapUnlink)
+            .remove_consumed_inputs(&unlink)?;
         Ok(stats)
     }
 
@@ -1474,8 +1502,8 @@ impl VolumeActor {
                                 }
                             }
                         }
-                        VolumeRequest::Reap { reply } => {
-                            let _ = reply.send(self.handle_reap());
+                        VolumeRequest::Reap { stop, reply } => {
+                            let _ = reply.send(self.handle_reap(stop));
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             self.start_gc_handoffs(Some(reply));
@@ -1912,9 +1940,21 @@ impl VolumeClient {
     /// nothing (or skipped behind an in-flight promote) reports zeros,
     /// so the caller may tick as often as it likes.
     pub fn reap(&self) -> io::Result<crate::volume::ReapStats> {
+        self.reap_stopping(ReapStop::Never)
+    }
+
+    /// [`Self::reap`], stopping the pass at `stop`. A stop leaves the
+    /// volume mid-transaction in a way only a crash reaches in
+    /// production, where the phases run back to back under the actor,
+    /// so the caller must crash (shut the actor down and reopen)
+    /// immediately after.
+    pub fn reap_stopping(&self, stop: ReapStop) -> io::Result<crate::volume::ReapStats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Reap { reply: reply_tx })
+            .send(VolumeRequest::Reap {
+                stop,
+                reply: reply_tx,
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
