@@ -4,7 +4,7 @@
 
 ## Problem
 
-Guest FLUSH/FUA reaches `wal_fsync`, which is `sync_data()` on a WAL file that grows by appends. Every append extends the file, so each fdatasync commits extent allocation and the size update through the host filesystem journal in addition to the data itself. The WAL lifecycle repeats this cost every generation: the file is created lazily on first write (`ensure_wal_open`), grows to `FLUSH_THRESHOLD` (32 MiB), is promoted, and is unlinked in `apply_promote`. Since #728 wired FUA through to `wal_fsync` in-lock, this journal traffic sits directly on guest fsync latency.
+Guest FLUSH/FUA reaches `sync_wal_handle`, which is `sync_data()` on a WAL file that grows by appends. Every append extends the file, so each fdatasync commits extent allocation and the size update through the host filesystem journal in addition to the data itself. The WAL lifecycle repeats this cost every generation: the file is created lazily on first write (`ensure_wal_open`), grows to `FLUSH_THRESHOLD` (32 MiB), is promoted, and is unlinked in `apply_promote`. Since #728 wired FUA through to the WAL sync, this journal traffic sits directly on guest fsync latency.
 
 ## Measurement
 
