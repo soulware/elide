@@ -414,6 +414,37 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
     volume.lock().expect("volume mutex poisoned")
 }
 
+/// Acquire the volume mutex for a guest write, timing the wait only when
+/// there is one.
+///
+/// `try_lock` is the same compare-and-swap the blocking acquisition would
+/// have made, so a write that finds the mutex free pays one relaxed
+/// counter increment beyond what it already paid. A write that does block
+/// has parked, and the two clock reads charged to it are far below the
+/// wait they measure.
+///
+/// The guest's hold goes unmeasured: it would cost a third clock read per
+/// write to record the one quantity here that no writer waits on.
+fn lock_volume_for_write<'a>(
+    volume: &'a Arc<Mutex<Volume>>,
+    stats: &LockStats,
+) -> MutexGuard<'a, Volume> {
+    // A poisoned mutex comes back from `try_lock` *acquired*, inside the
+    // error, so the result is consumed here rather than held across the
+    // blocking acquisition below — which would deadlock against itself.
+    match volume.try_lock() {
+        Ok(guard) => {
+            stats.record_write_uncontended();
+            return guard;
+        }
+        Err(contended) => drop(contended),
+    }
+    let requested = Instant::now();
+    let guard = lock_volume(volume);
+    stats.record_write_blocked(requested.elapsed());
+    guard
+}
+
 /// Sync a WAL file handle taken under the volume mutex, on a caller that
 /// has since released it.
 ///
@@ -435,8 +466,7 @@ fn sync_wal_handle(handle: Option<Arc<fs::File>>) -> io::Result<()> {
 /// when it drops.
 ///
 /// Three clock reads per acquisition, which is why the guest write path
-/// keeps acquiring through the bare [`lock_volume`] instead
-/// (`crate::lock_stats`).
+/// acquires through [`lock_volume_for_write`] instead.
 pub(crate) struct TimedGuard<'a> {
     guard: MutexGuard<'a, Volume>,
     stats: &'a LockStats,
@@ -1797,7 +1827,7 @@ impl VolumeClient {
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
         let (needs_promote, sync) = {
-            let mut guard = lock_volume(&volume);
+            let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
             publish_snapshot(
                 &guard,
@@ -1823,7 +1853,7 @@ impl VolumeClient {
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         let volume = self.volume()?;
         let (needs_promote, sync) = {
-            let mut guard = lock_volume(&volume);
+            let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_zeroes(start_lba, lba_count)?;
             publish_snapshot(
                 &guard,
@@ -1852,7 +1882,8 @@ impl VolumeClient {
     /// no actor round trip and takes no lock — which is what lets it be
     /// sampled while the actor holds the mutex it describes.
     ///
-    /// The guest write path is not counted; see [`crate::lock_stats`].
+    /// The guest write path contributes what it waited, under
+    /// [`LockStatsSnapshot::writes`] rather than a site.
     pub fn lock_stats(&self) -> LockStatsSnapshot {
         self.lock_stats.snapshot()
     }
@@ -4729,10 +4760,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The counters describe what the actor does to writers, so an
-    /// actor-side operation must land against its own site while the
-    /// guest write path, which acquires through the untimed primitive,
-    /// stays absent from them.
+    /// The sites describe what the actor does to writers, so an
+    /// actor-side operation must land against its own site and a guest
+    /// write against none of them — a write lands in the separate write
+    /// counters, which measure what it waited rather than what it held.
     #[test]
     fn actor_operations_record_against_their_site() {
         let dir = temp_dir();
@@ -4754,7 +4785,16 @@ mod tests {
         assert_eq!(
             after_writes.site(LockSite::PublishSnapshot).acquisitions,
             0,
-            "the guest write path must not be counted"
+            "the guest write path must not be attributed to a site"
+        );
+        assert_eq!(
+            after_writes.writes().acquisitions,
+            3,
+            "every guest write counts its acquisition"
+        );
+        assert!(
+            after_writes.writes().blocked <= after_writes.writes().acquisitions,
+            "a write can only block on an acquisition it made"
         );
 
         client.promote_wal().unwrap();
