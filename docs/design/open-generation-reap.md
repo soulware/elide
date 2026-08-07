@@ -51,9 +51,10 @@ The open generation keeps its bound, supplied by a cheaper operation.
 
 ## The open generation reaps
 
-The tick asks the volume to unlink pending segments nothing can reach. No parse,
-no signature verify, no classification, no body read, no output ULID, no WAL
-rotation, no worker job.
+The tick asks the volume to unlink pending segments nothing can reach. No
+classification, no body read, no signature verify, no output ULID, no WAL
+rotation, no worker job. It parses the index region of the segments it removes,
+and of nothing else.
 
 This targets what actually dies inside a ten-second window. Whole-death is the
 mortality mode a short window sees: a jbd2 ring rewrite supersedes the LBAs of
@@ -66,7 +67,8 @@ Three rules govern which segments the reap may take.
   claiming at it, or the extent index holds a location at it whose hash is live
   (claimed, or named as a delta source). The reap takes what is outside both,
   and removes that segment's remaining index entries as it goes, which is what
-  keeps dead entries from accumulating in the open window.
+  keeps dead entries from accumulating in the open window and what stops a
+  later write deduping against a body that is gone.
 - **The snapshot floor.** A segment at or below `latest_snapshot` is pinned by
   the snapshot whatever the live maps say, exactly as it is for GC.
 - **Publish before unlink.** The reap unlinks only after the read snapshot that
@@ -93,21 +95,57 @@ every promote queues behind, so a reap dispatched there delays the promote a
 it avoids.
 
 The reap also has little to move. Where repack has classification, body reads,
-recompression and signing, the reap has a census read, a set of index removals,
-a snapshot publish and a batch of unlinks. The first three need the mutex to be
-consistent. The unlinks do not: publish-before-unlink is what makes the names
-safe to remove, and after the publish nothing references them. The actor is
-single-threaded, so no other volume operation runs alongside them either way.
-So the mutex covers the census read, the index removals and the publish, and
-the unlinks run without it, batched behind one `fsync_dir` as
-`remove_consumed_inputs` already does.
+recompression and signing, the reap has a census read, an index-region parse
+per reaped segment, a set of index removals, a snapshot publish and a batch of
+unlinks. So the pass is the same prepare/execute/apply trio as everything else,
+with the mutex over the first and third phases:
 
-What that leaves is the backlog case. The first pass after a long stall can
-face thousands of dead segments, and both the index removals and the unlinks
-are O(N) in it. So a pass takes at most a fixed number of segments and the rest
-wait for the next tick, the bound GC already carries as `max_buckets_per_tick`.
-The reap is cheap enough per segment that a few passes clear a large backlog,
-and the cap holds the mutex window flat whatever the backlog is.
+1. **Prepare (mutex).** Read the census, take the reap set under the cap below.
+2. **Execute (no mutex).** Parse the index region of each segment in the set for
+   its owned hashes.
+3. **Apply (mutex).** Remove those hashes, purge the journal and delta-source
+   tiers, publish the snapshot.
+4. **Unlink (no mutex).** Remove the files, batched behind one `fsync_dir` as
+   `remove_consumed_inputs` already does.
+
+Phase 2 exists because `ExtentIndex::inner` and `deltas` are keyed by hash with
+no reverse index, so `remove_input_owned` takes an explicit hash list, the one
+repack gets from its classification. The parse skips signature verification.
+`remove_owner_at` removes a hash only where the current owner is the segment
+being reaped, so a hash a bad parse invents either does not exist or is owned
+elsewhere, and either way removes nothing. The gate is the protection, not the
+signature.
+
+The `journal` and `delta_sources` tiers are segment-outer, so purging one is a
+single outer removal and needs no hash list at all. A pure journal segment
+therefore reaps with no parse, which is the tier that dies fastest.
+
+Phase 4 needs no mutex because publish-before-unlink is what makes the names
+safe to remove, and after phase 3 nothing references them. The actor is
+single-threaded, so no other volume operation runs alongside them either way.
+
+### The per-pass cap
+
+The mutex window is proportional to the entries phase 3 removes, not to the
+segments phase 1 selects, so the cap counts entries. **32,768 per pass**, four
+times `FLUSH_ENTRY_THRESHOLD`, so a pass reaps at least four full flush
+segments' worth and on the ~3,800 entries per segment measured on pg14 around
+eight typical ones. Phase 2 parses until the accumulated hash count reaches it.
+
+That sits below a window the volume already accepts. A close-pass apply holds
+the mutex across a whole generation's registrations, ~57,000 entries on the
+same measurement, so the reap is bounded under an operation running beside it
+rather than to a stricter standard invented here.
+
+Journal segments do not count against the cap. They cost one outer removal
+each, so counting them would price the cheap tier against the expensive one and
+throttle exactly the segments the reap exists to take.
+
+A backlog clears in a few passes rather than one. The stall case does not
+accumulate, because the reap runs every tick and takes deaths as they happen;
+what arrives at once is a restart, where the first pass meets whatever
+`pending/open/` holds. The measured post-respawn directory was 38 segments,
+which is five passes, twenty-five seconds at a 5s tick.
 
 Journal consolidation moves entirely to the close. The reap is what makes that
 safe: superseded ring segments leave as they die, so what survives to the seal
@@ -280,11 +318,9 @@ crash model, and runs from one caller.
   close may sit on the cut's critical path.
 - Whether the proptest simulation model needs a reap operation of its own or
   reads it as a variant of the existing repack op.
-- The reap's per-pass segment cap. It wants to be large enough that a stall
-  backlog clears in a few ticks and small enough that the mutex window stays
-  under a guest write's tolerance, which is a measurement rather than a
-  derivation.
-- What `quiet_cut_after` should be on the soak rig. 20s is reasoned from the
+- What `quiet_cut_after` should be on the soak rig.
+- Whether a close-pass apply's own mutex window is a latency source. The reap's
+  cap is calibrated against it, and nothing has measured it. 20s is reasoned from the
   mortality knee rather than measured, and the workload that would settle it is
   a bursty one, which the current pgbench soaks are not.
 
