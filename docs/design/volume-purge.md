@@ -55,7 +55,7 @@ tree, so the prompt arrives with its first caller.
 
 Three properties of `remove` invert under `--purge`.
 
-**The name record is deleted rather than released.** The release flip
+**The name record is retired rather than released.** The release flip
 publishes a `handoff_snapshot` naming the state a future claimant forks
 from, and the invariant is that the snapshot lives under the record's
 `vol_ulid` (`elide-coordinator/src/inbound/lifecycle.rs:732-758`).
@@ -95,46 +95,86 @@ Segments, manifests and `HEAD` are the only artefacts that scale with
 the data, and all of them live under `by_id/`. So the deletion set that
 reclaims the storage bill is a single prefix.
 
-Scoping to that prefix also means purge needs no new delete authority
-anywhere. `volume-rw` already carries `s3:DeleteObject` on
+Scoping to that prefix also means purge deletes nothing a role cannot
+already delete. `volume-rw` carries `s3:DeleteObject` on
 `by_id/{{caveat.volume}}/*`
-(`deploy/mint/role-templates/volume-rw.json:6-8`), and `coord-rw`
-already carries it on `names/*`
+(`deploy/mint/role-templates/volume-rw.json:6-8`), and the name-record
+transitions are ordinary conditional PUTs on `coord-rw`
 (`deploy/mint/role-templates/coord-rw.json:5-8`). `meta/*` stays
 undeletable by every role, which is the property
 `docs/design/mint.md:194-202` records.
 
-`names/<name>` is deleted rather than parked in a terminal state, so
-the name is immediately reusable by an ordinary `create`. A surviving
-`Purged` record would block reuse forever and would duplicate what the
-event journal already holds.
+`names/<name>` is rewritten in place to a terminal `Purged` state
+rather than deleted. `docs/design/volume-event-log.md:21` gives the
+division: the pointer is canonical for "now", the log is canonical for
+"ever". After a purge, "now" is *purged*, and a deleted record cannot
+say that — it collapses purged and never-existed into the same
+observation, which is the one distinction the pointer is there to
+carry.
+
+The record keeps `vol_ulid`, so `GET names/<name>` answers which volume
+was destroyed as typed fields rather than as a parse of the event log,
+and it clears the ownership identity and handoff fields the way
+`mark_released` does. It is a current-state pointer, so a name purged
+twice over its life records only the second; the sequence stays in
+`events/<name>/`, which is the split the same doc describes.
 
 ## Name record lifecycle
 
-Purge adds a `NameState::Purging` variant, mirroring `Importing`
-(`elide-core/src/name_record.rs:123-131`). `check_transition` refuses
-every verb for it, which makes the name unclaimable and makes the
-record single-writer by construction. That single-writer property is
-what lets the final delete be unconditional, on the reasoning already
-recorded for `clear_importing`
-(`elide-coordinator/src/inbound/lifecycle.rs:626-631`).
+Purge adds two `NameState` variants, `Purging` and `Purged`.
+`check_transition` refuses every existing verb for both, the way it
+already does for `Importing` (`elide-core/src/name_record.rs:229-237`).
+That makes the name unclaimable across the whole operation and makes
+the record single-writer by construction, on the reasoning recorded for
+`clear_importing` (`elide-coordinator/src/inbound/lifecycle.rs:626-631`).
 
 The ordering is:
 
 1. CAS `names/<name>` to `Purging`.
 2. Delete every object under `by_id/<vol_ulid>/`.
 3. Append a `Purged` event to `events/<name>/`.
-4. Delete `names/<name>`.
+4. CAS `names/<name>` to `Purged`.
 5. Tear down local state: the fork directory, the `by_name/<name>`
    symlink, and the key shadow.
 
 Step 1 first is what makes the sequence crash-safe. A crash at any
-later point leaves a `Purging` record, which is a tombstone no verb
-accepts and which carries the `vol_ulid` needed to resume from step 2.
-A boot-time sweep resumes those records, alongside the existing
+later point leaves a `Purging` record, which no verb accepts and which
+carries the `vol_ulid` needed to resume from step 2. A boot-time sweep
+resumes those records, alongside the existing
 `clear_stale_import_records` (`elide-coordinator/src/import.rs:664-703`).
 
+The two states divide as in-progress from settled, so `Purged` is also
+the evidence that the operation completed. Ending at a deleted key
+would leave a purge that crashed after its last delete
+indistinguishable from one that finished.
+
+## Reusing a purged name
+
+`create` over a `Purged` record refuses by default and names what it
+found: the purge date and the destroyed `vol_ulid`. Reuse is confirmed
+the same way the purge itself was, by a `y/N` prompt with `--yes` for
+scripted callers, so no second flag vocabulary appears and a script
+without `--yes` fails closed rather than silently taking the name.
+
+Refusing by default is most of what the tombstone buys. A deleted
+record lets `create <name>` quietly succeed a week after the operator
+destroyed the volume that held it, with nothing to distinguish the
+reuse from a first use.
+
+Mechanically this is a second entry into `create`. `mark_initial`
+creates with `If-None-Match: *`, so reuse needs a CAS over the existing
+`Purged` record instead, minting a fresh `vol_ulid` under the same
+name. The event journal continues across the boundary with the `Purged`
+event already in place as its marker, in the same role as the two-event
+rename boundary in `docs/design/volume-event-log.md`.
+
+This is a distinct transition rather than a conditional inside the
+create path: `check_transition` gains `Purged → reuse` as the single
+accepted edge out of the state, and every other verb keeps refusing it.
+
 ## What survives
+
+`names/<name>` survives as the `Purged` tombstone described above.
 
 `meta/<vol_ulid>.pub` and `meta/<vol_ulid>.provenance` survive, as
 unreferenced small objects that nothing collects. That accumulation is
