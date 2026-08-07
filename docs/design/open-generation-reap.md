@@ -218,7 +218,10 @@ Four changes, in leverage order.
 every hash it removes or registers in either map, every claim it merges, and
 the journal-tier hashes of the segments it purges — and the gate checks that
 each claimed footprint hash still resolves, O(footprint) with the same refuse
-and restore contract. The whole-map walk survives as the `volume-invariants`
+and restore contract. Journal-tier resolution is claimant-keyed, so a
+footprint holding journal claims adds one shared map walk to pair each claim
+with its claimant; a wholly-durable footprint — GC folds, close-pass data
+buckets — settles with hash probes alone. The whole-map walk survives as the `volume-invariants`
 oracle, which audits the declaration after every structural op. Delta
 resolution turns on source hashes resolving, which would otherwise need a
 reverse map from source to dependents, and does not: the stale-liveness check
