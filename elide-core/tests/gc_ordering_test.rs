@@ -34,14 +34,14 @@ fn gc_filters_stale_entries_when_lba_overwritten_before_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB — drain to index/ + cache/.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Take GC checkpoint (flushes WAL, advances mint).
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
@@ -105,14 +105,14 @@ fn gc_output_loses_to_live_write_applied_after_gc() {
         vol.write(lba, &[0xAA; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Seed batch 2 — LBAs 4-7 = 0xBB.
     for lba in 4u64..8 {
         vol.write(lba, &[0xBB; 4096]).unwrap();
     }
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // GC checkpoint then GC pass — no overwrites yet so GC output contains
     // 0xAA for LBAs 0-3 and 0xBB for LBAs 4-7.
@@ -187,7 +187,7 @@ fn gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush() {
     // Stale generation: LBA 0 = 0xAA, promoted to index/.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Canonical content P at LBA 5, promoted to index/. The overwrite of
     // LBA 0 below dedups against this hash, keeping it live at LBA 5
@@ -195,7 +195,7 @@ fn gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush() {
     let payload: Vec<u8> = (0..4096).map(|i| (i * 7 + 13) as u8).collect();
     vol.write(5, &payload).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Open the WAL pre-checkpoint with an unrelated write.
     vol.write(9, &[0x55; 4096]).unwrap();
@@ -228,7 +228,7 @@ fn gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush() {
     );
 
     // Promote the flush segment; the claim must still resolve fresh.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     assert_eq!(
         vol.read(0, 1).unwrap(),
         payload,
@@ -266,7 +266,7 @@ fn gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush() {
 ///   CoordGcLocal(2), Crash      — G2 only carries LBA 1→H101; LBA 0 reverts
 ///                                  to H40 from G1 → data loss
 #[test]
-#[ignore = "post-repack-unification, drain_with_repack bin-packs S3+S4 into a single output before they reach index/, breaking this test's setup. The GC property under test (non-canonical-but-LBA-live entry preservation) is still covered by the proptest suite — restoring this regression test means engineering inputs large enough to force separate buckets, which is non-mechanical."]
+#[ignore = "post-repack-unification, drain_with_reap bin-packs S3+S4 into a single output before they reach index/, breaking this test's setup. The GC property under test (non-canonical-but-LBA-live entry preservation) is still covered by the proptest suite — restoring this regression test means engineering inputs large enough to force separate buckets, which is non-mechanical."]
 fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
@@ -276,12 +276,12 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // S1: LBA 0 = seed 40
     vol.write(0, &[40u8; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // S2: LBA 1 = seed 41
     vol.write(1, &[41u8; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // GC pass 1: compact S1+S2 into G1.
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
@@ -312,7 +312,7 @@ fn gc_preserves_data_entry_when_lba_live_but_not_extent_canonical() {
     // Drain: materialise S3 (no thin refs) and S4 (DedupRef → DedupRef).
     // After promote, index/ has S3.idx (Data) and S4.idx (DedupRef).
     // extent_index: H101 → S4 (S4 processed last, overwrites S3).
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // GC pass 3: compact S3+S4.
     // Bug: S3's DATA entry is not extent-canonical (extent says H101→S4), so
@@ -398,7 +398,7 @@ fn gc_preserves_canonical_when_only_sibling_dedup_ref_keeps_hash_alive() {
 
     // Drain: redact must preserve the LBA-dead-but-hash-alive DATA entry,
     // and promote publishes the segment to index/ + cache/.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // LBA 1 reads must return the original payload (resolved via extent
     // index to the same-segment DATA at LBA 0).

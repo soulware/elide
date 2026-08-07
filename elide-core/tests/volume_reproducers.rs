@@ -189,7 +189,7 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
 /// shares the same composite `seed=88` content across two distinct
 /// start LBAs (24 and 25), so the third write lands as a `DedupRef`
 /// against the second write's body. After `reclaim_alias_merge` and
-/// `drain_with_repack`, LBAs 25..32 read back blocks shifted by one
+/// `drain_with_reap`, LBAs 25..32 read back blocks shifted by one
 /// position relative to the oracle.
 ///
 /// ## Root cause
@@ -276,7 +276,7 @@ fn reclaim_crash_recovery_seed_3f9275b5_regression() {
     assert!(!outcome.discarded, "single-threaded driver: never discards");
     assert_oracle(&mut vol, &oracle, "ReclaimRange(start_lba=28,lba_count=6)");
 
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     assert_oracle(&mut vol, &oracle, "DrainWithRedact");
 }
 
@@ -345,7 +345,7 @@ fn crash_recovery_writemulti_dedup_regression() {
     write_multi(&mut vol, &mut oracle, 6, 2, 1);
 
     // Drain before gc_checkpoint to match production sequencing.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let _ = common::half_promote_first_pending(fork_dir);
@@ -353,7 +353,7 @@ fn crash_recovery_writemulti_dedup_regression() {
     // Mirrors `SimOp::PopulateFetched { lba: 0, seed: 0 }`: writes a
     // direct-fetch cache entry at LBA 16 with effective_seed 0x80.
     // PopulateFetched also drains first; do the same here.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let effective_seed: u8 = 0x80;
     let cache_ulid = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, cache_ulid, 16, effective_seed);
@@ -480,7 +480,7 @@ fn gc_interleaved_writemulti_overlap_regression() {
     oracle.insert(4, data);
 
     // CoordGcLocal { n: 2 }
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
@@ -583,7 +583,7 @@ fn crash_recovery_seed_b1c5223d_regression() {
 
     // SimOp::CoordGcLocal
     let coord_gc_local = |vol: &mut Volume, n: usize| {
-        common::drain_with_repack(vol);
+        common::drain_with_reap(vol);
         let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
         let to_delete =
             if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, n) {
@@ -612,12 +612,12 @@ fn crash_recovery_seed_b1c5223d_regression() {
     oracle.insert(0, data);
 
     // SimOp::DrainWithRedact
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     write_multi(&mut vol, &mut oracle, 1, 4, 241);
 
     // SimOp::GcCheckpoint
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let _ = vol.gc_checkpoint_for_test().unwrap();
 
     // SimOp::CoordGcLocal { n: 2 } — invalidates the stashed checkpoint
@@ -679,7 +679,7 @@ fn gc_apply_double_fold_serialized_by_pending_gate() {
     let _ = vol.sign_snapshot_manifest(snap_ulid);
 
     // SimOp::GcCheckpoint — drain, then mint a checkpoint ULID.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let _ = vol.gc_checkpoint_for_test().unwrap();
 
     // SimOp::GcPlan { n: 2 } — stage a plan without applying it.
@@ -689,7 +689,7 @@ fn gc_apply_double_fold_serialized_by_pending_gate() {
     // SimOp::CoordGcLocal { n: 2 } — drain, checkpoint, simulate, apply.
     // The gate makes this second pass stage nothing while the GcPlan output
     // is pending, so a single output applies and the consistency check holds.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete =
         if let Some((_, _, paths)) = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2) {
@@ -748,7 +748,7 @@ fn gc_stale_plan_double_fold_blocked_by_pending_gate() {
     let _ = vol.write(97, &d);
     let _ = vol.write(96, &d);
     // GcCheckpoint
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let _ = vol.gc_checkpoint_for_test().unwrap();
     // GcPlan{2}: stage a plan carrying LBA 46 = block(0).
     let plan_ulid = vol.gc_checkpoint_for_test().unwrap();
@@ -756,7 +756,7 @@ fn gc_stale_plan_double_fold_blocked_by_pending_gate() {
     // WriteMulti{3,4,0}: LBA 46 = block(3), overwriting the plan's LBA.
     write_multi(&mut vol, 43, 4);
     // CoordGcLocal{2}: the gate defers this second fold; apply the staged one.
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
     let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, 2)
         .map(|(_, _, p)| p)
@@ -801,7 +801,7 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
 
     let coord_gc = |vol: &mut elide_core::volume::Volume, n: usize| {
-        common::drain_with_repack(vol);
+        common::drain_with_reap(vol);
         let gc_ulid = vol.gc_checkpoint_for_test().unwrap();
         let to_delete = common::simulate_coord_gc_local(fork_dir, gc_ulid, n)
             .map(|(_, _, p)| p)
@@ -816,21 +816,21 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     // Write{0,40}, Flush, DrainWithRedact
     let _ = vol.write(0, &[40u8; 4096]);
     let _ = vol.flush_wal();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     // Write{1,41}, Flush, DrainWithRedact
     let _ = vol.write(1, &[41u8; 4096]);
     let _ = vol.flush_wal();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     // CoordGcLocal{2}
     coord_gc(&mut vol, 2);
     // PopulateFetched{0,0}: actual_lba=16, seed=0x80
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let u = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, u, 16, 0x80);
     drop(vol);
     vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
     // PopulateFetched{1,0}: actual_lba=17, seed=0x90
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
     let u = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, u, 17, 0x90);
     drop(vol);

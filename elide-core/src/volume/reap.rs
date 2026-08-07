@@ -16,6 +16,7 @@
 //! removes.
 
 use std::collections::HashSet;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -302,6 +303,45 @@ impl Volume {
         let (stats, unlink) = self.apply_reap(parsed);
         self.remove_consumed_inputs(&unlink)?;
         Ok(stats)
+    }
+
+    /// Simulate a crash inside the reap pipeline, for proptests.
+    ///
+    /// Applies the pass, then unlinks only the first `unlink` reaped
+    /// files — a crash partway through [`Self::remove_consumed_inputs`].
+    /// The caller must crash (drop and reopen) immediately after: the
+    /// in-memory maps have dropped entries whose segment files are
+    /// still on disk, and only a crash reaches that state in
+    /// production, where apply and removal are atomic with respect to
+    /// other ops on the actor. The rebuild restores the entries the
+    /// apply dropped, so the reaped bytes come back until a later pass
+    /// removes them.
+    ///
+    /// The sweep and parse phases mutate nothing, so a crash before
+    /// the apply leaves a state no different from a pass that never
+    /// ran, and takes no shape of its own here.
+    ///
+    /// Returns `false` when the sweep found nothing to reap.
+    pub fn reap_crash_for_test(&mut self, unlink: usize) -> io::Result<bool> {
+        let open = list_open_segments(&self.base_dir)?;
+        if open.is_empty() {
+            return Ok(false);
+        }
+        let floor = super::latest_snapshot(&self.base_dir)?;
+        let candidates = sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let parsed = parse_reap_candidates(candidates);
+        let (_stats, paths) = self.apply_reap(parsed);
+        for path in paths.iter().take(unlink) {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
     }
 }
 

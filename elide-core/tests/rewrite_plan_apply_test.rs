@@ -32,11 +32,11 @@ fn plan_keep_two_data_entries_round_trips() {
     // fully-alive Data entry).
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     vol.write(1, &[0xBB; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
@@ -180,13 +180,13 @@ fn plan_partial_death_data_reconstructs_sub_runs() {
     }
     vol.write(0, &parent_bytes).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Overwrite LBA 2.
     let overwrite = vec![0xEE; 4096];
     vol.write(2, &overwrite).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
@@ -307,18 +307,18 @@ fn plan_orphaning_dedup_ref_claim_is_refused() {
     // Segment A: DATA entry for H at LBA 0.
     vol.write(0, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Segment B: same bytes at LBA 1 → dedups to a DedupRef claim on H.
     vol.write(1, &[0xAA; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     // Segment C: overwrite LBA 0 so A's DATA entry is LBA-dead; H stays
     // live only via B's DedupRef claim at LBA 1.
     vol.write(0, &[0xCC; 4096]).unwrap();
     vol.flush_wal().unwrap();
-    common::drain_with_repack(&mut vol);
+    common::drain_with_reap(&mut vol);
 
     let index_dir = fork_dir.join("index");
     let gc_dir = fork_dir.join("gc");
