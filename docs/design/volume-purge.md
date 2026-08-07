@@ -82,6 +82,33 @@ demotion protects them.
 `<data_dir>/keys/<vol_ulid>.key` (`elide-coordinator/src/key_shadow.rs:12`)
 so a removed volume can be re-claimed. Purge removes it with the rest.
 
+## Scope: `by_id/` is the bill
+
+The bytes purge exists to reclaim are all under `by_id/<vol_ulid>/`,
+and that prefix is the whole of what it deletes from the data plane.
+
+Every other object belonging to a volume is a fixed small count.
+`meta/<vol_ulid>.pub` is a public key, `meta/<vol_ulid>.provenance` is a
+signed lineage record, `names/<name>` is one claim record, and
+`events/<name>/*` grows with lifecycle transitions rather than with IO.
+Segments, manifests and `HEAD` are the only artefacts that scale with
+the data, and all of them live under `by_id/`. So the deletion set that
+reclaims the storage bill is a single prefix.
+
+Scoping to that prefix also means purge needs no new delete authority
+anywhere. `volume-rw` already carries `s3:DeleteObject` on
+`by_id/{{caveat.volume}}/*`
+(`deploy/mint/role-templates/volume-rw.json:6-8`), and `coord-rw`
+already carries it on `names/*`
+(`deploy/mint/role-templates/coord-rw.json:5-8`). `meta/*` stays
+undeletable by every role, which is the property
+`docs/design/mint.md:194-202` records.
+
+`names/<name>` is deleted rather than parked in a terminal state, so
+the name is immediately reusable by an ordinary `create`. A surviving
+`Purged` record would block reuse forever and would duplicate what the
+event journal already holds.
+
 ## Name record lifecycle
 
 Purge adds a `NameState::Purging` variant, mirroring `Importing`
@@ -96,10 +123,9 @@ The ordering is:
 
 1. CAS `names/<name>` to `Purging`.
 2. Delete every object under `by_id/<vol_ulid>/`.
-3. Delete `meta/<vol_ulid>.pub` and `meta/<vol_ulid>.provenance`.
-4. Append a `Purged` event to `events/<name>/`.
-5. Delete `names/<name>`.
-6. Tear down local state: the fork directory, the `by_name/<name>`
+3. Append a `Purged` event to `events/<name>/`.
+4. Delete `names/<name>`.
+5. Tear down local state: the fork directory, the `by_name/<name>`
    symlink, and the key shadow.
 
 Step 1 first is what makes the sequence crash-safe. A crash at any
@@ -110,7 +136,13 @@ A boot-time sweep resumes those records, alongside the existing
 
 ## What survives
 
-`events/<name>/*` survives, and step 4 appends a terminal `Purged`
+`meta/<vol_ulid>.pub` and `meta/<vol_ulid>.provenance` survive, as
+unreferenced small objects that nothing collects. That accumulation is
+the price of holding the `meta/*` no-delete invariant, and it is priced
+in key count rather than in bytes. It has one consequence beyond size,
+in the open question below.
+
+`events/<name>/*` survives, and step 3 appends a terminal `Purged`
 record to it. The event journal is append-only at three layers: the
 `EventJournal` trait has no `delete` method
 (`elide-coordinator/src/stores.rs:148-151`), the IAM templates grant no
@@ -127,22 +159,22 @@ same role as the two-event rename boundary in
 
 ## Credential
 
-Purge runs on a new `volume-purge` mint role, a sixth template
-alongside the five in `deploy/mint/role-templates/`. It grants
-`s3:ListBucket` and `s3:DeleteObject` on `by_id/{{caveat.volume}}/*`,
-and `s3:DeleteObject` on `meta/{{caveat.volume}}.*`. Both are
-expressible as trailing wildcards, which is what Tigris supports.
+The one authority purge needs and no existing role carries is list.
 
-A separate role keeps the destroy authority off every running volume.
-`volume-rw` already carries delete on `by_id/<vol>/*`
-(`deploy/mint/role-templates/volume-rw.json:6-8`) and could absorb the
-rest, but then a live volume permanently holds the authority to
-enumerate and destroy its own prefix, and minting a purge credential
-stops being its own audit event. `meta/*` is currently undeletable by
-every role, with `coord-rw` holding put-only
-(`deploy/mint/role-templates/coord-rw.json:32-35`); scoping the new
-grant to `meta/<vol>.*` keeps that property for every volume other than
-the purge target.
+It runs on a new `volume-purge` mint role, a sixth template alongside
+the five in `deploy/mint/role-templates/`, granting `s3:ListBucket` and
+`s3:DeleteObject` on `by_id/{{caveat.volume}}/*`. That prefix is a
+trailing wildcard, which is what Tigris supports.
+
+The delete half duplicates a grant `volume-rw` already holds, so the
+role earns its place on the list half alone. Adding list to `volume-rw`
+instead would put it on the credential every running volume holds
+continuously, and the `NotSupported` in `RoleStore`
+(`elide-coordinator/src/mint_stores.rs:210-235`) would stop being a
+structural guarantee that no steady-state path can begin enumerating.
+Confining list to a role minted for one operation keeps that guard
+intact for every other path, and makes minting a purge credential its
+own audit event.
 
 `names/<name>` deletion rides the existing `coord-rw` grant
 (`deploy/mint/role-templates/coord-rw.json:5-8`).
@@ -179,17 +211,30 @@ Purge can see local lineage and refuse against it, by the same forest
 taken on another host, because detecting one means enumerating
 `names/`, and no coordinator credential carries list over that prefix.
 
-The failure mode of purging under an unseen descendant is bounded but
-real. The descendant's next `pull_volume_skeleton` fails hard when
-`meta/<vol>.pub` or `meta/<vol>.provenance` is absent
-(`elide-coordinator/src/pull.rs:86-97`), so a host that has not yet
-hydrated the ancestor breaks loudly rather than silently. A host that
-already holds the ancestor's local read form keeps serving metadata and
-fails only on a cache miss that reaches for a deleted segment body.
+Keeping `meta/` shapes how that failure presents, and it presents
+badly. `pull_volume_skeleton` fetches exactly `meta/<vol>.pub` and
+`meta/<vol>.provenance`, writes them alongside an empty `index/`, and
+returns (`elide-coordinator/src/pull.rs:88-110`); it fetches no
+manifest. Over a purged volume both GETs still succeed, so the pull
+reports success and produces an identity-complete skeleton. Its
+early-return guard then keys on those same two files
+(`elide-coordinator/src/pull.rs:73-81`), so every later heal pass sees
+the ancestor as already pulled. The failure lands instead at
+`verify_ancestor_manifests`, reaching for a manifest under the deleted
+prefix, and the descendant crash-loops under supervision. That is the
+shape of the incident `ancestor-liveness.md` was written for.
 
-Three candidate dispositions, undecided:
+Deleting `meta/<vol>.*` would instead fail the pull itself, at the GET,
+naming the missing key. It costs one more statement on the same
+single-volume purge role, against the `meta/*` no-delete invariant.
 
-- Refuse on local lineage alone and accept the remote failure as loud.
+So the two questions are coupled, and the second should be decided
+after the first:
+
+- Refuse on local lineage alone and accept an unseen descendant's
+  failure as the cost. This is the option that wants `meta/` deleted,
+  because a crash-loop against a present-looking skeleton is the worst
+  diagnostic of the three.
 - Require `--force` in addition to the confirmation for every purge,
   treating an unseen fork as always possible.
 - Grant the purge role list over `names/`, GET each record, and refuse
