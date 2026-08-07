@@ -116,7 +116,14 @@ struct SiteCounters {
     acquisitions: AtomicU64,
     wait_nanos: AtomicU64,
     hold_nanos: AtomicU64,
-    max_hold_nanos: AtomicU64,
+    /// Longest hold since the last [`LockStats::take_window`], which the
+    /// reporter swaps to zero as it reads. A maximum cannot be recovered
+    /// by subtraction, so a windowed one has to be reset rather than
+    /// differenced.
+    window_max_hold_nanos: AtomicU64,
+    /// Longest hold since the volume opened, never reset, so a spike
+    /// survives the window it happened in.
+    peak_hold_nanos: AtomicU64,
 }
 
 /// Counters for every labelled acquisition of one volume's mutex.
@@ -147,17 +154,42 @@ impl LockStats {
             .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
         counters.hold_nanos.fetch_add(hold_nanos, Ordering::Relaxed);
         counters
-            .max_hold_nanos
+            .window_max_hold_nanos
+            .fetch_max(hold_nanos, Ordering::Relaxed);
+        counters
+            .peak_hold_nanos
             .fetch_max(hold_nanos, Ordering::Relaxed);
     }
 
+    /// Read the counters without disturbing them. `max_hold_nanos`
+    /// covers whatever has accumulated since the last
+    /// [`Self::take_window`], so a caller sampling between reports sees a
+    /// partial window.
     pub fn snapshot(&self) -> LockStatsSnapshot {
+        self.read(false)
+    }
+
+    /// Read the counters and start a fresh window, returning the maxima
+    /// the closing one held. One reporter calls this; anything else
+    /// wanting a look uses [`Self::snapshot`].
+    pub fn take_window(&self) -> LockStatsSnapshot {
+        self.read(true)
+    }
+
+    fn read(&self, close_window: bool) -> LockStatsSnapshot {
         LockStatsSnapshot {
             sites: std::array::from_fn(|i| SiteSnapshot {
                 acquisitions: self.sites[i].acquisitions.load(Ordering::Relaxed),
                 wait_nanos: self.sites[i].wait_nanos.load(Ordering::Relaxed),
                 hold_nanos: self.sites[i].hold_nanos.load(Ordering::Relaxed),
-                max_hold_nanos: self.sites[i].max_hold_nanos.load(Ordering::Relaxed),
+                max_hold_nanos: if close_window {
+                    self.sites[i]
+                        .window_max_hold_nanos
+                        .swap(0, Ordering::Relaxed)
+                } else {
+                    self.sites[i].window_max_hold_nanos.load(Ordering::Relaxed)
+                },
+                peak_hold_nanos: self.sites[i].peak_hold_nanos.load(Ordering::Relaxed),
             }),
         }
     }
@@ -169,9 +201,10 @@ pub struct SiteSnapshot {
     pub acquisitions: u64,
     pub wait_nanos: u64,
     pub hold_nanos: u64,
-    /// Longest single hold. A `since` window reports the running maximum
-    /// rather than the window's own, because a maximum does not subtract.
+    /// Longest single hold within the window this snapshot covers.
     pub max_hold_nanos: u64,
+    /// Longest single hold since the volume opened.
+    pub peak_hold_nanos: u64,
 }
 
 /// Every site's counters read at one instant.
@@ -195,9 +228,10 @@ impl LockStatsSnapshot {
 
     /// What accumulated between `earlier` and this snapshot.
     ///
-    /// Counts and totals subtract. `max_hold_nanos` carries this
-    /// snapshot's running maximum, so a window reports the largest hold
-    /// the volume has seen rather than the largest within the window.
+    /// Counts and totals subtract. The two maxima are carried through:
+    /// `max_hold_nanos` is already scoped to the window by the reset in
+    /// [`LockStats::take_window`], and `peak_hold_nanos` is meant to
+    /// outlive its window.
     pub fn since(&self, earlier: &LockStatsSnapshot) -> LockStatsSnapshot {
         LockStatsSnapshot {
             sites: std::array::from_fn(|i| SiteSnapshot {
@@ -211,8 +245,20 @@ impl LockStatsSnapshot {
                     .hold_nanos
                     .saturating_sub(earlier.sites[i].hold_nanos),
                 max_hold_nanos: self.sites[i].max_hold_nanos,
+                peak_hold_nanos: self.sites[i].peak_hold_nanos,
             }),
         }
+    }
+
+    /// The site holding the mutex longest since the volume opened, and
+    /// for how long.
+    pub fn peak(&self) -> Option<(LockSite, Duration)> {
+        LockSite::ALL
+            .iter()
+            .map(|&site| (site, self.site(site).peak_hold_nanos))
+            .filter(|(_, peak)| *peak > 0)
+            .max_by_key(|(_, peak)| *peak)
+            .map(|(site, peak)| (site, Duration::from_nanos(peak)))
     }
 
     /// Total hold across every site.
@@ -220,8 +266,9 @@ impl LockStatsSnapshot {
         Duration::from_nanos(self.sites.iter().map(|s| s.hold_nanos).sum())
     }
 
-    /// One line naming every site that acquired, ordered by hold time
-    /// descending. `None` when nothing acquired, which is what keeps an
+    /// One line naming every site that acquired in this window, ordered
+    /// by hold time descending, closing on the longest hold the volume
+    /// has seen. `None` when nothing acquired, which is what keeps an
     /// idle volume silent.
     pub fn report(&self) -> Option<String> {
         let mut active: Vec<(LockSite, SiteSnapshot)> = LockSite::ALL
@@ -246,6 +293,13 @@ impl LockStatsSnapshot {
                 millis(s.hold_nanos),
                 millis(s.max_hold_nanos),
                 millis(s.wait_nanos),
+            ));
+        }
+        if let Some((site, peak)) = self.peak() {
+            out.push_str(&format!(
+                "; peak {} {:.1}ms",
+                site.label(),
+                millis(peak.as_nanos() as u64)
             ));
         }
         Some(out)
@@ -330,30 +384,92 @@ mod tests {
         assert_eq!(snap.site(LockSite::ClosePrep).acquisitions, 0);
     }
 
-    /// A window reports what accumulated in it. The maximum is the one
-    /// quantity that cannot subtract, so it stays cumulative.
+    /// A window reports what accumulated in it, maximum included. A
+    /// maximum cannot subtract, so `take_window` resets it; carrying the
+    /// cumulative one instead would repeat an old spike in every window
+    /// and leave no way to tell when it happened.
     #[test]
-    fn since_subtracts_totals_and_carries_the_maximum() {
+    fn a_window_maximum_covers_only_that_window() {
         let stats = LockStats::default();
         stats.record(
             LockSite::GcPlanApply,
             Duration::ZERO,
             Duration::from_millis(20),
         );
-        let mark = stats.snapshot();
+        let mark = stats.take_window();
         stats.record(
             LockSite::GcPlanApply,
             Duration::ZERO,
             Duration::from_millis(5),
         );
 
-        let window = stats.snapshot().since(&mark);
+        let window = stats.take_window().since(&mark);
         let site = window.site(LockSite::GcPlanApply);
         assert_eq!(site.acquisitions, 1);
         assert_eq!(site.hold_nanos, Duration::from_millis(5).as_nanos() as u64);
         assert_eq!(
             site.max_hold_nanos,
-            Duration::from_millis(20).as_nanos() as u64
+            Duration::from_millis(5).as_nanos() as u64,
+            "the 20ms hold belongs to the window before this one"
+        );
+    }
+
+    /// The peak outlives its window, so a spike stays visible in every
+    /// later report rather than scrolling away with the window it
+    /// happened in.
+    #[test]
+    fn the_peak_survives_the_window_it_happened_in() {
+        let stats = LockStats::default();
+        stats.record(
+            LockSite::RepackApply,
+            Duration::ZERO,
+            Duration::from_millis(1700),
+        );
+        stats.take_window();
+        stats.record(
+            LockSite::PromoteApply,
+            Duration::ZERO,
+            Duration::from_millis(2),
+        );
+
+        let window = stats.take_window();
+        assert_eq!(
+            window.site(LockSite::RepackApply).max_hold_nanos,
+            0,
+            "the spike is not in this window"
+        );
+        let (site, peak) = window.peak().expect("a peak was recorded");
+        assert_eq!(site, LockSite::RepackApply);
+        assert_eq!(peak, Duration::from_millis(1700));
+        assert!(
+            window
+                .report()
+                .expect("sites acquired")
+                .contains("peak repack-apply"),
+            "the report names the all-time peak"
+        );
+    }
+
+    /// A plain read must not disturb the window the reporter is
+    /// accumulating, or a handle sampling the counters would silently
+    /// truncate the next log line's maximum.
+    #[test]
+    fn snapshot_leaves_the_window_intact() {
+        let stats = LockStats::default();
+        stats.record(
+            LockSite::ClosePrep,
+            Duration::ZERO,
+            Duration::from_millis(7),
+        );
+        let peeked = stats.snapshot();
+        assert_eq!(
+            peeked.site(LockSite::ClosePrep).max_hold_nanos,
+            Duration::from_millis(7).as_nanos() as u64
+        );
+        assert_eq!(
+            stats.take_window().site(LockSite::ClosePrep).max_hold_nanos,
+            Duration::from_millis(7).as_nanos() as u64,
+            "the peek consumed the window"
         );
     }
 

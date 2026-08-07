@@ -1381,14 +1381,31 @@ impl VolumeActor {
     /// move the mark.
     ///
     /// Every acquisition named here is time a guest write could spend
-    /// waiting, so the line is ranked by hold. A window in which nothing
-    /// acquired logs nothing, which keeps an idle volume quiet.
+    /// waiting, so the line is ranked by hold and closes on the longest
+    /// hold the volume has seen. A window in which nothing acquired logs
+    /// nothing, which keeps an idle volume quiet.
     fn report_lock_stats(&mut self) {
-        let now = self.lock_stats.snapshot();
+        let now = self.lock_stats.take_window();
         if let Some(report) = now.since(&self.lock_stats_reported).report() {
-            info!("volume lock [{}s]: {report}", IDLE_FLUSH_INTERVAL.as_secs());
+            info!(
+                "[lock {}] {}s: {report}",
+                self.volume_label(),
+                IDLE_FLUSH_INTERVAL.as_secs(),
+            );
         }
         self.lock_stats_reported = now;
+    }
+
+    /// The volume's directory name, which is its ULID under `by_id/`.
+    ///
+    /// Every volume server on a host writes to the same log, so the
+    /// report carries this the way the coordinator's own lines carry
+    /// `[drain <ulid>]`.
+    fn volume_label(&self) -> Cow<'_, str> {
+        self.base_dir
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or(Cow::Borrowed("volume"))
     }
 
     pub fn run(mut self) {
