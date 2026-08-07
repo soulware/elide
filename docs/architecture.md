@@ -789,6 +789,26 @@ The per-volume Ed25519 signing key (`volume.key`) is never uploaded to S3 — it
 
 The coordinator captures the import process's stdout and stderr. Output lines are buffered in memory for the lifetime of the coordinator (or until a configurable retention limit). `import attach` replays buffered output to any client that connects after the process has already exited, so a brief disconnect during a long import does not lose the log.
 
+## Concurrency and locking
+
+A volume process runs three kinds of thread against one volume, and they are separated by a single mutex rather than by ownership.
+
+- **ublk queue threads** serve the guest. They read and write through `VolumeClient`, one per queue.
+- **The actor thread** serves `VolumeRequest` IPC from the coordinator (promote, repack, close generation, GC checkpoint and apply, reclaim, snapshot). It runs the prepare and apply phases of every structural operation.
+- **The worker thread** executes the heavy middle phase of those operations — parsing, classifying, materialising, compressing, signing, writing segments.
+
+**Reads take no volume lock.** `VolumeReader::read_into` performs one `ArcSwap` load of a `ReadSnapshot`, an immutable `(lbamap, extent_index, flush_gen, layout_gen)` tuple, and resolves the whole read out of it. This holds through the cold paths too: locating a segment across ancestor layers and fetching a body from S3 both read the snapshot's extent index and immutable config. A reader takes its own descriptor-cache and `.dmat`-cache locks, which are per-cache and never the volume's. Readers are therefore unbounded-parallel and no operation described in this document can block one.
+
+**Writes take the volume mutex directly**, on the ublk queue thread, for the WAL append, the claim staging, the snapshot publish and any `fua` fsync. They do not pass through the actor.
+
+That last point is the one worth stating explicitly, because the name suggests otherwise. The actor is not the sole owner of volume state. It is a dispatcher that takes the same mutex the guest write path takes, so **the actor and the guest are peers contending for one lock**. The mutex is what serialises volume mutation; the actor is one of several threads that acquire it.
+
+The consequence for anyone reasoning about latency: **moving work off the actor does nothing for the guest. Only shortening a critical section does.** A long operation on the worker costs the guest nothing, because the worker holds no lock. A short operation on the actor costs the guest exactly as long as it holds the mutex. When the question is "where should this run", the answer is decided by lock hold time, not by thread.
+
+Writes bypassing the actor is deliberate. Routing them through the actor's request channel would queue every write behind whatever the actor is doing, so a long apply would delay all of them rather than only those that collide; taking the mutex directly lets a write proceed the moment the apply releases it.
+
+The maps are persistent structures behind `Arc`, mutated copy-on-write via `Arc::make_mut` and published to readers by `ArcSwap`, which is what lets the read path stay lock-free while a mutation is in progress. A reader holding a snapshot from before a structural operation keeps resolving through it; the `NotFound` retry in `read_with_snapshot` is what carries a reader across a segment file that a rewrite has since unlinked.
+
 ## Write Path
 
 ```

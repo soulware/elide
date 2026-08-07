@@ -3,6 +3,9 @@
 **Status:** Implemented. Pairs with `generation-close-pass.md`, which covers
 the sealed generation. Builds on upload generations (`upload-generations.md`)
 and halt-on-failure drain (`durable-cut.md`), both shipped.
+`open-generation-reap.md` proposes replacing this pass with a reap, on the
+grounds this document's own *What a pass over the open generation is for*
+establishes.
 
 ## Problem
 

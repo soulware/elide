@@ -4,7 +4,8 @@
 outputs*). Builds on upload generations (`upload-generations.md`) and
 journal consolidation (`journal-pending-consolidation.md`), both
 shipped. Pairs with `open-generation-repack.md`, which covers the pass over
-`pending/open/`.
+`pending/open/`. `open-generation-reap.md` proposes making this the only pass
+that materialises bytes, with a parse-free admission and an elastic budget.
 
 ## Problem
 
