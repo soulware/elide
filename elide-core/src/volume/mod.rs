@@ -2301,16 +2301,22 @@ impl Volume {
     /// one resolves for every claimant at once through `inner` or a
     /// delta with a resolving source, and otherwise per claim through
     /// the claimant's journal map — the one tier whose resolution is
-    /// claimant-keyed, reached by walking the map for the hash's runs.
-    /// That walk is linear, and it runs only for a claimed footprint
-    /// hash the durable tiers cannot resolve — a hash the gate is about
-    /// to refuse anyway, or one claimed journal-tier.
+    /// claimant-keyed, which takes a map walk to pair each claim with
+    /// its claimant.
+    ///
+    /// That walk is shared: every hash the claimant-free tiers leave
+    /// unresolved settles in one pass over the map. A journal
+    /// consolidation bucket lands its whole footprint in that residual
+    /// — journal hashes resolve only through their claimant — so the
+    /// walk's cost has to be per gate call, with the wholly-durable
+    /// footprints of GC folds and close-pass buckets skipping it.
     fn unresolvable_footprint_hashes(
         &self,
         footprint: &HashSet<blake3::Hash>,
         sample_limit: usize,
     ) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
+        let mut residual: HashSet<blake3::Hash> = HashSet::new();
         for &hash in footprint {
             if hash == ZERO_HASH || self.lbamap.claim_refcount(&hash) == 0 {
                 continue;
@@ -2325,15 +2331,19 @@ impl Volume {
             }) {
                 continue;
             }
-            for (lba, _len, _off) in self.lbamap.runs_for_hash(&hash) {
-                let resolves = self.lbamap.claimant_at(lba).is_some_and(|claimant| {
-                    self.extent_index.lookup_journal(claimant, &hash).is_some()
-                });
-                if !resolves {
-                    found.total += 1;
-                    if found.sample.len() < sample_limit {
-                        found.sample.push((lba, hash));
-                    }
+            residual.insert(hash);
+        }
+        if residual.is_empty() {
+            return found;
+        }
+        for (lba, _len, hash, _off, claimant) in self.lbamap.iter_entries_with_claimant() {
+            if !residual.contains(&hash) {
+                continue;
+            }
+            if self.extent_index.lookup_journal(claimant, &hash).is_none() {
+                found.total += 1;
+                if found.sample.len() < sample_limit {
+                    found.sample.push((lba, hash));
                 }
             }
         }
