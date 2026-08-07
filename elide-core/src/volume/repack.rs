@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ulid::Ulid;
 
@@ -410,6 +411,7 @@ impl Volume {
             journal_untouched.into_iter().collect();
 
         for bucket in &buckets {
+            let derive_start = Instant::now();
             let carried_hashes = bucket
                 .output
                 .as_ref()
@@ -476,15 +478,6 @@ impl Volume {
                 continue;
             }
 
-            let delta_body_source = match &bucket.output {
-                Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
-                    &pending_dir.join(out.new_ulid.to_string()),
-                    &out.out_entries,
-                    out.new_body_section_start,
-                )?),
-                None => None,
-            };
-
             // Every hash whose resolvability this bucket can change: the
             // inputs' owned hashes it removes, the journal-tier hashes
             // of the segments it purges, and the output's entries.
@@ -499,9 +492,24 @@ impl Volume {
             if let Some(out) = &bucket.output {
                 footprint.extend(out.out_entries.iter().map(|e| e.hash));
             }
+            let derive = derive_start.elapsed();
+
+            let header_start = Instant::now();
+            let delta_body_source = match &bucket.output {
+                Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
+                    &pending_dir.join(out.new_ulid.to_string()),
+                    &out.out_entries,
+                    out.new_body_section_start,
+                )?),
+                None => None,
+            };
+            let header = header_start.elapsed();
 
             let mut extents_removed = 0usize;
+            let mut merge = Duration::ZERO;
+            let gate_start = Instant::now();
             let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
+                let merge_start = Instant::now();
                 let index = Arc::make_mut(&mut vol.extent_index);
 
                 // Per-input CAS-remove for hashes the bucket's output
@@ -552,8 +560,10 @@ impl Volume {
                         );
                     }
                 }
+                merge = merge_start.elapsed();
                 Ok(())
             })?;
+            let gate_check = gate_start.elapsed().saturating_sub(merge);
 
             if let ResolvabilityGate::Refused(orphaned) = gate {
                 let detail = orphaned
@@ -603,21 +613,36 @@ impl Volume {
             } else {
                 ""
             };
+            let phases = format!(
+                "derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms",
+                derive.as_secs_f64() * 1e3,
+                header.as_secs_f64() * 1e3,
+                merge.as_secs_f64() * 1e3,
+                gate_check.as_secs_f64() * 1e3,
+            );
             match &bucket.output {
                 Some(out) => log::info!(
-                    "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed)",
+                    "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed; {phases})",
                     out.new_ulid,
                     out.out_entries.len(),
                     bucket.bytes_freed,
                 ),
                 None => log::info!(
-                    "repack {generation}: [{inputs_fmt}] -> deleted ({tier}{} bytes freed)",
+                    "repack {generation}: [{inputs_fmt}] -> deleted ({tier}{} bytes freed; {phases})",
                     bucket.bytes_freed,
                 ),
             }
         }
 
+        let fsync_start = Instant::now();
         segment::fsync_dir(&pending_dir)?;
+        if !buckets.is_empty() {
+            log::info!(
+                "repack {generation}: apply pass {} bucket(s), fsync={:.1}ms",
+                buckets.len(),
+                fsync_start.elapsed().as_secs_f64() * 1e3,
+            );
+        }
 
         // A close pass runs over the sealed generation, whose segments
         // are not the ones the open generation's sweep bounds.
