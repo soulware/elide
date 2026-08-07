@@ -132,10 +132,10 @@ times `FLUSH_ENTRY_THRESHOLD`, so a pass reaps at least four full flush
 segments' worth and on the ~3,800 entries per segment measured on pg14 around
 eight typical ones. Phase 2 parses until the accumulated hash count reaches it.
 
-That sits below a window the volume already accepts. A close-pass apply holds
-the mutex across a whole generation's registrations, ~57,000 entries on the
-same measurement, so the reap is bounded under an operation running beside it
-rather than to a stricter standard invented here.
+The number stands on that anchor alone. A close-pass apply holds the mutex
+across a whole generation's registrations, ~57,000 entries on the same
+measurement, but entry count is not what makes that window long (*The apply
+window* below), so it is not a calibration the reap can borrow.
 
 Journal segments do not count against the cap. They cost one outer removal
 each, so counting them would price the cheap tier against the expensive one and
@@ -199,6 +199,60 @@ This is the dial. A larger budget means a longer close and a longer stall
 recovery; a smaller one means more S3 bytes and more objects. The census puts a
 measured quantity on both sides of it, so it can be tuned against Tigris pricing
 rather than guessed.
+
+## The apply window
+
+A read takes no lock, and a write takes the volume mutex from the ublk queue
+thread, so every mutex window in the pipeline is a window in which writes wait.
+The apply is the longest of them, and what makes it long is not the entries it
+registers.
+
+`apply_repack_result` runs `mutate_gated_on_resolvability` once per bucket, and
+that gate ends in `unresolvable_lbamap_hashes`, which walks **every** LBA-map
+entry doing up to three extent-index lookups each. So the apply is
+O(buckets × lbamap), and a close pass over a volume holding a few hundred
+thousand extents does millions of lookups with the write path waiting. Two
+smaller costs sit beside it under the same mutex: `claim_referenced_hashes()`
+copies every live hash key into a fresh set and `named_delta_sources()` walks
+every delta source into another, both once per apply and both used only for
+membership; and `DeltaBodySource::full_for_segment` opens and reads the output
+file per bucket carrying deltas.
+
+Four changes, in leverage order.
+
+**The gate becomes incremental.** It asks a whole-map question, but the
+pre-state already answers it and the mutation's footprint is known. An LBA
+becomes unresolvable only where the mutation removed or moved the location its
+hash resolved through, or where the mutation's lbamap merge introduced the
+LBA-to-hash pair. Both sets are bounded by the bucket, so the check is
+O(footprint) with the same contract. Delta resolution turns on source hashes
+resolving, which would otherwise need a reverse map from source to dependents,
+and does not: the stale-liveness check refuses any bucket that drops a hash in
+`named_delta_sources` (#897), so a stranded source never reaches the gate.
+
+**The mutex is taken per bucket.** The gate is already per-bucket and the CAS
+and consuming-inputs rules are already per-input, so a write landing between
+buckets is indistinguishable from one landing before the apply. Publishing once
+at the end keeps readers off any partial state, and the inputs stay in place
+until after that publish as they do today.
+
+**The two set materialisations become membership probes.**
+`LbaMap::is_referenced` already is one, against the maintained refcounts;
+`named_delta_sources` wants an `is_named_delta_source` counterpart. That takes
+two volume-sized allocations out of every apply.
+
+**`full_for_segment` moves to the worker**, which wrote the file and holds the
+entries and `body_section_start` already.
+
+The first and third apply unchanged to GC's fold apply, which reaches the same
+gate through the same pair of set materialisations in
+`apply_plan_apply_result`. They are tracked there rather than here.
+
+The reap needs none of this. It removes locations for hashes the census says
+nothing references, so no LBA can become unresolvable by construction and the
+gate has nothing to catch. Its apply is O(removed entries), with the
+resolvability check kept as a `volume-invariants` assertion rather than a
+production scan.
 
 ## A quiet volume cuts early
 
@@ -319,8 +373,9 @@ crash model, and runs from one caller.
 - Whether the proptest simulation model needs a reap operation of its own or
   reads it as a variant of the existing repack op.
 - What `quiet_cut_after` should be on the soak rig.
-- Whether a close-pass apply's own mutex window is a latency source. The reap's
-  cap is calibrated against it, and nothing has measured it. 20s is reasoned from the
+- The ordering of the four apply-window changes. They come from reading the
+  code, and nothing has profiled an apply, so which of them dominates is a
+  guess until something does. 20s is reasoned from the
   mortality knee rather than measured, and the workload that would settle it is
   a bursty one, which the current pgbench soaks are not.
 
