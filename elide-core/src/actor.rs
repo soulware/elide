@@ -45,10 +45,10 @@ use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
-    ReclaimPrep, ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackPrep,
-    RepackResult, SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume,
-    WorkerJob, WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs,
-    read_extents, read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
+    ReclaimPrep, ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult,
+    SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob,
+    WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
+    read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,9 +131,8 @@ pub(crate) enum VolumeRequest {
     CloseGeneration {
         reply: Sender<io::Result<Option<u32>>>,
     },
-    Repack {
-        trigger: crate::volume::RepackTrigger,
-        reply: Sender<io::Result<CompactionStats>>,
+    Reap {
+        reply: Sender<io::Result<crate::volume::ReapStats>>,
     },
     /// Promote the current WAL to a `pending/` segment via the worker
     /// thread.  Reply is sent once `pending/<ulid>` is on disk.
@@ -319,15 +318,7 @@ struct ParkedOps {
     /// A finished plan-apply result held back until in-flight promotes
     /// have applied. See [`VolumeActor::apply_or_defer_gc_plan`].
     deferred_handoff: Option<Box<crate::volume::GcPlanApplyResult>>,
-    /// Reply channel for an in-flight `Repack` request, parked while
-    /// the worker thread executes the repack. Stays occupied while a
-    /// finished result waits in `deferred_repack`, so concurrent
-    /// repack requests are still rejected.
-    repack: Option<Sender<io::Result<CompactionStats>>>,
     close_generation: Option<ParkedCloseGeneration>,
-    /// A finished repack result held back until in-flight promotes
-    /// have applied. See [`VolumeActor::apply_or_defer_repack`].
-    deferred_repack: Option<Box<RepackResult>>,
     /// Reply channel for an in-flight `SignSnapshotManifest` request,
     /// parked while the worker thread enumerates `index/`, signs, and
     /// writes the manifest + marker.  Concurrent requests are rejected
@@ -901,53 +892,43 @@ impl VolumeActor {
         HandoffDispatch::Finished
     }
 
-    /// Run the repack prep on the actor and dispatch the heavy middle
-    /// to the worker.  Reply is parked until
-    /// [`crate::volume::RepackResult`] arrives and is applied.
-    fn start_repack(
-        &mut self,
-        trigger: crate::volume::RepackTrigger,
-        reply: Sender<io::Result<CompactionStats>>,
-    ) {
-        let prep = match self
-            .lock_volume(LockSite::RepackPrep)
-            .prepare_repack(trigger)
-        {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                let _ = reply.send(Ok(CompactionStats::default()));
-                return;
-            }
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
-        let RepackPrep { flush, job } = prep;
-        // The rotated WAL goes first, so its apply lands before the
-        // repack's. `apply_or_defer_repack` holds the repack result
-        // behind in-flight promotes, which is what orders the two.
-        if let Some(flush) = flush {
-            let old_wal_path = flush.old_wal_path.clone();
-            if let Err(e) = self.send_worker_job(WorkerJob::Promote(flush)) {
-                warn!("repack flush dispatch failed: {e}");
-                let _ = reply.send(Err(e));
-                return;
-            }
-            self.pipeline.promotes_in_flight += 1;
-            self.pipeline.promote_gen += 1;
-            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+    /// One reap pass over `pending/open/`, inline on the actor: sweep
+    /// the published snapshot and parse candidate index regions off the
+    /// mutex, then revalidate, remove, publish and unlink
+    /// (`docs/design/open-generation-reap.md`).
+    ///
+    /// Skipped whole while a promote is in flight: the promote's worker
+    /// may be composing a delta against a claim-dead source this pass
+    /// would remove, and its source pin is recorded only when its apply
+    /// lands — the same ordering that holds a GC plan apply behind
+    /// in-flight promotes. The pass runs every tick, so a skip costs one
+    /// interval.
+    fn handle_reap(&mut self) -> io::Result<crate::volume::ReapStats> {
+        if self.pipeline.promotes_in_flight > 0 {
+            return Ok(crate::volume::ReapStats::default());
         }
-        // Prep took the WAL, so the extent index the readers see still
-        // points hashes at it. Republish so a reader picks up the
-        // snapshot the promote's apply will move off.
-        self.publish_snapshot();
-        if let Err(e) = self.send_worker_job(WorkerJob::Repack(job)) {
-            warn!("repack dispatch failed: {e}");
-            let _ = reply.send(Err(e));
-            return;
+        let open = crate::volume::list_open_segments(&self.base_dir)?;
+        if open.is_empty() {
+            return Ok(crate::volume::ReapStats::default());
         }
-        self.parked.repack = Some(reply);
+        let floor = crate::volume::latest_snapshot(&self.base_dir)?;
+        let snap = self.snapshot.load();
+        let candidates =
+            crate::volume::sweep_unreachable(&snap.lbamap, &snap.extent_index, &open, floor);
+        if candidates.is_empty() {
+            return Ok(crate::volume::ReapStats::default());
+        }
+        let parsed = crate::volume::parse_reap_candidates(candidates);
+        if parsed.is_empty() {
+            return Ok(crate::volume::ReapStats::default());
+        }
+        let (stats, unlink) = self.lock_volume(LockSite::ReapApply).apply_reap(parsed);
+        if !unlink.is_empty() {
+            self.publish_snapshot();
+            self.lock_volume(LockSite::ReapUnlink)
+                .remove_consumed_inputs(&unlink)?;
+        }
+        Ok(stats)
     }
 
     /// Seal the open generation on the actor, then dispatch the pass
@@ -1092,7 +1073,6 @@ impl VolumeActor {
         self.pipeline.promotes_in_flight > 0
             || self.pipeline.promote_segments_in_flight > 0
             || self.parked.handoff_in_flight
-            || self.parked.repack.is_some()
             || self.parked.close_generation.is_some()
             || self.parked.sign_snapshot_manifest.is_some()
             || self.parked.reclaim.is_some()
@@ -1220,15 +1200,6 @@ impl VolumeActor {
                     let _ = p.reply.send(outcome.map(|()| p.rotated));
                 }
             }
-            WorkerResult::Repack(result) => match result {
-                Ok(r) => self.apply_or_defer_repack(Box::new(r)),
-                Err(e) => {
-                    warn!("worker repack failed: {e}");
-                    if let Some(reply) = self.parked.repack.take() {
-                        let _ = reply.send(Err(e));
-                    }
-                }
-            },
             WorkerResult::SignSnapshotManifest(result) => {
                 let reply = self.parked.sign_snapshot_manifest.take();
                 let outcome = match result {
@@ -1271,14 +1242,11 @@ impl VolumeActor {
             WorkerResult::Barrier => {}
         }
         // A promote applying above may have been the last one a deferred
-        // plan or repack was waiting for.
-        if self.pipeline.promotes_in_flight == 0 {
-            if let Some(result) = self.parked.deferred_handoff.take() {
-                self.apply_or_defer_gc_plan(result);
-            }
-            if let Some(result) = self.parked.deferred_repack.take() {
-                self.apply_or_defer_repack(result);
-            }
+        // plan was waiting for.
+        if self.pipeline.promotes_in_flight == 0
+            && let Some(result) = self.parked.deferred_handoff.take()
+        {
+            self.apply_or_defer_gc_plan(result);
         }
     }
 
@@ -1307,23 +1275,8 @@ impl VolumeActor {
     /// commit a delta naming an input-owned hash as its source, and that
     /// reference exists nowhere checkable until the promote applies — so
     /// the stale-liveness refusal in `apply_repack_result` can only be
-    /// trusted once in-flight promotes have landed.
-    fn apply_or_defer_repack(&mut self, result: Box<RepackResult>) {
-        if self.pipeline.promotes_in_flight > 0 {
-            debug!(
-                "holding repack apply behind {} in-flight promote(s)",
-                self.pipeline.promotes_in_flight
-            );
-            self.parked.deferred_repack = Some(result);
-            return;
-        }
-        let reply = self.parked.repack.take();
-        let outcome = self.apply_repack_and_publish(*result);
-        if let Some(reply) = reply {
-            let _ = reply.send(outcome);
-        }
-    }
-
+    /// trusted once in-flight promotes have landed. The reap holds the
+    /// same rule by skipping its pass while a promote is in flight.
     fn apply_or_defer_gc_plan(&mut self, result: Box<crate::volume::GcPlanApplyResult>) {
         if self.pipeline.promotes_in_flight > 0 {
             debug!(
@@ -1521,13 +1474,8 @@ impl VolumeActor {
                                 }
                             }
                         }
-                        VolumeRequest::Repack { trigger, reply } => {
-                            if self.parked.repack.is_some() {
-                                let _ = reply
-                                    .send(Err(io::Error::other("concurrent repack not allowed")));
-                            } else {
-                                self.start_repack(trigger, reply);
-                            }
+                        VolumeRequest::Reap { reply } => {
+                            let _ = reply.send(self.handle_reap());
                         }
                         VolumeRequest::ApplyGcHandoffs { reply } => {
                             self.start_gc_handoffs(Some(reply));
@@ -1959,19 +1907,14 @@ impl VolumeClient {
             .send(VolumeRequest::TestParkThenDispatchBarriers { park, holds });
     }
 
-    /// Rewrite every pending segment with any hash-dead body bytes.
-    /// Blocks until the actor replies.
-    ///
-    /// Under [`crate::volume::RepackTrigger::Pressure`] the pass runs
-    /// only once the open generation has accumulated enough since the
-    /// last one, so the caller may tick as often as it likes.
-    pub fn repack(&self, trigger: crate::volume::RepackTrigger) -> io::Result<CompactionStats> {
+    /// One reap pass over `pending/open/`: unlink whatever nothing
+    /// references. Blocks until the actor replies. A pass finding
+    /// nothing (or skipped behind an in-flight promote) reports zeros,
+    /// so the caller may tick as often as it likes.
+    pub fn reap(&self) -> io::Result<crate::volume::ReapStats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Repack {
-                trigger,
-                reply: reply_tx,
-            })
+            .send(VolumeRequest::Reap { reply: reply_tx })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -2267,7 +2210,6 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 let result = execute_promote_segment(job);
                 WorkerResult::PromoteSegment { ulid, result }
             }
-            WorkerJob::Repack(job) => WorkerResult::Repack(execute_repack(job)),
             WorkerJob::CloseGeneration(job) => WorkerResult::CloseGeneration(execute_repack(job)),
             WorkerJob::SignSnapshotManifest(job) => {
                 WorkerResult::SignSnapshotManifest(execute_sign_snapshot_manifest(job))
@@ -2770,18 +2712,6 @@ pub(crate) fn execute_promote_segment(job: PromoteSegmentJob) -> io::Result<Prom
 /// `SWEEP_MATERIALISE_CAP` is the same size in the same unit.
 pub(crate) const REPACK_TARGET_LIVE: u64 = 32 * 1024 * 1024;
 
-/// Live fraction at or above which a settled segment stays out of a
-/// pass over the open generation. Mirrors the coordinator's default
-/// `density_threshold` for committed segments, so both rewriters call
-/// the same shape of segment worth rewriting.
-const REPACK_SETTLED_DENSITY: f64 = 0.70;
-
-/// Whether `seg_ulid` names a segment an earlier pass over the same
-/// directory covered. See [`crate::volume::RepackJob::settled_floor`].
-fn is_settled(seg_ulid: Ulid, settled_floor: Option<Ulid>) -> bool {
-    settled_floor.is_some_and(|w| seg_ulid <= w)
-}
-
 /// Entry-count cap on a packed output. Mirrors the WAL's
 /// `FLUSH_ENTRY_THRESHOLD` so packed outputs sit at the same scale as
 /// freshly-flushed segments and the index region stays bounded.
@@ -2896,15 +2826,7 @@ struct Admission {
 /// repacks data must carry all pending journal above its outputs, so a
 /// journal segment left behind is an ordering violation rather than a
 /// saving.
-fn admit_within_budget(scanned: Vec<ScannedSegment>, budget: Option<u64>) -> Admission {
-    let Some(budget) = budget else {
-        return Admission {
-            admitted: scanned,
-            spent: 0,
-            turned_away: 0,
-            turned_away_bytes: 0,
-        };
-    };
+fn admit_within_budget(scanned: Vec<ScannedSegment>, budget: u64) -> Admission {
     let (journal, mut data): (Vec<ScannedSegment>, Vec<ScannedSegment>) =
         scanned.into_iter().partition(|s| s.journal);
     data.sort_by_key(|s| s.stored_bytes);
@@ -3012,7 +2934,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         pending_dir,
         floor,
         seg_paths,
-        settled_floor,
         work_budget,
         output_ulids,
         journal_output_ulids,
@@ -3088,25 +3009,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         // coverage is why the gates below leave journal alone.
         let is_journal_segment = entries.iter().any(|e| e.journal);
 
-        // A settled segment is one an earlier pass over this directory
-        // already packed. Re-admitting it costs a full classification —
-        // `extents_in_range` per entry — and pays only when its bytes
-        // have died since, so `live_bytes_est` decides: a hash-set probe
-        // per entry against an index the segment cache already holds.
-        //
-        // The estimate counts an entry live whenever its hash resolves
-        // anywhere, so it reads a segment denser than a classification
-        // would and admits a subset of what one would find worth
-        // rewriting. Mortality is monotone, so what it leaves behind is
-        // harvested whole by the pass over the sealed generation.
-        if is_settled(seg_ulid, settled_floor) && !is_journal_segment {
-            let dense = total_bytes == 0
-                || live_bytes_est as f64 >= total_bytes as f64 * REPACK_SETTLED_DENSITY;
-            if dense {
-                continue;
-            }
-        }
-
         scanned.push(ScannedSegment {
             seg_path: seg_path.clone(),
             seg_ulid,
@@ -3135,10 +3037,9 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         turned_away_bytes,
     } = admit_within_budget(scanned, work_budget);
     if turned_away > 0 {
-        let budget = work_budget.unwrap_or_default();
         log::info!(
-            "repack: {spent} bytes of data segments admitted against a {budget} byte budget, \
-             {turned_away} segment(s) upload as-is ({turned_away_bytes} bytes)"
+            "repack: {spent} bytes of data segments admitted against a {work_budget} byte \
+             budget, {turned_away} segment(s) upload as-is ({turned_away_bytes} bytes)"
         );
     }
 
@@ -4360,20 +4261,13 @@ mod tests {
     }
 
     #[test]
-    fn admission_without_a_budget_takes_every_segment() {
-        let a = admit_within_budget(vec![scanned(9, false), scanned(1, true)], None);
-        assert_eq!(admitted_bytes(&a), vec![9, 1]);
-        assert_eq!(a.turned_away, 0);
-    }
-
-    #[test]
     fn admission_spends_the_budget_on_the_smallest_segments() {
         // A budget of 10 over 8, 3 and 2: smallest-first fits two segments
         // and folds two objects away, where taking them in the order given
         // would fit 8 and 2 and fold one.
         let a = admit_within_budget(
             vec![scanned(8, false), scanned(3, false), scanned(2, false)],
-            Some(10),
+            10,
         );
         assert_eq!(admitted_bytes(&a), vec![2, 3]);
         assert_eq!(a.spent, 5);
@@ -4387,7 +4281,7 @@ mod tests {
         // outputs, so the budget governs data alone.
         let a = admit_within_budget(
             vec![scanned(64, true), scanned(32, true), scanned(4, false)],
-            Some(1),
+            1,
         );
         assert_eq!(admitted_bytes(&a), vec![64, 32]);
         assert_eq!(a.spent, 0, "journal spends none of the budget");
@@ -4812,15 +4706,19 @@ mod tests {
             "a promote must not be attributed to the close pass"
         );
 
-        client.write(1, &unique_block(2), false).unwrap();
-        client.promote_wal().unwrap();
-        client
-            .repack(crate::volume::RepackTrigger::Unconditional)
-            .unwrap();
-        let after_repack = client.lock_stats().since(&after_promote);
+        // Overwrite everything the promoted segment claims, so the reap
+        // finds it whole-dead and its apply acquires the mutex.
+        for lba in 0..3u64 {
+            client
+                .write(lba, &unique_block(10 + lba as u32), false)
+                .unwrap();
+        }
+        let stats = client.reap().unwrap();
+        assert!(stats.segments_reaped > 0, "setup: nothing reaped");
+        let after_reap = client.lock_stats().since(&after_promote);
         assert!(
-            after_repack.site(LockSite::RepackPrep).acquisitions > 0,
-            "repack prep acquires the mutex"
+            after_reap.site(LockSite::ReapApply).acquisitions > 0,
+            "the reap's apply acquires the mutex"
         );
         assert!(
             client.lock_stats().report().is_some(),
@@ -4828,12 +4726,12 @@ mod tests {
         );
     }
 
-    /// A reader whose snapshot predates a repack must still resolve reads
-    /// after the repack unlinks its input segments — the data is live, only
-    /// its location changed. Reproduces the 2026-07-11 field EIO ("segment
-    /// not found" during the repack swap window).
+    /// A reader whose snapshot predates the close pass must still resolve
+    /// reads after the pass unlinks its input segments — the data is
+    /// live, only its location changed. Reproduces the 2026-07-11 field
+    /// EIO ("segment not found" during the rewrite swap window).
     #[test]
-    fn stale_snapshot_read_survives_repack() {
+    fn stale_snapshot_read_survives_the_close_pass() {
         let dir = temp_dir();
         let volume = Volume::open(&dir, &dir).unwrap();
         let (actor, client) = spawn(volume);
@@ -4853,22 +4751,21 @@ mod tests {
         client.write(1, &unique_block(4), false).unwrap();
         client.promote_wal().unwrap();
 
-        // A reader's view captured before the repack.
+        // A reader's view captured before the close pass.
         let stale = client.snapshot.load_full();
 
-        let stats = client
-            .repack(crate::volume::RepackTrigger::Unconditional)
-            .unwrap();
-        assert!(
-            stats.segments_compacted > 0,
-            "setup: repack consumed no segments, race not exercised"
+        let closed = client.close_generation().unwrap();
+        assert_eq!(
+            closed,
+            Some(2),
+            "setup: the close sealed no segments, race not exercised"
         );
 
         let reader = client.reader();
         let mut buf = vec![0u8; 4096];
         reader
             .read_with_snapshot(&stale, 0, &mut buf)
-            .expect("read of live data through a pre-repack snapshot");
+            .expect("read of live data through a pre-close snapshot");
         assert_eq!(buf, block_a, "read must return the live block contents");
     }
 

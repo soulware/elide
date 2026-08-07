@@ -13,8 +13,6 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::volume::CompactionStats;
-
 /// Typed volume control IPC request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "verb", rename_all = "kebab-case")]
@@ -23,9 +21,10 @@ pub enum VolumeRequest {
     Flush,
     /// Promote the WAL to a `pending/` segment, blocking until it's on disk.
     PromoteWal,
-    /// Rewrite every pending segment with any hash-dead body bytes;
-    /// bin-pack small segments into denser outputs at the same time.
-    Repack,
+    /// Unlink `pending/open/` segments nothing references
+    /// (`docs/design/open-generation-reap.md`). Packing happens once,
+    /// at the close.
+    Reap,
     /// Rewrite post-snapshot pending segments as zstd-dictionary deltas.
     /// Flush the WAL and return `max_buckets` pre-minted GC output
     /// ULIDs. The coordinator emits up to one plan per ULID this tick.
@@ -74,10 +73,10 @@ pub enum VolumeRequest {
     Shutdown,
 }
 
-/// Reply for [`VolumeRequest::Repack`].
+/// Reply for [`VolumeRequest::Reap`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct CompactionReply {
-    pub stats: CompactionStats,
+pub struct ReapReply {
+    pub stats: crate::volume::ReapStats,
 }
 
 /// Reply for [`VolumeRequest::GcCheckpoint`]. Carries one ULID per

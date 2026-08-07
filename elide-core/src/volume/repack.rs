@@ -27,63 +27,11 @@ use super::{ResolvabilityGate, Volume, latest_snapshot};
 /// that split path is not yet built.
 pub(crate) const JOURNAL_CONSOLIDATION_ULIDS: usize = 1;
 
-/// Bytes accumulated in `pending/open/` since the last pass that start a
-/// new one on their own. One output target: below this a pass has no
-/// packing to do.
-const REPACK_PRESSURE_BYTES: u64 = crate::actor::REPACK_TARGET_LIVE;
-
-/// Segments accumulated in `pending/open/` since the last pass that start
-/// a new one on their own. Each is a file the read path may probe and a
-/// descriptor the cache may hold, a cost the bytes do not describe, so
-/// the count crosses on its own.
-const REPACK_PRESSURE_SEGMENTS: usize = 32;
-
-/// Settled data segments a pass examines. Bounds the sweep's cost to a
-/// constant per pass, where the directory it rotates through grows with
-/// the backlog.
-const REPACK_SETTLED_SCAN: usize = 16;
-
 /// Stored bytes of data segments the close pass takes on. A sealed
 /// generation is normally a cut's worth and fits whole; a generation that
 /// grew while the drain was down does not, and the excess ships as its own
 /// objects rather than holding the next cut behind one long job.
 const REPACK_CLOSE_WORK_BYTES: u64 = 4 * crate::actor::REPACK_TARGET_LIVE;
-
-/// What decides whether [`Volume::prepare_repack`] starts a pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepackTrigger {
-    /// Start a pass once the open generation has accumulated
-    /// [`REPACK_PRESSURE_BYTES`] or [`REPACK_PRESSURE_SEGMENTS`] since
-    /// the last one. Backlog is what accumulates, so the pass fires
-    /// hardest exactly when the directory is growing.
-    Pressure,
-    /// Start a pass over whatever `pending/open/` holds.
-    Unconditional,
-}
-
-/// Bytes and segment count in `pending/open/` above `watermark` — what
-/// has arrived since the last pass covered the directory.
-fn accumulation_since(seg_paths: &[PathBuf], watermark: Option<Ulid>) -> io::Result<(u64, usize)> {
-    let mut bytes = 0u64;
-    let mut count = 0usize;
-    for path in seg_paths {
-        let ulid = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .and_then(|s| Ulid::from_string(s).ok())
-            .ok_or_else(|| io::Error::other("bad segment filename"))?;
-        if watermark.is_some_and(|w| ulid <= w) {
-            continue;
-        }
-        match fs::metadata(path) {
-            Ok(m) => bytes += m.len(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        }
-        count += 1;
-    }
-    Ok((bytes, count))
-}
 
 /// Results from a single compaction run.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -104,14 +52,6 @@ pub struct CompactionStats {
     pub buckets_refused: usize,
 }
 
-/// What [`Volume::prepare_repack`] hands back: the WAL rotation to
-/// dispatch first, and the repack job itself.
-pub struct RepackPrep {
-    /// The closed WAL, `None` when it held nothing to promote.
-    pub flush: Option<super::PromoteJob>,
-    pub job: RepackJob,
-}
-
 /// What [`Volume::prepare_close_generation`] hands back: the sealed
 /// generation's segment count, which the cut reports, and the pass over
 /// it.
@@ -125,7 +65,7 @@ pub struct CloseGenerationPrep {
 }
 
 /// Data needed by the worker to repack sparse segments in a generation
-/// directory. [`Volume::prepare_repack`] produces one over
+/// directory. [`Volume::prepare_pack_open_for_test`] produces one over
 /// `pending/open/`, [`Volume::prepare_close_generation`] one over
 /// `pending/upload/`; both run on the actor thread.
 ///
@@ -141,17 +81,10 @@ pub struct RepackJob {
     /// segment landing while the worker runs is outside this pass rather
     /// than classified against a snapshot that predates its entries.
     pub seg_paths: Vec<PathBuf>,
-    /// Highest ULID an earlier pass over this directory covered. A
-    /// segment at or below it is packed already, so the pass classifies
-    /// it only once the cheap live-hash estimate reads it sparse; a
-    /// segment above it is classified unconditionally. `None` classifies
-    /// every candidate, which is what the close pass over a sealed
-    /// generation does.
-    pub settled_floor: Option<Ulid>,
     /// Stored bytes of data segments the pass takes on, spent
     /// smallest-first. What it turns away uploads as its own object.
-    /// `None` admits every candidate. See [`REPACK_CLOSE_WORK_BYTES`].
-    pub work_budget: Option<u64>,
+    /// See [`REPACK_CLOSE_WORK_BYTES`].
+    pub work_budget: u64,
     pub output_ulids: Vec<Ulid>,
     /// Output ULIDs reserved for the journal-consolidation merge, minted
     /// after every entry of `output_ulids` so each sorts above every data
@@ -219,18 +152,13 @@ pub struct RepackResult {
 }
 
 impl Volume {
-    /// Rewrite every pending segment with at least one hash-dead body
-    /// entry under a freshly-minted ULID; all-dead segments produce no
-    /// output and are unlinked after apply. Skips fully-live segments
-    /// larger than the small threshold.
-    /// Guarantees deleted data does not leave the host.
-    ///
-    /// Synchronous wrapper around [`Self::prepare_repack`] +
-    /// [`crate::actor::execute_repack`] + [`Self::apply_repack_result`]
-    /// for tests and inline callers; the actor uses the trio directly
-    /// to offload the middle phase.
-    pub fn repack(&mut self) -> io::Result<CompactionStats> {
-        let Some(job) = self.prepare_repack_inline()? else {
+    /// Run the packing engine over whatever `pending/open/` holds —
+    /// the engine's test seam. Production packs once, at the close
+    /// ([`Self::close_generation`]); tests drive the same
+    /// execute/apply/unlink over the open directory so refusal, CAS
+    /// and consolidation semantics are exercised without a rotate.
+    pub fn repack_open_for_test(&mut self) -> io::Result<CompactionStats> {
+        let Some(job) = self.prepare_pack_open_for_test()? else {
             return Ok(CompactionStats::default());
         };
         let result = crate::actor::execute_repack(job)?;
@@ -272,7 +200,7 @@ impl Volume {
             apply || remove_inputs == 0,
             "inputs are only removable after apply"
         );
-        let Some(job) = self.prepare_repack_inline()? else {
+        let Some(job) = self.prepare_pack_open_for_test()? else {
             return Ok(false);
         };
         let result = crate::actor::execute_repack(job)?;
@@ -289,124 +217,16 @@ impl Volume {
         Ok(true)
     }
 
-    /// [`Self::prepare_repack`] with the rotated WAL promoted inline, for
-    /// callers without a worker thread. The promote applies before the
-    /// repack job runs, matching the order the actor gets from
-    /// dispatching the flush first.
-    pub(in crate::volume) fn prepare_repack_inline(&mut self) -> io::Result<Option<RepackJob>> {
-        let Some(RepackPrep { flush, job }) = self.prepare_repack(RepackTrigger::Unconditional)?
-        else {
-            return Ok(None);
-        };
-        if let Some(flush) = flush {
-            match crate::actor::execute_promote(
-                flush,
-                &mut crate::actor::PriorSourceCache::default(),
-            ) {
-                Ok(result) => self.apply_promote(&result)?,
-                Err(failure) => {
-                    self.restore_failed_promote(*failure.job)?;
-                    return Err(failure.error);
-                }
-            }
-        }
-        Ok(Some(job))
-    }
-
-    /// Narrow the directory listing to the candidates this pass covers:
-    /// everything above `settled_floor`, every pending journal segment,
-    /// and [`REPACK_SETTLED_SCAN`] settled data segments taken in ULID
-    /// order from [`Volume::repack_settled_cursor`], wrapping.
-    ///
-    /// The sweep needs each settled segment's parsed index to estimate
-    /// its live fraction, and the segment index cache holds 64, so an
-    /// unbounded sweep re-reads and re-verifies every index in the
-    /// directory once it outgrows the cache — worst under the stalled
-    /// drain the pass exists for. The cursor covers the whole directory
-    /// across successive passes instead, which is quick against the
-    /// minutes-scale mortality the sweep looks for.
-    ///
-    /// Journal segments are never held back. A pass that repacks data
-    /// mints its outputs above everything pending, so a journal segment
-    /// left below them inverts data-before-journal
-    /// (`docs/design/journal-pending-consolidation.md`).
-    /// [`Volume::pending_journal`] names them, which is what lets the
-    /// sweep skip a settled segment without parsing it.
-    fn select_candidates(
+    /// Build a pass over whatever `pending/open/` holds, with the
+    /// rotated WAL promoted inline first — the packing engine's test
+    /// seam, mirroring the mint and snapshot ordering the close prep
+    /// uses. Pre-mints one output ULID per candidate, then the journal
+    /// outputs, then `u_flush`, and snapshots the maps before the
+    /// promote applies, so the worker classifies against prep-time
+    /// state exactly as it does behind the actor.
+    pub(in crate::volume) fn prepare_pack_open_for_test(
         &mut self,
-        seg_paths: Vec<PathBuf>,
-        settled_floor: Option<Ulid>,
-    ) -> io::Result<Vec<PathBuf>> {
-        let Some(floor) = settled_floor else {
-            return Ok(seg_paths);
-        };
-        let mut listed: Vec<(Ulid, PathBuf)> = seg_paths
-            .into_iter()
-            .map(|p| {
-                let ulid = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| Ulid::from_string(s).ok())
-                    .ok_or_else(|| io::Error::other("bad segment filename"))?;
-                Ok((ulid, p))
-            })
-            .collect::<io::Result<_>>()?;
-        listed.sort_by_key(|(u, _)| *u);
-
-        let mut selected: Vec<(Ulid, PathBuf)> = Vec::with_capacity(listed.len());
-        let mut settled_data: Vec<(Ulid, PathBuf)> = Vec::new();
-        for (ulid, path) in listed {
-            if ulid > floor || self.pending_journal.contains(&ulid) {
-                selected.push((ulid, path));
-            } else {
-                settled_data.push((ulid, path));
-            }
-        }
-
-        if !settled_data.is_empty() {
-            let start = match self.repack_settled_cursor {
-                Some(c) => settled_data
-                    .iter()
-                    .position(|(u, _)| *u > c)
-                    .unwrap_or_default(),
-                None => 0,
-            };
-            let take = REPACK_SETTLED_SCAN.min(settled_data.len());
-            for i in 0..take {
-                let scanned = settled_data[(start + i) % settled_data.len()].clone();
-                self.repack_settled_cursor = Some(scanned.0);
-                selected.push(scanned);
-            }
-        }
-
-        selected.sort_by_key(|(u, _)| *u);
-        Ok(selected.into_iter().map(|(_, p)| p).collect())
-    }
-
-    /// Prep phase of `repack` — runs on the actor thread.
-    ///
-    /// Pre-mints one output ULID per candidate segment, then the journal
-    /// outputs, then `u_flush`, and closes the WAL into a [`PromoteJob`]
-    /// at `u_flush`. The mint is monotonic, so the flushed segment sorts
-    /// above every output and the next WAL above that. Snapshots
-    /// `lbamap`, `extent_index`, `ancestor_layers`, and `fetcher` for
-    /// the worker's classifier and body resolver.
-    ///
-    /// The segment write itself runs on the worker, so the volume lock
-    /// covers the rotation and the mints alone.
-    ///
-    /// The caller dispatches [`RepackPrep::flush`] before the repack
-    /// job, so the promote's own apply lands first.
-    ///
-    /// Under [`RepackTrigger::Pressure`] the pass starts on what has
-    /// accumulated above [`Volume::repack_watermark`]. The tick asks at
-    /// its own cadence and the answer is usually `None`, which makes the
-    /// cadence an upper bound on how often the question is posed rather
-    /// than a schedule of work.
-    ///
-    /// Returns `None` when `pending/` is missing, has no segments, or
-    /// holds too little accumulation to be worth a pass.
-    pub fn prepare_repack(&mut self, trigger: RepackTrigger) -> io::Result<Option<RepackPrep>> {
+    ) -> io::Result<Option<RepackJob>> {
         let pending_dir = segment::pending_open_dir(&self.base_dir);
         let seg_paths = match segment::collect_segment_files(&pending_dir) {
             Ok(v) => v,
@@ -416,15 +236,7 @@ impl Volume {
         if seg_paths.is_empty() {
             return Ok(None);
         }
-        let settled_floor = self.repack_watermark;
-        if trigger == RepackTrigger::Pressure {
-            let (bytes, count) = accumulation_since(&seg_paths, settled_floor)?;
-            if bytes < REPACK_PRESSURE_BYTES && count < REPACK_PRESSURE_SEGMENTS {
-                return Ok(None);
-            }
-        }
         let floor = latest_snapshot(&self.base_dir)?;
-        let seg_paths = self.select_candidates(seg_paths, settled_floor)?;
 
         let mut output_ulids: Vec<Ulid> = Vec::with_capacity(seg_paths.len());
         for _ in 0..seg_paths.len() {
@@ -441,31 +253,36 @@ impl Volume {
             .collect();
         let u_flush = self.mint.next();
         let flush = self.rotate_wal_into_promote(u_flush)?;
-        // Every candidate listed above sits below `u_flush`, so the pass
-        // covers the directory as far as this ULID and the next one
-        // measures its accumulation from here.
-        self.repack_watermark = Some(u_flush);
 
-        Ok(Some(RepackPrep {
-            flush,
-            job: RepackJob {
-                base_dir: self.base_dir.clone(),
-                pending_dir,
-                floor,
-                seg_paths,
-                settled_floor,
-                work_budget: None,
-                output_ulids,
-                journal_output_ulids,
-                lbamap_snapshot: Arc::clone(&self.lbamap),
-                extent_index_snapshot: Arc::clone(&self.extent_index),
-                ancestor_layers: self.ancestor_layers.clone(),
-                fetcher: self.fetcher.clone(),
-                signer: Arc::clone(&self.signer),
-                verifying_key: self.verifying_key,
-                segment_cache: Arc::clone(&self.segment_cache),
-            },
-        }))
+        let job = RepackJob {
+            base_dir: self.base_dir.clone(),
+            pending_dir,
+            floor,
+            seg_paths,
+            work_budget: u64::MAX,
+            output_ulids,
+            journal_output_ulids,
+            lbamap_snapshot: Arc::clone(&self.lbamap),
+            extent_index_snapshot: Arc::clone(&self.extent_index),
+            ancestor_layers: self.ancestor_layers.clone(),
+            fetcher: self.fetcher.clone(),
+            signer: Arc::clone(&self.signer),
+            verifying_key: self.verifying_key,
+            segment_cache: Arc::clone(&self.segment_cache),
+        };
+        if let Some(flush) = flush {
+            match crate::actor::execute_promote(
+                flush,
+                &mut crate::actor::PriorSourceCache::default(),
+            ) {
+                Ok(result) => self.apply_promote(&result)?,
+                Err(failure) => {
+                    self.restore_failed_promote(*failure.job)?;
+                    return Err(failure.error);
+                }
+            }
+        }
+        Ok(Some(job))
     }
 
     /// Prep phase of the close pass — runs on the actor thread.
@@ -490,7 +307,6 @@ impl Volume {
         // The rotate empties `pending/open/`, so the sweep's view of it
         // starts over with the next generation's first segments.
         self.pending_journal.clear();
-        self.repack_settled_cursor = None;
         self.assert_volume_invariants("close_generation");
         let Some(rotated) = rotated else {
             return Ok(CloseGenerationPrep {
@@ -521,8 +337,7 @@ impl Volume {
                 pending_dir,
                 floor,
                 seg_paths,
-                settled_floor: None,
-                work_budget: Some(REPACK_CLOSE_WORK_BYTES),
+                work_budget: REPACK_CLOSE_WORK_BYTES,
                 output_ulids,
                 journal_output_ulids,
                 lbamap_snapshot: Arc::clone(&self.lbamap),
@@ -871,155 +686,6 @@ mod tests {
     }
 
     #[test]
-    fn pressure_withholds_a_pass_the_unconditional_trigger_starts() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        vol.write(0, &incompressible(1)).unwrap();
-        vol.promote_for_test().unwrap();
-
-        assert!(
-            vol.prepare_repack(RepackTrigger::Pressure)
-                .unwrap()
-                .is_none(),
-            "one small segment is below both thresholds"
-        );
-        assert!(
-            vol.prepare_repack(RepackTrigger::Unconditional)
-                .unwrap()
-                .is_some(),
-            "the unconditional trigger runs a pass over whatever is there"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    /// The sweep parses every settled segment it examines, so the count
-    /// it examines has to be bounded independently of how deep the
-    /// directory has got.
-    /// Settle `n` one-block segments without packing them, so the sweep
-    /// has a settled population to bound. A real pass would bin-pack
-    /// segments this small into a single output.
-    fn settled_volume(base: &std::path::Path, n: usize) -> (Volume, Vec<Ulid>) {
-        let mut vol = Volume::open(base, base).unwrap();
-        for lba in 0..n as u64 {
-            vol.write(lba, &incompressible(1)).unwrap();
-            vol.promote_for_test().unwrap();
-        }
-        let ulids = pending_open_ulids(base);
-        assert_eq!(ulids.len(), n, "setup: one segment per promote");
-        vol.repack_watermark = ulids.last().copied();
-        (vol, ulids)
-    }
-
-    /// ULIDs of the settled segments a prep put in the candidate set.
-    fn settled_in_pass(vol: &mut Volume, settled: &[Ulid]) -> Vec<Ulid> {
-        let job = vol
-            .prepare_repack(RepackTrigger::Unconditional)
-            .unwrap()
-            .expect("a pass")
-            .job;
-        job.seg_paths
-            .iter()
-            .filter_map(|p| p.file_name()?.to_str()?.parse::<Ulid>().ok())
-            .filter(|u| settled.contains(u))
-            .collect()
-    }
-
-    #[test]
-    fn a_pass_examines_a_bounded_number_of_settled_segments() {
-        let base = keyed_temp_dir();
-        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 3);
-
-        let examined = settled_in_pass(&mut vol, &settled).len();
-        assert_eq!(
-            examined,
-            REPACK_SETTLED_SCAN,
-            "examined {examined} settled segments of {}, cap is {REPACK_SETTLED_SCAN}",
-            settled.len()
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    /// Successive passes rotate through the settled population, so a
-    /// segment the cap skipped is reached by a later pass rather than
-    /// left forever.
-    #[test]
-    fn the_cursor_rotates_through_the_settled_population() {
-        let base = keyed_temp_dir();
-        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 2);
-
-        let mut seen: std::collections::BTreeSet<Ulid> = std::collections::BTreeSet::new();
-        for _ in 0..2 {
-            seen.extend(settled_in_pass(&mut vol, &settled));
-        }
-        assert_eq!(
-            seen.len(),
-            settled.len(),
-            "two passes at {REPACK_SETTLED_SCAN} each must reach all {} settled segments",
-            settled.len()
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    /// A pass that repacks data mints its outputs above everything
-    /// pending, so a journal segment the sweep held back would land
-    /// below them and invert data-before-journal. The memo is what lets
-    /// the sweep skip a settled segment without parsing it, so the two
-    /// have to agree.
-    #[test]
-    fn a_settled_journal_segment_is_never_held_back_by_the_cap() {
-        let base = keyed_temp_dir();
-        let (mut vol, settled) = settled_volume(&base, REPACK_SETTLED_SCAN * 3);
-
-        // The oldest segment is journal-tier as far as the sweep is
-        // concerned, and the cursor starts at the beginning, so a later
-        // pass is the one that would otherwise reach it.
-        let journal = settled[0];
-        vol.pending_journal.insert(journal);
-
-        for pass in 0..3 {
-            assert!(
-                settled_in_pass(&mut vol, &settled).contains(&journal),
-                "pass {pass} left the journal segment out of the candidate set"
-            );
-        }
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    /// The memo is rebuilt by each pass from what it classified, so a
-    /// consolidation output is what the next pass exempts.
-    #[test]
-    fn the_close_pass_carries_a_work_budget_and_the_tick_pass_does_not() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        vol.write(0, &incompressible(1)).unwrap();
-        vol.promote_for_test().unwrap();
-
-        let prep = vol
-            .prepare_repack(RepackTrigger::Unconditional)
-            .unwrap()
-            .expect("the unconditional trigger starts a pass");
-        assert_eq!(
-            prep.job.work_budget, None,
-            "the tick pass covers the open generation whole"
-        );
-
-        let prep = vol.prepare_close_generation().unwrap();
-        assert_eq!(
-            prep.job
-                .expect("a pass over the sealed generation")
-                .work_budget,
-            Some(REPACK_CLOSE_WORK_BYTES),
-            "the close pass bounds the work one sealed generation costs"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
     fn a_pass_records_the_journal_segments_it_leaves_behind() {
         let base = keyed_temp_dir();
         let mut cfg = crate::config::VolumeConfig::read(&base).unwrap();
@@ -1036,7 +702,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         assert!(vol.pending_journal.is_empty(), "nothing has passed yet");
-        vol.repack().unwrap();
+        vol.repack_open_for_test().unwrap();
 
         assert_eq!(
             vol.pending_journal.len(),
@@ -1048,124 +714,6 @@ mod tests {
             pending_open_ulids(&base).contains(&recorded),
             "the recorded journal ULID must name a segment that is there"
         );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn accumulated_bytes_start_a_pass() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        let payload = incompressible((REPACK_PRESSURE_BYTES / 4096) as usize + 1);
-        vol.write(0, &payload).unwrap();
-        vol.promote_for_test().unwrap();
-
-        assert!(
-            vol.prepare_repack(RepackTrigger::Pressure)
-                .unwrap()
-                .is_some(),
-            "one segment over the byte threshold starts a pass on its own"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn accumulated_segments_start_a_pass() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        for lba in 0..REPACK_PRESSURE_SEGMENTS as u64 {
-            vol.write(lba, &incompressible(1)).unwrap();
-            vol.promote_for_test().unwrap();
-        }
-
-        assert!(
-            vol.prepare_repack(RepackTrigger::Pressure)
-                .unwrap()
-                .is_some(),
-            "the segment count crosses on bytes far below the byte threshold"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn accumulation_is_measured_above_the_watermark() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        for lba in 0..REPACK_PRESSURE_SEGMENTS as u64 {
-            vol.write(lba, &incompressible(1)).unwrap();
-            vol.promote_for_test().unwrap();
-        }
-        vol.repack().unwrap();
-
-        assert!(
-            vol.prepare_repack(RepackTrigger::Pressure)
-                .unwrap()
-                .is_none(),
-            "a pass covered the directory, so nothing has accumulated since"
-        );
-
-        vol.write(1024, &incompressible(1)).unwrap();
-        vol.promote_for_test().unwrap();
-        assert!(
-            vol.prepare_repack(RepackTrigger::Pressure)
-                .unwrap()
-                .is_none(),
-            "one segment above the watermark is below both thresholds"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    // --- settled admission ---
-
-    #[test]
-    fn a_settled_segment_that_went_sparse_re_enters_the_pass() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        let block = incompressible(1);
-        vol.write(0, &block).unwrap();
-        vol.promote_for_test().unwrap();
-        vol.write(0, &incompressible(2)[4096..]).unwrap();
-        vol.promote_for_test().unwrap();
-
-        let ulids = pending_open_ulids(&base);
-        assert_eq!(ulids.len(), 2, "setup: one dead segment, one live");
-        vol.repack_watermark = ulids.last().copied();
-
-        let stats = vol.repack().unwrap();
-        assert_eq!(
-            stats.segments_compacted, 1,
-            "the fully-dead segment is sparse and re-enters; the live one is dense and stays out"
-        );
-        assert!(
-            pending_open_ulids(&base).contains(&ulids[1]),
-            "the dense settled segment keeps its own ULID"
-        );
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn settled_dense_segments_stay_out_of_the_pass() {
-        let base = keyed_temp_dir();
-        let mut vol = Volume::open(&base, &base).unwrap();
-        for lba in 0..2u64 {
-            vol.write(lba, &incompressible(1)).unwrap();
-            vol.promote_for_test().unwrap();
-        }
-
-        let ulids = pending_open_ulids(&base);
-        assert_eq!(ulids.len(), 2);
-        vol.repack_watermark = ulids.last().copied();
-
-        let stats = vol.repack().unwrap();
-        assert_eq!(
-            stats.segments_compacted, 0,
-            "two small all-live settled segments would otherwise pack into one bucket"
-        );
-        assert_eq!(pending_open_ulids(&base), ulids);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1182,7 +730,7 @@ mod tests {
         vol.write(1, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.bytes_freed, 0);
         assert_eq!(stats.extents_removed, 0);
@@ -1212,7 +760,7 @@ mod tests {
 
         // Two segments: first is 100% dead, second is live small.
         // The unified pass packs both into one bucket.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 2,
             "both inputs go into the packed bucket"
@@ -1243,7 +791,10 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
         let result = crate::actor::execute_repack(job).unwrap();
         let (stats, consumed) = vol.apply_repack_result(result).unwrap();
 
@@ -1291,7 +842,10 @@ mod tests {
         vol.promote_for_test().unwrap();
         vol.write(0, &interim).unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         // Worker window: the recurring content returns as a DedupRef
         // against the repack input.
@@ -1306,7 +860,7 @@ mod tests {
 
         // The next pass preps a snapshot that includes the claim,
         // carries the body, and converges.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(stats.buckets_refused, 0);
         assert_eq!(vol.read(0, 1).unwrap(), recurring);
 
@@ -1397,7 +951,7 @@ mod tests {
             vol.promote_for_test().unwrap();
             vol.write(0, &vec![0xBBu8; 4096]).unwrap(); // overwrite
             vol.promote_for_test().unwrap();
-            vol.repack().unwrap();
+            vol.repack_open_for_test().unwrap();
         }
 
         let vol = Volume::open(&base, &base).unwrap();
@@ -1422,7 +976,7 @@ mod tests {
 
         // First segment has a hash-dead entry; second is small and live.
         // The unified pass packs both into one bucket.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(stats.segments_compacted, 2);
         assert_eq!(stats.new_segments, 1);
         assert!(stats.bytes_freed > 0);
@@ -1450,7 +1004,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // Even with a strict threshold the pre-snapshot segments must be skipped.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be compacted"
@@ -1484,7 +1038,7 @@ mod tests {
 
         // Pre-snapshot dead segment is frozen; the two post-snapshot segments
         // (one dead, one live small) pack into one bucket.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 2,
             "both post-snapshot segments are packed; pre-snapshot is frozen"
@@ -1515,7 +1069,7 @@ mod tests {
         vol.promote_for_test().unwrap();
 
         // Strict threshold: repack anything with dead bytes.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "repack must not touch uploaded (cache/) segments"
@@ -1541,7 +1095,7 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert!(stats.segments_compacted >= 1);
         assert!(stats.bytes_freed > 0);
         assert_eq!(stats.extents_removed, 1);
@@ -1569,7 +1123,7 @@ mod tests {
         vol.write(0, &vec![0x22u8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         // The old dead extent is in cache/ — repack doesn't touch it.
         assert_eq!(stats.extents_removed, 0);
         // The new pending segment is small and all-live: single segment, no
@@ -1597,7 +1151,7 @@ mod tests {
         vol.snapshot().unwrap();
 
         // The two pre-snapshot segments are now frozen.
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 0,
             "pre-snapshot segments must not be touched"
@@ -1633,7 +1187,7 @@ mod tests {
             "pre-repack read must return the second write"
         );
 
-        vol.repack().unwrap();
+        vol.repack_open_for_test().unwrap();
         assert_eq!(
             vol.read(24, 8).unwrap(),
             payload_b,
@@ -1657,7 +1211,7 @@ mod tests {
         vol.write(2, &vec![0xccu8; 4096]).unwrap();
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(stats.segments_compacted, 3);
         assert_eq!(stats.new_segments, 1);
 
@@ -1706,7 +1260,7 @@ mod tests {
         // budget alongside the small.
         promote_segment_with_blocks(&mut vol, 1, 4352, 2);
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(
             stats.segments_compacted, 2,
             "bin-pack must combine the small and the 17 MiB segment"
@@ -1760,7 +1314,7 @@ mod tests {
         }
         vol.promote_for_test().unwrap();
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         // Anchor (1 entry) + first dedup (4096 entries) fill bucket[0]
         // (4097 entries; the next 4096 wouldn't fit). Buckets[1] takes
         // the remaining two dedup segments (4096 + 4096 = 8192). All
@@ -1785,7 +1339,7 @@ mod tests {
 
         promote_segment_with_blocks(&mut vol, 0, 4352, 1);
 
-        let stats = vol.repack().unwrap();
+        let stats = vol.repack_open_for_test().unwrap();
         assert_eq!(stats.segments_compacted, 0);
         assert_eq!(stats.new_segments, 0);
 
@@ -1798,7 +1352,7 @@ mod tests {
     // PR #302 (50511cd) lets `VolumeClient::write` acquire the volume mutex
     // from the calling thread instead of routing through the actor request
     // channel.  That moves writes outside the actor's serialisation window:
-    // a write can land between `prepare_repack` returning and
+    // a write can land between the pack prep returning and
     // `apply_repack_result` reacquiring the lock, while the worker is
     // classifying / materialising against a frozen snapshot.
     //
@@ -1808,7 +1362,7 @@ mod tests {
     // interpose a write).  They mirror the production sequence:
     //
     //   1. Set up at least one pending segment carrying a Keep entry.
-    //   2. Call `prepare_repack` — captures lbamap + extent_index snapshot,
+    //   2. Call the pack prep — captures lbamap + extent_index snapshot,
     //      mints u_flush + output_ulids.
     //   3. Issue a `Volume::write` that targets one of the snapshot's
     //      Keep entries' LBA ranges.
@@ -1841,7 +1395,10 @@ mod tests {
         vol.write(200, &payload_peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         // Lock-drop window: same LBA, different bytes → different hash.
         vol.write(100, &payload_b).unwrap();
@@ -1891,7 +1448,10 @@ mod tests {
         // Still in the WAL at prep, so the rotate has something to promote.
         vol.write(300, &unpromoted).unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         // Lands on the WAL the rotate left to be opened lazily.
         vol.write(100, &window).unwrap();
@@ -1941,7 +1501,10 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         // Lock-drop window: three single-block direct writes covering the
         // whole [100..103) range.
@@ -2017,7 +1580,10 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         // Lock-drop window: single-block direct write at the middle of the
         // 3-block range.  Splits lbamap into three:
@@ -2089,7 +1655,10 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
 
         for (i, block) in kernel_blocks.iter().enumerate() {
             vol.write(100 + i as u64, block).unwrap();
@@ -2146,7 +1715,10 @@ mod tests {
         vol.write(200, &peer).unwrap();
         vol.promote_for_test().unwrap();
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
         for (i, block) in kernel_blocks.iter().enumerate() {
             vol.write(100 + i as u64, block).unwrap();
         }
@@ -2157,7 +1729,7 @@ mod tests {
         // Second repack pass — now operating on the bucket output + the
         // segment(s) carrying the kernel writes.
         vol.flush_wal().unwrap();
-        vol.repack().unwrap();
+        vol.repack_open_for_test().unwrap();
 
         for (i, block) in kernel_blocks.iter().enumerate() {
             assert_eq!(
@@ -2212,7 +1784,10 @@ mod tests {
         vol.promote_for_test().unwrap();
         promote_segment_with_blocks(&mut vol, 2, 2, 2);
 
-        let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
         let result = crate::actor::execute_repack(job).unwrap();
 
         let mut saw_inline = false;

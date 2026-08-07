@@ -21,7 +21,7 @@ use elide_core::actor::VolumeClient;
 use elide_core::ipc::{Envelope, IpcError};
 use elide_core::volume::ReclaimThresholds;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CloseGenerationReply, CompactionReply, ConnectedReply, GcCheckpointReply,
+    ApplyGcHandoffsReply, CloseGenerationReply, ConnectedReply, GcCheckpointReply, ReapReply,
     ReclaimReply, ReclaimTarget, VolumeRequest,
 };
 
@@ -137,12 +137,12 @@ fn dispatch(
     match request {
         VolumeRequest::Flush => write_unit(writer, handle.flush()),
         VolumeRequest::PromoteWal => write_unit(writer, handle.promote_wal()),
-        VolumeRequest::Repack => match handle.repack(elide_core::volume::RepackTrigger::Pressure) {
+        VolumeRequest::Reap => match handle.reap() {
             Ok(stats) => {
-                let _ = write_envelope(writer, &Envelope::ok(CompactionReply { stats }));
+                let _ = write_envelope(writer, &Envelope::ok(ReapReply { stats }));
             }
             Err(e) => {
-                let _ = write_envelope::<CompactionReply>(
+                let _ = write_envelope::<ReapReply>(
                     writer,
                     &Envelope::err(IpcError::internal(e.to_string())),
                 );

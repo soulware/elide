@@ -52,6 +52,7 @@ mod jobs;
 mod open_state;
 mod read;
 mod readonly;
+mod reap;
 mod reclaim;
 mod repack;
 mod wal;
@@ -79,13 +80,17 @@ pub(crate) use read::{
     SharedFileCache, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
 };
 pub use readonly::ReadonlyVolume;
+pub use reap::{
+    ReapCandidate, ReapSegment, ReapStats, list_open_segments, parse_reap_candidates,
+    sweep_unreachable,
+};
 pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult, ReclaimThresholds,
     ReclaimedEntry, scan_reclaim_candidates,
 };
 pub use repack::{
-    CloseGenerationPrep, CompactionStats, RepackJob, RepackPrep, RepackResult, RepackTrigger,
-    RepackedBucket, RepackedInput, RepackedOutput,
+    CloseGenerationPrep, CompactionStats, RepackJob, RepackResult, RepackedBucket, RepackedInput,
+    RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -588,26 +593,8 @@ pub struct Volume {
     /// file on the next promote(). Populated by `write_commit` and by
     /// `recover_wal`, so body bytes live once — in the WAL and its page cache.
     pub(in crate::volume) pending: Vec<PendingWrite>,
-    /// Highest ULID a repack pass over the open generation has covered.
-    /// Segments at or below it are settled: a pass has already packed
-    /// them, so the pressure gate leaves them out of its accumulation
-    /// and the pass itself re-admits one only once it has gone sparse.
-    /// `None` until the first pass, which makes the whole directory
-    /// count as accumulation.
-    pub(in crate::volume) repack_watermark: Option<Ulid>,
-    /// Where the bounded settled sweep resumes: the last settled data
-    /// segment a pass examined. Successive passes rotate through the
-    /// settled population from here rather than parsing all of it.
-    pub(in crate::volume) repack_settled_cursor: Option<Ulid>,
-    /// Journal-tier ULIDs in `pending/open/`, as the last pass left it.
-    /// The sweep consults this to keep every journal segment in the
-    /// candidate set without parsing settled indexes to find them.
-    ///
-    /// Each pass rewrites it from what it saw, so it stays exact: a pass
-    /// classifies every journal segment, and a segment arriving between
-    /// passes sits above the watermark and is classified by the next
-    /// one. Empty at open, where the absent watermark makes the whole
-    /// directory a candidate.
+    /// Journal-tier ULIDs in `pending/open/`, as the last close pass
+    /// left it, with reaped segments removed as they go.
     pub(in crate::volume) pending_journal: std::collections::BTreeSet<Ulid>,
     /// True if at least one segment has been committed since the last snapshot
     /// (or since open, if no snapshot has been taken this session). Used by
@@ -935,8 +922,6 @@ impl Volume {
             sketch_index: Arc::new(sketch_index),
             wal,
             pending,
-            repack_watermark: None,
-            repack_settled_cursor: None,
             pending_journal: std::collections::BTreeSet::new(),
             has_new_segments,
             last_segment_ulid,

@@ -553,6 +553,13 @@ impl ExtentIndex {
         self.journal.remove(&segment);
     }
 
+    /// Whether `segment` holds any journal-tier body. A journal
+    /// segment's entries all register here, so membership identifies
+    /// the tier for callers holding only a segment ULID.
+    pub fn is_journal_segment(&self, segment: Ulid) -> bool {
+        self.journal.contains_key(&segment)
+    }
+
     /// Every journal-tier hash `segment` holds a body for. Seeds the
     /// resolvability footprint of an apply that purges the segment.
     pub fn journal_hashes(&self, segment: Ulid) -> impl Iterator<Item = blake3::Hash> + '_ {

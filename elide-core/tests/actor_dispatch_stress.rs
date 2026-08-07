@@ -99,7 +99,7 @@ fn actor_survives_dispatch_flood() {
         expected += 1;
         thread::spawn(move || {
             for i in 0..200u64 {
-                let _ = h.repack(elide_core::volume::RepackTrigger::Unconditional);
+                let _ = h.reap();
                 let _ = h.apply_gc_handoffs();
                 let _ = h.gc_checkpoint(2);
                 let _ = h.reclaim_alias_merge((i % 16) * 64, 64);

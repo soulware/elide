@@ -36,7 +36,7 @@ fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let _ = vol.repack();
+    let _ = vol.repack_open_for_test();
 
     let mut pending_after_repack: Vec<ulid::Ulid> = Vec::new();
     for gen_dir in elide_core::segment::pending_generation_dirs(dir) {

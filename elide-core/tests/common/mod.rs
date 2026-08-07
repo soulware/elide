@@ -45,17 +45,16 @@ pub fn write_test_keypair(dir: &Path) {
 /// Mirror the production drain (no S3 upload): repack, then promote
 /// every remaining pending segment in ULID-ascending order.
 pub fn drain_with_repack(vol: &mut elide_core::volume::Volume) {
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     for ulid in pending_ulids(vol.base_dir()) {
         vol.promote_segment(ulid).unwrap();
     }
 }
 
-/// `drain_with_repack` for a `VolumeClient` (actor-mediated).
+/// `drain_with_repack` for a `VolumeClient` (actor-mediated): reap what
+/// died, then promote what survives.
 pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
-    handle
-        .repack(elide_core::volume::RepackTrigger::Unconditional)
-        .unwrap();
+    handle.reap().unwrap();
     for ulid in pending_ulids(base_dir) {
         handle.promote_segment(ulid).unwrap();
     }
@@ -66,7 +65,7 @@ pub fn drain_via_handle(handle: &VolumeClient, base_dir: &Path) {
 /// promote its segments in ULID-ascending order — the in-process form
 /// of the uploader draining a closed generation.
 pub fn cut_and_drain(vol: &mut elide_core::volume::Volume) {
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     let base = vol.base_dir().to_path_buf();
     vol.close_generation().unwrap();
     for ulid in upload_ulids(&base) {

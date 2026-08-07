@@ -132,9 +132,9 @@ enum Command {
         out_dir: String,
     },
 
-    /// Rewrite pending segments that have any hash-dead body bytes (diagnostic)
+    /// Unlink open-generation segments nothing references (diagnostic)
     #[command(hide = true)]
-    Repack { fork_dir: PathBuf },
+    Reap { fork_dir: PathBuf },
 
     /// Print header and index entries of a segment or .idx file (diagnostic)
     #[command(hide = true)]
@@ -1096,14 +1096,14 @@ fn main() {
             extract_boot(Path::new(&image), Path::new(&out_dir)).expect("extract-boot failed");
         }
 
-        Command::Repack { fork_dir } => {
+        Command::Reap { fork_dir } => {
             let by_id_dir = fork_dir.parent().unwrap_or(&fork_dir).to_owned();
             let mut vol =
                 volume::Volume::open(&fork_dir, &by_id_dir).expect("failed to open volume");
-            let stats = vol.repack().expect("repack failed");
+            let stats = vol.reap_open_generation().expect("reap failed");
             println!(
-                "segments repacked: {}  bytes freed: {}  extents removed: {}",
-                stats.segments_compacted, stats.bytes_freed, stats.extents_removed,
+                "segments reaped: {}  entries removed: {}  bytes reclaimed: {}",
+                stats.segments_reaped, stats.entries_removed, stats.bytes_reclaimed,
             );
         }
 

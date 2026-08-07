@@ -87,7 +87,7 @@ fn reclaim_crash_recovery_seed_a978281b_regression() {
     assert!(!outcome.discarded, "single-threaded driver: never discards");
     assert_oracle(&mut vol, &oracle, "ReclaimRange(start_lba=3,lba_count=6)");
 
-    let _ = vol.repack();
+    let _ = vol.repack_open_for_test();
     assert_oracle(&mut vol, &oracle, "Repack");
 
     drop(vol);
@@ -173,7 +173,7 @@ fn reclaim_crash_recovery_seed_b0f166f0_regression() {
         "ReclaimRange(start_lba=24,lba_count=1)#2",
     );
 
-    let _ = vol.repack();
+    let _ = vol.repack_open_for_test();
     assert_oracle(&mut vol, &oracle, "SweepPending");
 
     drop(vol);
@@ -441,8 +441,8 @@ fn writemulti_overlap_sweep_then_repack_regression() {
     write_multi(&mut vol, &mut oracle, 3, 4, 0);
     write_multi(&mut vol, &mut oracle, 2, 2, 0);
 
-    let _ = vol.repack();
-    let _ = vol.repack();
+    let _ = vol.repack_open_for_test();
+    let _ = vol.repack_open_for_test();
 
     drop(vol);
     let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
@@ -517,8 +517,8 @@ fn gc_interleaved_writemulti_overlap_regression() {
     write_multi(&mut vol, &mut oracle, 3, 4, 0);
     write_multi(&mut vol, &mut oracle, 2, 2, 0);
 
-    let _ = vol.repack();
-    let _ = vol.repack();
+    let _ = vol.repack_open_for_test();
+    let _ = vol.repack_open_for_test();
 
     drop(vol);
     let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
@@ -987,7 +987,7 @@ fn repack_pipeline_crash_states_recover() {
     common::check_journal_flag_containment(fork_dir).expect("flag containment violated");
 }
 
-/// Repack may elide a body only because `prepare_repack` flushed its
+/// Repack may elide a body only because `prepare_pack_open_for_test` flushed its
 /// killer first.
 ///
 /// A guest write claims the lbamap immediately under the WAL ULID;
@@ -995,7 +995,7 @@ fn repack_pipeline_crash_states_recover() {
 /// (`apply_promoted_entries`). The classifier tests `still_at_input`,
 /// so a claim that moved anywhere marks the flushed body dead — safe
 /// only if the killer is durable alongside the elision. What makes it
-/// safe is structural: `prepare_repack` mints `u_flush` and flushes
+/// safe is structural: the pack prep mints `u_flush` and flushes
 /// the WAL into `pending/` *before* snapshotting the lbamap, so every
 /// killer the classifier can see is segment-resident and drains in
 /// the same batch, and writes racing in after prepare claim under a
@@ -1029,7 +1029,7 @@ fn repack_elision_always_ships_the_killer() {
     // Repack folds the flushed segment, eliding block 1; prepare's own
     // WAL flush puts the killer into pending first. Promote everything
     // — the local form of drain + cut publish.
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     for ulid in common::pending_ulids(fork_dir) {
         vol.promote_segment(ulid).unwrap();
     }

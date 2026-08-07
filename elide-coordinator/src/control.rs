@@ -14,9 +14,9 @@
 use std::path::Path;
 
 use elide_core::ipc::{Envelope, IpcError};
-use elide_core::volume::CompactionStats;
+use elide_core::volume::ReapStats;
 use elide_core::volume_ipc::{
-    ApplyGcHandoffsReply, CloseGenerationReply, CompactionReply, ConnectedReply, GcCheckpointReply,
+    ApplyGcHandoffsReply, CloseGenerationReply, ConnectedReply, GcCheckpointReply, ReapReply,
     ReclaimReply, VolumeRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -39,11 +39,11 @@ pub async fn promote_wal(fork_dir: &Path) -> bool {
     call_unit(fork_dir, &VolumeRequest::PromoteWal).await
 }
 
-/// Rewrite every pending segment with any hash-dead body bytes.
-/// Returns compaction stats on success.
+/// Unlink `pending/open/` segments nothing references.
+/// Returns reap stats on success.
 /// Returns `None` and logs a warning if the socket is absent or the call fails.
-pub async fn repack(fork_dir: &Path) -> Option<CompactionStats> {
-    let reply: CompactionReply = call_typed(fork_dir, &VolumeRequest::Repack).await?;
+pub async fn reap(fork_dir: &Path) -> Option<ReapStats> {
+    let reply: ReapReply = call_typed(fork_dir, &VolumeRequest::Reap).await?;
     Some(reply.stats)
 }
 
@@ -307,7 +307,7 @@ fn verb_label(request: &VolumeRequest) -> &'static str {
     match request {
         VolumeRequest::Flush => "flush",
         VolumeRequest::PromoteWal => "promote-wal",
-        VolumeRequest::Repack => "repack",
+        VolumeRequest::Reap => "reap",
         VolumeRequest::GcCheckpoint { .. } => "gc-checkpoint",
         VolumeRequest::ApplyGcHandoffs => "apply-gc-handoffs",
         VolumeRequest::SnapshotManifest { .. } => "snapshot-manifest",

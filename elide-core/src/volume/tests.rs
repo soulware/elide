@@ -1486,7 +1486,7 @@ fn a_data_repack_lifts_a_lone_all_live_journal_segment() {
     assert_eq!(journal_before.len(), 1, "setup: one journal segment");
     assert_eq!(data_before.len(), 2, "setup: two data segments");
 
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
 
     let (data_after, journal_after) = pending_tiers(&base, &vol.verifying_key);
     assert_eq!(journal_after.len(), 1, "the live ring stays one segment");
@@ -1518,7 +1518,7 @@ fn a_pass_with_no_data_output_leaves_the_journal_segment_alone() {
     let before = pending_ulids(&base);
     assert_eq!(before.len(), 1, "setup: journal segment only");
 
-    let stats = vol.repack().unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
     assert_eq!(stats.new_segments, 0);
     assert_eq!(pending_ulids(&base), before);
 
@@ -1845,7 +1845,7 @@ fn journal_consolidation_merges_pending_journal_segments() {
     vol.promote_for_test().unwrap();
     assert_eq!(pending_ulids(&base).len(), 3);
 
-    let stats = vol.repack().unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
     assert_eq!(
         stats.segments_compacted, 3,
         "all three journal segments are merged"
@@ -1893,7 +1893,7 @@ fn journal_consolidation_drops_dead_journal_entries() {
     vol.promote_for_test().unwrap();
     assert_eq!(pending_ulids(&base).len(), 2);
 
-    let stats = vol.repack().unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
     assert!(
         stats.bytes_freed > 0,
         "the superseded journal body is reclaimed"
@@ -1935,7 +1935,7 @@ fn journal_consolidation_keeps_data_below_journal() {
     vol.promote_for_test().unwrap();
     assert_eq!(pending_ulids(&base).len(), 4);
 
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
 
     let ulids = pending_ulids(&base);
     let journal_ulids: Vec<Ulid> = ulids
@@ -1988,7 +1988,7 @@ fn journal_consolidation_skips_lone_all_live_segment() {
     let before = pending_ulids(&base);
     assert_eq!(before.len(), 1);
 
-    let stats = vol.repack().unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
     assert_eq!(
         stats.new_segments, 0,
         "a lone all-live journal segment is not rewritten"
@@ -2039,7 +2039,7 @@ fn journal_lift_carries_the_input_inode() {
     assert_eq!(before.len(), 1);
     let ino_before = fs::metadata(seg_path(before[0])).unwrap().ino();
 
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
 
     let after = journal_of(&vol);
     assert_eq!(after.len(), 1);
@@ -2617,14 +2617,14 @@ fn pending_ulids(base: &Path) -> Vec<ulid::Ulid> {
     ulids
 }
 
-/// Run `vol.repack()` and return the post-repack ULID for `input_ulid`
+/// Run `vol.repack_open_for_test()` and return the post-repack ULID for `input_ulid`
 /// (input ULID on no-op, smallest fresh ULID on rewrite — repack
 /// pre-mints `u_repack_i < u_flush`, so the rewrite output sorts below
 /// any WAL-flush peer). For single-input test scenarios.
 fn repack_for_input(vol: &mut Volume, base: &Path, input_ulid: ulid::Ulid) -> ulid::Ulid {
     use std::collections::HashSet;
     let pre: HashSet<_> = pending_ulids(base).into_iter().collect();
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     let post: HashSet<_> = pending_ulids(base).into_iter().collect();
     if post.contains(&input_ulid) {
         return input_ulid;
@@ -3139,7 +3139,7 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     let data_a = vec![17u8; 4096];
     vol.write(2, &data_a).unwrap();
     vol.flush_wal().unwrap();
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     for ulid in pending_ulids(&base) {
         vol.promote_segment(ulid).unwrap();
     }
@@ -3147,7 +3147,7 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     let data_b = vec![34u8; 4096];
     vol.write(3, &data_b).unwrap();
     vol.flush_wal().unwrap();
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     for ulid in pending_ulids(&base) {
         vol.promote_segment(ulid).unwrap();
     }
@@ -3167,7 +3167,7 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     vol.write(6, &dedup_data_1).unwrap();
 
     // Repack: the post-snapshot segment (seed=0) is now fully dead.
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
 
     // The fully-dead seed=0 segment must have been deleted. Repack's
     // prep also flushes the WAL (the seed=1 writes) into a fresh
@@ -3181,9 +3181,9 @@ fn repack_deletes_fully_dead_segment_before_drain() {
     );
 
     // DrainWithRedact: redact + promote each remaining pending segment.
-    // (The WAL was already flushed during prepare_repack.)
+    // (The WAL was already flushed during the pack prep.)
     vol.flush_wal().unwrap();
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
     for ulid in pending_ulids(&base) {
         vol.promote_segment(ulid).unwrap();
     }
@@ -4764,7 +4764,7 @@ fn inline_repack_preserves_data() {
 
     // Repack: the segment with d0+d1 should be compacted; d1 survives.
     // Threshold 1.0 → compact any segment with dead extents.
-    let stats = vol.repack().unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
     assert!(stats.segments_compacted > 0);
 
     // Reads still correct after repack.
@@ -5212,7 +5212,10 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
         pending_ulids(&base).into_iter().collect();
     vol.write(0, &vec![8u8; 4096]).unwrap();
 
-    let job = vol.prepare_repack_inline().unwrap().expect("repack job");
+    let job = vol
+        .prepare_pack_open_for_test()
+        .unwrap()
+        .expect("repack job");
     let result = crate::actor::execute_repack(job).unwrap();
 
     // Between execute and apply, a promote lands a delta whose only

@@ -193,7 +193,7 @@ enum SimOp {
     /// Flush the WAL to a pending/ segment, directly on the volume.
     Flush,
     /// Volume-level sweep: packs small segments from pending/ into a single
-    /// new segment. Calls vol.repack() directly, bypassing the actor
+    /// new segment. Calls vol.repack_open_for_test() directly, bypassing the actor
     /// channel. Exercises ULID monotonicity and crash-recovery invariants.
     SweepPending,
     /// Volume-level density pass: rewrites sparse segments from pending/.
@@ -870,7 +870,7 @@ proptest! {
                         } else {
                             Default::default()
                         };
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -918,7 +918,7 @@ proptest! {
                         };
                     // Use a high threshold so any segment with dead bytes is a
                     // candidate, maximising the chance of actually repacking.
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                     let after = all_segment_ulids(fork_dir);
                     for u in after.difference(&ulids_before) {
                         prop_assert!(
@@ -1330,7 +1330,7 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::SweepPending => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 SimOp::HalfRepack {
                     apply,
@@ -1363,7 +1363,7 @@ proptest! {
                     }
                 }
                 SimOp::Repack => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
@@ -1737,7 +1737,7 @@ proptest! {
                     let _ = vol.flush_wal();
                 }
                 SimOp::SweepPending => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 SimOp::HalfRepack {
                     apply,
@@ -1770,7 +1770,7 @@ proptest! {
                     }
                 }
                 SimOp::Repack => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
@@ -2119,10 +2119,10 @@ proptest! {
                     common::drain_with_repack(&mut vol);
                 }
                 ReclaimOp::SweepPending => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 ReclaimOp::Repack => {
-                    let _ = vol.repack();
+                    let _ = vol.repack_open_for_test();
                 }
                 ReclaimOp::ReclaimRange { start_lba, lba_count } => {
                     let outcome = vol

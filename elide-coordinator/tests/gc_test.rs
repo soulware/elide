@@ -1088,7 +1088,7 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     // ULID-ascending order.
     let drain = |vol: &mut Volume| {
         let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
-        let _ = vol.repack();
+        let _ = vol.repack_open_for_test();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
         for ulid in pending_after_repack {
@@ -1215,7 +1215,7 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
-        let _ = vol.repack();
+        let _ = vol.repack_open_for_test();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
         for ulid in pending_after_repack {
@@ -1349,7 +1349,7 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
 
     let drain = |vol: &mut Volume| {
         let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
-        let _ = vol.repack();
+        let _ = vol.repack_open_for_test();
         let pending_after_repack =
             elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap_or_default();
         for ulid in pending_after_repack {
