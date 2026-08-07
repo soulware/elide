@@ -228,6 +228,24 @@ enum SimOp {
     /// bucket then removes only `remove_inputs` consumed-input files —
     /// a crash partway through `remove_consumed_inputs`.
     HalfRepack { apply: bool, remove_inputs: u8 },
+    /// The open generation's reap: unlink `pending/open/` segments the
+    /// sweep finds unreachable. The tick's pass in production, where
+    /// packing happens once at the close.
+    Reap,
+    /// A crash inside the reap pipeline (`reap_crash_for_test`):
+    /// applies the pass, then unlinks only `unlink` of the reaped
+    /// files — a crash partway through `remove_consumed_inputs`, with
+    /// entries dropped from the in-memory maps whose segment files a
+    /// rebuild still finds.
+    HalfReap { unlink: u8 },
+    /// Manufacture a whole-dead open segment and reap it: write an
+    /// LBA, flush it to a segment of its own, overwrite the same LBA,
+    /// flush again, then reap. The first segment holds nothing live by
+    /// construction — the shape a seconds-old window produces in
+    /// production (a jbd2 ring rewrite, a hot page overwritten twice),
+    /// and the one a bare `Reap` on generated state reaches only by
+    /// chance.
+    ReapCycle { lba: u8, seed_a: u8, seed_b: u8 },
     /// Simulate one coordinator GC sweep pass directly on the filesystem,
     /// using `n` segments as input. Exercises ULID monotonicity and
     /// crash-recovery invariants for the coordinator GC path.
@@ -522,6 +540,16 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
             // Inputs are only removable after apply (the in-memory index
             // still resolves through them until then).
             remove_inputs: if apply { r } else { 0 },
+        }),
+        Just(SimOp::Reap),
+        (0u8..=2).prop_map(|unlink| SimOp::HalfReap { unlink }),
+        // `delta` is non-zero mod 128, so the overwrite always changes
+        // content — an identical second write is skipped, and the first
+        // segment would stay live.
+        (0u8..4, 0u8..128u8, 1u8..128u8).prop_map(|(lba, seed_a, delta)| SimOp::ReapCycle {
+            lba,
+            seed_a,
+            seed_b: seed_a.wrapping_add(delta) % 128,
         }),
     ]
 }
@@ -884,6 +912,70 @@ proptest! {
                             "sweep_pending deleted frozen segment {u} (floor {:?})",
                             snapshot_floor
                         );
+                    }
+                }
+                SimOp::Reap => {
+                    let frozen_before: std::collections::BTreeSet<Ulid> =
+                        if let Some(floor) = snapshot_floor {
+                            ulids_before.iter().copied().filter(|u| *u <= floor).collect()
+                        } else {
+                            Default::default()
+                        };
+                    let _ = vol.reap_open_generation();
+                    let after = all_segment_ulids(fork_dir);
+                    for u in &frozen_before {
+                        prop_assert!(
+                            after.contains(u),
+                            "reap deleted frozen segment {u} (floor {:?})",
+                            snapshot_floor
+                        );
+                    }
+                }
+                SimOp::ReapCycle {
+                    lba,
+                    seed_a,
+                    seed_b,
+                } => {
+                    let actual_lba = 68 + *lba as u64;
+                    let _ = vol.write(actual_lba, &[*seed_a; 4096]);
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(actual_lba, &[*seed_b; 4096]);
+                    let _ = vol.flush_wal();
+                    let frozen_before: std::collections::BTreeSet<Ulid> =
+                        if let Some(floor) = snapshot_floor {
+                            all_segment_ulids(fork_dir)
+                                .iter()
+                                .copied()
+                                .filter(|u| *u <= floor)
+                                .collect()
+                        } else {
+                            Default::default()
+                        };
+                    let _ = vol.reap_open_generation();
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "reap_cycle produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
+                    for u in &frozen_before {
+                        prop_assert!(
+                            after.contains(u),
+                            "reap_cycle deleted frozen segment {u} (floor {:?})",
+                            snapshot_floor
+                        );
+                    }
+                }
+                SimOp::HalfReap { unlink } => {
+                    let _ = vol.reap_crash_for_test(*unlink as usize);
+                    {
+                        // Applied in memory with the reaped files still
+                        // on disk: a state only a crash reaches, so the
+                        // op takes that crash immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
                     }
                 }
                 SimOp::HalfRepack {
@@ -1365,6 +1457,48 @@ proptest! {
                 SimOp::Repack => {
                     let _ = vol.repack_open_for_test();
                 }
+                SimOp::Reap => {
+                    let _ = vol.reap_open_generation();
+                }
+                SimOp::ReapCycle {
+                    lba,
+                    seed_a,
+                    seed_b,
+                } => {
+                    let actual_lba = 68 + *lba as u64;
+                    let _ = vol.write(actual_lba, &[*seed_a; 4096]);
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(actual_lba, &[*seed_b; 4096]);
+                    let _ = vol.flush_wal();
+                    let _ = vol.reap_open_generation();
+                    oracle.insert(actual_lba, [*seed_b; 4096]);
+                }
+                SimOp::HalfReap { unlink } => {
+                    let _ = vol.reap_crash_for_test(*unlink as usize);
+                    {
+                        // Applied in memory with the reaped files still
+                        // on disk: a state only a crash reaches, so the
+                        // op takes that crash immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
+                        common::assert_promote_recovery(&mut vol, fork_dir);
+                        common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_journal_flag_containment(fork_dir)
+                            .map_err(TestCaseError::fail)?;
+                        for (&lba, expected) in &oracle {
+                            let actual = vol.read(lba, 1).unwrap();
+                            prop_assert_eq!(
+                                actual.as_slice(),
+                                expected.as_slice(),
+                                "lba {} wrong after half-reap crash+rebuild",
+                                lba
+                            );
+                        }
+                    }
+                }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
                 }
@@ -1771,6 +1905,48 @@ proptest! {
                 }
                 SimOp::Repack => {
                     let _ = vol.repack_open_for_test();
+                }
+                SimOp::Reap => {
+                    let _ = vol.reap_open_generation();
+                }
+                SimOp::ReapCycle {
+                    lba,
+                    seed_a,
+                    seed_b,
+                } => {
+                    let actual_lba = 68 + *lba as u64;
+                    let _ = vol.write(actual_lba, &[*seed_a; 4096]);
+                    let _ = vol.flush_wal();
+                    let _ = vol.write(actual_lba, &[*seed_b; 4096]);
+                    let _ = vol.flush_wal();
+                    let _ = vol.reap_open_generation();
+                    oracle.insert(actual_lba, [*seed_b; 4096]);
+                }
+                SimOp::HalfReap { unlink } => {
+                    let _ = vol.reap_crash_for_test(*unlink as usize);
+                    {
+                        // Applied in memory with the reaped files still
+                        // on disk: a state only a crash reaches, so the
+                        // op takes that crash immediately.
+                        drop(vol);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        pending_gc = None;
+                        common::assert_promote_recovery(&mut vol, fork_dir);
+                        common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_tier_purity(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_generation_layout(fork_dir).map_err(TestCaseError::fail)?;
+                        common::check_journal_flag_containment(fork_dir)
+                            .map_err(TestCaseError::fail)?;
+                        for (&lba, expected) in &oracle {
+                            let actual = vol.read(lba, 1).unwrap();
+                            prop_assert_eq!(
+                                actual.as_slice(),
+                                expected.as_slice(),
+                                "lba {} wrong after half-reap crash+rebuild",
+                                lba
+                            );
+                        }
+                    }
                 }
                 SimOp::DrainWithRedact => {
                     common::drain_with_repack(&mut vol);
