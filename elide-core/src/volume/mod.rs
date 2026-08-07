@@ -31,6 +31,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub use segment::BoxFetcher;
 
@@ -1612,6 +1613,7 @@ impl Volume {
             return Ok(StagedApply::Diverged);
         }
 
+        let derive_start = Instant::now();
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
         // Liveness for the veto is a claim or any recorded encoding
@@ -1669,21 +1671,7 @@ impl Volume {
             return Ok(StagedApply::Cancelled);
         }
 
-        // Register the output's entries as the disk rebuild would,
-        // gated on the current owner being a consumed input. Carried
-        // Delta locations are `Full` against the bare `gc/<new_ulid>`
-        // file (still at `tmp_path` until the rename below, hence the
-        // layout read); the gc-carried promote flips them to `Cached`.
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
-        let delta_body_source =
-            extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
-        let ctx = extentindex::SegmentRegistrationCtx {
-            segment_id: new_ulid,
-            body_section_start: new_bss,
-            body_tier: extentindex::RegistrationBodyTier::Cached,
-            delta_body_source,
-            inline: extentindex::InlineSource::Section(&handoff_inline),
-        };
         // Every hash whose resolvability this apply can change: the
         // output's entries (registered in the index, merged as claims),
         // the input-owned hashes it removes, and the journal-tier
@@ -1693,13 +1681,34 @@ impl Volume {
         for input in &consumed {
             footprint.extend(self.extent_index.journal_hashes(*input));
         }
+        let derive = derive_start.elapsed();
+
+        // Register the output's entries as the disk rebuild would,
+        // gated on the current owner being a consumed input. Carried
+        // Delta locations are `Full` against the bare `gc/<new_ulid>`
+        // file (still at `tmp_path` until the rename below, hence the
+        // layout read); the gc-carried promote flips them to `Cached`.
+        let header_start = Instant::now();
+        let delta_body_source =
+            extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
+        let header = header_start.elapsed();
+        let ctx = extentindex::SegmentRegistrationCtx {
+            segment_id: new_ulid,
+            body_section_start: new_bss,
+            body_tier: extentindex::RegistrationBodyTier::Cached,
+            delta_body_source,
+            inline: extentindex::InlineSource::Section(&handoff_inline),
+        };
 
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
         // path.
         let pre_apply_index = Arc::clone(&self.extent_index);
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
+        let mut merge = Duration::ZERO;
+        let gate_start = Instant::now();
         let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
+            let merge_start = Instant::now();
             {
                 let index = Arc::make_mut(&mut vol.extent_index);
                 for (i, e) in entries.iter().enumerate() {
@@ -1742,8 +1751,10 @@ impl Volume {
             for e in &entries {
                 lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
             }
+            merge = merge_start.elapsed();
             Ok(())
         })?;
+        let gate_check = gate_start.elapsed().saturating_sub(merge);
 
         if let ResolvabilityGate::Refused(orphaned) = gate {
             let detail = orphaned
@@ -1772,6 +1783,7 @@ impl Volume {
             return Ok(StagedApply::Cancelled);
         }
 
+        let fs_start = Instant::now();
         for input in &inputs {
             if let Some(p) = segment::find_pending_file(&self.base_dir, &input.to_string()) {
                 let _ = fs::remove_file(p);
@@ -1790,6 +1802,18 @@ impl Volume {
             return Err(e);
         }
         let _ = fs::remove_file(&plan_path);
+        log::info!(
+            "plan {new_ulid}: apply phases entries={} removed={} inputs={} \
+             derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms fs={:.1}ms",
+            entries.len(),
+            to_remove.len(),
+            inputs.len(),
+            derive.as_secs_f64() * 1e3,
+            header.as_secs_f64() * 1e3,
+            merge.as_secs_f64() * 1e3,
+            gate_check.as_secs_f64() * 1e3,
+            fs_start.elapsed().as_secs_f64() * 1e3,
+        );
         self.own_segments.insert(new_ulid);
         // Bump last_segment_ulid so a snapshot taken after this apply
         // (with no intervening write) mints its marker at or above the
@@ -2319,6 +2343,10 @@ impl Volume {
         if residual.is_empty() {
             return found;
         }
+        log::info!(
+            "resolvability gate: residual walk over {} journal-tier hash(es)",
+            residual.len(),
+        );
         for (lba, _len, hash, _off, claimant) in self.lbamap.iter_entries_with_claimant() {
             if !residual.contains(&hash) {
                 continue;
