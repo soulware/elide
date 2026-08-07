@@ -1629,12 +1629,10 @@ impl Volume {
 
         let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
-        // Liveness for the veto is claims plus every named delta source:
-        // a base body must stay resolvable while any registered encoding
-        // names it, so its extent must cancel a plan that drops it.
-        let mut live_hashes = self.lbamap.claim_referenced_hashes();
-        live_hashes.extend(self.extent_index.named_delta_sources());
-
+        // Liveness for the veto is a claim or any recorded encoding
+        // naming the hash as a source: a base body must stay resolvable
+        // while an encoding names it, so its extent must cancel a plan
+        // that drops it. Both probe maintained counts.
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
         for (hash, _kind, input_ulid) in &input_old_entries {
@@ -1654,7 +1652,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if live_hashes.contains(hash) {
+            if self.lbamap.is_referenced(hash) || self.extent_index.is_named_delta_source(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
@@ -2466,6 +2464,7 @@ impl Volume {
         self.assert_pending_above_committed(caller);
         self.assert_extent_index_consistent(caller);
         self.assert_lbamap_hashes_resolvable(caller);
+        self.extent_index.debug_assert_delta_source_counts();
     }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,

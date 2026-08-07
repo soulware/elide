@@ -594,12 +594,6 @@ impl Volume {
         let mut pending_journal: std::collections::BTreeSet<Ulid> =
             journal_untouched.into_iter().collect();
 
-        // Claims plus every named delta source: a base body must stay
-        // resolvable while any registered encoding names it, so its
-        // extent must refuse a bucket that drops it.
-        let mut live_hashes = self.lbamap.claim_referenced_hashes();
-        live_hashes.extend(self.extent_index.named_delta_sources());
-
         for bucket in &buckets {
             let carried_hashes = bucket
                 .output
@@ -623,7 +617,9 @@ impl Volume {
             // naming an input-owned hash as its source — can make a hash
             // this bucket drops live again. A delta source makes no LBA
             // claim, so the resolvability gate cannot see it; the liveness
-            // check here is what refuses the bucket.
+            // check here is what refuses the bucket. Liveness is probed
+            // against the maintained counts as each bucket reaches it, so
+            // an earlier bucket's landing counts.
             let stale: Vec<blake3::Hash> = bucket
                 .inputs
                 .iter()
@@ -640,7 +636,9 @@ impl Volume {
                                 .extent_index
                                 .lookup_delta(hash)
                                 .is_some_and(|loc| loc.segment_id == input.input_ulid);
-                        still_at_input && live_hashes.contains(hash)
+                        still_at_input
+                            && (self.lbamap.is_referenced(hash)
+                                || self.extent_index.is_named_delta_source(hash))
                     })
                 })
                 .copied()

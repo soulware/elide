@@ -234,10 +234,12 @@ buckets is indistinguishable from one landing before the apply. Publishing once
 at the end keeps readers off any partial state, and the inputs stay in place
 until after that publish as they do today.
 
-**The two set materialisations become membership probes.**
-`LbaMap::is_referenced` already is one, against the maintained refcounts;
-`named_delta_sources` wants an `is_named_delta_source` counterpart. That takes
-two volume-sized allocations out of every apply.
+**The two set materialisations are membership probes.** The stale-liveness
+veto probes `LbaMap::is_referenced` against the maintained claim refcounts and
+`ExtentIndex::is_named_delta_source` against source counts maintained on the
+recording and purge paths. The probes read live state, so a pin an earlier
+bucket's purge lapsed permits the drop a rebuild would; the snapshot form
+survives in the worker-side classifiers, which hold no mutex.
 
 **`full_for_segment` moves to the worker**, which wrote the file and holds the
 entries and `body_section_start` already.

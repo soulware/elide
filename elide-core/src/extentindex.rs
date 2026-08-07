@@ -360,6 +360,12 @@ pub struct ExtentIndex {
     /// Segment-outer for the same reason as `journal`: retiring an input is
     /// one `remove`.
     delta_sources: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, Arc<[blake3::Hash]>>>,
+    /// `delta_source_counts[s]` equals the number of recorded encodings
+    /// across `delta_sources` naming `s` as a source, maintained on the
+    /// recording and purge paths. Answers
+    /// [`Self::is_named_delta_source`] with one probe, where inverting
+    /// `delta_sources` walks every recorded encoding.
+    delta_source_counts: imbl::HashMap<blake3::Hash, u32>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -375,7 +381,26 @@ impl ExtentIndex {
             deltas: Blake3HamtMap::default(),
             journal: imbl::HashMap::new(),
             delta_sources: imbl::HashMap::new(),
+            delta_source_counts: imbl::HashMap::new(),
             segment_presence: HashMap::new(),
+        }
+    }
+
+    fn bump_source_counts(&mut self, sources: &[blake3::Hash]) {
+        for source in sources {
+            *self.delta_source_counts.entry(*source).or_insert(0) += 1;
+        }
+    }
+
+    fn drop_source_counts(&mut self, sources: &[blake3::Hash]) {
+        for source in sources {
+            match self.delta_source_counts.get_mut(source) {
+                Some(1) => {
+                    self.delta_source_counts.remove(source);
+                }
+                Some(n) => *n -= 1,
+                None => debug_assert!(false, "delta_source_counts drop below zero"),
+            }
         }
     }
 
@@ -663,7 +688,45 @@ impl ExtentIndex {
     /// unlinked its entries name nothing, and a rebuild walks only the
     /// segments that remain.
     pub fn purge_segment_delta_sources(&mut self, segment: Ulid) {
-        self.delta_sources.remove(&segment);
+        if let Some(per_hash) = self.delta_sources.remove(&segment) {
+            for sources in per_hash.values() {
+                self.drop_source_counts(sources);
+            }
+        }
+    }
+
+    /// Whether any recorded encoding names `hash` as a source — one
+    /// probe against the maintained counts, the membership form of
+    /// [`Self::named_delta_sources`] for callers holding the volume
+    /// mutex.
+    pub fn is_named_delta_source(&self, hash: &blake3::Hash) -> bool {
+        self.delta_source_counts.contains_key(hash)
+    }
+
+    /// Recompute the source counts from `delta_sources`, the definition
+    /// the maintained map has to match. The oracle for
+    /// [`Self::debug_assert_delta_source_counts`].
+    fn recount_delta_sources(&self) -> imbl::HashMap<blake3::Hash, u32> {
+        let mut out: imbl::HashMap<blake3::Hash, u32> = imbl::HashMap::new();
+        for per_hash in self.delta_sources.values() {
+            for sources in per_hash.values() {
+                for source in sources.iter() {
+                    *out.entry(*source).or_insert(0) += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Assert the maintained `delta_source_counts` equals a fresh
+    /// recount. Compiled out of release builds; call it after mutations
+    /// in tests and at apply boundaries.
+    pub fn debug_assert_delta_source_counts(&self) {
+        debug_assert_eq!(
+            self.delta_source_counts,
+            self.recount_delta_sources(),
+            "delta_source_counts diverged from a recount over delta_sources"
+        );
     }
 
     /// Flip `DeltaBodySource::Full → Cached` for `hash`, but only if
@@ -818,10 +881,15 @@ impl ExtentIndex {
                         .iter()
                         .map(|opt| opt.source_hash)
                         .collect();
-                    self.delta_sources
+                    self.bump_source_counts(&sources);
+                    if let Some(replaced) = self
+                        .delta_sources
                         .entry(ctx.segment_id)
                         .or_default()
-                        .insert(entry.hash, sources);
+                        .insert(entry.hash, sources)
+                    {
+                        self.drop_source_counts(&replaced);
+                    }
                 }
                 if admitted {
                     self.deltas.insert(
@@ -1749,6 +1817,52 @@ mod tests {
             !sources.contains(&h(13)),
             "a purged segment's records pin nothing"
         );
+    }
+
+    /// The maintained source counts answer the same question the
+    /// inverted set does, through recording, a same-slot re-record, a
+    /// shared source across segments, and purges — with the recount
+    /// oracle checked at every step.
+    #[test]
+    fn is_named_delta_source_tracks_recording_and_purge() {
+        let mut index = ExtentIndex::new();
+        let consumed = std::collections::HashSet::new();
+
+        let home = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(11), delta_opt(12)]);
+        let dup = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(11)]);
+        index
+            .register_entry_consuming_inputs(&home, 0, &reg_ctx(useg(3)), &consumed)
+            .unwrap();
+        index
+            .register_entry_consuming_inputs(&dup, 0, &reg_ctx(useg(5)), &consumed)
+            .unwrap();
+        index.debug_assert_delta_source_counts();
+        assert!(index.is_named_delta_source(&h(11)));
+        assert!(index.is_named_delta_source(&h(12)));
+        assert!(!index.is_named_delta_source(&h(13)));
+
+        // A re-record in the same segment slot replaces the recording,
+        // so the replaced sources lapse and the new ones count.
+        let rerecord = SegmentEntry::new_delta(h(1), 0, 1, vec![delta_opt(13)]);
+        index
+            .register_entry_consuming_inputs(&rerecord, 1, &reg_ctx(useg(3)), &consumed)
+            .unwrap();
+        index.debug_assert_delta_source_counts();
+        assert!(
+            !index.is_named_delta_source(&h(12)),
+            "the replaced recording's source lapsed"
+        );
+        assert!(index.is_named_delta_source(&h(13)));
+
+        // h(11) is still named by useg(5)'s recording after useg(3)
+        // purges, and lapses when the last naming segment purges.
+        index.purge_segment_delta_sources(useg(3));
+        index.debug_assert_delta_source_counts();
+        assert!(index.is_named_delta_source(&h(11)));
+        assert!(!index.is_named_delta_source(&h(13)));
+        index.purge_segment_delta_sources(useg(5));
+        index.debug_assert_delta_source_counts();
+        assert!(!index.is_named_delta_source(&h(11)));
     }
 
     #[test]
