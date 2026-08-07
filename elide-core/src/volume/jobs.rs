@@ -326,7 +326,6 @@ pub enum WorkerJob {
     Promote(PromoteJob),
     GcPlan(GcPlanApplyJob),
     PromoteSegment(PromoteSegmentJob),
-    Repack(RepackJob),
     /// The pass over a sealed generation. Same job and same
     /// `execute_repack`, aimed at `pending/upload/`.
     CloseGeneration(RepackJob),
@@ -348,7 +347,6 @@ pub enum WorkerResult {
         ulid: Ulid,
         result: io::Result<PromoteSegmentResult>,
     },
-    Repack(io::Result<RepackResult>),
     CloseGeneration(io::Result<RepackResult>),
     SignSnapshotManifest(io::Result<SignSnapshotManifestResult>),
     Reclaim(io::Result<ReclaimResult>),

@@ -2350,7 +2350,7 @@ mod tests {
     ) {
         let pending_dir = elide_core::segment::pending_open_dir(dir);
 
-        let _ = vol.repack().unwrap();
+        let _ = vol.repack_open_for_test().unwrap();
 
         let pending_after_repack = elide_core::segment::read_ulid_dir_sorted(&pending_dir).unwrap();
         for ulid in pending_after_repack {

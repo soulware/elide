@@ -1,6 +1,6 @@
 # Operations
 
-Ongoing system behaviour: WAL promotion, S3 upload, garbage collection, repacking, and filesystem metadata awareness.
+Ongoing system behaviour: WAL promotion, S3 upload, garbage collection, the reap and close passes, and filesystem metadata awareness.
 
 ## WAL promotion
 
@@ -58,9 +58,9 @@ Any CLI operation that mutates a live volume's directory must go through coordin
 
 Segments accumulate in `pending/` after WAL promotion. The coordinator's per-fork drain loop runs these steps sequentially on each tick:
 
-1. **Promote WAL** via `promote-wal` IPC — moves any open WAL records into a `pending/<ulid>` segment so they're visible to compaction and upload. Distinct from the `flush` IPC verb, which is `fdatasync` only and does not promote. An idle volume's writes wouldn't otherwise reach `pending/` until the 32 MiB size threshold or the 10 s idle tick fires; sweep and repack early-return when `pending/` is empty.
-2. **Sweep** via `sweep_pending` IPC (merges small `pending/` segments)
-3. **Repack** via `repack` IPC (rewrites every `pending/` segment with any hash-dead body; deleted data does not reach S3)
+1. **Promote WAL** via `promote-wal` IPC — moves any open WAL records into a `pending/<ulid>` segment so they're visible to compaction and upload. Distinct from the `flush` IPC verb, which is `fdatasync` only and does not promote. An idle volume's writes wouldn't otherwise reach `pending/` until the 32 MiB size threshold or the 10 s idle tick fires; sweep and reap early-return when `pending/` is empty.
+2. **Reap** via `reap` IPC (unlinks `pending/open/` segments nothing references)
+3. **Close** via `close-generation` IPC once the cut lands (packs the sealed generation into `pending/upload/`; deleted data does not reach S3)
 4. **Upload** — PUT each `pending/` file, send `promote <ulid>` IPC on success; the volume writes `index/<ulid>.idx` + `cache/<ulid>.body` + `cache/<ulid>.present` and removes `pending/<ulid>`.
 5. **GC** — rate-limited to `gc_interval` (default 10s); see below.
 
@@ -188,7 +188,7 @@ The `serve-volume` actor runs a compaction pass on `pending/` in its idle arm af
 
 The entry cap mirrors the WAL flush cap (`FLUSH_ENTRY_THRESHOLD = 8192`) and matters because `live_bytes` here counts only `Data + Inline` body bytes — `DedupRef` and `Zero` entries are zero-cost on the byte budget. Without an entry cap, several DedupRef-heavy pending segments could pack into one output with an unboundedly large index region.
 
-Selection is purely about packing. Dead-data removal is repack's job (gated on density); sweep clears any dead entries inside its selected inputs as a side-effect of the rewrite, but does not select on that signal. A single-segment bucket is skipped — single rewrites either accomplish nothing (no-dead) or are repack's domain (has-dead).
+Selection is purely about packing. Dead-data removal in the pending tier belongs to the reap and the close pass; sweep clears any dead entries inside its selected inputs as a side-effect of the rewrite, but does not select on that signal. A single-segment bucket is skipped — single rewrites either accomplish nothing (no-dead) or are the close pass's domain (has-dead).
 
 The 16 MiB threshold is half the 32 MiB target, so two smalls always combine to fit and the merged output exits the small set permanently — no infinite re-pack loop.
 

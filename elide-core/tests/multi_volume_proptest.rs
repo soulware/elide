@@ -187,8 +187,8 @@ proptest! {
                 }
                 MultiOp::FlushA => { vol_a.flush_wal().unwrap(); }
                 MultiOp::FlushB => { vol_b.flush_wal().unwrap(); }
-                MultiOp::RepackA => { vol_a.repack().unwrap(); }
-                MultiOp::RepackB => { vol_b.repack().unwrap(); }
+                MultiOp::RepackA => { vol_a.repack_open_for_test().unwrap(); }
+                MultiOp::RepackB => { vol_b.repack_open_for_test().unwrap(); }
                 MultiOp::DrainA => { common::drain_with_repack(&mut vol_a); }
                 MultiOp::DrainB => { common::drain_with_repack(&mut vol_b); }
                 MultiOp::CrashA => {

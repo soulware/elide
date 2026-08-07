@@ -1,9 +1,12 @@
 # Design: the open generation reaps, the close pass packs
 
-**Status:** Proposed. Revises the division of labour set out in
-`open-generation-repack.md` and `generation-close-pass.md`, both implemented.
-Builds on upload generations (`upload-generations.md`) and journal
-consolidation (`journal-pending-consolidation.md`).
+**Status:** Reap implemented (#899): the sweep, the reap trio, the removal of
+the open-pass trigger machinery, and journal consolidation at the close.
+Parse-free close admission, the elastic budget and the quiescence cut are
+design only. Revises the division of labour set out in
+`open-generation-repack.md` and `generation-close-pass.md`. Builds on upload
+generations (`upload-generations.md`) and journal consolidation
+(`journal-pending-consolidation.md`).
 
 ## Problem
 
@@ -92,15 +95,17 @@ every promote queues behind, so a reap dispatched there delays the promote a
 it avoids.
 
 The reap also has little to move. Where repack has classification, body reads,
-recompression and signing, the reap has a census read, an index-region parse
+recompression and signing, the reap has a snapshot sweep, an index-region parse
 per reaped segment, a set of index removals, a snapshot publish and a batch of
 unlinks. So the pass is the same prepare/execute/apply trio as everything else,
 with the mutex over the first and third phases:
 
-1. **Prepare (mutex).** Read the census, take the reap set under the cap below.
-2. **Execute (no mutex).** Parse the index region of each segment in the set for
+1. **Sweep (no mutex).** Walk the published snapshot's maps for the candidate
+   set, take the reap set under the cap below.
+2. **Parse (no mutex).** Parse the index region of each segment in the set for
    its owned hashes.
-3. **Apply (mutex).** Remove those hashes, purge the journal and delta-source
+3. **Apply (mutex).** Revalidate each segment through the liveness probes,
+   remove the taken segments' hashes, purge the journal and delta-source
    tiers, publish the snapshot.
 4. **Unlink (no mutex).** Remove the files, batched behind one `fsync_dir` as
    `remove_consumed_inputs` already does.
@@ -149,29 +154,39 @@ safe: superseded ring segments leave as they die, so what survives to the seal
 is at most one live ring, which is the population
 `JOURNAL_CONSOLIDATION_ULIDS = 1` already assumes.
 
-## Segment liveness is an incremental census
+## Selection is a sweep, the apply is the authority
 
-The reap needs one thing, a `Ulid → live reference count` over pending segments.
-A reference is an LBA-map extent claiming at that segment, or an extent-index
-location at that segment whose hash is live. A count of zero means unreachable.
+The reap needs a candidate set: pending segments nothing references. A
+reference is an LBA-map extent claiming at the segment, or an extent-index
+location at the segment whose hash is live (claimed, or named as a delta
+source).
 
-Both halves are maintained at choke points that already exist, and the pattern is
-established. `LbaMap::claim_counts` is already a maintained refcount over hashes,
-and `--features volume-invariants` already reconciles the extent index against
-`rebuild_owners_unverified` at runtime. The census follows both: maintained
-incrementally, reconciled against a rebuild under the same feature gate.
+Selection runs off the mutex. The published read snapshot carries both maps,
+so a per-pass sweep over it counts, per open segment, the claims naming it as
+claimant and the locations at it whose hash is live, and yields the segments
+where both are zero. The same walk accumulates live bytes per segment, which
+is what prices the close pass's admission and budget below. The sweep costs
+one walk over snapshot maps shared by `Arc`, and the mutex cost of selection
+is zero.
 
-The crux is the second half. A location's contribution turns on whether its hash
-is live, so the census reacts to hash-liveness transitions rather than to index
-mutations alone. The 1→0 and 0→1 transitions of `claim_counts` are the site,
-and each resolves the hash's home segment and moves that segment's count. This
-is the part to build carefully, and the part a reconciliation check earns its
-place on, because a count that drifts low deletes live bytes.
+The sweep is a filter, and the apply is what makes a filter safe. A claim can
+arrive between the sweep and the apply — the dedup race every rewrite apply
+already absorbs — so the apply revalidates each segment under the mutex
+through the maintained-count probes (`LbaMap::is_referenced`,
+`ExtentIndex::is_named_delta_source`, on the hashes the segment owns) and
+refuses the segment on any hit. Selection therefore cannot delete live bytes
+whatever it returns: an over-selection is refused at the apply, an
+under-selection waits a tick. That authority is what lets liveness be swept
+rather than maintained — a maintained count's failure mode is drift deleting
+live bytes, and no drift in a filter reaches the data, so the transition
+hooks and their reconciliation oracle have nothing left to protect.
 
-If that proves heavier than it reads, the fallback is a per-pass sweep. A pass
-already builds `claim_referenced_hashes()` at O(lbamap), so recomputing the
-census per pass is the same order as what the current pass pays and still
-removes every per-segment parse.
+A journal segment revalidates on a different ground. Its claims are keyed by
+its own ULID, and claims by a sealed segment are minted only by that
+segment's registration, so its claimant count is non-increasing for the life
+of the process: the sweep's zero is stable, and the apply takes the segment
+on the sweep's word. The `volume-invariants` build asserts the monotonicity
+it relies on.
 
 ## The close budget is elastic
 
@@ -180,10 +195,10 @@ smallest-first. Smallest-first stays right, because admitting a segment folds
 away one object whatever its size. What changes is the size of the budget and
 what the pass knows before it spends.
 
-The census makes admission parse-free. Three inputs decide it, all available
+The sweep makes admission parse-free. Three inputs decide it, all available
 without opening a segment: the file size from `stat`, the journal-tier membership
 carried across the rotate rather than cleared at it, and the live byte count from
-the census. Parse and verify only what admission accepts.
+the sweep. Parse and verify only what admission accepts.
 
 Knowing the live bytes is what lets the budget stretch. A generation that grew
 during a stall has been dying the whole time it grew, so it is measurably sparse
@@ -193,7 +208,7 @@ pays most. The budget therefore scales with the generation's measured dead
 fraction, spending more work where more bytes leave.
 
 This is the dial. A larger budget means a longer close and a longer stall
-recovery; a smaller one means more S3 bytes and more objects. The census puts a
+recovery; a smaller one means more S3 bytes and more objects. The sweep puts a
 measured quantity on both sides of it, so it can be tuned against Tigris pricing
 rather than guessed.
 
@@ -248,8 +263,8 @@ The first and third apply unchanged to GC's fold apply, which reaches the same
 gate through the same pair of set materialisations in
 `apply_plan_apply_result`. They are tracked there rather than here.
 
-The reap needs none of this. It removes locations for hashes the census says
-nothing references, so no LBA can become unresolvable by construction and the
+The reap needs none of this. It removes locations for hashes the apply-time
+probes confirm nothing references, so no LBA can become unresolvable and the
 gate has nothing to catch. Its apply is O(removed entries), with the
 resolvability check kept as a `volume-invariants` assertion rather than a
 production scan.

@@ -541,12 +541,12 @@ impl GcCycleOrchestrator {
         let vol_ulid = self.vol_ulid;
         let flushed = flush_due && control::promote_wal(&self.fork_dir).await;
 
-        if let Some(s) = control::repack(&self.fork_dir).await
-            && s.segments_compacted > 0
+        if let Some(s) = control::reap(&self.fork_dir).await
+            && s.segments_reaped > 0
         {
             info!(
-                "[drain {vol_ulid}] repack: {} segment(s), ~{} bytes freed",
-                s.segments_compacted, s.bytes_freed
+                "[drain {vol_ulid}] reap: {} segment(s), {} bytes reclaimed",
+                s.segments_reaped, s.bytes_reclaimed
             );
         }
 

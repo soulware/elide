@@ -70,7 +70,7 @@ fn repack_after_half_promote_preserves_oracle_across_crash() {
 
     // Repack — consumes pending/<u_flush> into a fresh-ULID output,
     // leaving the half-promote's siblings naming a segment that is gone.
-    vol.repack().unwrap();
+    vol.repack_open_for_test().unwrap();
 
     // Repack invalidates a consumed input's promote siblings, so the
     // rebuild below finds no segment `<u_flush>` at all. Reads survive
