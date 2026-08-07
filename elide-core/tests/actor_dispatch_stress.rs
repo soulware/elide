@@ -14,6 +14,7 @@
 // Single-flight rejections and empty-WAL no-ops are expected; the only
 // assertion is liveness.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -52,6 +53,13 @@ fn actor_survives_dispatch_flood() {
     let actor_thread = thread::spawn(move || actor.run());
 
     let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+    // The last acked write per LBA, as (lba, content seed). Each writer
+    // owns a disjoint LBA range and writes it in order, so its final map
+    // is the last word on those LBAs, and each must read back unchanged
+    // however the reap, promotes and GC reshape the segments underneath.
+    // Writers revisit their LBAs, which is what leaves whole-dead
+    // segments in the open generation for the reap to take.
+    let (acked_tx, acked_rx) = mpsc::channel::<HashMap<u64, u64>>();
     let mut expected = 0usize;
 
     // Writers: sustained unique-content writes across disjoint LBA
@@ -61,18 +69,24 @@ fn actor_survives_dispatch_flood() {
     for w in 0u64..4 {
         let h = handle.clone();
         let tx = done_tx.clone();
+        let acked = acked_tx.clone();
         expected += 1;
         thread::spawn(move || {
+            let mut mine: HashMap<u64, u64> = HashMap::new();
             for i in 0..300u64 {
-                let lba = w * 4096 + (i % 512) * 4;
+                let lba = w * 4096 + (i % 64) * 4;
                 for b in 0..4u64 {
-                    let block = incompressible_block(w * 1_000_003 + i * 7 + b);
-                    let _ = h.write(lba + b, &block, false);
+                    let seed = w * 1_000_003 + i * 7 + b;
+                    let block = incompressible_block(seed);
+                    if h.write(lba + b, &block, false).is_ok() {
+                        mine.insert(lba + b, seed);
+                    }
                 }
                 if i % 32 == 0 {
                     let _ = h.flush();
                 }
             }
+            let _ = acked.send(mine);
             let _ = tx.send("writer");
         });
     }
@@ -108,6 +122,7 @@ fn actor_survives_dispatch_flood() {
         });
     }
     drop(done_tx);
+    drop(acked_tx);
 
     for _ in 0..expected {
         done_rx
@@ -115,8 +130,42 @@ fn actor_survives_dispatch_flood() {
             .expect("actor dispatch wedged: a stress thread failed to finish in time");
     }
 
+    let acked: HashMap<u64, u64> = acked_rx.iter().flatten().collect();
+    assert!(
+        acked.len() > 500,
+        "writers acked only {} distinct LBAs; the flood did not run",
+        acked.len()
+    );
+
     // The volume must still answer requests after the flood.
     handle.flush().expect("flush after flood");
+
+    // Every acked write reads back through the published snapshot, with
+    // the reap having unlinked segments under a live write load.
+    for (lba, seed) in &acked {
+        let actual = handle.reader().read(*lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            incompressible_block(*seed).as_slice(),
+            "lba {lba} wrong after the flood"
+        );
+    }
+
     handle.shutdown();
     actor_thread.join().unwrap();
+
+    // And again through a rebuild: the crash the soak takes.
+    let reopened = Volume::open(&fork_dir, &fork_dir).unwrap();
+    let (actor2, handle2) = spawn(reopened);
+    let actor2_thread = thread::spawn(move || actor2.run());
+    for (lba, seed) in &acked {
+        let actual = handle2.reader().read(*lba, 1).unwrap();
+        assert_eq!(
+            actual.as_slice(),
+            incompressible_block(*seed).as_slice(),
+            "lba {lba} wrong after the flood and rebuild"
+        );
+    }
+    handle2.shutdown();
+    actor2_thread.join().unwrap();
 }
