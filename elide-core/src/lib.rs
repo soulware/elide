@@ -15,6 +15,7 @@ pub mod import;
 pub mod ipc;
 pub mod journal;
 pub mod lbamap;
+pub mod lock_stats;
 pub mod malloc_debug;
 pub mod malloc_policy;
 pub mod name_record;

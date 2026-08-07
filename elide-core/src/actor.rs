@@ -29,16 +29,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, tick};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 
 use ulid::Ulid;
 
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
+use crate::lock_stats::{LockSite, LockStats, LockStatsSnapshot};
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
@@ -244,6 +245,13 @@ pub struct VolumeActor {
     pipeline: PromotePipeline,
     /// Reply slots for the at-most-one-in-flight worker operations.
     parked: ParkedOps,
+    /// Volume-mutex occupancy per labelled site, shared with
+    /// [`VolumeClient`] so a handle can read it without an actor round
+    /// trip.
+    lock_stats: Arc<LockStats>,
+    /// Counters as the last report left them, so the idle tick reports
+    /// the window rather than the volume's whole history.
+    lock_stats_reported: LockStatsSnapshot,
 }
 
 /// Promote-pipeline bookkeeping: dispatch/completion generations for
@@ -406,6 +414,41 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
     volume.lock().expect("volume mutex poisoned")
 }
 
+/// A volume-mutex guard that folds its wait and hold into [`LockStats`]
+/// when it drops.
+///
+/// Three clock reads per acquisition, which is why the guest write path
+/// keeps acquiring through the bare [`lock_volume`] instead
+/// (`crate::lock_stats`).
+pub(crate) struct TimedGuard<'a> {
+    guard: MutexGuard<'a, Volume>,
+    stats: &'a LockStats,
+    site: LockSite,
+    wait: Duration,
+    acquired: Instant,
+}
+
+impl std::ops::Deref for TimedGuard<'_> {
+    type Target = Volume;
+
+    fn deref(&self) -> &Volume {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TimedGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Volume {
+        &mut self.guard
+    }
+}
+
+impl Drop for TimedGuard<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .record(self.site, self.wait, self.acquired.elapsed());
+    }
+}
+
 /// What a publication did to the files on disk, which decides whether a
 /// reader's open descriptors survive it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -449,8 +492,20 @@ fn publish_snapshot(
 }
 
 impl VolumeActor {
-    fn lock_volume(&self) -> MutexGuard<'_, Volume> {
-        lock_volume(&self.volume)
+    /// Acquire the volume mutex, timing the wait and the hold against
+    /// `site`. Every actor-side acquisition carries a label, so a site
+    /// cannot enter the mutex uncounted.
+    fn lock_volume(&self, site: LockSite) -> TimedGuard<'_> {
+        let requested = Instant::now();
+        let guard = lock_volume(&self.volume);
+        let acquired = Instant::now();
+        TimedGuard {
+            guard,
+            stats: &self.lock_stats,
+            site,
+            wait: acquired.saturating_duration_since(requested),
+            acquired,
+        }
     }
 
     /// Install the fail-stop hook invoked on [`StagedApply::Diverged`].
@@ -479,7 +534,7 @@ impl VolumeActor {
     /// worker moved, rewrote or unlinked segment files, so they all retire
     /// readers' descriptors.
     fn publish_snapshot(&mut self) {
-        let guard = self.lock_volume();
+        let guard = self.lock_volume(LockSite::PublishSnapshot);
         publish_snapshot(
             &guard,
             &self.snapshot,
@@ -496,11 +551,13 @@ impl VolumeActor {
     /// older snapshot recover via the `NotFound` retry in
     /// [`VolumeReader::read_with_snapshot`].
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
-        let (stats, consumed_inputs) = self.lock_volume().apply_repack_result(result)?;
+        let (stats, consumed_inputs) = self
+            .lock_volume(LockSite::RepackApply)
+            .apply_repack_result(result)?;
         if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
             self.publish_snapshot();
         }
-        self.lock_volume()
+        self.lock_volume(LockSite::RepackUnlink)
             .remove_consumed_inputs(&consumed_inputs)?;
         Ok(stats)
     }
@@ -606,7 +663,7 @@ impl VolumeActor {
     /// is empty.  Logs and returns on error.
     fn dispatch_promote(&mut self) {
         self.retry_failed_promote();
-        let job = match self.lock_volume().prepare_promote() {
+        let job = match self.lock_volume(LockSite::PromotePrep).prepare_promote() {
             Ok(Some(job)) => job,
             Ok(None) => return,
             Err(e) => {
@@ -655,7 +712,10 @@ impl VolumeActor {
         reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
     ) {
         self.retry_failed_promote();
-        let prep = match self.lock_volume().prepare_gc_checkpoint(max_buckets) {
+        let prep = match self
+            .lock_volume(LockSite::GcCheckpoint)
+            .prepare_gc_checkpoint(max_buckets)
+        {
             Ok(prep) => prep,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -690,7 +750,10 @@ impl VolumeActor {
         } else {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
-            let own_segments = Some(self.lock_volume().own_segments_commitment());
+            let own_segments = Some(
+                self.lock_volume(LockSite::OwnSegments)
+                    .own_segments_commitment(),
+            );
             let _ = reply.send(Ok(crate::volume_ipc::GcCheckpointReply {
                 bucket_ulids: u_buckets,
                 own_segments,
@@ -772,7 +835,7 @@ impl VolumeActor {
                 continue;
             };
             let job = self
-                .lock_volume()
+                .lock_volume(LockSite::GcPlanPrep)
                 .prepare_plan_apply(plan_path, new_ulid, plan);
             if let Err(e) = self.send_worker_job(WorkerJob::GcPlan(job)) {
                 warn!("gc plan dispatch failed: {e}");
@@ -799,7 +862,10 @@ impl VolumeActor {
         trigger: crate::volume::RepackTrigger,
         reply: Sender<io::Result<CompactionStats>>,
     ) {
-        let prep = match self.lock_volume().prepare_repack(trigger) {
+        let prep = match self
+            .lock_volume(LockSite::RepackPrep)
+            .prepare_repack(trigger)
+        {
             Ok(Some(p)) => p,
             Ok(None) => {
                 let _ = reply.send(Ok(CompactionStats::default()));
@@ -842,7 +908,10 @@ impl VolumeActor {
     /// applies, so a drain of the sealed generation — which the *next*
     /// cut starts — cannot begin before its outputs are in place.
     fn start_close_generation(&mut self, reply: Sender<io::Result<Option<u32>>>) {
-        let prep = match self.lock_volume().prepare_close_generation() {
+        let prep = match self
+            .lock_volume(LockSite::ClosePrep)
+            .prepare_close_generation()
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -875,7 +944,10 @@ impl VolumeActor {
         lba_length: u32,
         reply: Sender<io::Result<ReclaimOutcome>>,
     ) {
-        let prep = match self.lock_volume().prepare_reclaim(start_lba, lba_length) {
+        let prep = match self
+            .lock_volume(LockSite::ReclaimPrep)
+            .prepare_reclaim(start_lba, lba_length)
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -922,7 +994,7 @@ impl VolumeActor {
         reply: Sender<io::Result<()>>,
     ) {
         let job = self
-            .lock_volume()
+            .lock_volume(LockSite::SnapshotPrep)
             .prepare_sign_snapshot_manifest_kind(snap_ulid, kind);
         if let Err(e) = self.send_worker_job(WorkerJob::SignSnapshotManifest(job)) {
             warn!("sign_snapshot_manifest dispatch failed: {e}");
@@ -987,7 +1059,9 @@ impl VolumeActor {
             WorkerResult::Promote(Ok(result)) => {
                 self.pipeline.promotes_in_flight -= 1;
                 let ulid = result.segment_ulid;
-                let apply = self.lock_volume().apply_promote(&result);
+                let apply = self
+                    .lock_volume(LockSite::PromoteApply)
+                    .apply_promote(&result);
                 if let Err(e) = &apply {
                     // The segment is committed and the old WAL was kept, so
                     // reads stay resolvable; the in-memory maps are missing
@@ -1008,7 +1082,10 @@ impl VolumeActor {
                 // Complete any parked operations waiting for this ULID.
                 // GC checkpoint.
                 if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
-                    let own_segments = Some(self.lock_volume().own_segments_commitment());
+                    let own_segments = Some(
+                        self.lock_volume(LockSite::OwnSegments)
+                            .own_segments_commitment(),
+                    );
                     let _ = parked.reply.send(clone_apply(&apply).map(|()| {
                         crate::volume_ipc::GcCheckpointReply {
                             bucket_ulids: parked.u_buckets,
@@ -1069,7 +1146,9 @@ impl VolumeActor {
                 self.pipeline.promote_segments_in_flight -= 1;
                 match result {
                     Ok(r) => {
-                        let apply_result = self.lock_volume().apply_promote_segment_result(r);
+                        let apply_result = self
+                            .lock_volume(LockSite::PromoteSegmentApply)
+                            .apply_promote_segment_result(r);
                         if apply_result.is_ok() {
                             self.publish_snapshot();
                         }
@@ -1107,7 +1186,8 @@ impl VolumeActor {
                 let reply = self.parked.sign_snapshot_manifest.take();
                 let outcome = match result {
                     Ok(r) => {
-                        self.lock_volume().apply_sign_snapshot_manifest_result(r);
+                        self.lock_volume(LockSite::SnapshotApply)
+                            .apply_sign_snapshot_manifest_result(r);
                         Ok(())
                     }
                     Err(e) => {
@@ -1123,7 +1203,9 @@ impl VolumeActor {
                 let reply = self.parked.reclaim.take();
                 let outcome = match result {
                     Ok(r) => {
-                        let apply_result = self.lock_volume().apply_reclaim_result(r);
+                        let apply_result = self
+                            .lock_volume(LockSite::ReclaimApply)
+                            .apply_reclaim_result(r);
                         if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
                             self.publish_snapshot();
                         }
@@ -1205,7 +1287,9 @@ impl VolumeActor {
             return;
         }
         self.parked.handoff_in_flight = false;
-        let applied = self.lock_volume().apply_plan_apply_result(*result);
+        let applied = self
+            .lock_volume(LockSite::GcPlanApply)
+            .apply_plan_apply_result(*result);
         match applied {
             Ok(crate::volume::StagedApply::Applied) => {
                 self.publish_snapshot();
@@ -1276,6 +1360,20 @@ impl VolumeActor {
         }
     }
 
+    /// Log what the volume mutex was held for since the last report, and
+    /// move the mark.
+    ///
+    /// Every acquisition named here is time a guest write could spend
+    /// waiting, so the line is ranked by hold. A window in which nothing
+    /// acquired logs nothing, which keeps an idle volume quiet.
+    fn report_lock_stats(&mut self) {
+        let now = self.lock_stats.snapshot();
+        if let Some(report) = now.since(&self.lock_stats_reported).report() {
+            info!("volume lock [{}s]: {report}", IDLE_FLUSH_INTERVAL.as_secs());
+        }
+        self.lock_stats_reported = now;
+    }
+
     pub fn run(mut self) {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
@@ -1294,7 +1392,7 @@ impl VolumeActor {
                             // Direct writers signal here when needs_promote()
                             // is true post-write.  Idempotent — prepare_promote
                             // handles an empty WAL by returning Ok(None).
-                            if self.lock_volume().needs_promote() {
+                            if self.lock_volume(LockSite::CheckPromote).needs_promote() {
                                 self.dispatch_promote();
                             }
                         }
@@ -1314,7 +1412,7 @@ impl VolumeActor {
                             // trip.  Promote dispatch shares this thread,
                             // so the WAL this handle names stays the one
                             // the flush must cover.
-                            let handle = self.lock_volume().wal_sync_handle();
+                            let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
                             let fsync_result = match handle {
                                 Some(file) => file.sync_data(),
                                 None => Ok(()),
@@ -1330,7 +1428,7 @@ impl VolumeActor {
                             // Promote the WAL to a pending/ segment via the
                             // worker.  Reply once the segment is on disk.
                             let retried = self.retry_failed_promote();
-                            let prep = self.lock_volume().prepare_promote();
+                            let prep = self.lock_volume(LockSite::PromotePrep).prepare_promote();
                             match prep {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
@@ -1400,7 +1498,7 @@ impl VolumeActor {
                         VolumeRequest::Promote { ulid, reply } => {
                             // Prep on the actor: cheap directory stat +
                             // job build. Dispatch to worker, park reply.
-                            let prep = self.lock_volume().prepare_promote_segment(ulid);
+                            let prep = self.lock_volume(LockSite::PromoteSegmentPrep).prepare_promote_segment(ulid);
                             match prep {
                                 Ok(PromoteSegmentPrep::AlreadyPromoted) => {
                                     let _ = reply.send(Ok(()));
@@ -1424,7 +1522,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::FinalizeGcHandoff { ulid, reply } => {
-                            let _ = reply.send(self.lock_volume().finalize_gc_handoff(ulid));
+                            let _ = reply.send(self.lock_volume(LockSite::GcHandoffFinalize).finalize_gc_handoff(ulid));
                         }
                         VolumeRequest::SignSnapshotManifest {
                             snap_ulid,
@@ -1440,7 +1538,7 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::NoopStats { reply } => {
-                            let _ = reply.send(self.lock_volume().noop_stats());
+                            let _ = reply.send(self.lock_volume(LockSite::NoopStats).noop_stats());
                         }
                         VolumeRequest::Reclaim {
                             start_lba,
@@ -1491,6 +1589,7 @@ impl VolumeActor {
                     self.dispatch_promote();
                     // Apply any pending GC plan handoffs inline.
                     self.start_gc_handoffs(None);
+                    self.report_lock_stats();
                 }
             }
         }
@@ -1544,6 +1643,9 @@ pub struct VolumeClient {
     /// by every reader (see `volume::read::FileCache` for the layout-
     /// generation discipline that keeps overlapping snapshots safe).
     file_cache: SharedFileCache,
+    /// Volume-mutex occupancy per labelled site, shared with the actor
+    /// that records it. Read through [`VolumeClient::lock_stats`].
+    lock_stats: Arc<LockStats>,
 }
 
 /// Per-thread reader for a volume session.
@@ -1719,6 +1821,16 @@ impl VolumeClient {
     /// Trim (discard) `lba_count` blocks starting at `lba`.
     pub fn trim(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         self.write_zeroes(start_lba, lba_count, fua)
+    }
+
+    /// Volume-mutex occupancy per labelled site, cumulative since the
+    /// volume opened. Read straight off the shared counters, so it needs
+    /// no actor round trip and takes no lock — which is what lets it be
+    /// sampled while the actor holds the mutex it describes.
+    ///
+    /// The guest write path is not counted; see [`crate::lock_stats`].
+    pub fn lock_stats(&self) -> LockStatsSnapshot {
+        self.lock_stats.snapshot()
     }
 
     /// Fetch the current no-op write skip counters from the actor.
@@ -3625,6 +3737,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     let volume = Arc::new(Mutex::new(volume));
     let flush_gen = Arc::new(AtomicU64::new(0));
     let layout_gen = Arc::new(AtomicU64::new(0));
+    let lock_stats = Arc::new(LockStats::default());
 
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
@@ -3651,6 +3764,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         divergence_exit: None,
         pipeline: PromotePipeline::default(),
         parked: ParkedOps::default(),
+        lock_stats: Arc::clone(&lock_stats),
+        lock_stats_reported: LockStatsSnapshot::default(),
     };
 
     let client = VolumeClient {
@@ -3662,6 +3777,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         volume: Arc::downgrade(&volume),
         flush_gen,
         layout_gen,
+        lock_stats,
     };
 
     (actor, client)
@@ -4528,6 +4644,65 @@ mod tests {
         assert_eq!(recovered.read(0, 1).unwrap(), first);
         assert_eq!(recovered.read(1, 1).unwrap(), second);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The counters describe what the actor does to writers, so an
+    /// actor-side operation must land against its own site while the
+    /// guest write path, which acquires through the untimed primitive,
+    /// stays absent from them.
+    #[test]
+    fn actor_operations_record_against_their_site() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        std::thread::Builder::new()
+            .name("volume-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+
+        // Every write publishes a snapshot under the mutex, so counting
+        // the write path would show up here and nowhere else.
+        for lba in 0..3u64 {
+            client
+                .write(lba, &unique_block(lba as u32 + 1), false)
+                .unwrap();
+        }
+        let after_writes = client.lock_stats();
+        assert_eq!(
+            after_writes.site(LockSite::PublishSnapshot).acquisitions,
+            0,
+            "the guest write path must not be counted"
+        );
+
+        client.promote_wal().unwrap();
+        let after_promote = client.lock_stats().since(&after_writes);
+        assert!(
+            after_promote.site(LockSite::PromotePrep).acquisitions > 0,
+            "promote prep acquires the mutex"
+        );
+        assert!(
+            after_promote.site(LockSite::PromoteApply).acquisitions > 0,
+            "promote apply acquires the mutex"
+        );
+        assert!(
+            after_promote.site(LockSite::ClosePrep).acquisitions == 0,
+            "a promote must not be attributed to the close pass"
+        );
+
+        client.write(1, &unique_block(2), false).unwrap();
+        client.promote_wal().unwrap();
+        client
+            .repack(crate::volume::RepackTrigger::Unconditional)
+            .unwrap();
+        let after_repack = client.lock_stats().since(&after_promote);
+        assert!(
+            after_repack.site(LockSite::RepackPrep).acquisitions > 0,
+            "repack prep acquires the mutex"
+        );
+        assert!(
+            client.lock_stats().report().is_some(),
+            "a window with acquisitions reports a line"
+        );
     }
 
     /// A reader whose snapshot predates a repack must still resolve reads
