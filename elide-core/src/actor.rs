@@ -414,6 +414,23 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
     volume.lock().expect("volume mutex poisoned")
 }
 
+/// Sync a WAL file handle taken under the volume mutex, on a caller that
+/// has since released it.
+///
+/// Running off the mutex lets concurrent writers' device round trips
+/// overlap, so they land in one host filesystem commit.  The handle stays
+/// correct across a rotation because a promote unlinks the old WAL only
+/// once the segment carrying its bytes is committed, so the bytes this sync
+/// reaches are either still the WAL's or already durable in that segment.
+///
+/// `None` is the no-WAL-open state, which is already durable.
+fn sync_wal_handle(handle: Option<Arc<fs::File>>) -> io::Result<()> {
+    match handle {
+        Some(file) => file.sync_data(),
+        None => Ok(()),
+    }
+}
+
 /// A volume-mutex guard that folds its wait and hold into [`LockStats`]
 /// when it drops.
 ///
@@ -1405,19 +1422,11 @@ impl VolumeActor {
                             // device keeps accepting commands while a FLUSH
                             // is in flight at the controller.
                             //
-                            // The lock covers taking the file handle; the
-                            // sync itself runs off it, so the ublk writers
-                            // contending for the volume mutex are blocked
-                            // for a pointer clone rather than a disk round
-                            // trip.  Promote dispatch shares this thread,
-                            // so the WAL this handle names stays the one
-                            // the flush must cover.
+                            // Promote dispatch shares this thread, so the
+                            // WAL this handle names stays the one the flush
+                            // must cover.
                             let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
-                            let fsync_result = match handle {
-                                Some(file) => file.sync_data(),
-                                None => Ok(()),
-                            };
-                            match fsync_result {
+                            match sync_wal_handle(handle) {
                                 Ok(()) => self.park_or_resolve_flush(reply),
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
@@ -1763,14 +1772,14 @@ impl VolumeClient {
     /// fine for real ublk traffic, where the kernel page cache filters
     /// unchanged pages and dedup hits are a small fraction of writes.
     ///
-    /// `fua` fsyncs the WAL inside the same critical section as the
-    /// append, so a concurrent promote can't rotate the WAL between the
-    /// two — the write is durable when this returns.
+    /// `fua` takes the WAL's file handle under the lock and syncs it after
+    /// releasing, so the write is durable when this returns and concurrent
+    /// FUA writers share one commit.  See [`sync_wal_handle`].
     pub fn write(&self, lba: u64, data: &[u8], fua: bool) -> io::Result<()> {
         let hash = blake3::hash(data);
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
-        let needs_promote = {
+        let (needs_promote, sync) = {
             let mut guard = lock_volume(&volume);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
             publish_snapshot(
@@ -1780,11 +1789,10 @@ impl VolumeClient {
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            if fua {
-                guard.wal_fsync()?;
-            }
-            guard.needs_promote()
+            let sync = if fua { guard.wal_sync_handle() } else { None };
+            (guard.needs_promote(), sync)
         };
+        sync_wal_handle(sync)?;
         if needs_promote {
             self.signal_check_promote();
         }
@@ -1797,7 +1805,7 @@ impl VolumeClient {
     /// See [`Volume::write_zeroes`] for details.
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         let volume = self.volume()?;
-        let needs_promote = {
+        let (needs_promote, sync) = {
             let mut guard = lock_volume(&volume);
             guard.write_zeroes(start_lba, lba_count)?;
             publish_snapshot(
@@ -1807,11 +1815,10 @@ impl VolumeClient {
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            if fua {
-                guard.wal_fsync()?;
-            }
-            guard.needs_promote()
+            let sync = if fua { guard.wal_sync_handle() } else { None };
+            (guard.needs_promote(), sync)
         };
+        sync_wal_handle(sync)?;
         if needs_promote {
             self.signal_check_promote();
         }
@@ -4550,10 +4557,69 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A FUA write fsyncs the WAL in the same critical section as the
-    /// append: the WAL bytes are on disk when `write` returns, so a
-    /// recovery open of the same directory sees the data with no flush
-    /// or promote in between.
+    /// A FUA write's sync runs off the volume lock, leaving a window for a
+    /// promote to rotate the WAL between the handle being taken and the
+    /// sync running.  Drive that ordering directly: take the handle, let a
+    /// promote consume the WAL, then sync the handle.  The sync succeeds
+    /// on the rotated-away file and the bytes recover, because the promote
+    /// commits the segment carrying them before unlinking the WAL.
+    #[test]
+    fn fua_sync_survives_promote_between_handle_and_sync() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        let block = unique_block(21);
+        client.write(9, &block, false).unwrap();
+
+        let handle = lock_volume(&client.volume().unwrap()).wal_sync_handle();
+        assert!(handle.is_some(), "the write left a WAL open");
+
+        client.promote_wal().unwrap();
+        sync_wal_handle(handle).unwrap();
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+
+        let recovered = Volume::open(&dir, &dir).unwrap();
+        assert_eq!(recovered.read(9, 1).unwrap(), block);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Concurrent FUA writers each sync off the lock, so their syncs
+    /// overlap.  Every write is durable when its own call returns, which a
+    /// recovery open with no flush or promote in between confirms.
+    #[test]
+    fn concurrent_fua_writes_are_each_durable() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        let blocks: Vec<Vec<u8>> = (0..8).map(unique_block).collect();
+        std::thread::scope(|s| {
+            for (i, block) in blocks.iter().enumerate() {
+                let client = &client;
+                s.spawn(move || client.write(i as u64, block, true).unwrap());
+            }
+        });
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
+
+        let recovered = Volume::open(&dir, &dir).unwrap();
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(&recovered.read(i as u64, 1).unwrap(), block);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A FUA write syncs the WAL before returning, so a recovery open of
+    /// the same directory sees the data with no flush or promote in
+    /// between.
     #[test]
     fn fua_write_is_durable_without_flush() {
         let dir = temp_dir();

@@ -3248,18 +3248,6 @@ impl Volume {
     // Off-actor promote: prep + apply
     // ------------------------------------------------------------------
 
-    /// Fsync the WAL without promoting. No-op when no WAL is open.
-    ///
-    /// Serves the FUA write path, which needs the sync inside the same
-    /// critical section as its append so a promote can't rotate the WAL
-    /// between the two.
-    pub fn wal_fsync(&mut self) -> io::Result<()> {
-        match self.wal.as_mut() {
-            Some(open) => open.wal.fsync(),
-            None => Ok(()),
-        }
-    }
-
     /// The open WAL's file, for a caller that fsyncs it after releasing
     /// the volume lock. `None` when no WAL is open; that state is already
     /// durable.
