@@ -4,9 +4,24 @@
 //! takes, and why, is `docs/design/compression-codecs.md`.
 
 use std::io;
+use std::sync::LazyLock;
 
 use crate::chunk_tree::{self, ChunkTable};
 use crate::segment::Codec;
+
+/// MEASUREMENT BUILD ONLY — never merge to main.
+///
+/// `ELIDE_BODY_CODEC=none` stores segment bodies as plaintext and
+/// `ELIDE_WAL_CODEC=none` stores WAL and `.dmat` records as plaintext, so one
+/// binary can run both arms of a codec-cost A/B back to back on one machine.
+/// Both take the `Codec::None` path formation already uses for content no
+/// codec shrinks, so neither invents a new stored form.
+fn codec_off(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| v == "none")
+}
+
+static BODY_CODEC_OFF: LazyLock<bool> = LazyLock::new(|| codec_off("ELIDE_BODY_CODEC"));
+static WAL_CODEC_OFF: LazyLock<bool> = LazyLock::new(|| codec_off("ELIDE_WAL_CODEC"));
 
 /// Minimum compression ratio required to store compressed data (1.5×).
 ///
@@ -34,6 +49,9 @@ pub(crate) const BODY_ZSTD_LEVEL: i32 = 3;
 /// The WAL and `.dmat` take this. Their cost is decompression on a latency
 /// path, which is the quantity the ratio threshold prices.
 pub(crate) fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
+    if *WAL_CODEC_OFF {
+        return None;
+    }
     let compressed = lz4_flex::compress_prepend_size(data);
     if compressed.len() * MIN_COMPRESSION_RATIO_NUM / MIN_COMPRESSION_RATIO_DEN >= data.len() {
         return None;
@@ -54,6 +72,9 @@ pub(crate) fn maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
 /// that does not outlive its segment, and lz4 keeps formation CPU off a tier
 /// that is a large share of segments on a churning volume.
 pub(crate) fn compress_body(plain: &[u8], journal: bool) -> io::Result<Option<(Codec, Vec<u8>)>> {
+    if *BODY_CODEC_OFF {
+        return Ok(None);
+    }
     if journal {
         return Ok(maybe_compress(plain).map(|c| (Codec::Lz4, c)));
     }
