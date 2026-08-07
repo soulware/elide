@@ -5216,23 +5216,35 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
     let result = crate::actor::execute_repack(job).unwrap();
 
     // Between execute and apply, a promote lands a delta whose only
-    // source option is the input-owned hash.
+    // source option is the input-owned hash. Registered as the promote
+    // registers it, which records the source pin the stale-liveness
+    // check consults.
     let target_hash = blake3::hash(b"delta target content");
     let claimant = vol.mint.next();
-    Arc::make_mut(&mut vol.extent_index).insert_delta(
+    let delta_entry = segment::SegmentEntry::new_delta(
         target_hash,
-        extentindex::DeltaLocation {
-            segment_id: claimant,
-            entry_idx: 0,
-            body_source: extentindex::DeltaBodySource::Cached,
-            options: vec![segment::DeltaOption {
-                source_hash,
-                delta_offset: 0,
-                delta_length: 8,
-                delta_hash: blake3::hash(b"blob"),
-            }],
-        },
+        50,
+        1,
+        vec![segment::DeltaOption {
+            source_hash,
+            delta_offset: 0,
+            delta_length: 8,
+            delta_hash: blake3::hash(b"blob"),
+        }],
     );
+    Arc::make_mut(&mut vol.extent_index)
+        .register_entry_if_absent(
+            &delta_entry,
+            0,
+            &extentindex::SegmentRegistrationCtx {
+                segment_id: claimant,
+                body_section_start: 0,
+                body_tier: extentindex::RegistrationBodyTier::Cached,
+                delta_body_source: Some(extentindex::DeltaBodySource::Cached),
+                inline: extentindex::InlineSource::EntryInline,
+            },
+        )
+        .unwrap();
     Arc::make_mut(&mut vol.lbamap).insert(50, 1, target_hash, claimant);
 
     let (stats, consumed_inputs) = vol.apply_repack_result(result).unwrap();
@@ -5449,6 +5461,143 @@ fn same_epoch_rewrite_cycle_matches_rebuild() {
             .as_slice(),
         a_prime.as_slice(),
         "cycled LBA must read back the closing write's bytes"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The gate refuses a mutation that strands a claim over a declared
+/// hash, and restores both maps whole.
+#[test]
+fn gate_refuses_a_mutation_stranding_a_declared_hash() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data = vec![9u8; 4096];
+    let hash = blake3::hash(&data);
+    vol.write(0, &data).unwrap();
+    vol.flush_wal().unwrap();
+    let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
+
+    let footprint: std::collections::HashSet<blake3::Hash> = [hash].into();
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, |v| {
+            Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
+            Ok(())
+        })
+        .unwrap();
+
+    match gate {
+        ResolvabilityGate::Refused(orphaned) => {
+            assert_eq!(orphaned.total, 1);
+            assert_eq!(orphaned.sample, vec![(0, hash)]);
+        }
+        ResolvabilityGate::Applied => panic!("stranding a declared hash must refuse"),
+    }
+    assert!(
+        vol.extent_index.lookup(&hash).is_some(),
+        "refusal restores the index"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), data);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The gate checks the declared footprint and nothing else — the bound
+/// that holds it to O(footprint) under the write mutex. A mutation
+/// reaching outside its declaration escapes it; the whole-map oracle in
+/// the `volume-invariants` build is what audits that contract.
+#[test]
+fn the_gate_trusts_the_declared_footprint() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let data = vec![9u8; 4096];
+    let hash = blake3::hash(&data);
+    vol.write(0, &data).unwrap();
+    vol.flush_wal().unwrap();
+    let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
+
+    let gate = vol
+        .mutate_gated_on_resolvability(&std::collections::HashSet::new(), |v| {
+            Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(matches!(gate, ResolvabilityGate::Applied));
+    assert!(
+        vol.read(0, 1).is_err(),
+        "the undeclared stranded claim fails at the extent lookup"
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// Journal-tier resolution is claimant-keyed, and the footprint check
+/// honours that: a claim resolves through its own claimant's journal
+/// map, another segment's copy of the hash resolves nothing, and a
+/// purge of the claimant's map strands its claims.
+#[test]
+fn the_footprint_check_resolves_journal_claims_per_claimant() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let hash = blake3::hash(b"journal block");
+    let seg = vol.mint.next();
+    Arc::make_mut(&mut vol.extent_index).insert_journal_if_absent(
+        seg,
+        hash,
+        extentindex::ExtentLocation {
+            segment_id: seg,
+            body_offset: 0,
+            body_length: 4096,
+            codec: segment::Codec::None,
+            body_source: extentindex::BodySource::Local,
+            body_section_start: 0,
+            inline_data: None,
+        },
+    );
+    Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
+    let footprint: std::collections::HashSet<blake3::Hash> = [hash].into();
+
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, |_| Ok(()))
+        .unwrap();
+    assert!(
+        matches!(gate, ResolvabilityGate::Applied),
+        "the claimant's journal map resolves its claim"
+    );
+
+    let other = vol.mint.next();
+    Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, other);
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, |_| Ok(()))
+        .unwrap();
+    match gate {
+        ResolvabilityGate::Refused(orphaned) => {
+            assert_eq!(orphaned.total, 1, "only the foreign claimant is stranded");
+            assert_eq!(orphaned.sample, vec![(1, hash)]);
+        }
+        ResolvabilityGate::Applied => {
+            panic!("a claimant whose journal map lacks the hash must strand")
+        }
+    }
+
+    Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, seg);
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, |v| {
+            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        matches!(gate, ResolvabilityGate::Refused(_)),
+        "purging the claimant's journal map strands its claims"
+    );
+    assert!(
+        vol.extent_index.lookup_journal(seg, &hash).is_some(),
+        "refusal restores the journal map"
     );
 
     fs::remove_dir_all(base).unwrap();

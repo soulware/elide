@@ -528,6 +528,15 @@ impl ExtentIndex {
         self.journal.remove(&segment);
     }
 
+    /// Every journal-tier hash `segment` holds a body for. Seeds the
+    /// resolvability footprint of an apply that purges the segment.
+    pub fn journal_hashes(&self, segment: Ulid) -> impl Iterator<Item = blake3::Hash> + '_ {
+        self.journal
+            .get(&segment)
+            .into_iter()
+            .flat_map(|entries| entries.keys().copied())
+    }
+
     /// Compare-and-replace: overwrite the entry for `hash` only if the current
     /// location matches `(expected_segment_id, expected_body_offset)`. Returns
     /// `true` if the replacement happened, `false` if the precondition failed

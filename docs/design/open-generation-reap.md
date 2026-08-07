@@ -203,28 +203,27 @@ Every mutex window is a window in which writes wait (`architecture.md`
 *Concurrency and locking*). The apply is the longest of them, and what makes it
 long is not the entries it registers.
 
-`apply_repack_result` runs `mutate_gated_on_resolvability` once per bucket, and
-that gate ends in `unresolvable_lbamap_hashes`, which walks **every** LBA-map
-entry doing up to three extent-index lookups each. So the apply is
-O(buckets × lbamap), and a close pass over a volume holding a few hundred
-thousand extents does millions of lookups with the write path waiting. Two
-smaller costs sit beside it under the same mutex: `claim_referenced_hashes()`
-copies every live hash key into a fresh set and `named_delta_sources()` walks
-every delta source into another, both once per apply and both used only for
-membership; and `DeltaBodySource::full_for_segment` opens and reads the output
-file per bucket carrying deltas.
+`apply_repack_result` runs `mutate_gated_on_resolvability` once per bucket.
+Measured on the rig (v0.1.52, #902), the gate's whole-map walk put the apply at
+80% of all mutex occupancy, with a single hold reaching 1.72 s. Three costs sit
+beside the gate under the same mutex: `claim_referenced_hashes()` copies every
+live hash key into a fresh set and `named_delta_sources()` walks every delta
+source into another, both once per apply and both used only for membership;
+and `DeltaBodySource::full_for_segment` opens and reads the output file per
+bucket carrying deltas.
 
 Four changes, in leverage order.
 
-**The gate becomes incremental.** It asks a whole-map question, but the
-pre-state already answers it and the mutation's footprint is known. An LBA
-becomes unresolvable only where the mutation removed or moved the location its
-hash resolved through, or where the mutation's lbamap merge introduced the
-LBA-to-hash pair. Both sets are bounded by the bucket, so the check is
-O(footprint) with the same contract. Delta resolution turns on source hashes
-resolving, which would otherwise need a reverse map from source to dependents,
-and does not: the stale-liveness check refuses any bucket that drops a hash in
-`named_delta_sources` (#897), so a stranded source never reaches the gate.
+**The gate is incremental.** The caller declares the mutation's footprint —
+every hash it removes or registers in either map, every claim it merges, and
+the journal-tier hashes of the segments it purges — and the gate checks that
+each claimed footprint hash still resolves, O(footprint) with the same refuse
+and restore contract. The whole-map walk survives as the `volume-invariants`
+oracle, which audits the declaration after every structural op. Delta
+resolution turns on source hashes resolving, which would otherwise need a
+reverse map from source to dependents, and does not: the stale-liveness check
+refuses any bucket that drops a hash in `named_delta_sources` (#897), so a
+stranded source never reaches the gate.
 
 **The mutex is taken per bucket.** The gate is already per-bucket and the CAS
 and consuming-inputs rules are already per-input, so a write landing between
