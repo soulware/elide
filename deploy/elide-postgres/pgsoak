@@ -21,8 +21,8 @@
 #   bench-bg [secs]  same, detached (survives the ssh session)
 #   crash-pg         kill -9 every postgres process
 #   crash-vol        kill -9 the elide volume server mid-IO, then postgres
-#   verify           invariant sums + amcheck; exit 1 on any failure
-#   check            start, then verify (one ssh round-trip after a host crash)
+#   verify           remount cold, then invariant sums + amcheck; exit 1 on fail
+#   check            alias for verify (one ssh round-trip after a host crash)
 #   cycle pg|vol     bench-bg, crash at a random point mid-run, check
 #   status           volume + postgres + mount state at a glance
 #   tps              print every recorded bench result, oldest first
@@ -172,8 +172,29 @@ do_start() {
     assert_pgdata
 }
 
+# Reads reach the device only from a cold mount. Postgres answers from its
+# shared buffers and the filesystem from its page cache, and a volume that has
+# already lost a write still reads correct through either one. Dropping both
+# before the sums are taken puts the check on the device, and the unmount adds
+# an e2fsck between the crash and the check.
+remount_cold() {
+    if [ "$BACKEND" = raw ]; then
+        return 0
+    fi
+    if pg_running; then
+        as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -w -t 300 -m fast stop >/dev/null 2>&1 \
+            || die "pg_ctl stop failed for $PGDATA (see $OUT_ROOT/postgres.log)"
+    fi
+    if mountpoint -q "$MNT"; then
+        umount "$MNT" || die "umount $MNT failed; something still holds the mount"
+        log "unmounted $MNT for a cold check"
+    fi
+}
+
 do_verify() {
     local sums b t a h
+    remount_cold
+    do_start
     assert_pgdata
     sums="$(sql "SELECT (SELECT sum(bbalance) FROM pgbench_branches),
                         (SELECT sum(tbalance) FROM pgbench_tellers),
@@ -272,7 +293,6 @@ crash_vol() {
 do_cycle() {
     local mode="$1" point
     ((RUN_SECS >= 30)) || die "RUN_SECS must be at least 30"
-    do_start
     do_verify
     bench_bg "$RUN_SECS"
     point=$((10 + RANDOM % (RUN_SECS - 20)))
@@ -283,7 +303,6 @@ do_cycle() {
         vol) crash_vol ;;
         *)   die "unknown cycle mode '$mode' (pg|vol)" ;;
     esac
-    do_start
     do_verify
     log "cycle $mode: PASS"
 }
@@ -338,7 +357,7 @@ EOF
     crash-pg)  crash_pg ;;
     crash-vol) crash_vol ;;
     verify)    do_verify ;;
-    check)     do_start; do_verify ;;
+    check)     do_verify ;;
     cycle)     do_cycle "${2:?usage: pgsoak cycle pg|vol}" ;;
     tps)
         if [ -s "$TPS_TSV" ]; then
