@@ -1851,13 +1851,16 @@ impl Volume {
     /// be caught at the next structural op anyway. Asserting on every
     /// individual write doubles proptest runtime.
     ///
-    /// Gated behind the `proptest` feature so debug builds and the regular
-    /// `cargo test` suite aren't slowed by the per-op rebuild. The
-    /// `gc_proptest` runs already enable this feature; running with
-    /// `--features proptest` is what catches drift bugs of the class fixed
-    /// by sorting drain loops by ULID ascending.
-    #[cfg(feature = "volume-invariants")]
+    /// Answers to [`crate::volume_invariants_enabled`], so the per-op
+    /// rebuild costs only the runs that ask for it. `elide-coordinator`'s
+    /// `proptest` feature turns it on for the `gc_proptest` suite, and
+    /// `ELIDE_VOLUME_INVARIANTS=1` turns it on for a release binary —
+    /// which is what catches drift bugs of the class fixed by sorting
+    /// drain loops by ULID ascending.
     pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
         self.lbamap.debug_assert_claim_counts();
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
@@ -1972,11 +1975,6 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `volume-invariants` feature is disabled.
-    #[cfg(not(feature = "volume-invariants"))]
-    #[inline]
-    pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
-
     /// Stress-only invariant: every *data* pending ULID must be greater
     /// than every promote-tier (`index/`) ULID on disk — the structural
     /// form of the production drain's discipline
@@ -1997,10 +1995,12 @@ impl Volume {
     /// time and may legitimately exceed a write that was already pending when
     /// the pass forked, so they are excluded from the comparison.
     ///
-    /// Same `volume-invariants` feature gate so the perf cost only applies
-    /// to coordinator-layer stress runs.
-    #[cfg(feature = "volume-invariants")]
+    /// Answers to the same runtime switch, so the perf cost only applies
+    /// to runs that ask for the checks.
     pub(in crate::volume) fn assert_pending_above_committed(&self, caller: &'static str) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
         let mut pending_files: Vec<(Ulid, std::path::PathBuf)> = Vec::new();
         for dir in segment::pending_generation_dirs(&self.base_dir) {
             match segment::read_ulid_dir_sorted(&dir) {
@@ -2095,11 +2095,6 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `volume-invariants` feature is disabled.
-    #[cfg(not(feature = "volume-invariants"))]
-    #[inline]
-    pub(in crate::volume) fn assert_pending_above_committed(&self, _caller: &'static str) {}
-
     /// Stress-only invariant: every hash in `self.extent_index` must
     /// point at a segment that exists somewhere on disk (in-memory may
     /// disagree with the rebuild on *which* specific segment owns the
@@ -2143,8 +2138,10 @@ impl Volume {
     ///
     /// Both DATA-canonical (`inner`) and Delta-canonical (`deltas`)
     /// hashes are checked.
-    #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_extent_index_consistent(&self, caller: &'static str) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -2238,11 +2235,6 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `volume-invariants` feature is disabled.
-    #[cfg(not(feature = "volume-invariants"))]
-    #[inline]
-    pub(in crate::volume) fn assert_extent_index_consistent(&self, _caller: &'static str) {}
-
     /// Count every lbamap entry whose hash resolves through neither the
     /// extent index's DATA-style map nor its Delta-canonical map — the
     /// two lookups the read path performs — and keep the first
@@ -2265,7 +2257,6 @@ impl Volume {
     ///
     /// `ZERO_HASH` is a sentinel meaning "this LBA reads as all zeros";
     /// it never resolves through extent_index by design. Skipped here.
-    #[cfg(feature = "volume-invariants")]
     fn unresolvable_lbamap_hashes(&self, sample_limit: usize) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
         for (lba, _len, hash, _anchor, claimant) in self.lbamap.iter_entries_with_claimant() {
@@ -2377,9 +2368,9 @@ impl Volume {
     /// registers in either map, each hash whose lbamap claim it merges,
     /// and each journal-tier hash of a segment it purges. A claim over
     /// an undeclared hash can only strand through a mutation reaching
-    /// outside its declaration; the `volume-invariants` build re-checks
-    /// the whole map after every structural op, which is where that
-    /// class is caught. Checking the declaration rather than the map is
+    /// outside its declaration; with the volume invariants switched on
+    /// the whole map is re-checked after every structural op, which is
+    /// where that class is caught. Checking the declaration rather than the map is
     /// what takes the gate from O(lbamap) per call to O(footprint) —
     /// the difference between millions of lookups under the write mutex
     /// and thousands (#902).
@@ -2406,8 +2397,10 @@ impl Volume {
 
     /// Stress-only invariant: panic if [`Self::unresolvable_lbamap_hashes`]
     /// finds any entry after a structural op.
-    #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, caller: &'static str) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
         let unresolved = self.unresolvable_lbamap_hashes(REFUSAL_SAMPLE_LIMIT);
         if unresolved.total > 0 {
             let mut msg = format!(
@@ -2421,11 +2414,6 @@ impl Volume {
             panic!("{msg}");
         }
     }
-
-    /// No-op stub when `volume-invariants` feature is disabled.
-    #[cfg(not(feature = "volume-invariants"))]
-    #[inline]
-    pub(in crate::volume) fn assert_lbamap_hashes_resolvable(&self, _caller: &'static str) {}
 
     /// Stress-only invariant: the in-memory `own_segments` set equals the
     /// committed tier a fresh disk scan produces (`index/*.idx` ∪ bare
@@ -2443,8 +2431,10 @@ impl Volume {
     /// zero-entry tombstone dropped from disk but left in the set — so the
     /// check belongs there, matching the per-handoff granularity at which the
     /// coordinator validates the set in production.
-    #[cfg(feature = "volume-invariants")]
     pub(in crate::volume) fn assert_own_segments_match_disk(&self, caller: &'static str) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
         let disk = segment::committed_tier_ulids(&self.base_dir)
             .expect("committed_tier_ulids scan for own_segments invariant");
         if self.own_segments != disk {
@@ -2457,20 +2447,15 @@ impl Volume {
         }
     }
 
-    /// No-op stub when `volume-invariants` feature is disabled.
-    #[cfg(not(feature = "volume-invariants"))]
-    #[inline]
-    pub(in crate::volume) fn assert_own_segments_match_disk(&self, _caller: &'static str) {}
-
     /// Umbrella over every `assert_*` runtime invariant. Call this at
     /// the end of each structural state-mutating method instead of the
     /// individual asserts — adding a new invariant only requires
     /// extending this function, and every existing call site picks it
     /// up automatically.
     ///
-    /// All members are gated behind the `volume-invariants` feature
-    /// individually; this umbrella is unconditional and compiles to a
-    /// chain of (mostly) no-op stubs when the feature is disabled.
+    /// Each member returns immediately unless
+    /// [`crate::volume_invariants_enabled`] says otherwise, so this
+    /// umbrella costs a handful of loads when the checks are off.
     #[inline]
     pub(in crate::volume) fn assert_volume_invariants(&self, caller: &'static str) {
         self.assert_lbamap_consistent(caller);

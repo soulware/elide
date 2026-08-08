@@ -1246,7 +1246,6 @@ fn rebuild_inner(
 /// The `(inner_owners, delta_owners, journal_owners, live_segments)` tuple
 /// returned by [`rebuild_owners_unverified`]. `journal_owners` is the set of
 /// `(segment, hash)` keys the disk walk assigns to the disjoint journal map.
-#[cfg(feature = "volume-invariants")]
 pub type RebuiltOwners = (
     HashMap<blake3::Hash, Ulid>,
     HashMap<blake3::Hash, Ulid>,
@@ -1258,7 +1257,7 @@ pub type RebuiltOwners = (
 /// without signature verification, inline data, presence bitmaps, or
 /// any of the BodySource detail.
 ///
-/// Used only by the `--features volume-invariants` runtime drift check
+/// Used only by the runtime drift check
 /// (`Volume::assert_extent_index_consistent`). The full
 /// [`rebuild`] does much more work per segment and verifies signatures —
 /// neither is needed for an in-memory consistency check (signatures
@@ -1283,7 +1282,6 @@ pub type RebuiltOwners = (
 ///
 /// **Do not use for production rebuild paths** — they need the full
 /// machinery.
-#[cfg(feature = "volume-invariants")]
 pub fn rebuild_owners_unverified(
     forks: &[(PathBuf, Option<String>)],
     journal: &crate::journal::JournalRanges,

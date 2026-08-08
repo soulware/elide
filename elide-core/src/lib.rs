@@ -36,3 +36,19 @@ pub mod volume_event;
 pub mod volume_ipc;
 pub mod writelog;
 pub mod wtrace;
+
+/// Whether the volume's self-check assertions run.
+///
+/// Each one rebuilds a structure from disk and diffs it against memory,
+/// which costs more than the mutation it guards, so it answers to
+/// `ELIDE_VOLUME_INVARIANTS` at runtime and falls back to the
+/// `volume-invariants` build feature. Reading the variable once keeps a
+/// disabled check to a single load.
+pub fn volume_invariants_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| match std::env::var("ELIDE_VOLUME_INVARIANTS") {
+            Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => cfg!(feature = "volume-invariants"),
+        });
+    *ENABLED
+}

@@ -48,6 +48,11 @@ proptest = []
 # `elide-coordinator/proptest` so the gc_proptest suite (which DOES
 # exercise those paths) gets the invariants. See `docs/testing.md` for
 # the wiring rationale.
+#
+# The checks compile unconditionally and answer to
+# `ELIDE_VOLUME_INVARIANTS` at runtime; this feature sets what they do
+# when the variable is unset, so a test build gets them and a release
+# binary turns them on for the run that wants the attribution.
 volume-invariants = []
 
 [dev-dependencies]

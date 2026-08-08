@@ -126,11 +126,13 @@ Each entry below has a named deterministic regression test; see the listed file 
 - Bug E: on restart, the extent index was rebuilt from on-disk `.idx` files which still pointed at old segments, leaving the system stale once `apply_done_handoffs` removed them. Fix in the manifest era: re-apply `.applied` handoffs on restart. Under the self-describing protocol the bare `gc/<new>` body is picked up by `collect_gc_applied_segment_files` during rebuild and feeds the extent index at low priority — so the bug is resolved structurally and no explicit re-apply is needed.
 - GC compactor converted DEDUP_REF entries to DATA entries with `stored_length=0`, producing a zero-length body record that caused EIO on rebuild. Fix: check `is_dedup_ref` and emit `new_dedup_ref` in the coordinator GC path. This bug was invisible to `elide-core`'s proptest because the test helper was a *separate reimplementation* of GC that happened to handle DEDUP_REFs correctly — which is why `gc_proptest.rs` exists in the coordinator crate, calling the real code.
 
-### Runtime invariants gated behind `--features volume-invariants`
+### Runtime invariants, switched by `ELIDE_VOLUME_INVARIANTS`
 
 Some bugs are easier to catch at the introducing call site than at the eventual symptom. For those, the volume layer keeps "is the in-memory state consistent with disk?" assertions that fire at the end of structural state-mutating methods and panic on divergence with a labelled message identifying the calling method.
 
-These checks are **not free** — each call rebuilds an in-memory data structure from disk. To keep the everyday `cargo test -p elide-core` suite fast and to avoid slowing down elide-core's own proptest binaries (which don't exercise the coordinator-layer paths these invariants protect), the invariants are gated behind a separate `volume-invariants` feature. The rebuild path additionally **skips ed25519 signature verification** (`lbamap::rebuild_segments_unverified`) since `Volume::open` already verifies signatures at startup and on-disk segments are immutable thereafter — the per-segment verify dominates the assertion cost.
+These checks are **not free** — each call rebuilds an in-memory data structure from disk. They compile unconditionally and each returns immediately unless `elide_core::volume_invariants_enabled()` says otherwise, which reads `ELIDE_VOLUME_INVARIANTS` once and falls back to the `volume-invariants` build feature. That keeps the everyday `cargo test -p elide-core` suite fast, and lets a release binary run the checks for one soak by setting the variable rather than by rebuilding. The rebuild path additionally **skips ed25519 signature verification** (`lbamap::rebuild_segments_unverified`) since `Volume::open` already verifies signatures at startup and on-disk segments are immutable thereafter — the per-segment verify dominates the assertion cost.
+
+Running a volume server with `ELIDE_VOLUME_INVARIANTS=1` turns a silent drift into a panic naming the mutating method. On a volume with real history the per-op rebuild is expensive (`lbamap::rebuild_segments` measured at 394 ms on a soak volume), so it suits a targeted run rather than a standing configuration.
 
 #### Wiring
 
@@ -138,17 +140,16 @@ These checks are **not free** — each call rebuilds an in-memory data structure
 - `elide-coordinator/proptest` propagates **both** to elide-core: `proptest = ["elide-core/proptest", "elide-core/volume-invariants"]`. Running `cargo test -p elide-coordinator --features proptest` enables the invariants because elide-coordinator's coordinator-layer stress (gc_proptest) is exactly where the drift bugs live.
 - Running `cargo test -p elide-core --features proptest` does **not** enable `volume-invariants` — elide-core's volume_proptest / fork_proptest / actor_proptest stay fast.
 - CI **must split the workspace command per crate** rather than running `cargo test --workspace --features proptest` — Cargo's resolver-2 unifies features across a workspace build, which would activate `volume-invariants` for elide-core's test binaries via the elide-coordinator dependency. The split is in `.github/workflows/ci.yml` under the `host-proptests` job.
-- The invariant function is split into two definitions: a heavy implementation under `#[cfg(feature = "volume-invariants")]`, and an `#[inline]` no-op stub under `#[cfg(not(feature = "volume-invariants"))]`. Callers always invoke the same name; the compiler picks the right one. This avoids `#[cfg]` clutter at every call site.
+- The workspace root declares `volume-invariants = ["elide-core/volume-invariants"]`, so `cargo build --features volume-invariants` produces a binary with the checks on by default.
+- Each invariant is one function that leads with the switch, so call sites carry no `#[cfg]`.
 
 ```rust
-#[cfg(feature = "volume-invariants")]
 pub(in crate::volume) fn assert_lbamap_consistent(&self, caller: &'static str) {
+    if !crate::volume_invariants_enabled() {
+        return;
+    }
     // ... rebuild from disk + WAL, compare to self.lbamap, panic on diverge.
 }
-
-#[cfg(not(feature = "volume-invariants"))]
-#[inline]
-pub(in crate::volume) fn assert_lbamap_consistent(&self, _caller: &'static str) {}
 ```
 
 #### Calling convention

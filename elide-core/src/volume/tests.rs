@@ -4054,11 +4054,13 @@ fn write_multi_input_plan(vol: &mut Volume, fork_dir: &Path, inputs: &[Ulid]) ->
 }
 
 #[test]
-#[cfg_attr(
-    feature = "volume-invariants",
-    ignore = "deliberately diverges the daemon's read state from disk — the per-op rebuild checkers flag exactly that"
-)]
 fn gc_plan_with_unknown_input_diverges_and_reopen_recovers() {
+    // Deliberately diverges the daemon's read state from disk, which is
+    // exactly what the per-op rebuild checkers flag, so this runs only
+    // while they are off.
+    if crate::volume_invariants_enabled() {
+        return;
+    }
     // Re-enacts the 2026-07-02 incident shape: a committed segment lands
     // in index/ + cache/ behind a running daemon's back (there: force-claim
     // re-own; here: idx moved aside across a reopen and restored after).
