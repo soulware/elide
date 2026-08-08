@@ -60,14 +60,18 @@ fn run(path: &str, hz: i32, secs: u64) {
             return;
         }
     };
-    let file = match std::fs::File::create(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("[profile] could not create {path}: {e}");
-            return;
-        }
-    };
-    match report.flamegraph(file) {
+    // Rendered before the file exists so a run that sampled nothing leaves
+    // no 0-byte SVG to be mistaken for a profile.
+    let mut svg = Vec::new();
+    if let Err(e) = report.flamegraph(&mut svg) {
+        tracing::error!("[profile] could not render the flamegraph: {e}");
+        return;
+    }
+    if svg.is_empty() {
+        tracing::warn!("[profile] no samples collected, nothing written");
+        return;
+    }
+    match std::fs::write(path, &svg) {
         Ok(()) => tracing::info!("[profile] wrote {path}"),
         Err(e) => tracing::error!("[profile] could not write {path}: {e}"),
     }
@@ -85,16 +89,24 @@ mod tests {
     fn a_short_window_writes_a_flamegraph() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cpu.svg");
+        // Arithmetic between clock reads, not a clock read per iteration.
+        // `Instant::now()` lands in the vDSO, which the blocklist drops
+        // whole samples for, so a loop that spins on it collects nothing
+        // on Linux while passing on macOS, where there is no vDSO to match.
         let burn = std::thread::spawn(|| {
-            let end = std::time::Instant::now() + Duration::from_secs(1);
+            let end = std::time::Instant::now() + Duration::from_millis(2500);
             let mut n: u64 = 0;
-            while std::time::Instant::now() < end {
-                n = n.wrapping_add(1);
+            loop {
+                for i in 0..1_000_000u64 {
+                    n = n.wrapping_add(i).rotate_left(7);
+                }
+                if std::time::Instant::now() >= end {
+                    return n;
+                }
             }
-            n
         });
 
-        run(&path.to_string_lossy(), 99, 1);
+        run(&path.to_string_lossy(), 99, 2);
 
         let _ = burn.join();
         let svg = std::fs::read_to_string(&path).expect("flamegraph written");
