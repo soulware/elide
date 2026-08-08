@@ -376,6 +376,35 @@ impl LbaMap {
             }
         };
 
+        // Exact-extent fast path. Entries are disjoint, so one keyed at
+        // `start_lba` and exactly this long is the only entry this range
+        // meets: no predecessor reaches past `start_lba`, and nothing
+        // else starts below `new_end`. The claim can then be restated in
+        // place, and a carry that keeps the hash leaves the refcount
+        // alone. A GC fold takes this for every extent it carries
+        // forward without reslicing.
+        if let Some(existing) = self.inner.get(&start_lba).copied()
+            && existing.lba_length == lba_length
+        {
+            if blocks(existing.claimant_ulid, existing.hash) {
+                return 0;
+            }
+            self.inner.insert(
+                start_lba,
+                MapEntry {
+                    lba_length,
+                    hash,
+                    payload_block_offset: 0,
+                    claimant_ulid: claimant,
+                },
+            );
+            if existing.hash != hash {
+                self.claim_decref(&existing.hash);
+                self.claim_incref(hash);
+            }
+            return lba_length;
+        }
+
         // Sub-ranges of [start_lba, new_end) covered by an existing entry
         // whose claimant blocks ours — those we must leave untouched. The
         // BTreeMap's no-overlap invariant means these are emitted in
@@ -1117,6 +1146,54 @@ mod tests {
         );
         assert_eq!(map.lookup(0), Some((h(3), 0)));
         assert_eq!(map.lookup(10), Some((h(2), 0)));
+    }
+
+    /// The exact-extent path carries a hash forward under a new
+    /// claimant, which is what every unresliced entry of a GC fold does.
+    #[test]
+    fn consuming_inputs_restates_an_exact_extent_under_the_new_claimant() {
+        let mut map = LbaMap::new();
+        map.insert(8, 4, h(1), u(5));
+        let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
+
+        let installed = map.insert_consuming_inputs(8, 4, h(1), u(7), &inputs);
+
+        assert_eq!(installed, 4);
+        assert_eq!(map.lookup(8), Some((h(1), 0)));
+        assert_eq!(map.lookup(11), Some((h(1), 3)));
+        assert!(map.is_referenced(&h(1)));
+        map.debug_assert_claim_counts();
+    }
+
+    /// Same extent, different hash: the claim count moves across.
+    #[test]
+    fn consuming_inputs_exact_extent_moves_the_claim_count() {
+        let mut map = LbaMap::new();
+        map.insert(8, 4, h(1), u(5));
+        let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
+
+        let installed = map.insert_consuming_inputs(8, 4, h(2), u(7), &inputs);
+
+        assert_eq!(installed, 4);
+        assert_eq!(map.lookup(8), Some((h(2), 0)));
+        assert!(!map.is_referenced(&h(1)));
+        assert!(map.is_referenced(&h(2)));
+        map.debug_assert_claim_counts();
+    }
+
+    /// A claimant outside the consumed set keeps the whole extent.
+    #[test]
+    fn consuming_inputs_exact_extent_defers_to_a_blocking_claimant() {
+        let mut map = LbaMap::new();
+        map.insert(8, 4, h(1), u(9));
+        let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
+
+        let installed = map.insert_consuming_inputs(8, 4, h(2), u(7), &inputs);
+
+        assert_eq!(installed, 0);
+        assert_eq!(map.lookup(8), Some((h(1), 0)));
+        assert!(!map.is_referenced(&h(2)));
+        map.debug_assert_claim_counts();
     }
 
     #[test]
