@@ -63,6 +63,10 @@ ublk = ["dep:libublk", "dep:io-uring", "dep:smol"]
 # on every member crate that has one, so CI can run them all via a single
 # `cargo test --workspace --features proptest --tests` invocation.
 proptest = ["elide-core/proptest", "elide-coordinator/proptest"]
+# Make the volume self-checks default to on. They compile in either way
+# and answer to `ELIDE_VOLUME_INVARIANTS`, so a stock binary can run them
+# for one soak without a rebuild.
+volume-invariants = ["elide-core/volume-invariants"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk  = { version = "0.4", optional = true }
