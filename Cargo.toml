@@ -31,6 +31,9 @@ libc           = "0.2"
 lz4_flex       = "0.11"
 futures        = "0.3"
 object_store   = { version = "0.11", features = ["aws"] }
+# Sampling profiler for `serve-volume`, gated at runtime by
+# ELIDE_CPU_PROFILE so a release binary can be profiled as it ships.
+pprof          = { version = "0.15", default-features = false, features = ["flamegraph"] }
 # Pulled in transitively via rust-s3 (elide-fetch) and object_store (coordinator).
 # Declared directly here so we can call `CryptoProvider::install_default` at
 # startup — rustls 0.23 requires this when feature-flag auto-detection fails,

@@ -7,8 +7,9 @@ use elide_core::signing::{VOLUME_KEY_FILE, VOLUME_PROVENANCE_FILE, VOLUME_PUB_FI
 use elide_core::volume;
 
 use elide::{
-    VolumeFetchInputs, coordinator_client, corpus_sim, delta_sim, extents, inspect, inspect_files,
-    parse_size, resolve_volume_dir, resolve_volume_size, serve, ublk, validate_volume_name, verify,
+    VolumeFetchInputs, coordinator_client, corpus_sim, cpu_profile, delta_sim, extents, inspect,
+    inspect_files, parse_size, resolve_volume_dir, resolve_volume_size, serve, ublk,
+    validate_volume_name, verify,
 };
 
 /// Elide volume management and analysis tools.
@@ -501,6 +502,7 @@ fn main() {
             if elide_coordinator::log_init::init_for_volume(&inferred).is_err() {
                 elide_coordinator::log_init::init_stderr();
             }
+            cpu_profile::spawn_if_enabled();
         }
         _ => elide_coordinator::log_init::init_stderr(),
     }
