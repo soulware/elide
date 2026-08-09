@@ -271,6 +271,8 @@ pub struct VolumeActor {
     /// Counters as the last report left them, so the idle tick reports
     /// the window rather than the volume's whole history.
     lock_stats_reported: LockStatsSnapshot,
+    /// When that mark was taken, which is the span the next line covers.
+    lock_stats_marked: Instant,
 }
 
 /// Promote-pipeline bookkeeping: dispatch/completion generations for
@@ -413,6 +415,14 @@ enum HandoffDispatch {
 /// conservative value chosen for observability during development; it can be
 /// tightened without any correctness implications.
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Total volume-mutex hold a window must exceed to earn a log line.
+///
+/// A tick on a volume nobody is writing to still takes the mutex a few
+/// times to publish and to check for work, for tens of microseconds all
+/// told. At 5ms against a 10s window the mutex is free 99.95% of the
+/// time, which is quiet whatever the sites add up to.
+const LOCK_REPORT_FLOOR: Duration = Duration::from_millis(5);
 
 /// Acquire the volume mutex.
 ///
@@ -1393,18 +1403,25 @@ impl VolumeActor {
     ///
     /// Every acquisition named here is time a guest write could spend
     /// waiting, so the line is ranked by hold and closes on the longest
-    /// hold the volume has seen. A window in which nothing acquired logs
-    /// nothing, which keeps an idle volume quiet.
+    /// hold the volume has seen. A window costing less than
+    /// [`LOCK_REPORT_FLOOR`] keeps its counters and rolls into the next
+    /// one, so a quiet volume stays silent and the line that does come
+    /// out covers everything since the last, over the span it names.
     fn report_lock_stats(&mut self) {
+        let window = self.lock_stats.snapshot().since(&self.lock_stats_reported);
+        if !window.worth_reporting(LOCK_REPORT_FLOOR) {
+            return;
+        }
         let now = self.lock_stats.take_window();
         if let Some(report) = now.since(&self.lock_stats_reported).report() {
             info!(
                 "[lock {}] {}s: {report}",
                 self.volume_label(),
-                IDLE_FLUSH_INTERVAL.as_secs(),
+                self.lock_stats_marked.elapsed().as_secs(),
             );
         }
         self.lock_stats_reported = now;
+        self.lock_stats_marked = Instant::now();
     }
 
     /// The volume's directory name, which is its ULID under `by_id/`.
@@ -3762,6 +3779,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         parked: ParkedOps::default(),
         lock_stats: Arc::clone(&lock_stats),
         lock_stats_reported: LockStatsSnapshot::default(),
+        lock_stats_marked: Instant::now(),
     };
 
     let client = VolumeClient {
