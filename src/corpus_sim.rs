@@ -287,17 +287,51 @@ fn training_samples(entries: &[&Version], dict_bytes: usize) -> Vec<Vec<u8>> {
 /// chunk, which is what makes a slice at a multiple of it a subtree.
 const CHUNK_SIZES: [usize; 4] = [64 << 10, 128 << 10, 256 << 10, 512 << 10];
 
+/// What a body costs to store, and what one guest read of it pays.
+///
+/// A read decodes exactly the chunk it lands in, so weighting each chunk by
+/// the plaintext it covers and dividing by the population's plaintext gives
+/// what a read at a uniformly random offset pulls and decodes. Storage alone
+/// chose the shipped chunk size; these two are the other half of the trade.
+#[derive(Clone, Copy, Default)]
+struct ChunkCost {
+    stored: u64,
+    read: u64,
+    decoded: u64,
+}
+
+impl ChunkCost {
+    fn add(&mut self, other: ChunkCost) {
+        self.stored += other.stored;
+        self.read += other.read;
+        self.decoded += other.decoded;
+    }
+
+    fn one_frame(stored: u64, plain_len: u64) -> Self {
+        Self {
+            stored,
+            read: stored * plain_len,
+            decoded: plain_len * plain_len,
+        }
+    }
+}
+
 /// Stored size of `plain` as a chunked body at `chunk_bytes`: the table plus
 /// one frame per chunk. Mirrors `volume::compress_body`'s layout, including
 /// the 4-byte header and the 36 bytes each chunk costs in the table.
-fn chunked_len(level: i32, plain: &[u8], chunk_bytes: usize) -> io::Result<usize> {
+fn chunked_cost(level: i32, plain: &[u8], chunk_bytes: usize) -> io::Result<ChunkCost> {
     let count = plain.len().div_ceil(chunk_bytes);
-    let mut total = 4 + count * 36;
+    let mut cost = ChunkCost {
+        stored: (4 + count * 36) as u64,
+        ..ChunkCost::default()
+    };
     for index in 0..count {
         let start = index * chunk_bytes;
-        total += zstd_len(level, &plain[start..(start + chunk_bytes).min(plain.len())])?;
+        let piece = &plain[start..(start + chunk_bytes).min(plain.len())];
+        let frame = zstd_len(level, piece)? as u64;
+        cost.add(ChunkCost::one_frame(frame, piece.len() as u64));
     }
-    Ok(total)
+    Ok(cost)
 }
 
 fn codec_study(versions: &[Version]) -> io::Result<()> {
@@ -312,8 +346,8 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
     // below one chunk are stored as a single frame either way.
     let mut big_entries = 0u64;
     let mut big_plain = 0u64;
-    let mut big_whole = 0u64;
-    let mut big_chunked = [0u64; CHUNK_SIZES.len()];
+    let mut big_whole = ChunkCost::default();
+    let mut big_chunked = [ChunkCost::default(); CHUNK_SIZES.len()];
     let mut zstd9_total = 0u64;
 
     for v in versions {
@@ -334,9 +368,10 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         if v.plain.len() > CHUNK_SIZES[0] {
             big_entries += 1;
             big_plain += v.plain.len() as u64;
-            big_whole += zstd_len(BODY_LEVEL, &v.plain)? as u64;
+            let whole = zstd_len(BODY_LEVEL, &v.plain)? as u64;
+            big_whole.add(ChunkCost::one_frame(whole, v.plain.len() as u64));
             for (slot, chunk_bytes) in big_chunked.iter_mut().zip(CHUNK_SIZES) {
-                *slot += chunked_len(BODY_LEVEL, &v.plain, chunk_bytes)? as u64;
+                slot.add(chunked_cost(BODY_LEVEL, &v.plain, chunk_bytes)?);
             }
         }
     }
@@ -386,22 +421,35 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         println!("  no entry exceeds one chunk; chunking changes nothing here");
         return Ok(());
     }
+    // Per-read figures divide by the plaintext they were weighted with.
+    let per_read = |w: u64| w as f64 / big_plain as f64 / 1024.0;
     println!(
-        "  one frame        {:.1} MiB ({:.1}% of that plaintext)",
-        mib(big_whole),
-        pct(big_whole, big_plain),
+        "  {:<16} {:>9} {:>8} {:>10} {:>9} {:>10} {:>9}",
+        "", "stored", "of that", "vs 1 frame", "read", "decode", "dec vs1f"
+    );
+    println!(
+        "  {:<16} {:>7.1} MiB {:>7.1}% {:>10} {:>6.1} KiB {:>7.1} KiB {:>9}",
+        "one frame",
+        mib(big_whole.stored),
+        pct(big_whole.stored, big_plain),
+        "-",
+        per_read(big_whole.read),
+        per_read(big_whole.decoded),
+        "1.00x",
     );
     for (chunked, chunk_bytes) in big_chunked.iter().zip(CHUNK_SIZES) {
         println!(
-            "  {:>4} KiB chunks  {:.1} MiB ({:.1}% of it)  costs {:+.2}% against one frame, \
-             {:+.3}% of all plaintext",
-            chunk_bytes / 1024,
-            mib(*chunked),
-            pct(*chunked, big_plain),
-            100.0 * (*chunked as f64 - big_whole as f64) / big_whole as f64,
-            100.0 * (*chunked as f64 - big_whole as f64) / plain as f64,
+            "  {:<16} {:>7.1} MiB {:>7.1}% {:>+9.2}% {:>6.1} KiB {:>7.1} KiB {:>8.2}x",
+            format!("{} KiB chunks", chunk_bytes / 1024),
+            mib(chunked.stored),
+            pct(chunked.stored, big_plain),
+            100.0 * (chunked.stored as f64 - big_whole.stored as f64) / big_whole.stored as f64,
+            per_read(chunked.read),
+            per_read(chunked.decoded),
+            chunked.decoded as f64 / big_whole.decoded as f64,
         );
     }
+    println!("  read and decode are what one guest read pays at a uniformly random offset");
     Ok(())
 }
 
