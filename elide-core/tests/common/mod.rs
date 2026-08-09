@@ -882,8 +882,10 @@ impl segment::SegmentFetcher for CapturedBodyFetcher {
 pub fn open_with_captured_body_fetcher(
     fork_dir: &Path,
     store_dir: &Path,
+    delta: bool,
 ) -> elide_core::volume::Volume {
     let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_delta_policy(delta, delta);
     vol.set_fetcher(std::sync::Arc::new(CapturedBodyFetcher {
         store_dir: store_dir.to_path_buf(),
     }));

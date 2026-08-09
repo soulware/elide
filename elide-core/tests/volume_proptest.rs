@@ -848,7 +848,7 @@ fn arb_gc_interleaved_ops() -> impl Strategy<Value = Vec<SimOp>> {
 
 proptest! {
     #[test]
-    fn ulid_monotonicity(ops in arb_sim_ops()) {
+    fn ulid_monotonicity(ops in arb_sim_ops(), delta in any::<bool>()) {
         let tmp = tempfile::TempDir::new().unwrap();
         // Fork dir is named after a ULID so the read path's owner-vol-id
         // resolution accepts it (find_segment_in_dirs requires the dir
@@ -859,7 +859,7 @@ proptest! {
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
         stamp_journal_window(fork_dir);
-        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
         // Tracks the latest snapshot ULID; segments at or below this are frozen.
         let mut snapshot_floor: Option<Ulid> = None;
         // Pending GcCheckpoint ULIDs awaiting GcApply.
@@ -974,7 +974,7 @@ proptest! {
                         // on disk: a state only a crash reaches, so the
                         // op takes that crash immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                     }
                 }
@@ -997,7 +997,7 @@ proptest! {
                         // claimants until the pipeline completes, so the
                         // op takes the crash it models immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                     }
                 }
@@ -1148,7 +1148,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
                     // No assertion here: the next Flush or SweepPending
                     // will verify that the mint was correctly reseeded.
@@ -1207,7 +1207,7 @@ proptest! {
                     // trips the `volume-invariants` consistency check (disk has
                     // entries the in-memory mirror doesn't).
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -1395,7 +1395,7 @@ proptest! {
     /// exactly the value last written to it. This directly tests that no
     /// sequence of volume operations + GC + crash can produce a stale read.
     #[test]
-    fn crash_recovery_oracle(ops in arb_sim_ops()) {
+    fn crash_recovery_oracle(ops in arb_sim_ops(), delta in any::<bool>()) {
         let tmp = tempfile::TempDir::new().unwrap();
         let fork_dir = tmp.path().join(Ulid::new().to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
@@ -1403,7 +1403,7 @@ proptest! {
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
         stamp_journal_window(fork_dir);
-        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
@@ -1436,7 +1436,7 @@ proptest! {
                         // claimants until the pipeline completes, so the
                         // op takes the crash it models immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
@@ -1480,7 +1480,7 @@ proptest! {
                         // on disk: a state only a crash reaches, so the
                         // op takes that crash immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
@@ -1577,7 +1577,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
                     // For any pending/<ulid> whose cache/<ulid>.body survived
                     // (a HalfPromotePending before this crash), retrying
@@ -1657,7 +1657,7 @@ proptest! {
                     // `populate_cache` bypasses `Volume::write`; drop+reopen
                     // so `self.lbamap` reflects the populated entries.
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -1844,7 +1844,7 @@ proptest! {
     /// two segments already drained to `segments/`, ensuring `CoordGcLocal` has
     /// material to compact on most sequences rather than silently no-opping.
     #[test]
-    fn gc_interleaved_oracle(ops in arb_gc_interleaved_ops()) {
+    fn gc_interleaved_oracle(ops in arb_gc_interleaved_ops(), delta in any::<bool>()) {
         let tmp = tempfile::TempDir::new().unwrap();
         let fork_dir = tmp.path().join(Ulid::new().to_string());
         std::fs::create_dir_all(&fork_dir).unwrap();
@@ -1852,7 +1852,7 @@ proptest! {
         let store_dir = tmp.path().join("_store");
         common::write_test_keypair(fork_dir);
         stamp_journal_window(fork_dir);
-        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+        let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
         let mut pending_gc: Option<Ulid> = None;
@@ -1885,7 +1885,7 @@ proptest! {
                         // claimants until the pipeline completes, so the
                         // op takes the crash it models immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
@@ -1929,7 +1929,7 @@ proptest! {
                         // on disk: a state only a crash reaches, so the
                         // op takes that crash immediately.
                         drop(vol);
-                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                        vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                         pending_gc = None;
                         common::assert_promote_recovery(&mut vol, fork_dir);
                         common::check_presence_truthful(fork_dir).map_err(TestCaseError::fail)?;
@@ -2026,7 +2026,7 @@ proptest! {
                 }
                 SimOp::Crash => {
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
                     // See crash_recovery_oracle for rationale.
                     common::assert_promote_recovery(&mut vol, fork_dir);
@@ -2083,7 +2083,7 @@ proptest! {
                     // `populate_cache` bypasses `Volume::write`; drop+reopen
                     // so `self.lbamap` reflects the populated entries.
                     drop(vol);
-                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+                    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                 }
                 SimOp::DedupWrite { lba_a, lba_b, seed } => {
                     let data = [*seed; 4096];
@@ -2249,12 +2249,12 @@ proptest! {
     /// mutates state through the in-memory lbamap, so `vol.read` is always
     /// authoritative against the oracle.
     #[test]
-    fn reclaim_crash_recovery(ops in arb_reclaim_ops()) {
+    fn reclaim_crash_recovery(ops in arb_reclaim_ops(), delta in any::<bool>()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
         common::write_test_keypair(fork_dir);
         stamp_journal_window(fork_dir);
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = open_vol(fork_dir, delta);
         let mut oracle: std::collections::HashMap<u64, [u8; 4096]> =
             std::collections::HashMap::new();
 
@@ -2309,7 +2309,7 @@ proptest! {
                 }
                 ReclaimOp::Crash => {
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = open_vol(fork_dir, delta);
                 }
             }
 
@@ -2329,19 +2329,32 @@ proptest! {
     }
 }
 
+/// Open a volume with the delta tiers set either way.
+///
+/// The tiers are parked behind `ELIDE_ENABLE_DELTA`, so the shipped
+/// configuration runs without them. The simulations draw `delta` from the
+/// strategy rather than fixing it, so both configurations are explored and
+/// neither one's assumptions can hide a defect in the other.
+fn open_vol(fork_dir: &std::path::Path, delta: bool) -> Volume {
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_delta_policy(delta, delta);
+    vol
+}
+
 /// The `delta_gc_prefix` steps must actually mint a Delta entry —
 /// asserted on the promoted segment's `.idx` so a future change to the
 /// conversion gates (inline threshold, delta-smaller-than-stored,
 /// snapshot resolution) cannot silently regress the suite's Delta
 /// coverage back to a structural no-op, which is the gap that hid the
 /// #681 fold mis-registration for so long.
+
 #[test]
 fn delta_gc_prefix_mints_a_delta_entry() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
     common::write_test_keypair(fork_dir);
     stamp_journal_window(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
@@ -2391,7 +2404,7 @@ fn delta_cycle_prefix_mints_a_superseded_delta() {
     let fork_dir = dir.path();
     common::write_test_keypair(fork_dir);
     stamp_journal_window(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
@@ -2452,7 +2465,7 @@ fn gc_fold_over_superseded_delta_cycle_applies_cleanly() {
     let fork_dir = fork_dir_owned.as_path();
     common::write_test_keypair(fork_dir);
     stamp_journal_window(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
@@ -2499,7 +2512,7 @@ fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
     let fork_dir = fork_dir_owned.as_path();
     common::write_test_keypair(fork_dir);
     stamp_journal_window(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     vol.write(52, &common::variant_block(0, 0x01)).unwrap();
     vol.flush_wal().unwrap();
@@ -2531,7 +2544,7 @@ fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
     assert_eq!(live.as_slice(), a_prime.as_slice());
 
     drop(vol);
-    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let vol = open_vol(fork_dir, true);
     let rebuilt = vol.read(52, 1).expect("read after crash rebuild");
     assert_eq!(rebuilt.as_slice(), a_prime.as_slice());
 }

@@ -410,7 +410,7 @@ fn writemulti_overlap_sweep_then_repack_regression() {
     let fork_dir = fork_dir.as_path();
     let store_dir = tmp.path().join("_store");
     common::write_test_keypair(fork_dir);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
 
     // Seed pending with one segment so sweep has a 2-input bucket
@@ -445,7 +445,7 @@ fn writemulti_overlap_sweep_then_repack_regression() {
     let _ = vol.repack_open_for_test();
 
     drop(vol);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     common::assert_promote_recovery(&mut vol, fork_dir);
     for (&lba, expected) in &oracle {
         let actual = vol.read(lba, 1).unwrap();
@@ -469,7 +469,7 @@ fn gc_interleaved_writemulti_overlap_regression() {
     let fork_dir = fork_dir.as_path();
     let store_dir = tmp.path().join("_store");
     common::write_test_keypair(fork_dir);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
 
     // DedupWrite { lba_a: 0, lba_b: 4, seed: 0 }
@@ -521,7 +521,7 @@ fn gc_interleaved_writemulti_overlap_regression() {
     let _ = vol.repack_open_for_test();
 
     drop(vol);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     common::assert_promote_recovery(&mut vol, fork_dir);
     for (&lba, expected) in &oracle {
         let actual = vol.read(lba, 1).unwrap();
@@ -558,7 +558,7 @@ fn crash_recovery_seed_b1c5223d_regression() {
     let fork_dir = fork_dir.as_path();
     let store_dir = tmp.path().join("_store");
     common::write_test_keypair(fork_dir);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
 
     // SimOp::WriteMulti
@@ -625,7 +625,7 @@ fn crash_recovery_seed_b1c5223d_regression() {
 
     // SimOp::Crash
     drop(vol);
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     common::assert_promote_recovery(&mut vol, fork_dir);
     for (&lba, expected) in &oracle {
         let actual = vol.read(lba, 1).unwrap();
@@ -664,7 +664,7 @@ fn gc_apply_double_fold_serialized_by_pending_gate() {
     });
     cfg.write(fork_dir).unwrap();
 
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
 
     // SimOp::JournalDupWrite { journal_first: false, seed: 0 }
     let data = incompressible_block(0);
@@ -729,7 +729,7 @@ fn gc_stale_plan_double_fold_blocked_by_pending_gate() {
     });
     cfg.write(fork_dir).unwrap();
 
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
 
     let write_multi = |vol: &mut elide_core::volume::Volume, start: u64, count: u8| {
         let mut payload = Vec::with_capacity(count as usize * 4096);
@@ -798,7 +798,7 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     });
     cfg.write(fork_dir).unwrap();
 
-    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    let mut vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
 
     let coord_gc = |vol: &mut elide_core::volume::Volume, n: usize| {
         common::drain_with_reap(vol);
@@ -828,13 +828,13 @@ fn gc_interleaved_short_present_bitmap_not_a_violation() {
     let u = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, u, 16, 0x80);
     drop(vol);
-    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     // PopulateFetched{1,0}: actual_lba=17, seed=0x90
     common::drain_with_reap(&mut vol);
     let u = vol.gc_checkpoint_for_test().unwrap();
     common::populate_cache(fork_dir, u, 17, 0x90);
     drop(vol);
-    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir);
+    vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, true);
     // WriteNearDup{0,0,0}: actual_lba=52
     let _ = vol.write(52, &common::variant_block(0, 0));
     // DedupWrite{0,4,0}
