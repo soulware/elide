@@ -88,6 +88,7 @@ pub struct PendingSummary {
     pub open_bytes: u64,
     pub upload_files: usize,
     pub upload_bytes: u64,
+    pub wal_files: usize,
     pub wal_bytes: u64,
 }
 
@@ -117,10 +118,14 @@ pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
     let (upload_files, upload_bytes) =
         gen_dir_stats(&elide_core::segment::pending_upload_dir(vol_dir))?;
     let (open_files, open_bytes) = gen_dir_stats(&elide_core::segment::pending_open_dir(vol_dir))?;
+    let mut wal_files = 0usize;
     let mut wal_bytes = 0u64;
     for p in &segment::collect_segment_files(&vol_dir.join("wal"))? {
         match fs::metadata(p) {
-            Ok(m) => wal_bytes += m.len().saturating_sub(writelog::HEADER_LEN),
+            Ok(m) => {
+                wal_files += 1;
+                wal_bytes += m.len().saturating_sub(writelog::HEADER_LEN);
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -130,6 +135,7 @@ pub fn pending_summary(vol_dir: &Path) -> io::Result<PendingSummary> {
         open_bytes,
         upload_files,
         upload_bytes,
+        wal_files,
         wal_bytes,
     })
 }
@@ -315,8 +321,100 @@ fn read_origin(fork_dir: &Path) -> Option<String> {
 }
 
 fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
-    println!();
-    if t.cache_files > 0 {
+    for line in totals_lines(t, p, journal_window_blocks) {
+        println!("{line}");
+    }
+}
+
+/// Two blocks: segment-based counts, then entry-based counts. Within each,
+/// the header totals across every lifecycle stage and the rows beneath name
+/// the stage they cover.
+fn totals_lines(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let upload_segs = t.journal_segs_upload + t.data_segs_upload;
+    let open_segs = t.journal_segs_open + t.data_segs_open;
+    let total_segs = t.cache_files + upload_segs + open_segs;
+    let journal_segs = t.journal_segs_committed + t.journal_segs_upload + t.journal_segs_open;
+    let data_segs = t.data_segs_committed + t.data_segs_upload + t.data_segs_open;
+
+    out.push(String::new());
+    if total_segs > 0 {
+        out.push(format!(
+            "Segments: {}  ({} committed, {} upload, {} open)",
+            fmt_commas(total_segs as u64),
+            fmt_commas(t.cache_files as u64),
+            fmt_commas(upload_segs as u64),
+            fmt_commas(open_segs as u64),
+        ));
+        if journal_window_blocks > 0 || journal_segs > 0 {
+            let window = if journal_window_blocks > 0 {
+                format!(" / {} window", fmt_commas(journal_window_blocks))
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "  journal: {}  ({} committed, {} upload, {} open)   {} blocks{}",
+                fmt_commas(journal_segs as u64),
+                fmt_commas(t.journal_segs_committed as u64),
+                fmt_commas(t.journal_segs_upload as u64),
+                fmt_commas(t.journal_segs_open as u64),
+                fmt_commas(t.journal_blocks_committed + t.journal_blocks_pending),
+                window,
+            ));
+            out.push(format!(
+                "  data:    {}  ({} committed, {} upload, {} open)",
+                fmt_commas(data_segs as u64),
+                fmt_commas(t.data_segs_committed as u64),
+                fmt_commas(t.data_segs_upload as u64),
+                fmt_commas(t.data_segs_open as u64),
+            ));
+        }
+    }
+    if t.wal_files > 0 || p.total_bytes() > 0 || upload_segs + open_segs > 0 {
+        out.push(format!(
+            "  upload:  {} segment{} ({})",
+            fmt_commas(upload_segs as u64),
+            if upload_segs == 1 { "" } else { "s" },
+            fmt_size(p.upload_bytes),
+        ));
+        out.push(format!(
+            "  open:    {} segment{} ({})",
+            fmt_commas(open_segs as u64),
+            if open_segs == 1 { "" } else { "s" },
+            fmt_size(p.open_bytes),
+        ));
+    }
+
+    // A WAL file carries records rather than an index, so the journal and
+    // data rows above cannot classify one — it stands outside the segment
+    // total instead of inflating a column no tier row can account for.
+    if t.wal_files > 0 || p.wal_bytes > 0 {
+        out.push(String::new());
+        out.push(format!(
+            "WAL: {} segment{}  ({} payload, {} record{})",
+            fmt_commas(t.wal_files as u64),
+            if t.wal_files == 1 { "" } else { "s" },
+            fmt_size(p.wal_bytes),
+            fmt_commas(t.wal_records as u64),
+            if t.wal_records == 1 { "" } else { "s" },
+        ));
+    }
+
+    let committed_entries =
+        t.cache_data + t.cache_dedup_ref + t.cache_delta + t.cache_zero + t.cache_inline;
+    let total_entries = committed_entries + t.upload_entries + t.open_entries;
+    if total_entries == 0 {
+        return out;
+    }
+    out.push(String::new());
+    out.push(format!(
+        "Entries: {}  ({} committed, {} upload, {} open)",
+        fmt_commas(total_entries as u64),
+        fmt_commas(committed_entries as u64),
+        fmt_commas(t.upload_entries as u64),
+        fmt_commas(t.open_entries as u64),
+    ));
+    if committed_entries > 0 {
         let pct = if t.cache_data > 0 {
             format!(
                 "{:.1}%",
@@ -325,100 +423,48 @@ fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
         } else {
             "0%".to_owned()
         };
-        let total_index: usize =
-            t.cache_data + t.cache_dedup_ref + t.cache_delta + t.cache_zero + t.cache_inline;
-        println!(
-            "Total: {} segment{}",
-            t.cache_files,
-            if t.cache_files == 1 { "" } else { "s" },
-        );
-        println!(
-            "  index:   {} ({} idx, {} body on disk)  (data {}, dedup {}, inline {}, zero {}, delta {})",
-            fmt_commas(total_index as u64),
+        out.push(format!(
+            "  index:   {} ({} idx)  (data {}, dedup {}, inline {}, zero {}, delta {})",
+            fmt_commas(committed_entries as u64),
             fmt_size(t.cache_idx_file_bytes),
-            fmt_size(t.cache_body_actual),
             fmt_commas(t.cache_data as u64),
             fmt_commas(t.cache_dedup_ref as u64),
             fmt_commas(t.cache_inline as u64),
             fmt_commas(t.cache_zero as u64),
             fmt_commas(t.cache_delta as u64),
-        );
-        println!(
-            "  cached:  {} / {}  ({} local)  {} present{}",
+        ));
+        // Blocks the .body files occupy beside the size the index says those
+        // bodies are. The two track each other to within per-extent block
+        // rounding while every body is present, and the first falls away as
+        // eviction punches holes.
+        out.push(format!(
+            "  cached:  {} / {}  ({} local, {} indexed)  {} present{}",
             fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_data as u64),
+            fmt_size(t.cache_body_actual),
             fmt_size(t.cache_data_body),
             pct,
             canonical_note(t.cache_canonical_data),
-        );
+        ));
         if t.cache_inline > 0 {
-            println!(
+            out.push(format!(
                 "  inline:  {} ({}){}",
                 fmt_commas(t.cache_inline as u64),
                 fmt_size(t.cache_inline_body),
                 canonical_note(t.cache_canonical_inline),
-            );
+            ));
         }
         if t.cache_delta > 0 {
-            println!(
+            out.push(format!(
                 "  delta:   {} ({}{}){}",
                 fmt_commas(t.cache_delta as u64),
                 fmt_size(t.cache_delta_body),
                 dmat_note(t.cache_dmat),
                 canonical_note(t.cache_canonical_delta),
-            );
+            ));
         }
     }
-    let journal_segs_pending = t.journal_segs_open + t.journal_segs_upload;
-    let data_segs_pending = t.data_segs_open + t.data_segs_upload;
-    let journal_segs = t.journal_segs_committed + journal_segs_pending;
-    let data_segs = t.data_segs_committed + data_segs_pending;
-    if journal_window_blocks > 0 && journal_segs + data_segs > 0 {
-        println!(
-            "  journal: {} seg{}, {} blocks / {} window   ({} committed, {} upload, {} open)",
-            fmt_commas(journal_segs as u64),
-            if journal_segs == 1 { "" } else { "s" },
-            fmt_commas(t.journal_blocks_committed + t.journal_blocks_pending),
-            fmt_commas(journal_window_blocks),
-            fmt_commas(t.journal_segs_committed as u64),
-            fmt_commas(t.journal_segs_upload as u64),
-            fmt_commas(t.journal_segs_open as u64),
-        );
-        println!(
-            "  data:    {} seg{}   ({} committed, {} upload, {} open)",
-            fmt_commas(data_segs as u64),
-            if data_segs == 1 { "" } else { "s" },
-            fmt_commas(t.data_segs_committed as u64),
-            fmt_commas(t.data_segs_upload as u64),
-            fmt_commas(t.data_segs_open as u64),
-        );
-    }
-    if t.wal_files > 0 || p.total_bytes() > 0 {
-        println!(
-            "  upload:  {} segment{}, {} entr{} ({})",
-            p.upload_files,
-            if p.upload_files == 1 { "" } else { "s" },
-            fmt_commas(t.upload_entries as u64),
-            if t.upload_entries == 1 { "y" } else { "ies" },
-            fmt_size(p.upload_bytes),
-        );
-        println!(
-            "  open:    {} segment{}, {} entr{} ({})",
-            p.open_files,
-            if p.open_files == 1 { "" } else { "s" },
-            fmt_commas(t.open_entries as u64),
-            if t.open_entries == 1 { "y" } else { "ies" },
-            fmt_size(p.open_bytes),
-        );
-        println!(
-            "  wal:     {} record{} across {} file{} ({} payload)",
-            t.wal_records,
-            if t.wal_records == 1 { "" } else { "s" },
-            t.wal_files,
-            if t.wal_files == 1 { "" } else { "s" },
-            fmt_size(p.wal_bytes),
-        );
-    }
+    out
 }
 
 fn collect_wal_dir(dir: &Path) -> io::Result<Vec<WalInfo>> {
@@ -737,11 +783,11 @@ struct Totals {
     cache_dmat: u64,
     cache_idx_file_bytes: u64,
     cache_body_actual: u64,
-    // Journal tier, scoped to this volume's own node (committed index/ +
-    // pending/), not ancestors — mirrors the coordinator's per-fork census.
-    // These are stored counts by the `journal` entry flag, so they include
-    // pending segments (which the gc census cannot see) and any superseded
-    // segments still inside their reap retention window.
+    // Journal tier over every segment this volume reads: its own committed
+    // index/ and pending/, plus each ancestor layer's index/. These are
+    // stored counts by the `journal` entry flag, so they include pending
+    // segments (which the gc census cannot see) and any superseded segments
+    // still inside their reap retention window.
     journal_segs_committed: usize,
     journal_blocks_committed: u64,
     data_segs_committed: usize,
@@ -786,20 +832,18 @@ fn accumulate(node: &NodeInfo, t: &mut Totals) {
         }
         t.journal_blocks_pending += s.journal_blocks;
     }
-    for f in &node.cache {
-        if f.is_journal {
-            t.journal_segs_committed += 1;
-        } else {
-            t.data_segs_committed += 1;
-        }
-        t.journal_blocks_committed += f.journal_blocks;
-    }
     accumulate_cache(&node.cache, t);
 }
 
 fn accumulate_cache(cache: &[CacheInfo], t: &mut Totals) {
     for f in cache {
         t.cache_files += 1;
+        if f.is_journal {
+            t.journal_segs_committed += 1;
+        } else {
+            t.data_segs_committed += 1;
+        }
+        t.journal_blocks_committed += f.journal_blocks;
         t.cache_data += f.data_count;
         t.cache_dedup_ref += f.dedup_ref_count;
         t.cache_zero += f.zero_count;
@@ -1058,9 +1102,10 @@ fn print_cache_section(
             fmt_commas(f.delta_count as u64),
         );
         println!(
-            "{indent}cached:  {} / {}  ({} local)  {} present{}",
+            "{indent}cached:  {} / {}  ({} local, {} indexed)  {} present{}",
             fmt_commas(f.present_count as u64),
             fmt_commas(f.data_count as u64),
+            fmt_size(f.body_bytes_cached),
             fmt_size(f.data_body_bytes),
             pct,
             canonical_note(f.canonical_data_count),
@@ -1166,6 +1211,206 @@ mod tests {
     }
 
     #[test]
+    fn totals_split_segment_and_entry_blocks_by_lifecycle_stage() {
+        let t = Totals {
+            wal_files: 1,
+            wal_records: 2_787,
+            cache_files: 57,
+            cache_data: 132_779,
+            cache_dedup_ref: 555,
+            cache_zero: 1_675,
+            cache_inline: 3_685,
+            cache_delta: 1_223,
+            cache_present: 132_779,
+            journal_segs_committed: 32,
+            journal_blocks_committed: 15_000,
+            data_segs_committed: 25,
+            journal_segs_open: 8,
+            journal_blocks_pending: 2_477,
+            data_segs_open: 9,
+            open_entries: 31_216,
+            ..Default::default()
+        };
+        let p = PendingSummary {
+            open_files: 17,
+            open_bytes: 50_226_790,
+            upload_files: 0,
+            upload_bytes: 0,
+            wal_files: 1,
+            wal_bytes: 7_130_316,
+        };
+
+        let lines = totals_lines(&t, &p, 16_384);
+        let seg_block: Vec<&str> = lines
+            .iter()
+            .map(|l| l.as_str())
+            .skip_while(|l| !l.starts_with("Segments:"))
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            seg_block,
+            vec![
+                "Segments: 74  (57 committed, 0 upload, 17 open)",
+                "  journal: 40  (32 committed, 0 upload, 8 open)   17,477 blocks / 16,384 window",
+                "  data:    34  (25 committed, 0 upload, 9 open)",
+                "  upload:  0 segments (0 B)",
+                "  open:    17 segments (47.9 MiB)",
+            ],
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "WAL: 1 segment  (6.8 MiB payload, 2,787 records)"),
+            "the wal stands in its own section: {lines:#?}",
+        );
+
+        let entry_block: Vec<&str> = lines
+            .iter()
+            .map(|l| l.as_str())
+            .skip_while(|l| !l.starts_with("Entries:"))
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            entry_block[0],
+            "Entries: 171,133  (139,917 committed, 0 upload, 31,216 open)",
+        );
+        assert!(
+            entry_block[1].starts_with("  index:   139,917 "),
+            "the index row covers the committed column: {}",
+            entry_block[1],
+        );
+    }
+
+    #[test]
+    fn the_cached_row_separates_disk_footprint_from_indexed_body_size() {
+        let evicted = Totals {
+            cache_files: 1,
+            cache_data: 132_779,
+            cache_present: 10_000,
+            cache_data_body: 273_003_315,
+            cache_body_actual: 20_447_232,
+            cache_idx_file_bytes: 9_437_184,
+            ..Default::default()
+        };
+        let p = PendingSummary {
+            open_files: 0,
+            open_bytes: 0,
+            upload_files: 0,
+            upload_bytes: 0,
+            wal_files: 0,
+            wal_bytes: 0,
+        };
+
+        let lines = totals_lines(&evicted, &p, 0);
+        assert!(
+            lines.iter().any(|l| l
+                == "  cached:  10,000 / 132,779  (19.5 MiB local, 260.4 MiB indexed)  7.5% present"),
+            "eviction moves the local figure without touching the indexed one: {lines:#?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  index:   132,779 (9.0 MiB idx)  ")),
+            "the index row carries the idx size alone: {lines:#?}",
+        );
+    }
+
+    #[test]
+    fn journal_and_data_rows_partition_the_segment_header() {
+        let t = Totals {
+            cache_files: 6,
+            journal_segs_committed: 2,
+            data_segs_committed: 4,
+            journal_segs_upload: 1,
+            data_segs_upload: 2,
+            journal_segs_open: 3,
+            data_segs_open: 1,
+            ..Default::default()
+        };
+        let p = PendingSummary {
+            open_files: 4,
+            open_bytes: 4_096,
+            upload_files: 3,
+            upload_bytes: 2_048,
+            wal_files: 0,
+            wal_bytes: 0,
+        };
+
+        let lines = totals_lines(&t, &p, 1_024);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Segments: 13  (6 committed, 3 upload, 4 open)"),
+            "{lines:#?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  journal: 6  (2 committed, 1 upload, 3 open)")),
+            "{lines:#?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  data:    7  (4 committed, 2 upload, 1 open)"),
+            "{lines:#?}",
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("WAL:")),
+            "a volume with no wal file has no wal section: {lines:#?}",
+        );
+    }
+
+    #[test]
+    fn ancestor_segments_count_as_committed_in_both_blocks() {
+        let cache = |is_journal: bool| CacheInfo {
+            ulid: "01AAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            entry_count: 1,
+            data_count: 1,
+            dedup_ref_count: 0,
+            zero_count: 0,
+            inline_count: 0,
+            delta_count: 0,
+            canonical_data_count: 0,
+            canonical_inline_count: 0,
+            canonical_delta_count: 0,
+            present_count: 1,
+            data_body_bytes: 4_096,
+            inline_body_bytes: 0,
+            delta_body_bytes: 0,
+            dmat_bytes: 0,
+            idx_file_bytes: 64,
+            body_bytes_cached: 4_096,
+            journal_blocks: if is_journal { 1 } else { 0 },
+            is_journal,
+            error: None,
+        };
+        let node = NodeInfo {
+            is_live: false,
+            wal_files: Vec::new(),
+            open: Vec::new(),
+            upload: Vec::new(),
+            cache: vec![cache(true)],
+            extent_sources: Vec::new(),
+        };
+        let ancestors = vec![AncestorNode {
+            volume_ulid: "01AAAAAAAAAAAAAAAAAAAAAAAB".to_owned(),
+            branch_ulid: None,
+            cache: vec![cache(false), cache(true)],
+            extent_sources: Vec::new(),
+        }];
+
+        let t = totals(&node, &ancestors);
+        assert_eq!(
+            t.journal_segs_committed + t.data_segs_committed,
+            t.cache_files,
+            "the committed column and the tier rows count the same segments",
+        );
+        assert_eq!(t.journal_segs_committed, 2);
+        assert_eq!(t.data_segs_committed, 1);
+    }
+
+    #[test]
     fn pending_summary_counts_pending_files_and_wal_payload() {
         let tmp = temp_vol_dir();
         fs::create_dir_all(elide_core::segment::pending_open_dir(&tmp)).unwrap();
@@ -1198,6 +1443,7 @@ mod tests {
         assert_eq!(p.open_bytes, 100);
         assert_eq!(p.upload_files, 1);
         assert_eq!(p.upload_bytes, 40);
+        assert_eq!(p.wal_files, 1);
         assert_eq!(p.wal_bytes, 50);
         assert_eq!(p.total_bytes(), 190);
 

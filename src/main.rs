@@ -2109,7 +2109,7 @@ fn print_local_status(
         println!("  pending:  none");
     } else {
         println!(
-            "  pending:  {} (upload {} seg{} {}, open {} seg{} {}, wal {})",
+            "  pending:  {} (upload {} seg{} {}, open {} seg{} {}, wal {} seg{} {})",
             inspect::fmt_size(p.total_bytes()),
             p.upload_files,
             if p.upload_files == 1 { "" } else { "s" },
@@ -2117,6 +2117,8 @@ fn print_local_status(
             p.open_files,
             if p.open_files == 1 { "" } else { "s" },
             inspect::fmt_size(p.open_bytes),
+            p.wal_files,
+            if p.wal_files == 1 { "" } else { "s" },
             inspect::fmt_size(p.wal_bytes),
         );
     }
