@@ -334,6 +334,20 @@ fn chunked_cost(level: i32, plain: &[u8], chunk_bytes: usize) -> io::Result<Chun
     Ok(cost)
 }
 
+/// One power-of-two extent-size bucket of the chunking population.
+///
+/// Whether chunking costs or saves depends on where an extent's size sits
+/// against zstd's own parameter buckets, so a corpus average reports the mix
+/// its extent sizes happen to have. Splitting by size asks the question the
+/// average answers only for that mix.
+#[derive(Default)]
+struct BigBucket {
+    entries: u64,
+    plain: u64,
+    whole: ChunkCost,
+    chunked: [ChunkCost; CHUNK_SIZES.len()],
+}
+
 fn codec_study(versions: &[Version]) -> io::Result<()> {
     let mut plain = 0u64;
     let mut lz4_total = 0u64;
@@ -344,10 +358,7 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
 
     // The population chunking touches, and what it costs there. Extents at or
     // below one chunk are stored as a single frame either way.
-    let mut big_entries = 0u64;
-    let mut big_plain = 0u64;
-    let mut big_whole = ChunkCost::default();
-    let mut big_chunked = [ChunkCost::default(); CHUNK_SIZES.len()];
+    let mut big: BTreeMap<u32, BigBucket> = BTreeMap::new();
     let mut zstd9_total = 0u64;
 
     for v in versions {
@@ -366,13 +377,26 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         // Sized against the smallest chunk swept, so every size is reported
         // over one population.
         if v.plain.len() > CHUNK_SIZES[0] {
-            big_entries += 1;
-            big_plain += v.plain.len() as u64;
+            let b = big.entry(size_bucket(v.plain.len())).or_default();
+            b.entries += 1;
+            b.plain += v.plain.len() as u64;
             let whole = zstd_len(BODY_LEVEL, &v.plain)? as u64;
-            big_whole.add(ChunkCost::one_frame(whole, v.plain.len() as u64));
-            for (slot, chunk_bytes) in big_chunked.iter_mut().zip(CHUNK_SIZES) {
+            b.whole
+                .add(ChunkCost::one_frame(whole, v.plain.len() as u64));
+            for (slot, chunk_bytes) in b.chunked.iter_mut().zip(CHUNK_SIZES) {
                 slot.add(chunked_cost(BODY_LEVEL, &v.plain, chunk_bytes)?);
             }
+        }
+    }
+
+    let big_entries: u64 = big.values().map(|b| b.entries).sum();
+    let big_plain: u64 = big.values().map(|b| b.plain).sum();
+    let mut big_whole = ChunkCost::default();
+    let mut big_chunked = [ChunkCost::default(); CHUNK_SIZES.len()];
+    for b in big.values() {
+        big_whole.add(b.whole);
+        for (slot, part) in big_chunked.iter_mut().zip(b.chunked) {
+            slot.add(part);
         }
     }
 
@@ -450,6 +474,34 @@ fn codec_study(versions: &[Version]) -> io::Result<()> {
         );
     }
     println!("  read and decode are what one guest read pays at a uniformly random offset");
+
+    println!("\n  stored against one frame, by extent size");
+    print!("  {:<14} {:>8} {:>10}", "extent size", "entries", "plain");
+    for chunk_bytes in CHUNK_SIZES {
+        print!(" {:>9}", format!("{} KiB", chunk_bytes / 1024));
+    }
+    println!();
+    for (log2, b) in &big {
+        print!(
+            "  {:<14} {:>8} {:>6.1} MiB",
+            format!("<= {}", fmt_pow2(*log2)),
+            b.entries,
+            mib(b.plain),
+        );
+        for (chunked, chunk_bytes) in b.chunked.iter().zip(CHUNK_SIZES) {
+            // Every extent here is at most 2^log2, so a chunk that large holds
+            // all of it in one frame and the column reports only table bytes.
+            if chunk_bytes >= 1usize << log2 {
+                print!(" {:>9}", "-");
+            } else {
+                print!(
+                    " {:>+8.2}%",
+                    100.0 * (chunked.stored as f64 - b.whole.stored as f64) / b.whole.stored as f64,
+                );
+            }
+        }
+        println!();
+    }
     Ok(())
 }
 
