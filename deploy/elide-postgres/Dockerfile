@@ -11,13 +11,14 @@
 
 FROM ubuntu:24.04
 # kmod for `modprobe ublk_drv`; ca-certificates for HTTPS to Tigris; e2fsprogs
-# for mkfs/e2fsck on the elide device; procps for pkill in the crash verbs.
+# for mkfs/e2fsck on the elide device; procps for pkill in the crash verbs;
+# perl runs durtest.
 # postgresql-16 ships the server, pgbench, and the amcheck extension;
 # pg_dropcluster removes the cluster the deb postinst creates so the only
 # data directory is the one pgsoak makes on the elide volume.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates kmod e2fsprogs procps postgresql-16 \
+      ca-certificates kmod e2fsprogs procps perl postgresql-16 \
  && rm -rf /var/lib/apt/lists/* \
  && pg_dropcluster --stop 16 main || true
 
@@ -37,6 +38,7 @@ ADD --chmod=0755 ${ELIDE_BASE}/${ELIDE_PATH}/elide-import-${ELIDE_TARGET}      /
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=0755 pgsoak /usr/local/bin/pgsoak
+COPY --chmod=0755 durtest /usr/local/bin/durtest
 COPY coord.toml /app/coord.toml
 
 # Bake the per-deployment bucket into coord.toml.

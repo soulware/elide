@@ -1,0 +1,168 @@
+#!/usr/bin/env perl
+# durtest — do completed, flushed writes survive whatever ended the machine?
+#
+# Raw device, no filesystem, so what it measures is elide alone. Two shapes,
+# each with an oracle that convicts on its own evidence and needs no external
+# record of the last acknowledgement.
+#
+# Append: block N is written and flushed before block N+1 begins, so the
+# surviving set must be a prefix of 1..max. A gap below the highest survivor is
+# an acknowledged write that was lost.
+#
+# Ring: sequence numbers cycle over R blocks, which is the shape a journal
+# writes in and the shape that exercises overwrite, dedup and delta. The write
+# of sequence S was acknowledged only after S-1 .. S-R+1 completed, and those
+# cover every block exactly once, so every block must hold at least S-R. The
+# oracle is max(seq) - min(seq) < R.
+#
+# The `nosync` writer is the control the other two depend on. If a run with no
+# barrier at all loses nothing, the ending was graceful and a pass under a
+# barrier proves nothing. `fly machine stop` is such an ending: it unmounts
+# `/data`, where elide keeps its WAL, so on Fly every arm passes for free.
+#
+#   durtest write      <dev> <runid> [ring]   O_DSYNC, so write-then-FLUSH
+#   durtest fua        <dev> <runid> [ring]   O_DIRECT|O_DSYNC, so REQ_FUA
+#   durtest verify     <dev> <runid> [limit]  append oracle
+#   durtest verifyring <dev> <runid> <ring>   ring oracle
+use strict;
+use warnings;
+use Fcntl qw(O_WRONLY O_RDONLY SEEK_SET);
+
+my $BS    = 4096;
+my $MAGIC = 'ELIDEDUR';
+my $QUADS = ($BS - 16) / 8;
+
+my $O_DSYNC  = eval { Fcntl::O_DSYNC() }  || 0x1000;
+my $O_DIRECT = eval { Fcntl::O_DIRECT() } || 0x4000;
+
+sub record {
+    my ($runid, $seq) = @_;
+    return $MAGIC . pack('Q<', $runid) . (pack('Q<', $seq) x $QUADS);
+}
+
+sub block_of { my ($seq, $ring) = @_; return $ring ? 1 + ($seq % $ring) : $seq }
+
+# Reads block $b and returns its sequence number, or undef when the block does
+# not hold an intact record of this run. A block whose quads disagree is torn
+# and is reported as such rather than silently trusted.
+sub read_seq {
+    my ($fh, $b, $runid, $torn) = @_;
+    sysseek($fh, $b * $BS, SEEK_SET) or die "seek $b: $!";
+    my $buf = '';
+    my $r = sysread($fh, $buf, $BS);
+    return undef unless defined $r && $r == $BS;
+    return undef unless substr($buf, 0, 8) eq $MAGIC;
+    my ($rid, @q) = unpack("x8 Q<" . ($QUADS + 1), $buf);
+    return undef unless $rid == $runid;
+    if (grep { $_ != $q[0] } @q) {
+        push @$torn, $b if @$torn < 50;
+        return undef;
+    }
+    return $q[0];
+}
+
+sub writer {
+    my ($dev, $runid, $ring, $direct, $sync) = @_;
+    my $flags = O_WRONLY | ($sync ? $O_DSYNC : 0) | ($direct ? $O_DIRECT : 0);
+    sysopen(my $fh, $dev, $flags) or die "open $dev: $!";
+    $| = 1;
+    # O_DIRECT needs the source buffer aligned to the logical block size. Perl
+    # has no aligned allocator, so the record sits at an aligned offset inside
+    # an oversized slab; a reallocation would move it, so both properties are
+    # asserted every iteration rather than assumed.
+    my $slab = "\0" x ($BS * 2);
+    my $base = unpack('J', pack('p', $slab));
+    my $pad  = (-$base) % $BS;
+    my $seq  = 0;
+    while (1) {
+        $seq++;
+        substr($slab, $pad, $BS) = record($runid, $seq);
+        my $addr = unpack('J', pack('p', $slab));
+        die "slab moved at $seq\n"      unless $addr == $base;
+        die "slab misaligned at $seq\n" unless ($addr + $pad) % $BS == 0;
+        sysseek($fh, block_of($seq, $ring) * $BS, SEEK_SET) or die "seek $seq: $!";
+        my $w = syswrite($fh, $slab, $BS, $pad);
+        die "short write ($w) at $seq: $!" unless defined $w && $w == $BS;
+        print "ack $seq\n";
+    }
+}
+
+my ($mode, $dev, $runid, $arg) = @ARGV;
+die "usage: durtest write|fua|verify|verifyring <dev> <runid> [ring|limit]\n"
+    unless defined $mode && defined $dev && defined $runid;
+
+if    ($mode eq 'write')  { writer($dev, $runid, $arg || 0, 0, 1) }
+elsif ($mode eq 'fua')    { writer($dev, $runid, $arg || 0, 1, 1) }
+# The control the passing arms depend on: with no barrier at all, the crash
+# must lose the unflushed tail. If it does not, the kill is not reaching the
+# device and a pass under a barrier would have meant nothing.
+elsif ($mode eq 'nosync') { writer($dev, $runid, $arg || 0, 0, 0) }
+elsif ($mode eq 'verify') {
+    sysopen(my $fh, $dev, O_RDONLY) or die "open $dev: $!";
+    my $max_scan = $arg || 400000;
+    my ($max_present, $count, $miss_run) = (0, 0, 0);
+    my (%present, @torn);
+    for my $b (1 .. $max_scan) {
+        my $seq = read_seq($fh, $b, $runid, \@torn);
+        if (!defined $seq || $seq != $b) {
+            last if ++$miss_run > 20000;
+            next;
+        }
+        $present{$b} = 1;
+        $max_present = $b;
+        $count++;
+        $miss_run = 0;
+    }
+    my @holes = grep { !$present{$_} } 1 .. $max_present;
+    printf "runid       %s\n",   $runid;
+    printf "max present %d\n",   $max_present;
+    printf "present     %d\n",   $count;
+    printf "torn        %d%s\n", scalar @torn,
+        @torn ? " (" . join(',', @torn) . ")" : '';
+    printf "holes       %d\n",   scalar @holes;
+    if ($max_present == 0) {
+        print "VERDICT INCONCLUSIVE: no records of this run are on the device\n";
+        exit 2;
+    }
+    if (@holes) {
+        my @show = @holes > 50 ? (@holes[0 .. 49], '...') : @holes;
+        printf "hole list   %s\n", join(',', @show);
+        print "VERDICT FAIL: acknowledged flushed writes were lost\n";
+        exit 1;
+    }
+    print "VERDICT PASS: the surviving set is a prefix\n";
+    exit 0;
+}
+elsif ($mode eq 'verifyring') {
+    my $ring = $arg or die "verifyring needs a ring size\n";
+    sysopen(my $fh, $dev, O_RDONLY) or die "open $dev: $!";
+    my (@torn, @absent);
+    my ($min, $max);
+    for my $i (0 .. $ring - 1) {
+        my $b = 1 + $i;
+        my $seq = read_seq($fh, $b, $runid, \@torn);
+        if (!defined $seq) { push @absent, $b if @absent < 50; next }
+        $min = $seq if !defined $min || $seq < $min;
+        $max = $seq if !defined $max || $seq > $max;
+    }
+    printf "runid       %s\n",   $runid;
+    printf "ring        %d\n",   $ring;
+    printf "min seq     %s\n",   defined $min ? $min : '-';
+    printf "max seq     %s\n",   defined $max ? $max : '-';
+    printf "spread      %s\n",   defined $min ? $max - $min : '-';
+    printf "absent      %d%s\n", scalar @absent,
+        @absent ? " (" . join(',', @absent) . ")" : '';
+    printf "torn        %d%s\n", scalar @torn,
+        @torn ? " (" . join(',', @torn) . ")" : '';
+    if (!defined $min) {
+        print "VERDICT INCONCLUSIVE: no records of this run are on the device\n";
+        exit 2;
+    }
+    if (@absent || @torn || $max - $min >= $ring) {
+        print "VERDICT FAIL: acknowledged flushed writes were lost\n";
+        exit 1;
+    }
+    print "VERDICT PASS: every block is within one lap of the newest\n";
+    exit 0;
+}
+else { die "unknown mode '$mode'\n" }
