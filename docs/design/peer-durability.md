@@ -173,6 +173,48 @@ Nothing on disk leaves the primary. GC's local janitor work (unlinking
 retired inputs at apply time) stays, since only compute moves to the
 peer, and custody of every directory stays put.
 
+### To explore: aggressive evict, cache/ as working set
+
+The natural follow-on is an eviction policy that keeps `cache/` to the
+volume's hot working set, with the fully hydrated volume living in
+S3 (and on the peer for recent data) rather than on the primary. This
+converges on the LSVD reference's native model, where local SSD is
+strictly a cache over the object store; the fully-hydrated-locally
+stance is elide's departure from the paper. It also reframes the
+`cache/` point above: with a hot-only policy, repack outputs arriving
+cold is the steady state rather than a regression.
+
+The mechanism already permits it. Every `cache/` body is redundant with
+S3 by construction, `.present` tracks partial hydration so a miss
+fetches ranges rather than whole bodies, and signatures authenticate
+demand-fetched bytes. What is missing is policy (evict is a manual
+command today) and the data to set it:
+
+- **Miss latency and miss rate.** A local hit is ~100 µs of NVMe; a
+  peer fetch is an intra-region RTT plus the peer's NVMe; a Tigris GET
+  is tens of ms. A working set that outgrows `cache/` puts guest reads
+  on the slow path, so the policy wants miss telemetry that does not
+  exist yet.
+- **The cold-start read burst.** The unexplained 21.5 GB read after
+  overnight idle (against 1.4 GB warm) is a local-disk oddity today and
+  a guest-visible fetch storm under aggressive evict. Its mechanism
+  should be understood before the cache shrinks.
+- **Delta-aware eviction.** A miss on a Delta entry pulls its source
+  chain and rematerialises into `dmat/`, so one guest read can fan out
+  into several fetches plus decompression. Either sources of hot
+  dependents count as hot, or the close pass keeps hot ranges
+  non-delta.
+- **Granularity.** `.present` supports extent-level heat tracking,
+  which matters because repack mixes long-lived bytes into shared
+  segments. Journal segments are the easy first tier: write-hot,
+  read-cold, dead at wrap.
+
+The prize is a bounded, small disk budget on the primary, and a live
+volume reduced to claim + WAL + hot cache, which is the shape that
+makes portable-live-volume relocation
+([portable-live-volume.md](portable-live-volume.md)) and the
+warm-standby failover below cheap.
+
 ## What the peer tier additionally buys
 
 A peer that holds a volume's recent segments is a warm standby. Combined
@@ -190,3 +232,6 @@ prize, and one the generic-object-store shape cannot deliver.
   prototyping: primary writes with delta off, remote pass converts.
 - Measure the warm-to-cold read penalty an off-host repack pass imposes
   on the primary, before and after a peer-fetch prefetch of the outputs.
+- Instrument cache miss rate and miss latency on the primary, the
+  prerequisite for any evict policy, and explain the cold-start read
+  burst.
