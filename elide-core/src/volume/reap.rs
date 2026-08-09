@@ -15,7 +15,7 @@
 //! so a selection staled by a concurrent claim refuses rather than
 //! removes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,40 @@ pub struct ReapCandidate {
     pub journal: bool,
 }
 
+/// Stored body bytes a segment holds in the durable tier, split by
+/// whether the hash owning each location is still live.
+///
+/// Both figures read the same locations, so their ratio prices one
+/// population.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BodyBytes {
+    pub live: u64,
+    pub stored: u64,
+}
+
+/// What one sweep found.
+#[derive(Debug, Default)]
+pub struct Sweep {
+    /// Segments nothing references, ready for the parse phase.
+    pub candidates: Vec<ReapCandidate>,
+    /// Per eligible segment, the body bytes its durable-tier locations
+    /// account for (`docs/design/open-generation-reap.md`).
+    pub body_bytes: HashMap<Ulid, BodyBytes>,
+}
+
+impl Sweep {
+    /// Sum across every segment the sweep priced.
+    pub fn totals(&self) -> BodyBytes {
+        self.body_bytes
+            .values()
+            .fold(BodyBytes::default(), |mut acc, b| {
+                acc.live += b.live;
+                acc.stored += b.stored;
+                acc
+            })
+    }
+}
+
 /// A candidate with its owned hashes parsed, ready for the apply.
 #[derive(Debug)]
 pub struct ReapSegment {
@@ -101,19 +135,23 @@ pub fn list_open_segments(base_dir: &Path) -> io::Result<Vec<(Ulid, PathBuf, u64
 ///
 /// Runs against snapshot maps and takes no lock; the caller revalidates
 /// at apply time, which is what makes a stale answer safe.
+///
+/// The same walk accumulates each eligible segment's live and stored
+/// body bytes, which costs one liveness probe per durable-tier location
+/// at an eligible segment.
 pub fn sweep_unreachable(
     lbamap: &LbaMap,
     index: &ExtentIndex,
     open: &[(Ulid, PathBuf, u64)],
     floor: Option<Ulid>,
-) -> Vec<ReapCandidate> {
+) -> Sweep {
     let eligible: HashSet<Ulid> = open
         .iter()
         .map(|(u, _, _)| *u)
         .filter(|u| floor.is_none_or(|f| *u > f))
         .collect();
     if eligible.is_empty() {
-        return Vec::new();
+        return Sweep::default();
     }
 
     let mut referenced: HashSet<Ulid> = HashSet::new();
@@ -128,12 +166,17 @@ pub fn sweep_unreachable(
     // against and cannot read — so holding one routes the segment
     // through the parsed path whatever its journal membership says.
     let mut durable: HashSet<Ulid> = HashSet::new();
+    let mut body_bytes: HashMap<Ulid, BodyBytes> = HashMap::new();
     let live =
         |hash: &blake3::Hash| lbamap.is_referenced(hash) || index.is_named_delta_source(hash);
     for (hash, loc) in index.iter() {
         if eligible.contains(&loc.segment_id) {
             durable.insert(loc.segment_id);
-            if !referenced.contains(&loc.segment_id) && live(hash) {
+            let live_hash = live(hash);
+            let acc = body_bytes.entry(loc.segment_id).or_default();
+            acc.stored += u64::from(loc.body_length);
+            if live_hash {
+                acc.live += u64::from(loc.body_length);
                 referenced.insert(loc.segment_id);
             }
         }
@@ -147,7 +190,8 @@ pub fn sweep_unreachable(
         }
     }
 
-    open.iter()
+    let candidates = open
+        .iter()
         .filter(|(u, _, _)| eligible.contains(u) && !referenced.contains(u))
         .map(|(u, p, b)| ReapCandidate {
             ulid: *u,
@@ -155,7 +199,12 @@ pub fn sweep_unreachable(
             bytes: *b,
             journal: index.is_journal_segment(*u) && !durable.contains(u),
         })
-        .collect()
+        .collect();
+
+    Sweep {
+        candidates,
+        body_bytes,
+    }
 }
 
 /// Parse each data candidate's index region for its owned hashes,
@@ -295,7 +344,8 @@ impl Volume {
             return Ok(ReapStats::default());
         }
         let floor = super::latest_snapshot(&self.base_dir)?;
-        let candidates = sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor);
+        let candidates =
+            sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor).candidates;
         if candidates.is_empty() {
             return Ok(ReapStats::default());
         }
@@ -328,7 +378,8 @@ impl Volume {
             return Ok(false);
         }
         let floor = super::latest_snapshot(&self.base_dir)?;
-        let candidates = sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor);
+        let candidates =
+            sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor).candidates;
         if candidates.is_empty() {
             return Ok(false);
         }
@@ -414,6 +465,43 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// The sweep prices every eligible segment: `stored` covers each
+    /// durable-tier location at it, `live` the subset whose hash is
+    /// still claimed. A segment holding one overwritten and one live
+    /// 4 KiB extent reports half of itself dead, and stays off the
+    /// candidate list while the live one holds it.
+    #[test]
+    fn the_sweep_prices_a_partly_dead_segment() {
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        vol.write(0, &block(1)).unwrap();
+        vol.write(1, &block(2)).unwrap();
+        vol.flush_wal().unwrap();
+
+        // Kills block(1)'s hash. LBA 1 keeps block(2) claimed.
+        vol.write(0, &block(3)).unwrap();
+
+        let open = list_open_segments(&base).unwrap();
+        let sweep = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+
+        // XOF-filled blocks never shrink, so each rides its 4096 bytes raw.
+        assert_eq!(
+            sweep.totals(),
+            BodyBytes {
+                live: 4096,
+                stored: 8192
+            }
+        );
+        assert_eq!(sweep.body_bytes.len(), 1);
+        assert!(
+            sweep.candidates.is_empty(),
+            "a segment holding a live hash is no candidate"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     /// A dedup claim minted between the sweep and the apply revives a
     /// hash the sweep classified dead. The apply's revalidation refuses
     /// the segment, and the revived claim reads through the kept body.
@@ -428,7 +516,7 @@ mod tests {
         vol.write(0, &block(2)).unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
         assert_eq!(candidates.len(), 1);
         let parsed = parse_reap_candidates(candidates);
 
@@ -475,7 +563,7 @@ mod tests {
         assert!(vol.extent_index.is_journal_segment(old_ring));
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ulid, old_ring);
         assert!(
@@ -533,7 +621,7 @@ mod tests {
         vol.write(20, &block(8)).unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
         let cand = candidates
             .iter()
             .find(|c| c.ulid == mixed)
@@ -569,11 +657,11 @@ mod tests {
             (above, PathBuf::from("above"), 10),
         ];
 
-        let candidates = sweep_unreachable(&map, &index, &open, Some(pinned));
+        let candidates = sweep_unreachable(&map, &index, &open, Some(pinned)).candidates;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ulid, above);
 
-        let candidates = sweep_unreachable(&map, &index, &open, None);
+        let candidates = sweep_unreachable(&map, &index, &open, None).candidates;
         assert_eq!(candidates.len(), 2, "with no floor both are unreachable");
     }
 
@@ -593,7 +681,7 @@ mod tests {
         }
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
         assert_eq!(candidates.len(), 3);
 
         // Cap of two entries: the first two single-entry segments parse,
@@ -628,7 +716,7 @@ mod tests {
         vol.flush_wal().unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
         assert_eq!(candidates.len(), 1);
         let parsed = parse_reap_candidates(candidates);
         let (stats, unlink) = vol.apply_reap(parsed);

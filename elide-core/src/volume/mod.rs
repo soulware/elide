@@ -82,8 +82,8 @@ pub(crate) use read::{
 };
 pub use readonly::ReadonlyVolume;
 pub use reap::{
-    ReapCandidate, ReapSegment, ReapStats, list_open_segments, parse_reap_candidates,
-    sweep_unreachable,
+    BodyBytes, ReapCandidate, ReapSegment, ReapStats, Sweep, list_open_segments,
+    parse_reap_candidates, sweep_unreachable,
 };
 pub use reclaim::{
     ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult, ReclaimThresholds,

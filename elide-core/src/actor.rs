@@ -947,12 +947,23 @@ impl VolumeActor {
         }
         let floor = crate::volume::latest_snapshot(&self.base_dir)?;
         let snap = self.snapshot.load();
-        let candidates =
+        let sweep =
             crate::volume::sweep_unreachable(&snap.lbamap, &snap.extent_index, &open, floor);
-        if candidates.is_empty() {
+        let totals = sweep.totals();
+        if totals.stored > 0 {
+            log::info!(
+                "reap sweep: open generation {} segment(s), {} stored body bytes, \
+                 {} live, {:.1}% dead",
+                sweep.body_bytes.len(),
+                totals.stored,
+                totals.live,
+                100.0 * (totals.stored - totals.live) as f64 / totals.stored as f64,
+            );
+        }
+        if sweep.candidates.is_empty() {
             return Ok(crate::volume::ReapStats::default());
         }
-        let parsed = crate::volume::parse_reap_candidates(candidates);
+        let parsed = crate::volume::parse_reap_candidates(sweep.candidates);
         if parsed.is_empty() {
             return Ok(crate::volume::ReapStats::default());
         }
