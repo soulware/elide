@@ -362,6 +362,16 @@ impl LockStatsSnapshot {
         Duration::from_nanos(self.sites.iter().map(|s| s.hold_nanos).sum())
     }
 
+    /// Whether this window cost a writer enough to be worth a line: the
+    /// mutex held past `floor`, or a guest write that blocked on it.
+    ///
+    /// A blocked write qualifies on its own however short it waited,
+    /// since a guest stalling on the mutex is the quantity the whole
+    /// measurement exists to surface.
+    pub fn worth_reporting(&self, floor: Duration) -> bool {
+        self.total_hold() > floor || self.writes.blocked > 0
+    }
+
     /// One line naming every site that acquired in this window, ordered
     /// by hold time descending, then the longest hold the volume has seen
     /// and what the guest writes waited. `None` when nothing acquired,
@@ -582,6 +592,60 @@ mod tests {
     #[test]
     fn an_idle_window_reports_nothing() {
         assert!(LockStatsSnapshot::default().report().is_none());
+    }
+
+    /// A volume nobody is writing to still runs its tick, which takes the
+    /// mutex a handful of times for microseconds. Those acquisitions are
+    /// what the floor is for.
+    #[test]
+    fn a_tick_on_a_quiet_volume_falls_under_the_floor() {
+        let stats = LockStats::default();
+        for site in [
+            LockSite::OwnSegments,
+            LockSite::PublishSnapshot,
+            LockSite::GcCheckpoint,
+            LockSite::PromotePrep,
+        ] {
+            stats.record(site, Duration::ZERO, Duration::from_micros(20));
+        }
+        stats.record_write_uncontended();
+
+        let window = stats.snapshot();
+        assert!(
+            window.report().is_some(),
+            "the sites acquired, so there is a line to suppress"
+        );
+        assert!(!window.worth_reporting(Duration::from_millis(1)));
+    }
+
+    /// Held time accumulates across suppressed windows, so a volume
+    /// sitting just under the floor surfaces once the holds add up
+    /// rather than never.
+    #[test]
+    fn holds_under_the_floor_add_up_to_a_report() {
+        let stats = LockStats::default();
+        let floor = Duration::from_millis(1);
+        stats.record(
+            LockSite::GcPlanApply,
+            Duration::ZERO,
+            Duration::from_micros(600),
+        );
+        assert!(!stats.snapshot().worth_reporting(floor));
+        stats.record(
+            LockSite::GcPlanApply,
+            Duration::ZERO,
+            Duration::from_micros(600),
+        );
+        assert!(stats.snapshot().worth_reporting(floor));
+    }
+
+    /// A guest that stalled is the measurement's whole point, so it earns
+    /// a line however little the actor side held.
+    #[test]
+    fn a_blocked_write_reports_under_any_floor() {
+        let stats = LockStats::default();
+        stats.record_write_blocked(Duration::from_micros(30));
+        assert!(stats.snapshot().worth_reporting(Duration::from_secs(1)));
     }
 
     /// Every guest write counts, but only the ones that blocked carry a
