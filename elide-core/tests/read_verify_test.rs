@@ -347,22 +347,23 @@ fn the_live_path_refuses_a_zstd_extent_that_decodes_cleanly_but_hashes_wrong() {
 
 // --- chunked extents ---
 
-use elide_core::chunk_tree::{self, CHUNK_BYTES, ChunkTable};
+use elide_core::chunk_tree::{ChunkTable, WRITE_CHUNK_SIZE as CHUNK};
 
 /// Build the `ZstdChunked` stored form of `plain` the way `compress_body`
 /// does, so these tests exercise the reader against the real layout.
 fn chunked_form(plain: &[u8]) -> Vec<u8> {
-    let count = chunk_tree::chunk_count(plain.len());
+    let count = CHUNK.count(plain.len());
     let mut frames = Vec::new();
     let mut table = ChunkTable {
+        size: CHUNK,
         plain_len: plain.len(),
         stored_lengths: Vec::new(),
         cvs: Vec::new(),
     };
     for index in 0..count {
-        let chunk = &plain[chunk_tree::chunk_range(index, plain.len())];
+        let chunk = &plain[CHUNK.range(index, plain.len())];
         let frame = zstd::bulk::compress(chunk, 9).expect("compress");
-        table.cvs.push(chunk_tree::chunk_cv(index, chunk));
+        table.cvs.push(CHUNK.cv(index, chunk));
         table.stored_lengths.push(frame.len() as u32);
         frames.push(frame);
     }
@@ -387,16 +388,16 @@ fn multichunk_plaintext(blocks: usize) -> Vec<u8> {
 }
 
 /// Blocks in a test extent: over three chunks, with a partial one at the end,
-/// whatever `CHUNK_BYTES` is.
+/// whatever chunk size the write path takes.
 fn test_blocks() -> usize {
-    CHUNK_BYTES / 4096 * 3 + 7
+    CHUNK.bytes() / 4096 * 3 + 7
 }
 
 #[test]
 fn the_live_path_serves_a_whole_chunked_extent() {
     let blocks = test_blocks();
     let bytes = multichunk_plaintext(blocks);
-    assert!(bytes.len() > 3 * CHUNK_BYTES);
+    assert!(bytes.len() > 3 * CHUNK.bytes());
     let hash = blake3::hash(&bytes);
 
     let read = write_then_read_live(
@@ -445,7 +446,7 @@ fn the_live_path_serves_a_range_straddling_a_chunk_boundary() {
     let hash = blake3::hash(&bytes);
     let stored = chunked_form(&bytes);
 
-    let boundary = (CHUNK_BYTES / 4096) as u64;
+    let boundary = (CHUNK.bytes() / 4096) as u64;
     for (start, count) in [
         (boundary - 1, 2),
         (boundary - 2, 4),
@@ -534,8 +535,7 @@ fn a_chunked_read_refuses_a_tampered_chunk_table() {
 
     let mut stored = chunked_form(&bytes);
     // The last chaining value in the table, well away from chunk 0.
-    let count = chunk_tree::chunk_count(bytes.len());
-    let at = 4 + (count - 1) * 36 + 4;
+    let at = ChunkTable::encoded_len(bytes.len(), CHUNK) - 32;
     stored[at] ^= 0xFF;
 
     let err = write_then_read_live(stored, blocks as u32, Codec::ZstdChunked, hash, 0, 1)
@@ -548,9 +548,9 @@ fn a_chunked_read_refuses_a_tampered_chunk_table() {
 
 /// Every block of one extent, read twice from one volume.
 ///
-/// The first read proves the chunk table and the rest are served against the
-/// proved chaining values, so this is the path that no longer reads the table
-/// or reconstructs the root — the bytes still have to come back right.
+/// One volume serves every block of one extent twice, so each block is served
+/// from a reader that has already served the others. The tests that mint a
+/// volume per read cover the first read of an extent; this covers the rest.
 #[test]
 fn repeated_reads_of_one_chunked_extent_serve_every_block() {
     let blocks = test_blocks();

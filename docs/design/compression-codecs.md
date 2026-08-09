@@ -150,16 +150,20 @@ An extent over one chunk is chunked whether or not the frames shrink it. On cont
 
 The lost cross-chunk matches are what chunking costs, and they run larger than codec reach suggests. Measured at the body level over the entries above 64 KiB in each corpus, against storing the same extent as one frame:
 
-| chunk | pg5 | pg6 | import |
-|---|---|---|---|
-| 64 KiB | +9.77% | +6.67% | +7.84% |
-| 128 KiB | +6.53% | +4.83% | +6.00% |
-| 256 KiB | +1.95% | +1.25% | +2.65% |
-| 512 KiB | +1.00% | +1.66% | +2.04% |
+| chunk | pg5 | pg6 | import | pg16 |
+|---|---|---|---|---|
+| 64 KiB | +9.77% | +6.67% | +7.84% | -0.33% |
+| 128 KiB | +6.53% | +4.83% | +6.00% | -1.14% |
+| 256 KiB | +1.95% | +1.25% | +2.65% | +5.08% |
+| 512 KiB | +1.00% | +1.66% | +2.04% | +0.05% |
 
-zstd keeps finding matches past 128 KiB, so the ~128 KiB plateau in the dictionary table above is about what a *trained* dictionary adds and not about a frame's own history.
+Two terms move under that number, and a corpus average reports whichever its extent-size mix favours. Splitting pg16's population by extent size separates them: 256 KiB costs +7.13% on its 512 KiB extents and +7.41% on its 1 MiB ones, where 128 KiB costs -0.24% on the same extents. **The cost is non-monotonic in chunk size,** which a history effect cannot be — half the history would cost more, not less. What is left is zstd's compression-parameter table, which buckets by source size and puts 192 to 256 KiB on a plateau a 288 KiB source steps off. A 256 KiB chunk lands every frame on it. The same artefact runs the other way on pg16's 128 to 256 KiB extents, where the whole-extent baseline is the one on the plateau and cutting it into 64 KiB pieces stores 5.13% fewer bytes.
 
-**Chunks are 256 KiB,** where the curve flattens: it costs 1.3 to 2.7% of the stored bytes of the extents it chunks, a third of what 128 KiB costs, and 512 KiB buys little more and is worse on one corpus. On the import corpus, where 72% of plaintext sits in chunked extents, 256 KiB is 0.58% of everything stored. It bounds a 4 KiB read at 256 KiB of decode and hash against a corpus holding a 62.2 MiB extent.
+So the earlier corpora's 256 KiB figures are a history cost plus this penalty, and pg16's are the penalty nearly alone. A size sweep by itself cannot tell the two apart.
+
+**Chunks are 128 KiB,** under the plateau. It costs 4.8 to 6.5% of the stored bytes of the extents it chunks on corpora with redundancy across a boundary and nothing on one without, and it halves what a read decodes against 256 KiB. It bounds a 4 KiB read at 128 KiB of decode and hash against a corpus holding a 62.2 MiB extent. The read side of that trade is what a cold page cache charges: every guest read becomes a whole-chunk decode, worth 2x volume CPU and second-scale guest stalls on a postgres soak.
+
+**The chunk size is declared, not implied.** A table's header carries the log2 of the size its extent was written at, so a reader slices at what the extent says rather than at what its own build was compiled with. Moving the write-time size leaves extents written at earlier ones readable, and one volume may hold several. The size is a power-of-two multiple of BLAKE3's 1 KiB chunk wherever it is read, so a declared size that would slice off a subtree boundary is refused at the boundary rather than reconstructing a wrong root later.
 
 Chunked frames are a second body-format break beside the codec tag (§ Format). Existing volumes are already unreadable across the codec change, so both belong in one format revision — one break, not two.
 

@@ -1413,7 +1413,7 @@ fn formation_chunks_a_body_larger_than_one_chunk() {
     let mut vol = Volume::open(&base, &base).unwrap();
 
     let small: Vec<u8> = (0..64 * 1024).map(|i| (i / 97 % 251) as u8).collect();
-    let large: Vec<u8> = (0..crate::chunk_tree::CHUNK_BYTES * 3 + 8192)
+    let large: Vec<u8> = (0..crate::chunk_tree::WRITE_CHUNK_SIZE.bytes() * 3 + 8192)
         .map(|i| (i / 97 % 251) as u8)
         .collect();
     vol.write(0, &small).unwrap();
@@ -1435,7 +1435,7 @@ fn formation_chunks_a_body_larger_than_one_chunk() {
     assert_eq!(vol.read(0, 16).unwrap(), small);
     assert_eq!(vol.read(64, large.len() as u32 / 4096).unwrap(), large);
     // A single block out of the middle of the chunked extent.
-    let block = (crate::chunk_tree::CHUNK_BYTES / 4096) as u64 + 3;
+    let block = (crate::chunk_tree::WRITE_CHUNK_SIZE.bytes() / 4096) as u64 + 3;
     let at = block as usize * 4096;
     assert_eq!(
         vol.read(64 + block, 1).unwrap(),

@@ -65,7 +65,7 @@ pub(crate) fn compress_body(plain: &[u8], journal: bool) -> io::Result<Option<(C
     // extent makes it decode and hash all of them. Never producing a large
     // raw extent is what keeps the read bound a property of the format rather
     // than of the content.
-    if plain.len() > chunk_tree::CHUNK_BYTES {
+    if plain.len() > chunk_tree::WRITE_CHUNK_SIZE.bytes() {
         return Ok(Some((Codec::ZstdChunked, compress_chunked(plain)?)));
     }
 
@@ -112,29 +112,29 @@ fn zstd_frame(plain: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// A chunk table followed by one independently decodable frame per
-/// [`chunk_tree::CHUNK_BYTES`] of `plain`.
+/// [`chunk_tree::WRITE_CHUNK_SIZE`] of `plain`.
 ///
-/// The cost is the frames the compressor no longer sees across a chunk
-/// boundary. lz4 matches within 64 KiB and zstd gains little from history
-/// beyond about this size, because inputs this large supply their own, so a
-/// 128 KiB chunk gives up little of either.
+/// The table declares the size, so what a reader slices at comes from the
+/// extent rather than from this build.
 fn compress_chunked(plain: &[u8]) -> io::Result<Vec<u8>> {
-    let count = chunk_tree::chunk_count(plain.len());
+    let size = chunk_tree::WRITE_CHUNK_SIZE;
+    let count = size.count(plain.len());
     let mut frames = Vec::with_capacity(count);
     let mut table = ChunkTable {
+        size,
         plain_len: plain.len(),
         stored_lengths: Vec::with_capacity(count),
         cvs: Vec::with_capacity(count),
     };
     for index in 0..count {
-        let chunk = &plain[chunk_tree::chunk_range(index, plain.len())];
+        let chunk = &plain[size.range(index, plain.len())];
         let frame = zstd_frame(chunk)?;
-        table.cvs.push(chunk_tree::chunk_cv(index, chunk));
+        table.cvs.push(size.cv(index, chunk));
         table.stored_lengths.push(frame.len() as u32);
         frames.push(frame);
     }
     let mut out = Vec::with_capacity(
-        ChunkTable::encoded_len(plain.len()) + frames.iter().map(Vec::len).sum::<usize>(),
+        ChunkTable::encoded_len(plain.len(), size) + frames.iter().map(Vec::len).sum::<usize>(),
     );
     table.encode(&mut out);
     for frame in frames {

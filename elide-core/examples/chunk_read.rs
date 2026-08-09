@@ -1,13 +1,12 @@
 //! Time guest-sized random reads against chunked extents.
 //!
-//! Writes extents over `chunk_tree::CHUNK_BYTES` so every read lands in a
+//! Writes extents over the write path's chunk size so every read lands in a
 //! chunked body, then reads 8 KiB at uniformly random offsets — the shape that
 //! makes a read decode a whole chunk, and the shape a cold guest page cache
-//! produces. Random offsets over a large address space mean a decoded-chunk
-//! cache would almost never hit, so what this isolates is the per-read table
-//! read and root reconstruction rather than the decode.
+//! produces. This is what prices a chunk size on the read axis, against what
+//! `corpus-sim` prices it at on the storage one.
 //!
-//! Tables are proved once in a warm-up pass, so the timed loop measures the
+//! Each extent is read once before the timed loop, so the loop measures the
 //! steady state a long-running volume server is in.
 //!
 //! Run with:
@@ -56,15 +55,15 @@ fn main() -> io::Result<()> {
 
     let extent_bytes = extent_kib as usize * 1024;
     assert!(
-        extent_bytes > elide_core::chunk_tree::CHUNK_BYTES,
+        extent_bytes > elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes(),
         "extent must exceed CHUNK_BYTES ({}) to be chunked",
-        elide_core::chunk_tree::CHUNK_BYTES
+        elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes()
     );
     let blocks_per_extent = (extent_bytes / BLOCK) as u64;
     println!(
         "extents={extents} x {extent_kib} KiB ({} MiB)  chunk={} KiB  reads={reads}",
         extents * extent_kib / 1024,
-        elide_core::chunk_tree::CHUNK_BYTES / 1024,
+        elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes() / 1024,
     );
 
     let dir = tempfile::TempDir::new()?;
