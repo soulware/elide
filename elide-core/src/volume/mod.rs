@@ -585,6 +585,9 @@ pub struct Volume {
     /// resolves costs one failed lookup. Nothing rebuilds against it and
     /// nothing persists it.
     pub(in crate::volume) sketch_index: Arc<crate::sketch_index::SketchIndex>,
+    /// Whether this volume's promotes run the delta tiers and leave
+    /// sketches behind, resolved once at open.
+    pub(in crate::volume) delta_policy: jobs::DeltaPolicy,
     /// Lazy WAL state. `None` means no WAL file exists on disk — the next
     /// write opens a fresh one at `mint.next()`. Keeps idle volumes from
     /// churning the WAL on every GC tick.
@@ -868,6 +871,7 @@ impl Volume {
                     // and the candidate map by value at this point, so an
                     // empty spec leaves every entry alone.
                     delta: crate::volume::jobs::PromoteDeltaSpec {
+                        policy: crate::volume::jobs::DeltaPolicy::OFF,
                         extent_index: Arc::new(extentindex::ExtentIndex::new()),
                         sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
                         search_dirs: Vec::new(),
@@ -921,6 +925,7 @@ impl Volume {
             lbamap: Arc::new(lbamap),
             extent_index: Arc::new(extent_index),
             sketch_index: Arc::new(sketch_index),
+            delta_policy: jobs::DeltaPolicy::from_env(),
             wal,
             pending,
             pending_journal: std::collections::BTreeSet::new(),
@@ -2972,6 +2977,19 @@ impl Volume {
         self.flush_wal_to_pending()
     }
 
+    /// Run the delta tiers on this volume's promotes, and persist the
+    /// resemblance sketches later promotes select sources by.
+    ///
+    /// Both follow `ELIDE_ENABLE_DELTA` and `ELIDE_ENABLE_SKETCH` at open.
+    /// This sets them for one volume, which is what lets a test exercise
+    /// tiers the environment leaves parked.
+    pub fn set_delta_policy(&mut self, enabled: bool, persist_sketches: bool) {
+        self.delta_policy = jobs::DeltaPolicy {
+            enabled,
+            persist_sketches,
+        };
+    }
+
     /// In-process checkpoint of the fork at the current point in the
     /// segment sequence. **Not** the production path — the coordinator-
     /// driven snapshot flow (see `docs/plans/coordinator-driven-snapshot-plan.md`)
@@ -3427,6 +3445,7 @@ impl Volume {
             .lbamap
             .referenced_hashes(self.extent_index.named_delta_sources());
         let delta = jobs::PromoteDeltaSpec {
+            policy: self.delta_policy,
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,

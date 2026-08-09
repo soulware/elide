@@ -399,7 +399,7 @@ fn plan_emitted_during_inflight_apply_is_safe() {
     handle.shutdown();
     actor_thread.join().unwrap();
 
-    let vol = common::open_with_captured_body_fetcher(&fork_dir, &store_dir);
+    let vol = common::open_with_captured_body_fetcher(&fork_dir, &store_dir, true);
     for (lba, expected) in &oracle {
         let actual = vol.read(*lba, 1).unwrap();
         assert_eq!(actual, *expected, "lba {lba} wrong after reopen");

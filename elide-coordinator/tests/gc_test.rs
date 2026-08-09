@@ -1673,6 +1673,7 @@ fn gc_keeps_live_delta_source() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_delta_policy(true, true);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1921,6 +1922,7 @@ fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_delta_policy(true, true);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

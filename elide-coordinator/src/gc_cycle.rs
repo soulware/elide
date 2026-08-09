@@ -1532,8 +1532,15 @@ mod tests {
             elide_core::segment::Codec::None,
             body,
         )];
-        elide_core::segment::write_segment_full(&scratch, entries, &[], inputs, signer.as_ref())
-            .unwrap();
+        elide_core::segment::write_segment_full(
+            &scratch,
+            entries,
+            &[],
+            inputs,
+            true,
+            signer.as_ref(),
+        )
+        .unwrap();
         elide_core::segment::extract_idx(&scratch, &index_dir.join(format!("{seg}.idx"))).unwrap();
         std::fs::remove_file(&scratch).unwrap();
     }
@@ -2918,6 +2925,7 @@ mod tests {
                     entries,
                     &[],
                     &seg.inputs,
+                    true,
                     self.signer.as_ref(),
                 )
                 .unwrap();

@@ -359,17 +359,30 @@ fn arb_sim_ops() -> impl Strategy<Value = Vec<SimOp>> {
     prop::collection::vec(arb_sim_op(), 1..30)
 }
 
+/// Open a volume with the delta tiers set either way.
+///
+/// The tiers are parked behind `ELIDE_ENABLE_DELTA`, so the shipped
+/// configuration runs without them. The simulations draw `delta` from the
+/// strategy rather than fixing it, so both configurations are explored and
+/// neither one's assumptions can hide a defect in the other.
+fn open_vol(fork_dir: &std::path::Path, delta: bool) -> Volume {
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    vol.set_delta_policy(delta, delta);
+    vol
+}
+
 /// The BaseWrite → seal → VariantWrite → promote chain must actually
 /// mint a Delta entry — asserted on the promoted segment's `.idx` so a
 /// future change to the conversion gates cannot silently regress the
 /// suite's Delta coverage to a structural no-op (the gap that hid the
 /// #681 fold mis-registration).
+
 #[test]
 fn delta_ops_mint_a_delta_entry() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
     write_keypair_and_provenance(fork_dir);
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     vol.write(0, &incompressible_block(0)).unwrap();
     vol.flush_wal().unwrap();
@@ -416,7 +429,7 @@ fn snapshot_after_gc_apply_covers_fold_output() {
     let fork_dir = dir.path();
     write_keypair_and_provenance(fork_dir);
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -459,14 +472,14 @@ proptest! {
     /// Catches Bug A: DEDUP_REF-only segments were never deleted because
     /// compact_segments emitted no handoff line for them.
     #[test]
-    fn gc_segment_cleanup(ops in arb_sim_ops()) {
+    fn gc_segment_cleanup(ops in arb_sim_ops(), delta in any::<bool>()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
         write_keypair_and_provenance(fork_dir);
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = open_vol(fork_dir, delta);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -689,7 +702,7 @@ proptest! {
                     // (Bug E class).  No oracle mutation: restart is invisible
                     // to the logical data model.
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = open_vol(fork_dir, delta);
                     let _ = vol.apply_gc_handoffs();
                 }
             }
@@ -699,14 +712,14 @@ proptest! {
     /// GC oracle: after any sequence of writes + GC sweeps, every LBA that
     /// has ever been written reads back its last-written value.
     #[test]
-    fn gc_oracle(ops in arb_sim_ops()) {
+    fn gc_oracle(ops in arb_sim_ops(), delta in any::<bool>()) {
         let dir = tempfile::TempDir::new().unwrap();
         let fork_dir = dir.path();
 
         write_keypair_and_provenance(fork_dir);
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+        let mut vol = open_vol(fork_dir, delta);
         let mut oracle: HashMap<u64, [u8; 4096]> = HashMap::new();
 
         // Single runtime reused across all GcSweep ops in this sequence.
@@ -920,7 +933,7 @@ proptest! {
                     // (Bug E class) before any subsequent GcSweep can call
                     // apply_done_handoffs and delete old segments.
                     drop(vol);
-                    vol = Volume::open(fork_dir, fork_dir).unwrap();
+                    vol = open_vol(fork_dir, delta);
                     let _ = vol.apply_gc_handoffs();
 
                     // Assert: every oracle LBA is still readable after restart.
@@ -972,7 +985,7 @@ fn gc_oracle_repro_bug_h() {
     write_keypair_and_provenance(fork_dir);
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1037,7 +1050,7 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
 
     write_keypair_and_provenance(fork_dir);
 
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     // VariantWrite { lba: 6, base_seed: 0, tweak: 0 }
     vol.write(6, &variant_block(0, 0)).unwrap();
@@ -1086,7 +1099,7 @@ fn gc_oracle_repro_overwritten_delta_phantom() {
 
     write_keypair_and_provenance(fork_dir);
 
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
 
     // BaseWrite { lba: 5, base_seed: 3 }
     vol.write(5, &incompressible_block(3)).unwrap();
@@ -1130,7 +1143,7 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     let fork_dir = dir.path();
     write_keypair_and_provenance(fork_dir);
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1224,7 +1237,7 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
     let fork_dir = dir.path();
     write_keypair_and_provenance(fork_dir);
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let mut vol = open_vol(fork_dir, true);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1314,7 +1327,7 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
 
     // A fresh open must rebuild the identical committed tier from disk.
     drop(vol);
-    let _vol = Volume::open(fork_dir, fork_dir).unwrap();
+    let _vol = open_vol(fork_dir, true);
 }
 
 fn list_dir(dir: &Path) -> Vec<String> {

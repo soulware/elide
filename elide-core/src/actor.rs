@@ -2379,7 +2379,14 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     // Write the signed output segment to <ulid>.tmp. The actor renames it
     // to bare <ulid> as the commit point.
     let tmp_path = gc_dir.join(format!("{new_ulid}.tmp"));
-    segment::write_segment_full(&tmp_path, entries, &delta_body, &inputs, signer.as_ref())?;
+    segment::write_segment_full(
+        &tmp_path,
+        entries,
+        &delta_body,
+        &inputs,
+        crate::sketch_enabled(),
+        signer.as_ref(),
+    )?;
 
     let (new_bss, written_entries, _) =
         segment::read_and_verify_segment_index(&tmp_path, &verifying_key)?;
@@ -2561,69 +2568,71 @@ pub(crate) fn execute_promote(
     // because a delta optimisation's inputs were unavailable — while
     // conversion errors are real corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
-    if let Some(prior_spec) = &job.delta.prior {
-        match prior_cache.map_for(
-            &prior_spec.base_dir,
-            prior_spec.snap_ulid,
-            &prior_spec.journal_ranges,
-        ) {
-            Ok(prior) => {
-                match crate::delta_compute::delta_pendings_against_prior(
-                    &mut pendings,
-                    prior,
-                    &job.delta.extent_index,
-                    &job.delta.search_dirs,
-                ) {
-                    Ok((body, stats)) => {
-                        if stats.entries_converted > 0 {
-                            log::info!(
-                                "formation {}: {} delta entries vs snapshot {}, {} → {} bytes",
-                                job.segment_ulid,
-                                stats.entries_converted,
-                                prior_spec.snap_ulid,
-                                stats.original_body_bytes,
-                                stats.delta_body_bytes,
-                            );
+    if job.delta.policy.enabled {
+        if let Some(prior_spec) = &job.delta.prior {
+            match prior_cache.map_for(
+                &prior_spec.base_dir,
+                prior_spec.snap_ulid,
+                &prior_spec.journal_ranges,
+            ) {
+                Ok(prior) => {
+                    match crate::delta_compute::delta_pendings_against_prior(
+                        &mut pendings,
+                        prior,
+                        &job.delta.extent_index,
+                        &job.delta.search_dirs,
+                    ) {
+                        Ok((body, stats)) => {
+                            if stats.entries_converted > 0 {
+                                log::info!(
+                                    "formation {}: {} delta entries vs snapshot {}, {} → {} bytes",
+                                    job.segment_ulid,
+                                    stats.entries_converted,
+                                    prior_spec.snap_ulid,
+                                    stats.original_body_bytes,
+                                    stats.delta_body_bytes,
+                                );
+                            }
+                            delta_body = body;
                         }
-                        delta_body = body;
+                        Err(e) => return Err(fail(e, job)),
                     }
-                    Err(e) => return Err(fail(e, job)),
+                }
+                Err(e) => {
+                    warn!(
+                        "formation {}: snapshot {} source map unavailable, skipping same-LBA delta tier: {e}",
+                        job.segment_ulid, prior_spec.snap_ulid
+                    );
                 }
             }
-            Err(e) => {
-                warn!(
-                    "formation {}: snapshot {} source map unavailable, skipping same-LBA delta tier: {e}",
-                    job.segment_ulid, prior_spec.snap_ulid
-                );
-            }
         }
-    }
 
-    match crate::delta_compute::delta_pendings_by_resemblance(
-        &mut pendings,
-        &job.delta.sketch_index,
-        &job.delta.extent_index,
-        &job.delta.referenced,
-        &job.delta.search_dirs,
-        &mut delta_body,
-    ) {
-        Ok(stats) => {
-            if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
-                log::info!(
-                    "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes ({} cached), skipped {} unreferenced, converted {} entries, {} → {} bytes",
-                    job.segment_ulid,
-                    stats.targets_probed,
-                    stats.candidates_tried,
-                    stats.dictionary_bytes_read,
-                    stats.dictionary_cache_hits,
-                    stats.candidates_unreferenced,
-                    stats.delta.entries_converted,
-                    stats.delta.original_body_bytes,
-                    stats.delta.delta_body_bytes,
-                );
+        match crate::delta_compute::delta_pendings_by_resemblance(
+            &mut pendings,
+            &job.delta.sketch_index,
+            &job.delta.extent_index,
+            &job.delta.referenced,
+            &job.delta.search_dirs,
+            &mut delta_body,
+        ) {
+            Ok(stats) => {
+                if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
+                    log::info!(
+                        "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes ({} cached), skipped {} unreferenced, converted {} entries, {} → {} bytes",
+                        job.segment_ulid,
+                        stats.targets_probed,
+                        stats.candidates_tried,
+                        stats.dictionary_bytes_read,
+                        stats.dictionary_cache_hits,
+                        stats.candidates_unreferenced,
+                        stats.delta.entries_converted,
+                        stats.delta.original_body_bytes,
+                        stats.delta.delta_body_bytes,
+                    );
+                }
             }
+            Err(e) => return Err(fail(e, job)),
         }
-        Err(e) => return Err(fail(e, job)),
     }
 
     // An all-journal epoch leaves the primary partition empty; no
@@ -2637,6 +2646,7 @@ pub(crate) fn execute_promote(
             job.segment_ulid,
             pendings,
             &delta_body,
+            job.delta.policy.persist_sketches,
             job.signer.as_ref(),
         ) {
             Ok(v) => v,
@@ -2670,6 +2680,7 @@ pub(crate) fn execute_promote(
                 jpart.segment_ulid,
                 j_pendings,
                 &[],
+                job.delta.policy.persist_sketches,
                 job.signer.as_ref(),
             ) {
                 Ok((j_bss, j_entries)) => {
@@ -3378,6 +3389,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     entries,
                     &delta_body,
                     &[],
+                    crate::sketch_enabled(),
                     signer.as_ref(),
                 )?;
                 std::fs::rename(&tmp_path, &final_path)?;
@@ -3505,8 +3517,14 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let final_path = pending_dir.join(&new_ulid_str);
         let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
         let _ = std::fs::remove_file(&tmp_path);
-        let (new_body_section_start, out_entries) =
-            segment::write_segment_full(&tmp_path, out_entries, &delta_body, &[], signer.as_ref())?;
+        let (new_body_section_start, out_entries) = segment::write_segment_full(
+            &tmp_path,
+            out_entries,
+            &delta_body,
+            &[],
+            crate::sketch_enabled(),
+            signer.as_ref(),
+        )?;
         std::fs::rename(&tmp_path, &final_path)?;
         segment::fsync_dir(&final_path)?;
         stats.new_segments += 1;
@@ -4258,16 +4276,14 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let ulid_str = job.segment_ulid.to_string();
     let tmp_path = job.pending_dir.join(format!("{ulid_str}.tmp"));
     let final_path = job.pending_dir.join(&ulid_str);
-    let (body_section_start, entries) = if delta_body.is_empty() {
-        segment::write_segment(&tmp_path, entries, job.signer.as_ref())?
-    } else {
-        segment::write_segment_with_delta_body(
-            &tmp_path,
-            entries,
-            &delta_body,
-            job.signer.as_ref(),
-        )?
-    };
+    let (body_section_start, entries) = segment::write_segment_full(
+        &tmp_path,
+        entries,
+        &delta_body,
+        &[],
+        crate::sketch_enabled(),
+        job.signer.as_ref(),
+    )?;
     fs::rename(&tmp_path, &final_path)?;
     segment::fsync_dir(&final_path)?;
 
