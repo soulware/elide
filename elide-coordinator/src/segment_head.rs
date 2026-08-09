@@ -670,7 +670,8 @@ mod tests {
             elide_core::segment::Codec::None,
             body,
         )];
-        elide_core::segment::write_segment_full(&scratch, entries, &[], inputs, signer).unwrap();
+        elide_core::segment::write_segment_full(&scratch, entries, &[], inputs, true, signer)
+            .unwrap();
         elide_core::segment::extract_idx(&scratch, &index_dir.join(format!("{seg}.idx"))).unwrap();
         std::fs::remove_file(&scratch).unwrap();
     }

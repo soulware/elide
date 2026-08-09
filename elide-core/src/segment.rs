@@ -992,7 +992,7 @@ pub fn write_segment(
     entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
-    write_segment_full(path, entries, &[], &[], signer)
+    write_segment_full(path, entries, &[], &[], true, signer)
 }
 
 /// Write a segment file with an attached delta body section.
@@ -1013,7 +1013,7 @@ pub fn write_segment_with_delta_body(
     delta_body: &[u8],
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
-    write_segment_full(path, entries, delta_body, &[], signer)
+    write_segment_full(path, entries, delta_body, &[], true, signer)
 }
 
 /// Write a segment file with an explicit GC inputs list.
@@ -1031,7 +1031,7 @@ pub fn write_gc_segment(
     inputs: &[ulid::Ulid],
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
-    write_segment_full(path, entries, &[], inputs, signer)
+    write_segment_full(path, entries, &[], inputs, true, signer)
 }
 
 /// Core write path. All public writers funnel through here.
@@ -1039,11 +1039,15 @@ pub fn write_gc_segment(
 /// Consumes the pending entries and returns the bare [`SegmentEntry`]s
 /// with `stored_offset` assigned, alongside `body_section_start` — body
 /// bytes end at this write and do not travel further.
+///
+/// `sketch` decides whether fresh Data entries acquire a resemblance
+/// sketch; the volume server passes [`crate::volume_sketches_enabled`].
 pub fn write_segment_full(
     path: &Path,
     entries: Vec<PendingEntry>,
     delta_body: &[u8],
     inputs: &[ulid::Ulid],
+    sketch: bool,
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let (mut entries, bodies): (Vec<SegmentEntry>, Vec<Option<Vec<u8>>>) =
@@ -1077,7 +1081,8 @@ pub fn write_segment_full(
     // Inline and journal-tier content are never sketched. The sketch is over
     // raw bytes, so a compressed body is decompressed first.
     for (entry, body) in entries.iter_mut().zip(bodies.iter()) {
-        if entry.sketch.is_some()
+        if !sketch
+            || entry.sketch.is_some()
             || entry.journal
             || !entry.delta_options.is_empty()
             || !matches!(entry.kind, EntryKind::Data | EntryKind::CanonicalData)
@@ -2159,6 +2164,7 @@ pub fn write_and_commit(
     ulid: ulid::Ulid,
     entries: Vec<PendingEntry>,
     delta_body: &[u8],
+    sketch: bool,
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
     let ulid_str = ulid.to_string();
@@ -2166,7 +2172,7 @@ pub fn write_and_commit(
     let final_path = pending_dir.join(&ulid_str);
 
     let (body_section_start, entries) =
-        write_segment_with_delta_body(&tmp_path, entries, delta_body, signer)?;
+        write_segment_full(&tmp_path, entries, delta_body, &[], sketch, signer)?;
 
     // Atomic rename — COMMIT POINT.
     fs::rename(&tmp_path, &final_path)?;
@@ -2190,7 +2196,7 @@ pub fn promote(
     entries: Vec<PendingEntry>,
     signer: &dyn SegmentSigner,
 ) -> io::Result<(u64, Vec<SegmentEntry>)> {
-    let written = write_and_commit(pending_dir, ulid, entries, &[], signer)?;
+    let written = write_and_commit(pending_dir, ulid, entries, &[], true, signer)?;
     // WAL is now redundant; segment is the sole copy.
     fs::remove_file(wal_path)?;
     Ok(written)
@@ -3700,6 +3706,43 @@ mod tests {
         assert_eq!(read_back[0].sketch, None);
 
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sketching_off_leaves_fresh_data_unsketched() {
+        let (signer, vk) = test_signer();
+        // Above the size threshold and high-entropy, so the entry is one
+        // `Sketching::On` sketches and only the policy separates the arms.
+        let data = entropy_bytes(9, crate::sketch::MIN_SKETCH_BYTES);
+        assert!(crate::sketch::compute(&data).is_some());
+        let entry = || {
+            vec![SegmentEntry::new_data(
+                blake3::hash(&data),
+                0,
+                (crate::sketch::MIN_SKETCH_BYTES / 4096) as u32,
+                Codec::None,
+                data.clone(),
+            )]
+        };
+
+        let on = temp_path(".seg");
+        let (_, written) =
+            write_segment_full(&on, entry(), &[], &[], true, signer.as_ref()).unwrap();
+        assert!(written[0].sketch.is_some());
+
+        let off = temp_path(".seg");
+        let (_, written) =
+            write_segment_full(&off, entry(), &[], &[], false, signer.as_ref()).unwrap();
+        assert_eq!(written[0].sketch, None);
+
+        let (_, read_back, _) = read_and_verify_segment_index(&off, &vk).unwrap();
+        assert_eq!(
+            read_back[0].sketch, None,
+            "an unsketched segment reads back with an empty sketch section"
+        );
+
+        fs::remove_file(&on).unwrap();
+        fs::remove_file(&off).unwrap();
     }
 
     #[test]

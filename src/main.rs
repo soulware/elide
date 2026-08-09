@@ -503,6 +503,13 @@ fn main() {
                 elide_coordinator::log_init::init_stderr();
             }
             cpu_profile::spawn_if_enabled();
+            // A measurement arm is only as good as its record of which arm
+            // ran, and both switches arrive through the environment.
+            tracing::info!(
+                "[switches] delta={} sketches={}",
+                elide_core::volume_delta_enabled(),
+                elide_core::volume_sketches_enabled(),
+            );
         }
         _ => elide_coordinator::log_init::init_stderr(),
     }

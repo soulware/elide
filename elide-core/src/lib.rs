@@ -52,3 +52,63 @@ pub fn volume_invariants_enabled() -> bool {
         });
     *ENABLED
 }
+
+/// Whether the promote worker's delta tiers run.
+///
+/// Both tiers — same-LBA against a sealed snapshot, and the resemblance
+/// probe — answer to `ELIDE_VOLUME_DELTA` so one release binary serves
+/// both arms of a measurement. Off leaves each entry as the Data entry
+/// it already was; segments written earlier keep their Delta entries and
+/// still read.
+pub fn volume_delta_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| env_switch("ELIDE_VOLUME_DELTA", true));
+    *ENABLED
+}
+
+/// Whether the volume server's segment writes populate resemblance
+/// sketches.
+///
+/// Sketches are read by the resemblance tier alone, and computing one
+/// decompresses the body it describes, so they answer to
+/// `ELIDE_VOLUME_SKETCHES`. Import writes its own segments sketched
+/// either way — its delta producer matches on filemap paths, and this
+/// switch reaches only the writes the volume server makes.
+pub fn volume_sketches_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| env_switch("ELIDE_VOLUME_SKETCHES", true));
+    *ENABLED
+}
+
+fn env_switch(key: &str, default: bool) -> bool {
+    parse_switch(std::env::var(key).ok().as_deref(), default)
+}
+
+/// Hold `default` for a value that names neither state — a typo must not
+/// silently select the other arm.
+fn parse_switch(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::parse_switch;
+
+    #[test]
+    fn a_switch_reads_both_states_and_holds_its_default() {
+        for on in ["1", "true", "yes", "on"] {
+            assert!(parse_switch(Some(on), false), "{on} names the on state");
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert!(!parse_switch(Some(off), true), "{off} names the off state");
+        }
+        assert!(parse_switch(Some("of"), true), "a typo holds the default");
+        assert!(!parse_switch(Some("of"), false), "a typo holds the default");
+        assert!(parse_switch(None, true));
+        assert!(!parse_switch(None, false));
+    }
+}
