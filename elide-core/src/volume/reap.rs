@@ -236,7 +236,7 @@ impl Volume {
         let mut stats = ReapStats::default();
         let mut unlink = Vec::new();
         let mut reaped_fmt: Vec<String> = Vec::new();
-        let no_carried = HashSet::new();
+        let no_carried = crate::blake3_id_hasher::Blake3HashSet::default();
         for seg in segments {
             if !seg.journal {
                 let fresh = seg.owned_hashes.iter().find(|hash| {

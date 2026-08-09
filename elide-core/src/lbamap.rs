@@ -21,10 +21,11 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 
-use imbl::{HashMap as ImHashMap, OrdMap};
+use imbl::OrdMap;
 use log::warn;
 use ulid::Ulid;
 
+use crate::blake3_id_hasher::{Blake3HamtMap, Blake3HashSet};
 use crate::segment;
 use crate::signing;
 
@@ -112,8 +113,8 @@ enum Blocking<'a> {
 /// candidate source is worth pinning.
 #[derive(Clone, Default)]
 pub struct ReferencedHashes {
-    claims: ImHashMap<blake3::Hash, u32>,
-    delta_sources: HashSet<blake3::Hash>,
+    claims: Blake3HamtMap<u32>,
+    delta_sources: Blake3HashSet,
 }
 
 impl ReferencedHashes {
@@ -135,14 +136,14 @@ pub struct LbaMap {
     /// walk it replaces is the primary liveness oracle for GC, staged
     /// apply and full-warm enumeration, all of which asked it by
     /// collecting a fresh set over every entry.
-    claim_counts: ImHashMap<blake3::Hash, u32>,
+    claim_counts: Blake3HamtMap<u32>,
 }
 
 impl LbaMap {
     pub fn new() -> Self {
         Self {
             inner: OrdMap::new(),
-            claim_counts: ImHashMap::new(),
+            claim_counts: Blake3HamtMap::default(),
         }
     }
 
@@ -767,7 +768,7 @@ impl LbaMap {
     /// the LBA reads "no source option resolved in extent index". The GC
     /// planner, the plan-apply stale-liveness veto, repack, and the index
     /// liveness walk all follow that pattern.
-    pub fn claim_referenced_hashes(&self) -> HashSet<blake3::Hash> {
+    pub fn claim_referenced_hashes(&self) -> Blake3HashSet {
         self.claim_counts.keys().copied().collect()
     }
 
@@ -788,7 +789,7 @@ impl LbaMap {
     /// The claim map is persistent, so this shares structure rather than
     /// copying, and the view is a snapshot: it answers as of the moment
     /// it was taken.
-    pub fn referenced_hashes(&self, delta_sources: HashSet<blake3::Hash>) -> ReferencedHashes {
+    pub fn referenced_hashes(&self, delta_sources: Blake3HashSet) -> ReferencedHashes {
         ReferencedHashes {
             claims: self.claim_counts.clone(),
             delta_sources,
@@ -800,8 +801,8 @@ impl LbaMap {
     ///
     /// This is the walk `claim_referenced_hashes` used to do on every call.
     /// It survives as the oracle for [`Self::debug_assert_claim_counts`].
-    fn recount_claims(&self) -> ImHashMap<blake3::Hash, u32> {
-        let mut out: ImHashMap<blake3::Hash, u32> = ImHashMap::new();
+    fn recount_claims(&self) -> Blake3HamtMap<u32> {
+        let mut out: Blake3HamtMap<u32> = Blake3HamtMap::default();
         for e in self.inner.values() {
             *out.entry(e.hash).or_insert(0) += 1;
         }
@@ -1953,8 +1954,7 @@ mod tests {
         }
 
         // The maintained map is exactly the set the old walk produced.
-        let walked: HashSet<blake3::Hash> =
-            map.iter_entries().map(|(_, _, hash, _)| hash).collect();
+        let walked: Blake3HashSet = map.iter_entries().map(|(_, _, hash, _)| hash).collect();
         let mut referenced = map.claim_referenced_hashes();
         referenced.retain(|hash| map.claim_refcount(hash) > 0);
         assert_eq!(referenced, walked);

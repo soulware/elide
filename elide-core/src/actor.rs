@@ -2391,6 +2391,8 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     let (new_bss, written_entries, _) =
         segment::read_and_verify_segment_index(&tmp_path, &verifying_key)?;
     let handoff_inline = segment::read_inline_section(&tmp_path)?;
+    let carried_hashes = ExtentIndex::carried_hashes(&written_entries);
+    let entry_hashes = written_entries.iter().map(|e| e.hash).collect();
 
     Ok(GcPlanApplyResult {
         new_ulid,
@@ -2401,6 +2403,8 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         entries: written_entries,
         inputs,
         input_old_entries,
+        carried_hashes,
+        entry_hashes,
         handoff_inline,
         outcome: crate::volume::StagedApply::Applied,
     })
@@ -2421,6 +2425,8 @@ fn cancelled_result(
         entries: Vec::new(),
         inputs,
         input_old_entries: Vec::new(),
+        carried_hashes: Default::default(),
+        entry_hashes: Default::default(),
         handoff_inline: Vec::new(),
         outcome: crate::volume::StagedApply::Cancelled,
     }
@@ -3653,7 +3659,7 @@ pub(crate) fn live_index_segments(
     // source. A source body must stay resolvable while any registered
     // encoding names it, so all of them count as live even when no LBA
     // references the source directly.
-    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
+    let mut live_hashes = lbamap.claim_referenced_hashes();
     live_hashes.extend(extent_index.named_delta_sources());
 
     // Pass 2: apply predicate.
@@ -3688,7 +3694,7 @@ fn is_index_entry_live(
     entry: &segment::SegmentEntry,
     extent_index: &ExtentIndex,
     lbamap: &LbaMap,
-    live_hashes: &std::collections::HashSet<blake3::Hash>,
+    live_hashes: &crate::blake3_id_hasher::Blake3HashSet,
 ) -> bool {
     use segment::EntryKind;
     match entry.kind {

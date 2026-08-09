@@ -5488,7 +5488,7 @@ fn gate_refuses_a_mutation_stranding_a_declared_hash() {
     vol.flush_wal().unwrap();
     let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
 
-    let footprint: std::collections::HashSet<blake3::Hash> = [hash].into();
+    let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, |v| {
             Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
@@ -5528,7 +5528,7 @@ fn the_gate_trusts_the_declared_footprint() {
     let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
 
     let gate = vol
-        .mutate_gated_on_resolvability(&std::collections::HashSet::new(), |v| {
+        .mutate_gated_on_resolvability(&Default::default(), |v| {
             Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
             Ok(())
         })
@@ -5568,7 +5568,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
         },
     );
     Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
-    let footprint: std::collections::HashSet<blake3::Hash> = [hash].into();
+    let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
 
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, |_| Ok(()))

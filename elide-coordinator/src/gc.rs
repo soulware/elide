@@ -87,6 +87,7 @@ use ulid::Ulid;
 
 use crate::gc_census::DensityCensus;
 
+use elide_core::blake3_id_hasher::Blake3HashSet;
 use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
@@ -364,7 +365,7 @@ fn is_cache_resident(cache_dir: &Path, stats: &SegmentStats) -> bool {
 /// their LBAs are excluded from older-segment candidates.
 struct PassState {
     eligible_stats: Vec<SegmentStats>,
-    live_hashes: HashSet<blake3::Hash>,
+    live_hashes: Blake3HashSet,
     total_segments: usize,
     deferred_count: usize,
     /// Bloated extents this pass classified, keyed by the segment
@@ -1159,7 +1160,7 @@ fn collect_stats(
     fork_dir: &Path,
     vk: &elide_core::signing::VerifyingKey,
     index: &ExtentIndex,
-    live_hashes: &HashSet<blake3::Hash>,
+    live_hashes: &Blake3HashSet,
     lba_map: &LbaMap,
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
@@ -1500,7 +1501,7 @@ fn compact_segments(
     candidates: Vec<SegmentStats>,
     gc_dir: &Path,
     new_ulid: Ulid,
-    live_hashes: &HashSet<blake3::Hash>,
+    live_hashes: &Blake3HashSet,
 ) -> Result<()> {
     let new_ulid_str = new_ulid.to_string();
     fs::create_dir_all(gc_dir).context("creating gc dir")?;

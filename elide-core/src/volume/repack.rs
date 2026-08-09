@@ -481,7 +481,7 @@ impl Volume {
             // Every hash whose resolvability this bucket can change: the
             // inputs' owned hashes it removes, the journal-tier hashes
             // of the segments it purges, and the output's entries.
-            let mut footprint: std::collections::HashSet<blake3::Hash> = bucket
+            let mut footprint: crate::blake3_id_hasher::Blake3HashSet = bucket
                 .inputs
                 .iter()
                 .flat_map(|input| input.owned_hashes.iter().copied())

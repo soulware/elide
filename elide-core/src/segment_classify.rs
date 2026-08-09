@@ -34,7 +34,7 @@
 //! See `docs/design/gc-overlap-correctness.md` and
 //! `docs/design/gc-partial-death-compaction.md`.
 
-use std::collections::HashSet;
+use crate::blake3_id_hasher::Blake3HashSet;
 use std::sync::Arc;
 
 use ulid::Ulid;
@@ -116,7 +116,7 @@ pub struct ClassifyCtx<'a> {
     /// classification pass via [`LbaMap::claim_referenced_hashes`] and
     /// reused across every entry — included in the context rather than
     /// recomputed because it's `O(lbamap)` to build.
-    pub live_hashes: &'a HashSet<blake3::Hash>,
+    pub live_hashes: &'a Blake3HashSet,
     /// ULID of the segment the entry came from. Used by the
     /// extent-index ownership check.
     pub segment_id: Ulid,
@@ -332,7 +332,7 @@ mod tests {
         let hash = blake3::hash(b"referenced");
         let mut index = ExtentIndex::default();
         index.insert(hash, location(seg));
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
 
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
@@ -361,7 +361,7 @@ mod tests {
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &index,
-            live_hashes: &HashSet::new(),
+            live_hashes: &Blake3HashSet::default(),
             segment_id: seg,
         };
         assert!(matches!(
@@ -383,7 +383,7 @@ mod tests {
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &index,
-            live_hashes: &HashSet::new(),
+            live_hashes: &Blake3HashSet::default(),
             segment_id: seg,
         };
         assert!(matches!(
@@ -403,7 +403,7 @@ mod tests {
         let hash = blake3::hash(b"delta owner");
         let mut index = ExtentIndex::default();
         index.insert_delta(hash, delta_location(seg));
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
 
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
@@ -427,7 +427,7 @@ mod tests {
         let hash = blake3::hash(b"delta duplicate");
         let mut index = ExtentIndex::default();
         index.insert_delta(hash, delta_location(other));
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
 
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
@@ -453,7 +453,7 @@ mod tests {
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &index,
-            live_hashes: &HashSet::new(),
+            live_hashes: &Blake3HashSet::default(),
             segment_id: seg,
         };
         assert!(matches!(
@@ -476,7 +476,7 @@ mod tests {
 
         let mut owned = ExtentIndex::default();
         owned.insert_delta(hash, delta_location(seg));
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &owned,
@@ -491,7 +491,7 @@ mod tests {
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &owned,
-            live_hashes: &HashSet::new(),
+            live_hashes: &Blake3HashSet::default(),
             segment_id: seg,
         };
         assert!(matches!(
@@ -504,7 +504,7 @@ mod tests {
         let ctx = ClassifyCtx {
             lba_map: &LbaMap::new(),
             extent_index: &elsewhere,
-            live_hashes: &HashSet::new(),
+            live_hashes: &Blake3HashSet::default(),
             segment_id: seg,
         };
         assert!(matches!(
@@ -538,7 +538,7 @@ mod tests {
         lba_map.insert(100, 1, hash, s2);
 
         let index = ExtentIndex::default();
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
         let ctx = ClassifyCtx {
             lba_map: &lba_map,
             extent_index: &index,
@@ -567,7 +567,7 @@ mod tests {
         lba_map.insert(100, 1, hash, s1);
 
         let index = ExtentIndex::default();
-        let live: HashSet<blake3::Hash> = [hash].into_iter().collect();
+        let live: Blake3HashSet = [hash].into_iter().collect();
         let ctx = ClassifyCtx {
             lba_map: &lba_map,
             extent_index: &index,
