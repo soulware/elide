@@ -424,20 +424,24 @@ fn totals_lines(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) -> V
             "0%".to_owned()
         };
         out.push(format!(
-            "  index:   {} ({} idx, {} body on disk)  (data {}, dedup {}, inline {}, zero {}, delta {})",
+            "  index:   {} ({} idx)  (data {}, dedup {}, inline {}, zero {}, delta {})",
             fmt_commas(committed_entries as u64),
             fmt_size(t.cache_idx_file_bytes),
-            fmt_size(t.cache_body_actual),
             fmt_commas(t.cache_data as u64),
             fmt_commas(t.cache_dedup_ref as u64),
             fmt_commas(t.cache_inline as u64),
             fmt_commas(t.cache_zero as u64),
             fmt_commas(t.cache_delta as u64),
         ));
+        // Blocks the .body files occupy beside the size the index says those
+        // bodies are. The two track each other to within per-extent block
+        // rounding while every body is present, and the first falls away as
+        // eviction punches holes.
         out.push(format!(
-            "  cached:  {} / {}  ({} local)  {} present{}",
+            "  cached:  {} / {}  ({} local, {} indexed)  {} present{}",
             fmt_commas(t.cache_present as u64),
             fmt_commas(t.cache_data as u64),
+            fmt_size(t.cache_body_actual),
             fmt_size(t.cache_data_body),
             pct,
             canonical_note(t.cache_canonical_data),
@@ -1098,9 +1102,10 @@ fn print_cache_section(
             fmt_commas(f.delta_count as u64),
         );
         println!(
-            "{indent}cached:  {} / {}  ({} local)  {} present{}",
+            "{indent}cached:  {} / {}  ({} local, {} indexed)  {} present{}",
             fmt_commas(f.present_count as u64),
             fmt_commas(f.data_count as u64),
+            fmt_size(f.body_bytes_cached),
             fmt_size(f.data_body_bytes),
             pct,
             canonical_note(f.canonical_data_count),
@@ -1273,6 +1278,40 @@ mod tests {
             entry_block[1].starts_with("  index:   139,917 "),
             "the index row covers the committed column: {}",
             entry_block[1],
+        );
+    }
+
+    #[test]
+    fn the_cached_row_separates_disk_footprint_from_indexed_body_size() {
+        let evicted = Totals {
+            cache_files: 1,
+            cache_data: 132_779,
+            cache_present: 10_000,
+            cache_data_body: 273_003_315,
+            cache_body_actual: 20_447_232,
+            cache_idx_file_bytes: 9_437_184,
+            ..Default::default()
+        };
+        let p = PendingSummary {
+            open_files: 0,
+            open_bytes: 0,
+            upload_files: 0,
+            upload_bytes: 0,
+            wal_files: 0,
+            wal_bytes: 0,
+        };
+
+        let lines = totals_lines(&evicted, &p, 0);
+        assert!(
+            lines.iter().any(|l| l
+                == "  cached:  10,000 / 132,779  (19.5 MiB local, 260.4 MiB indexed)  7.5% present"),
+            "eviction moves the local figure without touching the indexed one: {lines:#?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  index:   132,779 (9.0 MiB idx)  ")),
+            "the index row carries the idx size alone: {lines:#?}",
         );
     }
 
