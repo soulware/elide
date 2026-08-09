@@ -2384,6 +2384,8 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     let (new_bss, written_entries, _) =
         segment::read_and_verify_segment_index(&tmp_path, &verifying_key)?;
     let handoff_inline = segment::read_inline_section(&tmp_path)?;
+    let carried_hashes = ExtentIndex::carried_hashes(&written_entries);
+    let entry_hashes = written_entries.iter().map(|e| e.hash).collect();
 
     Ok(GcPlanApplyResult {
         new_ulid,
@@ -2394,6 +2396,8 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         entries: written_entries,
         inputs,
         input_old_entries,
+        carried_hashes,
+        entry_hashes,
         handoff_inline,
         outcome: crate::volume::StagedApply::Applied,
     })
@@ -2414,6 +2418,8 @@ fn cancelled_result(
         entries: Vec::new(),
         inputs,
         input_old_entries: Vec::new(),
+        carried_hashes: Default::default(),
+        entry_hashes: Default::default(),
         handoff_inline: Vec::new(),
         outcome: crate::volume::StagedApply::Cancelled,
     }

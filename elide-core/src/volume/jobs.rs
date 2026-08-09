@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
+use crate::blake3_id_hasher::Blake3HashSet;
 use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
@@ -248,6 +249,12 @@ pub struct GcPlanApplyResult {
     /// `(hash, kind, input_ulid)` — the raw material for the to-remove and
     /// stale-cancel sets.
     pub input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)>,
+    /// Hashes `entries` carries forward (`ExtentIndex::carried_hashes`),
+    /// the protect-set for the to-remove derivation.
+    pub carried_hashes: Blake3HashSet,
+    /// Every hash in `entries` — the plan-derived seed of the apply's
+    /// resolvability footprint.
+    pub entry_hashes: Blake3HashSet,
     /// Inline bytes of the freshly written output segment, for populating
     /// `inline_data` on extent locations.
     pub handoff_inline: Vec<u8>,

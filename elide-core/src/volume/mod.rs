@@ -1579,6 +1579,8 @@ impl Volume {
             entries,
             inputs,
             input_old_entries,
+            carried_hashes,
+            entry_hashes,
             handoff_inline,
             outcome: _,
         } = result;
@@ -1614,7 +1616,6 @@ impl Volume {
         }
 
         let derive_start = Instant::now();
-        let carried_hashes = extentindex::ExtentIndex::carried_hashes(&entries);
 
         // Liveness for the veto is a claim or any recorded encoding
         // naming the hash as a source: a base body must stay resolvable
@@ -1673,10 +1674,11 @@ impl Volume {
 
         let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
         // Every hash whose resolvability this apply can change: the
-        // output's entries (registered in the index, merged as claims),
-        // the input-owned hashes it removes, and the journal-tier
-        // hashes of the segments it purges.
-        let mut footprint: Blake3HashSet = entries.iter().map(|e| e.hash).collect();
+        // output's entries (registered in the index, merged as claims,
+        // seeded into `entry_hashes` by the worker), the input-owned
+        // hashes it removes, and the journal-tier hashes of the
+        // segments it purges.
+        let mut footprint = entry_hashes;
         footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
         for input in &consumed {
             footprint.extend(self.extent_index.journal_hashes(*input));
