@@ -85,7 +85,7 @@ use crate::chunk_tree;
 
 // --- constants ---
 
-pub const MAGIC: &[u8; 8] = b"ELIDSEG\x08";
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x09";
 pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
@@ -380,8 +380,8 @@ pub enum Codec {
     /// prefix does.
     Zstd = 2,
     /// A [`chunk_tree::ChunkTable`] followed by one independently decodable
-    /// zstd frame per [`chunk_tree::CHUNK_BYTES`] of plaintext, so a read of
-    /// part of an extent decodes only the chunks holding it.
+    /// zstd frame per chunk of plaintext, at the size the table declares, so a
+    /// read of part of an extent decodes only the chunks holding it.
     ZstdChunked = 3,
 }
 
@@ -429,7 +429,7 @@ impl Codec {
             Codec::Zstd => zstd::zstd_safe::get_frame_content_size(stored)
                 .map_err(|e| io::Error::other(format!("zstd frame header: {e}")))?
                 .ok_or_else(|| io::Error::other("zstd frame declares no content size"))?,
-            Codec::ZstdChunked => chunk_tree::ChunkTable::peek_plain_len(stored)? as u64,
+            Codec::ZstdChunked => chunk_tree::ChunkTable::peek_header(stored)?.0 as u64,
         };
         if declared > MAX_EXTENT_PLAINTEXT as u64 {
             return Err(io::Error::other(format!(
@@ -500,7 +500,7 @@ impl Codec {
                     let frame = stored
                         .get(span)
                         .ok_or_else(|| io::Error::other("chunk runs past the stored payload"))?;
-                    let plain = chunk_tree::chunk_range(index, table.plain_len);
+                    let plain = table.size.range(index, table.plain_len);
                     Codec::Zstd.decode_into(frame, &mut out[plain])?;
                 }
                 Ok(())
@@ -3533,7 +3533,7 @@ mod tests {
     fn each_codec_round_trips_and_declares_its_plaintext_length() {
         let plain: Vec<u8> = (0..64 * 1024u32).map(|i| (i / 97 % 251) as u8).collect();
         // Over one chunk, so `compress_body` produces the chunked form.
-        let big: Vec<u8> = (0..5 * crate::chunk_tree::CHUNK_BYTES + 77)
+        let big: Vec<u8> = (0..5 * crate::chunk_tree::WRITE_CHUNK_SIZE.bytes() + 77)
             .map(|i| (i / 97 % 251) as u8)
             .collect();
         let forms = [

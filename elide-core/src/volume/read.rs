@@ -287,14 +287,14 @@ fn read_chunk_table(
         let prefix = TABLE_READ_PREFIX.min(body_length);
         s.table.resize(prefix, 0);
         f.read_exact_at(&mut s.table, file_body_offset)?;
-        let plain_len = chunk_tree::ChunkTable::peek_plain_len(&s.table)?;
+        let (plain_len, size) = chunk_tree::ChunkTable::peek_header(&s.table)?;
         if plain_len > segment::MAX_EXTENT_PLAINTEXT {
             return Err(io::Error::other(format!(
                 "chunked payload declares {plain_len} bytes of plaintext, over the {} cap",
                 segment::MAX_EXTENT_PLAINTEXT
             )));
         }
-        let table_len = chunk_tree::ChunkTable::encoded_len(plain_len);
+        let table_len = chunk_tree::ChunkTable::encoded_len(plain_len, size);
         if table_len > s.table.len() {
             s.table.resize(table_len, 0);
             f.read_exact_at(&mut s.table, file_body_offset)?;
@@ -330,7 +330,7 @@ fn serve_from_table(
         let s = &mut *s;
         let plain_len = table.plain_len;
 
-        let wanted = chunk_tree::chunks_covering(src_start, src_end);
+        let wanted = table.size.covering(src_start, src_end);
         let first = table.chunk_span(wanted.start)?;
         let last = table.chunk_span(wanted.end - 1)?;
         if last.end > body_length {
@@ -353,7 +353,7 @@ fn serve_from_table(
         for index in wanted {
             let span = table.chunk_span(index)?;
             let frame = &s.compressed[span.start - first.start..span.end - first.start];
-            let plain = chunk_tree::chunk_range(index, plain_len);
+            let plain = table.size.range(index, plain_len);
 
             // A chunk wholly inside the caller's range decodes into its
             // buffer; one that only overlaps decodes into the scratch and
@@ -363,7 +363,7 @@ fn serve_from_table(
                 let at = plain.start - src_start;
                 let into = &mut out_slice[at..at + plain.len()];
                 segment::Codec::Zstd.decode_into(frame, into)?;
-                chunk_tree::chunk_cv(index, into)
+                table.size.cv(index, into)
             } else {
                 s.decompressed.resize(plain.len(), 0);
                 segment::Codec::Zstd.decode_into(frame, &mut s.decompressed)?;
@@ -371,7 +371,7 @@ fn serve_from_table(
                 let to = src_end.min(plain.end);
                 out_slice[from - src_start..to - src_start]
                     .copy_from_slice(&s.decompressed[from - plain.start..to - plain.start]);
-                chunk_tree::chunk_cv(index, &s.decompressed)
+                table.size.cv(index, &s.decompressed)
             };
             match prove {
                 Some(_) => s.cvs[index] = cv,
@@ -392,7 +392,7 @@ fn serve_from_table(
         let Some(expected) = prove else {
             return Ok(None);
         };
-        let root = chunk_tree::root_from_cvs(&s.cvs, plain_len)?;
+        let root = table.size.root_from_cvs(&s.cvs, plain_len)?;
         if root != *expected {
             log::error!(
                 "content hash mismatch: lba={lba} segment={segment_id} expected={} got={} \

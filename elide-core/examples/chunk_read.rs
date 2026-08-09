@@ -56,15 +56,15 @@ fn main() -> io::Result<()> {
 
     let extent_bytes = extent_kib as usize * 1024;
     assert!(
-        extent_bytes > elide_core::chunk_tree::CHUNK_BYTES,
+        extent_bytes > elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes(),
         "extent must exceed CHUNK_BYTES ({}) to be chunked",
-        elide_core::chunk_tree::CHUNK_BYTES
+        elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes()
     );
     let blocks_per_extent = (extent_bytes / BLOCK) as u64;
     println!(
         "extents={extents} x {extent_kib} KiB ({} MiB)  chunk={} KiB  reads={reads}",
         extents * extent_kib / 1024,
-        elide_core::chunk_tree::CHUNK_BYTES / 1024,
+        elide_core::chunk_tree::WRITE_CHUNK_SIZE.bytes() / 1024,
     );
 
     let dir = tempfile::TempDir::new()?;
