@@ -26,7 +26,6 @@
 //   Any .tmp files in pending/ are removed (incomplete promotions).
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +37,7 @@ pub use segment::BoxFetcher;
 use ulid::Ulid;
 
 use crate::{
+    blake3_id_hasher::Blake3HashSet,
     extentindex::{self, BodySource},
     lbamap, rewrite_plan,
     segment::{self, EntryKind},
@@ -1676,7 +1676,7 @@ impl Volume {
         // output's entries (registered in the index, merged as claims),
         // the input-owned hashes it removes, and the journal-tier
         // hashes of the segments it purges.
-        let mut footprint: HashSet<blake3::Hash> = entries.iter().map(|e| e.hash).collect();
+        let mut footprint: Blake3HashSet = entries.iter().map(|e| e.hash).collect();
         footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
         for input in &consumed {
             footprint.extend(self.extent_index.journal_hashes(*input));
@@ -2310,11 +2310,11 @@ impl Volume {
     /// footprints of GC folds and close-pass buckets skipping it.
     fn unresolvable_footprint_hashes(
         &self,
-        footprint: &HashSet<blake3::Hash>,
+        footprint: &Blake3HashSet,
         sample_limit: usize,
     ) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
-        let mut residual: HashSet<blake3::Hash> = HashSet::new();
+        let mut residual: Blake3HashSet = Blake3HashSet::default();
         for &hash in footprint {
             if hash == ZERO_HASH || self.lbamap.claim_refcount(&hash) == 0 {
                 continue;
@@ -2376,7 +2376,7 @@ impl Volume {
     /// and thousands (#902).
     pub(in crate::volume) fn mutate_gated_on_resolvability(
         &mut self,
-        footprint: &HashSet<blake3::Hash>,
+        footprint: &Blake3HashSet,
         mutate: impl FnOnce(&mut Self) -> io::Result<()>,
     ) -> io::Result<ResolvabilityGate> {
         let pre_index = Arc::clone(&self.extent_index);

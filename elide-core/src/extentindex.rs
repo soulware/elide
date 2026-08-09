@@ -22,7 +22,7 @@
 //   index/*.idx for uploaded segments. Volume::open() then inserts WAL Data
 //   records on top via recover_wal().
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use log::warn;
 use ulid::Ulid;
 
-use crate::blake3_id_hasher::Blake3HamtMap;
+use crate::blake3_id_hasher::{Blake3HamtMap, Blake3HashSet};
 use crate::segment::{self, EntryKind};
 use crate::signing;
 use crate::sketch_index::SketchIndex;
@@ -365,7 +365,7 @@ pub struct ExtentIndex {
     /// recording and purge paths. Answers
     /// [`Self::is_named_delta_source`] with one probe, where inverting
     /// `delta_sources` walks every recorded encoding.
-    delta_source_counts: imbl::HashMap<blake3::Hash, u32>,
+    delta_source_counts: Blake3HamtMap<u32>,
     /// Per-segment presence bitsets for `BodySource::Cached` entries.
     /// Shared by `Arc` across snapshot republishes for unchanged
     /// segments; the fetcher writes through the same `Arc` every
@@ -381,7 +381,7 @@ impl ExtentIndex {
             deltas: Blake3HamtMap::default(),
             journal: imbl::HashMap::new(),
             delta_sources: imbl::HashMap::new(),
-            delta_source_counts: imbl::HashMap::new(),
+            delta_source_counts: Blake3HamtMap::default(),
             segment_presence: HashMap::new(),
         }
     }
@@ -678,8 +678,8 @@ impl ExtentIndex {
     /// Iterates the delta-source records — far smaller than the claim
     /// set — so the cost scales with the number of delta encodings
     /// rather than the volume's extent count.
-    pub fn named_delta_sources(&self) -> HashSet<blake3::Hash> {
-        let mut out = HashSet::new();
+    pub fn named_delta_sources(&self) -> Blake3HashSet {
+        let mut out = Blake3HashSet::default();
         for per_hash in self.delta_sources.values() {
             for sources in per_hash.values() {
                 out.extend(sources.iter().copied());
@@ -713,8 +713,8 @@ impl ExtentIndex {
     /// Recompute the source counts from `delta_sources`, the definition
     /// the maintained map has to match. The oracle for
     /// [`Self::debug_assert_delta_source_counts`].
-    fn recount_delta_sources(&self) -> imbl::HashMap<blake3::Hash, u32> {
-        let mut out: imbl::HashMap<blake3::Hash, u32> = imbl::HashMap::new();
+    fn recount_delta_sources(&self) -> Blake3HamtMap<u32> {
+        let mut out: Blake3HamtMap<u32> = Blake3HamtMap::default();
         for per_hash in self.delta_sources.values() {
             for sources in per_hash.values() {
                 for source in sources.iter() {
@@ -1003,9 +1003,7 @@ impl ExtentIndex {
     /// except DedupRef (a thin reference to a body owned elsewhere).
     /// The `carried` protect-set for
     /// [`remove_input_owned`](Self::remove_input_owned).
-    pub fn carried_hashes(
-        entries: &[segment::SegmentEntry],
-    ) -> std::collections::HashSet<blake3::Hash> {
+    pub fn carried_hashes(entries: &[segment::SegmentEntry]) -> Blake3HashSet {
         entries
             .iter()
             .filter(|e| e.kind != EntryKind::DedupRef)
@@ -1023,7 +1021,7 @@ impl ExtentIndex {
         &mut self,
         input: Ulid,
         owned: &[blake3::Hash],
-        carried: &std::collections::HashSet<blake3::Hash>,
+        carried: &Blake3HashSet,
     ) -> usize {
         let mut removed = 0;
         for hash in owned {

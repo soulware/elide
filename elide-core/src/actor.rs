@@ -3635,7 +3635,7 @@ pub(crate) fn live_index_segments(
     // source. A source body must stay resolvable while any registered
     // encoding names it, so all of them count as live even when no LBA
     // references the source directly.
-    let mut live_hashes: std::collections::HashSet<blake3::Hash> = lbamap.claim_referenced_hashes();
+    let mut live_hashes = lbamap.claim_referenced_hashes();
     live_hashes.extend(extent_index.named_delta_sources());
 
     // Pass 2: apply predicate.
@@ -3670,7 +3670,7 @@ fn is_index_entry_live(
     entry: &segment::SegmentEntry,
     extent_index: &ExtentIndex,
     lbamap: &LbaMap,
-    live_hashes: &std::collections::HashSet<blake3::Hash>,
+    live_hashes: &crate::blake3_id_hasher::Blake3HashSet,
 ) -> bool {
     use segment::EntryKind;
     match entry.kind {

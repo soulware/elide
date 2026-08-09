@@ -7,7 +7,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -482,7 +481,7 @@ fn compact_candidates_inner(
     fork_dir: &Path,
     candidates: Vec<(Ulid, PathBuf)>,
     lba_map: &lbamap::LbaMap,
-    live_hashes: &HashSet<blake3::Hash>,
+    live_hashes: &elide_core::blake3_id_hasher::Blake3HashSet,
     extent_index: &extentindex::ExtentIndex,
     new_ulid: Ulid,
 ) -> Option<CompactResult> {
