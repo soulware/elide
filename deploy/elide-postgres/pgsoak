@@ -39,9 +39,10 @@
 # against. `loop` is the comparison that isolates elide — same ext4, same mkfs
 # flags, same mount options, differing only in ublk+elide versus a direct-io
 # loop device over a sparse file. `raw` puts PGDATA straight on a host directory
-# for the ceiling. Both baselines still differ from elide in durability: ublk
-# runs write-through because FUA is ignored (#728), so elide does more work per
-# fsync than either. `crash-vol` needs BACKEND=elide; `crash-pg` works anywhere.
+# for the ceiling. The elide device advertises a volatile write cache and FUA
+# (#728), so it takes a FLUSH per journal commit where the baselines take one
+# straight to the host. `crash-vol` needs BACKEND=elide; `crash-pg` works
+# anywhere.
 #
 # Measured 2026-08-02, scale 50 / 8 clients, run 1 and run 2 of each:
 #   elide 353 -> 206 tps, latency stddev 266 and 486 ms

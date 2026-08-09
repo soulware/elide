@@ -4,9 +4,17 @@
 #   pg    kill -9 postgres (device healthy; postgres WAL recovery baseline)
 #   vol   kill -9 the elide volume server mid-IO (elide crash recovery:
 #         supervisor respawn, elide WAL replay, fsck, remount)
-#   host  fly machine stop --signal KILL mid-run, then start (whole-VM crash:
-#         acked fsyncs must survive through elide's local WAL on the Fly
-#         volume; this is the closest Fly gets to pulling the power)
+#   host  fly machine stop --signal KILL mid-run, then start. The signal goes
+#         to the app, and the guest then shuts down cleanly: `/data` unmounts
+#         with no journal replay, and a 200 MB unsynced file written to it
+#         survives. Elide's WAL and segments live on `/data`, so this mode
+#         cannot falsify elide's fsync discipline — the clean unmount syncs
+#         them either way. What it does exercise is the elide device being
+#         severed under a mounted filesystem: the volume server dies first, so
+#         the guest flushes /mnt to a ublk device whose server is already gone,
+#         and that filesystem does need journal recovery. Cutting the cache
+#         underneath elide needs dm-flakey beneath `/data`; Fly has nothing
+#         that pulls the power.
 #
 #   ./soak.sh [cycles]     default 6 (two of each mode)
 #
