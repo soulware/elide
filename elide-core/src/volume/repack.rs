@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -653,10 +653,10 @@ impl Volume {
         Ok((stats, consumed_inputs))
     }
 
-    /// Unlink input segment files consumed by a repack or delta-repack
-    /// apply, then fsync `pending/`. Called after the read snapshot
-    /// reflecting the apply has been published, so no published
-    /// snapshot ever references an unlinked file.
+    /// Unlink input segment files consumed by a repack, delta-repack or
+    /// reap apply, then fsync the directory each one lived in. Called
+    /// after the read snapshot reflecting the apply has been published,
+    /// so no published snapshot ever references an unlinked file.
     ///
     /// Already-missing files are fine — a previous partial unlink may
     /// have removed some of the batch.
@@ -668,15 +668,21 @@ impl Volume {
     /// above the pre-minted output ULIDs — content-equal but not
     /// claimant-equal to the in-memory maps.
     pub fn remove_consumed_inputs(&mut self, paths: &[PathBuf]) -> io::Result<()> {
+        let mut dirs: Vec<&Path> = Vec::new();
         for path in paths {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
+            if let Some(parent) = path.parent()
+                && !dirs.contains(&parent)
+            {
+                dirs.push(parent);
+            }
         }
-        if !paths.is_empty() {
-            segment::fsync_dir(&segment::pending_open_dir(&self.base_dir).join("."))?;
+        for dir in dirs {
+            segment::fsync_dir(&dir.join("."))?;
         }
         self.assert_volume_invariants("remove_consumed_inputs");
         Ok(())
