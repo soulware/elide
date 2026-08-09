@@ -975,6 +975,139 @@ fn gc_restart_safety_applied_handoff() {
     );
 }
 
+/// The bare `gc/<new>` file is local staging rather than a durability
+/// boundary: a GC input survives until the output has been uploaded and
+/// promoted, so losing the apply's `rename(<new>.tmp, <new>)` costs the
+/// fold alone. The inputs stay resolvable through `index/<input>.idx`
+/// and the plan re-applies from scratch.
+///
+/// That property is what makes the plan apply's unsynced rename safe,
+/// and it is enforced a whole crate away — `apply_done_handoffs` runs
+/// upload → promote → input cleanup. Moving input deletion ahead of
+/// promote breaks it: `load_input_states` then returns `MissingInput`,
+/// the materialise cancels, and step 5 below sees a zero handoff count
+/// and two unreadable LBAs.
+///
+/// Sequence:
+///
+///   1. Write D0 to lba=0 and D1 to lba=1, flush, drain → S1.
+///      Overwrite lba=0 with D2, flush, drain → S2. Both confirmed in
+///      S3 with an `index/<u>.idx`.
+///   2. gc_checkpoint + gc_fork → `gc/<new>.plan`.
+///   3. Apply it, then rebuild the durable state a machine crash
+///      between the rename and the plan removal leaves behind: bare
+///      `<new>` back under `<new>.tmp`, `.plan` restored.
+///   4. Drop the volume so the in-memory fold dies with it, and reopen.
+///   5. Both LBAs read the pre-GC world and the plan applies again.
+#[test]
+fn a_lost_plan_apply_rename_costs_only_the_fold() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let gc_config = make_gc_config();
+
+    let d0: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(7).wrapping_add(11) as u8)
+        .collect();
+    let d1: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(11).wrapping_add(22) as u8)
+        .collect();
+    let d2: Vec<u8> = (0u32..4096)
+        .map(|i| i.wrapping_mul(13).wrapping_add(33) as u8)
+        .collect();
+
+    // Step 1: two S3-confirmed inputs, the second killing D0's hash.
+    vol.write(0, &d0).unwrap();
+    vol.write(1, &d1).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    vol.write(0, &d2).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    // Step 2: emit the plan.
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+
+    let gc_dir = fork_dir.join("gc");
+    let plan_path = gc_dir.join(format!("{u_gc}.plan"));
+    let bare_path = gc_dir.join(u_gc.to_string());
+    let tmp_path = gc_dir.join(format!("{u_gc}.tmp"));
+    assert!(
+        plan_path.exists(),
+        "gc_fork must emit a plan over the two drained segments — without one \
+         the rest of this test asserts nothing"
+    );
+    let plan_bytes = fs::read(&plan_path).unwrap();
+
+    // Step 3: apply, then rebuild the crash state.
+    assert_eq!(vol.apply_gc_handoffs().unwrap(), 1);
+    assert!(bare_path.exists(), "the apply must commit a bare gc/<new>");
+    fs::rename(&bare_path, &tmp_path).unwrap();
+    fs::write(&plan_path, &plan_bytes).unwrap();
+
+    // Step 4: the fold dies with the process.
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    // Step 5: the inputs still serve every LBA, and the plan re-applies.
+    assert_eq!(
+        vol.read(0, 1)
+            .expect("lba=0 after a lost rename")
+            .as_slice(),
+        d2.as_slice(),
+        "lba=0 must still resolve through the inputs"
+    );
+    assert_eq!(
+        vol.read(1, 1)
+            .expect("lba=1 after a lost rename")
+            .as_slice(),
+        d1.as_slice(),
+        "lba=1 must still resolve through the inputs"
+    );
+
+    assert_eq!(
+        vol.apply_gc_handoffs().unwrap(),
+        1,
+        "the plan must re-materialise from inputs that outlived the output"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "the sweep must remove the stale apply scratch"
+    );
+    assert!(
+        bare_path.exists(),
+        "the re-apply must commit a bare gc/<new>"
+    );
+
+    assert_eq!(
+        vol.read(0, 1).expect("lba=0 after the re-apply").as_slice(),
+        d2.as_slice(),
+        "lba=0 must read D2 through the re-applied fold"
+    );
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the re-apply").as_slice(),
+        d1.as_slice(),
+        "lba=1 must read D1 through the re-applied fold"
+    );
+}
+
 /// Regression test for Bug F: collect_stats must skip segments that contain
 /// thin DedupRef entries. Thin refs should never appear in S3 (upload sanity
 /// check rejects them), but if one slips through (legacy data or bug), GC
