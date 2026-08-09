@@ -56,27 +56,25 @@ pub fn volume_invariants_enabled() -> bool {
 /// Whether the promote worker's delta tiers run.
 ///
 /// Both tiers — same-LBA against a sealed snapshot, and the resemblance
-/// probe — answer to `ELIDE_VOLUME_DELTA` so one release binary serves
-/// both arms of a measurement. Off leaves each entry as the Data entry
-/// it already was; segments written earlier keep their Delta entries and
-/// still read.
-pub fn volume_delta_enabled() -> bool {
+/// probe — are parked: they cost 29% of volume CPU and an order of
+/// magnitude of guest latency for about 2% of stored bytes, so they run
+/// only when `ELIDE_ENABLE_DELTA` asks for them. Segments written earlier
+/// keep their Delta entries and still read.
+pub fn delta_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| env_switch("ELIDE_VOLUME_DELTA", true));
+        std::sync::LazyLock::new(|| env_switch("ELIDE_ENABLE_DELTA", false));
     *ENABLED
 }
 
-/// Whether the volume server's segment writes populate resemblance
-/// sketches.
+/// Whether segment writes persist resemblance sketches.
 ///
 /// Sketches are read by the resemblance tier alone, and computing one
-/// decompresses the body it describes, so they answer to
-/// `ELIDE_VOLUME_SKETCHES`. Import writes its own segments sketched
-/// either way — its delta producer matches on filemap paths, and this
-/// switch reaches only the writes the volume server makes.
-pub fn volume_sketches_enabled() -> bool {
+/// decompresses the body it describes, so they follow the tier and answer
+/// to `ELIDE_ENABLE_SKETCH`. A segment written without them carries a
+/// zero-length sketch section, which the journal tier already produces.
+pub fn sketch_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| env_switch("ELIDE_VOLUME_SKETCHES", true));
+        std::sync::LazyLock::new(|| env_switch("ELIDE_ENABLE_SKETCH", false));
     *ENABLED
 }
 

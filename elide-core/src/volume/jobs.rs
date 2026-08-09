@@ -117,8 +117,39 @@ pub struct JournalPartition {
     pub partition: PendingPartition,
 }
 
+/// Whether a promote runs its delta tiers, and whether its segment
+/// writes leave sketches behind for later promotes to select sources by.
+///
+/// Carried per job rather than read from the environment at each use, so a
+/// test can exercise the parked tiers on a volume it built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaPolicy {
+    pub enabled: bool,
+    pub persist_sketches: bool,
+}
+
+impl DeltaPolicy {
+    pub const OFF: Self = Self {
+        enabled: false,
+        persist_sketches: false,
+    };
+
+    pub const ON: Self = Self {
+        enabled: true,
+        persist_sketches: true,
+    };
+
+    pub fn from_env() -> Self {
+        Self {
+            enabled: crate::delta_enabled(),
+            persist_sketches: crate::sketch_enabled(),
+        }
+    }
+}
+
 /// Where a promote's delta tiers find dictionaries.
 pub struct PromoteDeltaSpec {
+    pub policy: DeltaPolicy,
     /// Live extent-index snapshot for resolving source bodies by hash. Any
     /// canonical serving a hash yields identical bytes, so the live index
     /// suffices.

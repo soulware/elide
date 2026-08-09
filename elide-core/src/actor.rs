@@ -2367,7 +2367,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         entries,
         &delta_body,
         &inputs,
-        crate::volume_sketches_enabled(),
+        crate::sketch_enabled(),
         signer.as_ref(),
     )?;
 
@@ -2551,7 +2551,7 @@ pub(crate) fn execute_promote(
     // because a delta optimisation's inputs were unavailable — while
     // conversion errors are real corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
-    if crate::volume_delta_enabled() {
+    if job.delta.policy.enabled {
         if let Some(prior_spec) = &job.delta.prior {
             match prior_cache.map_for(
                 &prior_spec.base_dir,
@@ -2629,7 +2629,7 @@ pub(crate) fn execute_promote(
             job.segment_ulid,
             pendings,
             &delta_body,
-            crate::volume_sketches_enabled(),
+            job.delta.policy.persist_sketches,
             job.signer.as_ref(),
         ) {
             Ok(v) => v,
@@ -2663,7 +2663,7 @@ pub(crate) fn execute_promote(
                 jpart.segment_ulid,
                 j_pendings,
                 &[],
-                crate::volume_sketches_enabled(),
+                job.delta.policy.persist_sketches,
                 job.signer.as_ref(),
             ) {
                 Ok((j_bss, j_entries)) => {
@@ -3372,7 +3372,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     entries,
                     &delta_body,
                     &[],
-                    crate::volume_sketches_enabled(),
+                    crate::sketch_enabled(),
                     signer.as_ref(),
                 )?;
                 std::fs::rename(&tmp_path, &final_path)?;
@@ -3505,7 +3505,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             out_entries,
             &delta_body,
             &[],
-            crate::volume_sketches_enabled(),
+            crate::sketch_enabled(),
             signer.as_ref(),
         )?;
         std::fs::rename(&tmp_path, &final_path)?;
@@ -4263,7 +4263,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         entries,
         &delta_body,
         &[],
-        crate::volume_sketches_enabled(),
+        crate::sketch_enabled(),
         job.signer.as_ref(),
     )?;
     fs::rename(&tmp_path, &final_path)?;

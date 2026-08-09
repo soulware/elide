@@ -1041,7 +1041,7 @@ pub fn write_gc_segment(
 /// bytes end at this write and do not travel further.
 ///
 /// `sketch` decides whether fresh Data entries acquire a resemblance
-/// sketch; the volume server passes [`crate::volume_sketches_enabled`].
+/// sketch; a promote passes its [`crate::volume::jobs::DeltaPolicy`].
 pub fn write_segment_full(
     path: &Path,
     entries: Vec<PendingEntry>,

@@ -2335,6 +2335,7 @@ fn pending_entry_kinds(base: &Path, vol: &Volume, seg: Ulid) -> Vec<segment::Ent
 fn formation_deltas_post_seal_near_duplicate() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
+    vol.set_delta_policy(true, true);
 
     vol.write(0, &delta_base_block(1)).unwrap();
     vol.snapshot().unwrap();
@@ -2369,6 +2370,7 @@ fn formation_deltas_post_seal_near_duplicate() {
 fn formation_deltas_by_resemblance_without_a_snapshot() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
+    vol.set_delta_policy(true, true);
 
     // The source has to be promoted before it can be a candidate: the
     // candidate map is extended when a promote's result is applied.
@@ -5307,6 +5309,7 @@ fn same_content_rewrite_racing_flush_apply_matches_rebuild() {
 
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
+    vol.set_delta_policy(true, true);
 
     let a = prand_bytes(1, EXTENT_BYTES);
     let h_a = blake3::hash(&a);
@@ -5414,6 +5417,7 @@ fn same_content_rewrite_racing_flush_apply_matches_rebuild() {
 fn same_epoch_rewrite_cycle_matches_rebuild() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
+    vol.set_delta_policy(true, true);
 
     let a = prand_bytes(1, DELTA_EXTENT_BYTES);
     let mut a_prime = a.clone();
