@@ -144,80 +144,13 @@ fn verify_and_slice(
     Ok(())
 }
 
-/// Chaining values a thread keeps across reads, over all cached tables.
-///
-/// One value is 36 bytes with its stored length, so this bounds the cache at
-/// roughly 9 MiB per reading thread. A whole volume's tables are far smaller
-/// than that at the chunk sizes in use, so the bound is a backstop.
-const TABLE_CACHE_CVS: usize = 256 * 1024;
-
-/// A chunk table whose chaining values reconstruct `root`.
-struct ProvenTable {
-    root: blake3::Hash,
-    table: chunk_tree::ChunkTable,
-}
-
-/// Per-thread cache of chunk tables already checked against the extent hash
-/// their signed index carries.
-///
-/// A table enters only after a root reconstruction proved it, and leaves only
-/// to a read whose expected hash equals the one it was proved against, so an
-/// entry that does not belong to the read at hand simply misses and the slow
-/// path proves the table afresh. Body bytes for a segment ULID never change
-/// under a reader, so nothing outside has to invalidate this.
-#[derive(Default)]
-struct TableCache {
-    tables: HashMap<(Ulid, u64), ProvenTable>,
-    order: std::collections::VecDeque<(Ulid, u64)>,
-    cvs: usize,
-}
-
-impl TableCache {
-    /// The table proved against `expected`, if this thread holds it.
-    ///
-    /// One proved against a different hash describes different content, so it
-    /// misses and the caller proves the table this read needs.
-    fn get(&self, key: &(Ulid, u64), expected: &blake3::Hash) -> Option<&chunk_tree::ChunkTable> {
-        self.tables
-            .get(key)
-            .filter(|p| p.root == *expected)
-            .map(|p| &p.table)
-    }
-
-    fn put(&mut self, key: (Ulid, u64), root: blake3::Hash, table: chunk_tree::ChunkTable) {
-        self.cvs += table.cvs.len();
-        if let Some(prev) = self.tables.insert(key, ProvenTable { root, table }) {
-            self.cvs -= prev.table.cvs.len();
-        } else {
-            self.order.push_back(key);
-        }
-        while self.cvs > TABLE_CACHE_CVS {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            if let Some(dropped) = self.tables.remove(&oldest) {
-                self.cvs -= dropped.table.cvs.len();
-            }
-        }
-    }
-}
-
-thread_local! {
-    static TABLE_CACHE: RefCell<TableCache> = RefCell::new(TableCache::default());
-}
-
 /// Serve `src_start..src_end` of a chunked extent, reading and decoding only
 /// the chunks that range lands in.
 ///
 /// The chunk table's chaining values are subtree values of the extent's own
-/// hash tree. Proving a table costs one root reconstruction, over the
-/// values computed from the decoded chunks substituted into the rest: that
-/// checks the decoded bytes and the unsigned table together, against the hash
-/// the signed index carries. A table holds for the life of the extent, so a
-/// read that finds it already proved instead compares its decoded chunks
-/// against the proven values directly — the same statement about the bytes it
-/// serves, without the table read, the parse, or a reconstruction whose cost
-/// grows with the whole extent's chunk count.
+/// hash tree, so reconstructing the root over the values computed from the
+/// decoded chunks, substituted into the rest, checks the decoded bytes and the
+/// unsigned table together against the hash the signed index carries.
 #[allow(clippy::too_many_arguments)]
 fn serve_chunked(
     f: &fs::File,
@@ -230,60 +163,14 @@ fn serve_chunked(
     src_end: usize,
     out_slice: &mut [u8],
 ) -> io::Result<()> {
-    let key = (segment_id, file_body_offset);
-    let served = TABLE_CACHE.with(|c| {
-        let cache = c.borrow();
-        cache.get(&key, expected).map(|table| {
-            serve_from_table(
-                f,
-                file_body_offset,
-                body_length,
-                table,
-                None,
-                lba,
-                segment_id,
-                src_start,
-                src_end,
-                out_slice,
-            )
-        })
-    });
-    if let Some(result) = served {
-        return result.map(|_| ());
-    }
-
-    let mut table = read_chunk_table(f, file_body_offset, body_length)?;
-    let proved = serve_from_table(
-        f,
-        file_body_offset,
-        body_length,
-        &table,
-        Some(expected),
-        lba,
-        segment_id,
-        src_start,
-        src_end,
-        out_slice,
-    )?;
-    if let Some(cvs) = proved {
-        table.cvs = cvs;
-        TABLE_CACHE.with(|c| c.borrow_mut().put(key, *expected, table));
-    }
-    Ok(())
-}
-
-/// Read and parse the table at the head of a chunked stored payload.
-fn read_chunk_table(
-    f: &fs::File,
-    file_body_offset: u64,
-    body_length: usize,
-) -> io::Result<chunk_tree::ChunkTable> {
     use std::os::unix::fs::FileExt;
     READ_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        // The table's own length follows from the plaintext length in its
-        // first four bytes, so read a prefix that covers most tables outright
-        // and extend it only when one runs longer.
+        let s = &mut *s;
+
+        // The table's own length follows from the header at its head, so read
+        // a prefix that covers most tables outright and extend it only when
+        // one runs longer.
         let prefix = TABLE_READ_PREFIX.min(body_length);
         s.table.resize(prefix, 0);
         f.read_exact_at(&mut s.table, file_body_offset)?;
@@ -299,38 +186,9 @@ fn read_chunk_table(
             s.table.resize(table_len, 0);
             f.read_exact_at(&mut s.table, file_body_offset)?;
         }
-        chunk_tree::ChunkTable::parse(&s.table)
-    })
-}
+        let table = chunk_tree::ChunkTable::parse(&s.table)?;
 
-/// Decode the chunks `src_start..src_end` lands in out of `table`.
-///
-/// `prove` carries the extent hash when the table has yet to be checked
-/// against it, and the proved chaining values come back for the caller to
-/// cache. Without it the table is already proved, and each decoded chunk is
-/// checked against the value the table holds for it — which says the same
-/// thing about the bytes served, since those values are the ones a
-/// reconstruction matched to the signed hash.
-#[allow(clippy::too_many_arguments)]
-fn serve_from_table(
-    f: &fs::File,
-    file_body_offset: u64,
-    body_length: usize,
-    table: &chunk_tree::ChunkTable,
-    prove: Option<&blake3::Hash>,
-    lba: u64,
-    segment_id: Ulid,
-    src_start: usize,
-    src_end: usize,
-    out_slice: &mut [u8],
-) -> io::Result<Option<Vec<blake3::hazmat::ChainingValue>>> {
-    use std::os::unix::fs::FileExt;
-    READ_SCRATCH.with(|s| {
-        let mut s = s.borrow_mut();
-        let s = &mut *s;
-        let plain_len = table.plain_len;
-
-        let wanted = table.size.covering(src_start, src_end);
+        let wanted = size.covering(src_start, src_end);
         let first = table.chunk_span(wanted.start)?;
         let last = table.chunk_span(wanted.end - 1)?;
         if last.end > body_length {
@@ -344,16 +202,12 @@ fn serve_from_table(
         s.compressed.resize(last.end - first.start, 0);
         f.read_exact_at(&mut s.compressed, file_body_offset + first.start as u64)?;
 
-        // A reconstruction needs the whole array, with this read's chunks
-        // substituted into the values the table supplies for the rest.
-        if prove.is_some() {
-            s.cvs.clear();
-            s.cvs.extend_from_slice(&table.cvs);
-        }
+        s.cvs.clear();
+        s.cvs.extend_from_slice(&table.cvs);
         for index in wanted {
             let span = table.chunk_span(index)?;
             let frame = &s.compressed[span.start - first.start..span.end - first.start];
-            let plain = table.size.range(index, plain_len);
+            let plain = size.range(index, plain_len);
 
             // A chunk wholly inside the caller's range decodes into its
             // buffer; one that only overlaps decodes into the scratch and
@@ -363,7 +217,7 @@ fn serve_from_table(
                 let at = plain.start - src_start;
                 let into = &mut out_slice[at..at + plain.len()];
                 segment::Codec::Zstd.decode_into(frame, into)?;
-                table.size.cv(index, into)
+                size.cv(index, into)
             } else {
                 s.decompressed.resize(plain.len(), 0);
                 segment::Codec::Zstd.decode_into(frame, &mut s.decompressed)?;
@@ -371,28 +225,12 @@ fn serve_from_table(
                 let to = src_end.min(plain.end);
                 out_slice[from - src_start..to - src_start]
                     .copy_from_slice(&s.decompressed[from - plain.start..to - plain.start]);
-                table.size.cv(index, &s.decompressed)
+                size.cv(index, &s.decompressed)
             };
-            match prove {
-                Some(_) => s.cvs[index] = cv,
-                None if cv != table.cvs[index] => {
-                    log::error!(
-                        "chunk hash mismatch: lba={lba} segment={segment_id} chunk={index} \
-                         of {} ({plain_len} bytes)",
-                        table.cvs.len(),
-                    );
-                    return Err(io::Error::other(format!(
-                        "chunk {index} of a {plain_len}-byte extent failed its chaining value"
-                    )));
-                }
-                None => {}
-            }
+            s.cvs[index] = cv;
         }
 
-        let Some(expected) = prove else {
-            return Ok(None);
-        };
-        let root = table.size.root_from_cvs(&s.cvs, plain_len)?;
+        let root = size.root_from_cvs(&s.cvs, plain_len)?;
         if root != *expected {
             log::error!(
                 "content hash mismatch: lba={lba} segment={segment_id} expected={} got={} \
@@ -407,7 +245,7 @@ fn serve_from_table(
                 expected.to_hex()
             )));
         }
-        Ok(Some(s.cvs.clone()))
+        Ok(())
     })
 }
 

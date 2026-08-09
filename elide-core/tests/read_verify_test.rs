@@ -548,9 +548,9 @@ fn a_chunked_read_refuses_a_tampered_chunk_table() {
 
 /// Every block of one extent, read twice from one volume.
 ///
-/// The first read proves the chunk table and the rest are served against the
-/// proved chaining values, so this is the path that no longer reads the table
-/// or reconstructs the root — the bytes still have to come back right.
+/// One volume serves every block of one extent twice, so each block is served
+/// from a reader that has already served the others. The tests that mint a
+/// volume per read cover the first read of an extent; this covers the rest.
 #[test]
 fn repeated_reads_of_one_chunked_extent_serve_every_block() {
     let blocks = test_blocks();

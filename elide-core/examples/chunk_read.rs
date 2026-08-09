@@ -1,13 +1,12 @@
 //! Time guest-sized random reads against chunked extents.
 //!
-//! Writes extents over `chunk_tree::CHUNK_BYTES` so every read lands in a
+//! Writes extents over the write path's chunk size so every read lands in a
 //! chunked body, then reads 8 KiB at uniformly random offsets — the shape that
 //! makes a read decode a whole chunk, and the shape a cold guest page cache
-//! produces. Random offsets over a large address space mean a decoded-chunk
-//! cache would almost never hit, so what this isolates is the per-read table
-//! read and root reconstruction rather than the decode.
+//! produces. This is what prices a chunk size on the read axis, against what
+//! `corpus-sim` prices it at on the storage one.
 //!
-//! Tables are proved once in a warm-up pass, so the timed loop measures the
+//! Each extent is read once before the timed loop, so the loop measures the
 //! steady state a long-running volume server is in.
 //!
 //! Run with:
