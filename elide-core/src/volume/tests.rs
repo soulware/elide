@@ -5611,3 +5611,87 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// Place a segment in `index/` at `ulid`, carrying `inputs`. A non-empty
+/// inputs list is what a compaction output records; an empty one is what a
+/// promoted flush carries.
+#[cfg(feature = "volume-invariants")]
+fn plant_committed_segment(base: &Path, ulid: ulid::Ulid, inputs: &[ulid::Ulid]) {
+    let signer = crate::signing::load_signer(base, crate::signing::VOLUME_KEY_FILE).unwrap();
+    let body = vec![0x77u8; 4096];
+    let entries = vec![segment::SegmentEntry::new_data(
+        blake3::hash(&body),
+        4096,
+        1,
+        segment::Codec::None,
+        body,
+    )];
+    let staging = base.join(format!("{ulid}.staging"));
+    segment::write_segment_full(&staging, entries, &[], inputs, false, signer.as_ref()).unwrap();
+
+    // `index/<u>.idx` is the leading header-plus-index slice of a segment.
+    let full = fs::read(&staging).unwrap();
+    let (body_section_start, _, _) = segment::read_segment_index(&staging).unwrap();
+    let index_dir = base.join("index");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join(format!("{ulid}.idx")),
+        &full[..body_section_start as usize],
+    )
+    .unwrap();
+    fs::remove_file(&staging).unwrap();
+}
+
+/// A GC or repack output mints its ULID when the pass applies, so it can
+/// legitimately land above a write that was already pending when the pass
+/// forked. It shares `index/` with the promoted flushes, so the ordering
+/// check has to tell them apart by the inputs list rather than by location —
+/// #931, where it did not, and every volume that had run a GC panicked at
+/// open.
+#[cfg(feature = "volume-invariants")]
+#[test]
+fn a_compaction_output_above_a_pending_write_is_not_a_drain_violation() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(0, &vec![0x42u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    let pending_min = segment::read_ulid_dir_sorted(&segment::pending_open_dir(&base))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the flush leaves a pending segment");
+
+    // Minted after the pending write, exactly as an apply-time ULID is.
+    let compaction = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
+    assert!(compaction > pending_min);
+    plant_committed_segment(&base, compaction, &[pending_min]);
+
+    vol.assert_pending_above_committed("compaction_output_test");
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The companion to the case above: with an empty inputs list the same
+/// segment is a promoted flush, and a promoted flush above a pending write
+/// is the out-of-order drain the check exists to catch.
+#[cfg(feature = "volume-invariants")]
+#[test]
+#[should_panic(expected = "pending-above-committed invariant violation")]
+fn a_promoted_flush_above_a_pending_write_still_fires() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(0, &vec![0x42u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    let pending_min = segment::read_ulid_dir_sorted(&segment::pending_open_dir(&base))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the flush leaves a pending segment");
+
+    let promoted = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
+    plant_committed_segment(&base, promoted, &[]);
+
+    vol.assert_pending_above_committed("promoted_flush_test");
+}
