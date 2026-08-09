@@ -17,7 +17,7 @@
 /snapshots/
 
 # Rust build output
-/target/
+target/
 
 # Local reference copies (lsvd impl + paper)
 /refs/
