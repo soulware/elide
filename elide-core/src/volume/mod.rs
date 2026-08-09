@@ -1998,9 +1998,11 @@ impl Volume {
     /// message than the lbamap drift a broken drain would eventually
     /// cause.
     ///
-    /// GC outputs are outside this ordering: their ULID is minted at apply
-    /// time and may legitimately exceed a write that was already pending when
-    /// the pass forked, so they are excluded from the comparison.
+    /// Compaction outputs are outside this ordering: a GC or repack ULID is
+    /// minted at apply time and may legitimately exceed a write that was
+    /// already pending when the pass forked. They are identified by the
+    /// inputs list every compaction output carries, which is what separates
+    /// them from the promoted flushes they share `index/` with.
     ///
     /// Answers to the same runtime switch, so the perf cost only applies
     /// to runs that ask for the checks.
@@ -2051,8 +2053,11 @@ impl Volume {
             }
         }
 
-        // Only the promote tier (`index/`) is scanned; GC outputs are excluded
-        // for the reason given in the doc comment.
+        // A compaction output records the segments it consumed, so an empty
+        // inputs list is what marks a segment as having arrived through the
+        // drain. That is the property the ordering describes, and `index/`
+        // holds both kinds — an applied plan writes its `.idx` there beside
+        // the promoted flushes.
         let mut committed: Vec<(Ulid, std::path::PathBuf)> = Vec::new();
         if let Ok(idx_paths) = segment::collect_idx_files(&self.base_dir.join("index")) {
             for p in idx_paths {
@@ -2065,7 +2070,21 @@ impl Volume {
                 committed.push((u, p));
             }
         }
-        let committed_max = committed.iter().map(|(u, _)| *u).max();
+        // Read only as far as the max: a compaction output is skipped and the
+        // next candidate tried, so an ordered volume pays one index read.
+        let drained_max = |committed: &[(Ulid, std::path::PathBuf)]| -> Option<Ulid> {
+            let mut by_ulid: Vec<&(Ulid, std::path::PathBuf)> = committed.iter().collect();
+            by_ulid.sort_by_key(|(u, _)| std::cmp::Reverse(*u));
+            by_ulid
+                .into_iter()
+                .find(|(_, path)| {
+                    segment::read_segment_index(path)
+                        .map(|(_, _, inputs)| inputs.is_empty())
+                        .unwrap_or(true)
+                })
+                .map(|(u, _)| *u)
+        };
+        let committed_max = drained_max(&committed);
 
         // Strict `>`: same-ULID-in-both-tiers (the mid-promote crash recovery
         // state where `pending/<u>` and `index/<u>.idx` coexist briefly) is
