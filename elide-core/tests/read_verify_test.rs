@@ -545,3 +545,45 @@ fn a_chunked_read_refuses_a_tampered_chunk_table() {
         "error should report the hash mismatch, got: {err}"
     );
 }
+
+/// Every block of one extent, read twice from one volume.
+///
+/// The first read proves the chunk table and the rest are served against the
+/// proved chaining values, so this is the path that no longer reads the table
+/// or reconstructs the root — the bytes still have to come back right.
+#[test]
+fn repeated_reads_of_one_chunked_extent_serve_every_block() {
+    let blocks = test_blocks();
+    let bytes = multichunk_plaintext(blocks);
+    let hash = blake3::hash(&bytes);
+
+    let tmp = TempDir::new().unwrap();
+    let (vol_dir, signer) = setup_volume_dir(&tmp);
+    let seg_path = elide_core::segment::pending_open_dir(&vol_dir).join(Ulid::new().to_string());
+    let entries = vec![SegmentEntry::new_data(
+        hash,
+        0,
+        blocks as u32,
+        Codec::ZstdChunked,
+        chunked_form(&bytes),
+    )];
+    write_segment(&seg_path, entries, signer.as_ref()).unwrap();
+
+    let rv = ReadonlyVolume::open(&vol_dir, &vol_dir).unwrap();
+    for pass in 0..2 {
+        for block in 0..blocks as u64 {
+            let read = rv
+                .read(block, 1)
+                .expect("a correct chunked extent must read");
+            let at = block as usize * 4096;
+            assert_eq!(
+                &read[..],
+                &bytes[at..at + 4096],
+                "pass {pass} block {block}"
+            );
+        }
+        // A range spanning the whole extent takes the same proved table.
+        let all = rv.read(0, blocks as u32).expect("whole extent must read");
+        assert_eq!(&all[..], &bytes[..], "pass {pass} whole extent");
+    }
+}
