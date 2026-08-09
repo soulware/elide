@@ -90,16 +90,88 @@ work (fetch inputs, delta/zstd recompress, write outputs, publish a plan)
 against published state, scoped strictly below the floor so open
 generations and un-cut WAL are never in play.
 
-What cannot move: applying the plan into the live extent index. That runs
-where the live LBA map lives, and it is the measured source of
-guest-latency excursions (the merge phase of gc-plan-apply,
-[open-generation-reap.md](open-generation-reap.md)). Offload removes GC's
-CPU from the shared host (GC is ~97% of coord CPU) but leaves the apply
-cost in place.
-
 A peer that already holds recent segments does this work with warm cache
 locality, but the enabling requirement is only published-state access, so
 remote repack can be prototyped without any replication protocol.
+
+### What the CPU accounting says
+
+Moving only today's GC/repack work buys little on the primary. The GC-off
+ABBA (v0.1.51, fixed-rate pgbench) put GC at 97% of coordinator CPU
+(0.111 to 0.003 ms/txn) but ~8% of volume-server CPU (1.077 to 0.985),
+and the coordinator is the small process (0.11 ms/txn against the
+volume's ~1.0). The volume's CPU lives in the promote path: the
+v0.1.58-rc1 flamegraph reads zstd at 55% of visible self time and
+`delta_compute` at 34% inclusive, write-time work that runs wherever the
+writes land. Offload of the current GC therefore removes nearly all of a
+small process and ~8% of the big one.
+
+What cannot move: applying the plan into the live extent index. That runs
+where the live LBA map lives, and it is the measured source of
+guest-latency excursions (the merge phase of gc-plan-apply,
+[open-generation-reap.md](open-generation-reap.md), 71% of a hold that
+runs ~11.2 µs/entry). Offload leaves the excursions in place.
+
+One second-order win is real: the primary is a 2-cpu box, and the 3x
+spread in apply hold at fixed entry count is suspected CPU contention
+between the GC worker and the apply. An off-host worker removes that
+contention.
+
+### The recompression form
+
+The split earns its keep when the off-host leg carries the compression
+work, on the pattern of
+[close-pass-recompression.md](close-pass-recompression.md). The runtime
+delta ABA (v0.1.58-rc2) measured delta off cutting volume CPU 29%
+(0.976 to 0.695 ms/txn) and mean guest latency 10x (392 to 29 ms), for
+~2% of stored bytes. Delta's cost is where it runs, at write time on the
+primary. In the stronger form the primary writes cheap segments (delta
+off, plain body codec) and the peer performs delta conversion and heavy
+recompression below the cut floor as repack-shaped rewrite work. The CPU
+and latency win is bankable on the primary by the switch alone; the peer
+recovers the storage yield asynchronously instead of it being forfeited.
+
+### Apply pressure needs a budget
+
+Every rewrite the peer produces comes home as a plan apply under the
+volume mutex on the primary. Today the rewrite work and the apply share
+a host, so rewrite cost throttles apply pressure naturally. Off-host
+compute removes that throttle: a peer with idle CPU can generate plans
+faster than the primary can absorb their holds, feeding the excursion
+problem from a new direction. An off-host leg needs an explicit
+apply-pressure budget on the primary's side.
+
+### What the primary's data dir becomes
+
+The split leaves the directory taxonomy unchanged and shifts what the
+directories are doing.
+
+- `wal/`, `pending/open/`, `index/` are the unpublished spine above the
+  cut floor, which the peer never touches by construction. The plan
+  apply stays local and appends to `index/` as today.
+- `pending/upload/` depends on the leg. Leg 2 alone leaves publishing
+  with the primary, so closed generations drain to S3 as today. Under
+  leg 1's strong form the upload responsibility moves to the peer and
+  `upload/` shrinks to a confirmed-awaiting-index-publish queue; what
+  remains of it is the buffer the primary falls back on when the peer
+  is down, another face of the peer-down crux.
+- `cache/` works harder. Peer rewrites produce segments the primary
+  never wrote: the apply retargets the index at them, GC retires the
+  inputs, and the primary's next read of that data is a demand fetch.
+  Each off-host pass converts warm local bytes into cold remote ones,
+  and the volume trends toward the pulled-ancestor shape for its cold
+  tail, with only the recent spine native. The peer-fetch channel
+  offers the mitigation (peer pushes or primary prefetches outputs
+  before the apply lands).
+- `dmat/` growth becomes peer-driven. If the peer does delta
+  conversion, the primary still pays the read side: materialised
+  sources in `dmat/` (measured ~10x blob size) and decompression per
+  delta read. A read-side budget belongs with the close pass, alongside
+  the apply-pressure budget above.
+
+Nothing on disk leaves the primary. GC's local janitor work (unlinking
+retired inputs at apply time) stays, since only compute moves to the
+peer, and custody of every directory stays put.
 
 ## What the peer tier additionally buys
 
@@ -114,4 +186,7 @@ prize, and one the generic-object-store shape cannot deliver.
   peer RTT + NVMe fsync on the same pair.
 - Put a number on the value of sub-cut-cadence RPO for real workloads.
 - Prototype remote repack against published state below the cut floor,
-  as its own experiment.
+  as its own experiment. The recompression form is the one worth
+  prototyping: primary writes with delta off, remote pass converts.
+- Measure the warm-to-cold read penalty an off-host repack pass imposes
+  on the primary, before and after a peer-fetch prefetch of the outputs.
