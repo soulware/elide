@@ -515,12 +515,17 @@ const DROPPED_CLAIM: &str = "dropped_claim";
 /// `anchor_lba` all match, which is what lets recurrence be correlated
 /// from the tick log with nothing retained across ticks.
 ///
-/// Reading it: the same three on consecutive GC ticks means the
+/// Reading it: the same three recurring across ticks means the
 /// coordinator's disk-derived view and the volume's live map disagree
-/// about that LBA in a way that re-deriving does not fix, so the volume
+/// about that LBA in a way that survives re-deriving, so the volume
 /// should be run under `ELIDE_VOLUME_INVARIANTS=1` for
-/// `assert_lbamap_consistent` to name the divergence. A different anchor,
-/// or none next tick, is a scan that raced a mutation and has healed.
+/// `assert_lbamap_consistent` to name the divergence. A fresh anchor is a
+/// separate fault and starts its own correlation.
+///
+/// Correlate over a window of ticks. A fold trips this where GC selects a
+/// bucket touching that LBA, and `select_buckets` ranks its candidates
+/// and caps how many it takes, so a quiet tick is as readily a selection
+/// that went elsewhere as a fault that healed.
 ///
 /// `held_by` is the segment holding the disputed claim, which no refused
 /// fold can move, so it survives the re-bucketing between passes that
