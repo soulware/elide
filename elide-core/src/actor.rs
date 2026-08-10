@@ -2377,7 +2377,19 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         let idx_path = index_dir.join(format!("{input_ulid}.idx"));
         let parsed = match segment::read_segment_index(&idx_path) {
             Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            // Skipping the input leaves its ranges out of
+            // `input_claim_ranges` while `consumed` keeps naming it, so
+            // the apply's dropped-claim refusal stops seeing the claims
+            // it holds. Say so: the count this narrows by is silent
+            // otherwise.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                log::warn!(
+                    "plan {new_ulid}: input {input_ulid} has no idx at {}; its claims are \
+                     outside the coverage check for this apply",
+                    idx_path.display(),
+                );
+                continue;
+            }
             Err(e) => return Err(e),
         };
         let (_, old_entries, _) = parsed;
