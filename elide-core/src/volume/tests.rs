@@ -5757,4 +5757,38 @@ mod lba_ranges {
             Some((5, 6))
         );
     }
+
+    /// An empty range covers nothing, so it must not be what
+    /// `next_start_after` stops on when sizing the reported gap.
+    #[test]
+    fn empty_ranges_neither_cover_nor_truncate_the_gap() {
+        assert_eq!(
+            LbaRanges::new(vec![(0, 0), (1, 1)]).first_gap_in(0, 2),
+            Some((0, 2))
+        );
+    }
+
+    #[test]
+    fn an_empty_range_inside_a_covered_span_changes_nothing() {
+        assert_eq!(
+            LbaRanges::new(vec![(4, 9), (6, 6)]).first_gap_in(4, 9),
+            None
+        );
+    }
+
+    #[test]
+    fn overlapping_ranges_coalesce() {
+        assert_eq!(
+            LbaRanges::new(vec![(4, 7), (5, 9)]).first_gap_in(4, 9),
+            None
+        );
+    }
+
+    #[test]
+    fn unsorted_input_is_ordered_before_merging() {
+        assert_eq!(
+            LbaRanges::new(vec![(6, 9), (4, 6)]).first_gap_in(4, 9),
+            None
+        );
+    }
 }

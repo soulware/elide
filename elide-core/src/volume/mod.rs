@@ -511,11 +511,20 @@ impl LbaRanges {
     /// Canonical-only kinds carry a body for dedup resolution and claim
     /// nothing, so they contribute no range.
     fn from_claims(entries: &[segment::SegmentEntry]) -> Self {
-        let mut ranges: Vec<(u64, u64)> = entries
-            .iter()
-            .filter(|e| !e.kind.is_canonical_only())
-            .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
-            .collect();
+        Self::new(
+            entries
+                .iter()
+                .filter(|e| !e.kind.is_canonical_only())
+                .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
+                .collect(),
+        )
+    }
+
+    /// Sort and coalesce `ranges`. Empty ranges cover nothing and are
+    /// dropped, which keeps [`Self::next_start_after`] on a range that
+    /// can hold `cursor` back.
+    fn new(ranges: Vec<(u64, u64)>) -> Self {
+        let mut ranges: Vec<(u64, u64)> = ranges.into_iter().filter(|(s, e)| s < e).collect();
         ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -1912,6 +1921,12 @@ impl Volume {
         // Coverage is taken over LBA ranges rather than per entry: two of
         // an input's entries can cover one LBA, the earlier dead on the
         // anchor and dropped, with the later one carried.
+        self.assert_claims_within_input_ranges(
+            &pre_apply_lbamap,
+            &consumed,
+            &input_claim_ranges,
+            new_ulid,
+        );
         let covered = LbaRanges::from_claims(&entries);
         let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
             .iter()
@@ -1995,6 +2010,64 @@ impl Volume {
         self.assert_volume_invariants("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
+    }
+
+    /// Stress-only invariant: every live claim held by a segment this
+    /// apply consumes lies inside the union of that segment's entry LBA
+    /// ranges.
+    ///
+    /// It is what makes the dropped-claim refusal's bounded walk
+    /// complete rather than merely cheap. That walk queries the map over
+    /// the inputs' own entry ranges, so a claim keyed to an input from
+    /// outside them is one the refusal cannot see, and a fold that drops
+    /// it reports clean.
+    ///
+    /// A claim reaches the map by registering an entry, and a split only
+    /// narrows a range inside the original, so the property holds by
+    /// construction. `LbaMap::set_claimant_if_matches` is the one path
+    /// that re-keys claims rather than registering them, and it promotes
+    /// a predecessor entry whole — including the part below the range it
+    /// was handed. Its callers promote WAL writes, whose `insert` has
+    /// already split any overlapping predecessor at that boundary, so
+    /// the promoted claim is keyed at or above it. This asserts that
+    /// rather than resting on it.
+    fn assert_claims_within_input_ranges(
+        &self,
+        pre_apply: &lbamap::LbaMap,
+        consumed: &std::collections::HashSet<Ulid>,
+        input_claim_ranges: &[(u64, u32)],
+        new_ulid: Ulid,
+    ) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
+        let within = LbaRanges::new(
+            input_claim_ranges
+                .iter()
+                .map(|(start, length)| (*start, start + *length as u64))
+                .collect(),
+        );
+        let outside: Vec<(u64, u64, Ulid)> = pre_apply
+            .iter_entries_with_claimant()
+            .filter(|(_, _, _, _, claimant)| consumed.contains(claimant))
+            .filter_map(|(lba, length, _, _, claimant)| {
+                within
+                    .first_gap_in(lba, lba + length as u64)
+                    .map(|(from, to)| (from, to, claimant))
+            })
+            .collect();
+        if !outside.is_empty() {
+            let mut msg = format!(
+                "claims-within-input-ranges invariant violation during [plan {new_ulid} apply]: \
+                 {} claim(s) held by a consumed input sit outside its entry ranges, so the \
+                 dropped-claim refusal's bounded walk cannot see them",
+                outside.len()
+            );
+            for (from, to, claimant) in outside.iter().take(REFUSAL_SAMPLE_LIMIT) {
+                msg.push_str(&format!("\n  lba={from}..{to} held-by={claimant}"));
+            }
+            panic!("{msg}");
+        }
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
