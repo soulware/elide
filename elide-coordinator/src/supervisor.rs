@@ -24,6 +24,7 @@
 //   releases the lock on process death or host reboot, so a recycled pid can
 //   never read as a live server.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +41,11 @@ use elide_core::volume::lock_is_held;
 /// volume's fetcher inherits store config without operator-level env or a
 /// per-volume `fetch.toml`. Built by [`crate::config::StoreSection::child_env`].
 pub type ChildEnv = Arc<Vec<(&'static str, String)>>;
+
+/// Where a volume subprocess's stderr is appended, inside its fork
+/// directory. Holds panic messages and backtraces, which are written to
+/// the fd rather than through tracing.
+pub const VOLUME_STDERR_FILE: &str = "volume.stderr";
 
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -192,6 +198,29 @@ fn spawn_volume(
         && cfg.ublk.is_some()
     {
         cmd.arg("--ublk");
+    }
+
+    // Keep the child's stderr on the volume's own disk. Tracing output
+    // reaches the coordinator's log, but a panic writes straight to the
+    // fd, and a panic on a worker or actor thread unwinds that thread
+    // alone: the process stays up, the supervisor sees no exit to report,
+    // and the only account of what happened is whatever holds the
+    // container's stderr. Appending here keeps it for as long as the
+    // volume exists.
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fork_dir.join(VOLUME_STDERR_FILE))
+    {
+        Ok(f) => {
+            cmd.stderr(f);
+        }
+        Err(e) => warn!(
+            "[supervisor] {}: opening {VOLUME_STDERR_FILE} failed ({e}); \
+             the child's stderr stays on the coordinator's, where a thread \
+             panic lives only as long as that log does",
+            fork_dir.display(),
+        ),
     }
 
     // Place the child in a new session so it is not signalled when the
