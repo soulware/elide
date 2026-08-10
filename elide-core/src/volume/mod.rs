@@ -503,6 +503,110 @@ fn apply_promoted_partition(
 /// line. The count it reports is separate and unbounded.
 pub(in crate::volume) const REFUSAL_SAMPLE_LIMIT: usize = 8;
 
+/// A fold refused because the plan disagreed with the live map about an
+/// LBA. `SUPERSEDED_CARRY` is the plan claiming one it should not,
+/// `DROPPED_CLAIM` one it should have carried.
+const SUPERSEDED_CARRY: &str = "superseded_carry";
+const DROPPED_CLAIM: &str = "dropped_claim";
+
+/// Machine-readable identity for a refusal, appended to its ERROR line.
+///
+/// Two refusals name the same fault iff `refusal`, `held_by` and
+/// `anchor_lba` all match, which is what lets recurrence be correlated
+/// from the tick log with nothing retained across ticks.
+///
+/// Reading it: the same three recurring across ticks means the
+/// coordinator's disk-derived view and the volume's live map disagree
+/// about that LBA in a way that survives re-deriving, so the volume
+/// should be run under `ELIDE_VOLUME_INVARIANTS=1` for
+/// `assert_lbamap_consistent` to name the divergence. A fresh anchor is a
+/// separate fault and starts its own correlation.
+///
+/// Correlate over a window of ticks. A fold trips this where GC selects a
+/// bucket touching that LBA, and `select_buckets` ranks its candidates
+/// and caps how many it takes, so a quiet tick is as readily a selection
+/// that went elsewhere as a fault that healed.
+///
+/// `held_by` is the segment holding the disputed claim, which no refused
+/// fold can move, so it survives the re-bucketing between passes that
+/// makes the input set unstable. `runs` and `blocks` say whether the
+/// fault is growing. The plan ULID is minted per pass and identifies
+/// nothing across ticks, so it stays in the prose.
+///
+/// `None` when `runs` is empty, which is the no-refusal case.
+fn refusal_identity(kind: &str, runs: &[(u64, u64, Ulid)], inputs: usize) -> Option<String> {
+    // Iteration order over `runs` follows the inputs' index order and so
+    // shifts with bucket composition. The minimum names the same LBA
+    // whatever order they arrive in.
+    let (anchor_lba, _, held_by) = runs.iter().min_by_key(|(from, _, _)| *from)?;
+    let blocks: u64 = runs.iter().map(|(from, to, _)| to - from).sum();
+    Some(format!(
+        "refusal={kind} held_by={held_by} anchor_lba={anchor_lba} runs={} blocks={blocks} \
+         inputs={inputs}",
+        runs.len(),
+    ))
+}
+
+/// Disjoint half-open LBA ranges, ascending, for coverage queries.
+struct LbaRanges(Vec<(u64, u64)>);
+
+impl LbaRanges {
+    /// The union of the LBA ranges `entries` stakes a claim over.
+    /// Canonical-only kinds carry a body for dedup resolution and claim
+    /// nothing, so they contribute no range.
+    fn from_claims(entries: &[segment::SegmentEntry]) -> Self {
+        Self::new(
+            entries
+                .iter()
+                .filter(|e| !e.kind.is_canonical_only())
+                .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
+                .collect(),
+        )
+    }
+
+    /// Sort and coalesce `ranges`. Empty ranges cover nothing and are
+    /// dropped, which keeps [`Self::next_start_after`] on a range that
+    /// can hold `cursor` back.
+    fn new(ranges: Vec<(u64, u64)>) -> Self {
+        let mut ranges: Vec<(u64, u64)> = ranges.into_iter().filter(|(s, e)| s < e).collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        Self(merged)
+    }
+
+    /// The first sub-range of `[start, end)` this set leaves uncovered.
+    fn first_gap_in(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        let mut cursor = start;
+        // The predecessor is the only range that can cover `cursor` from
+        // below, and each subsequent range starts at or after it.
+        let from = self.0.partition_point(|(s, _)| *s <= cursor);
+        for (s, e) in &self.0[from.saturating_sub(1)..] {
+            if *s > cursor {
+                break;
+            }
+            cursor = cursor.max(*e);
+            if cursor >= end {
+                return None;
+            }
+        }
+        (cursor < end).then_some((
+            cursor,
+            end.min(self.next_start_after(cursor).unwrap_or(end)),
+        ))
+    }
+
+    fn next_start_after(&self, lba: u64) -> Option<u64> {
+        let i = self.0.partition_point(|(s, _)| *s <= lba);
+        self.0.get(i).map(|(s, _)| *s)
+    }
+}
+
 /// Unresolvable lbamap claims found by
 /// [`Volume::unresolvable_lbamap_hashes`]: how many there are, and the
 /// first few for the log line. `total` is the severity signal —
@@ -1590,6 +1694,7 @@ impl Volume {
             entries,
             inputs,
             input_old_entries,
+            input_claim_ranges,
             carried_hashes,
             entry_hashes,
             handoff_inline,
@@ -1719,6 +1824,7 @@ impl Volume {
         let pre_apply_index = Arc::clone(&self.extent_index);
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
         let mut merge = Duration::ZERO;
+        let mut blocked: Vec<(u64, u32)> = Vec::new();
         let gate_start = Instant::now();
         let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
             let merge_start = Instant::now();
@@ -1762,7 +1868,10 @@ impl Volume {
             // `gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush`.
             let lbamap = Arc::make_mut(&mut vol.lbamap);
             for e in &entries {
-                lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+                let took = lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+                if !e.kind.is_canonical_only() && took < e.lba_length {
+                    blocked.push((e.start_lba, e.lba_length));
+                }
             }
             merge = merge_start.elapsed();
             Ok(())
@@ -1793,6 +1902,108 @@ impl Volume {
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_refused");
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // A carried entry that took fewer LBA blocks than it covers ran
+        // into a claimant this apply does not consume. Above `new_ulid`
+        // that is the ordinary plan-then-write race: the rebuild admits
+        // by highest claimant ULID, so it prefers the same claimant the
+        // merge just did and the two agree.
+        //
+        // Below `new_ulid` they part. The rebuild hands the range to the
+        // fold, so committing buys a volume that reads correctly until
+        // its next mount serves content the merge had refused. Reaching
+        // that means the plan carried a hash another tier had already
+        // superseded, which is what `gc_fork` building liveness from a
+        // full rebuild plus a WAL replay exists to prevent. Refusing
+        // keeps the two in step and leaves the next pass to re-derive.
+        let superseded: Vec<(u64, u64, Ulid)> = blocked
+            .iter()
+            .flat_map(|(start, length)| {
+                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+            })
+            .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
+            .map(|x| (x.range_start, x.range_end, x.claimant_ulid))
+            .collect();
+        if let Some(identity) = refusal_identity(SUPERSEDED_CARRY, &superseded, inputs.len()) {
+            let detail = superseded
+                .iter()
+                .take(REFUSAL_SAMPLE_LIMIT)
+                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::error!(
+                "plan {new_ulid}: refusing fold — {} lba run(s) carried by the plan are held by \
+                 a lower-ULID claimant this apply does not consume, so the plan carries a hash \
+                 another tier has superseded and a rebuild would prefer the fold, first {}: \
+                 [{detail}]; dropping output and plan; {identity}",
+                superseded.len(),
+                superseded.len().min(REFUSAL_SAMPLE_LIMIT),
+            );
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&plan_path);
+            self.assert_volume_invariants("apply_plan_apply_result_superseded");
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // The mirror of the check above. That one catches a fold claiming
+        // an LBA it should not; this one catches a fold dropping an LBA
+        // it should have carried. A claim the plan was right to drop
+        // cannot still name a consumed input, because dropping it as dead
+        // means something else overwrote it and that something is the
+        // claimant. So a live claim held by an input over a range the
+        // output does not cover says the plan read that LBA as dead while
+        // the volume still serves it.
+        //
+        // The fold consumes its inputs, so on the next open that claim
+        // has no segment to come from and the LBA reverts to whatever
+        // older layer still holds it, or reads as a hole.
+        //
+        // Coverage is taken over LBA ranges rather than per entry: two of
+        // an input's entries can cover one LBA, the earlier dead on the
+        // anchor and dropped, with the later one carried.
+        self.assert_claims_within_input_ranges(
+            &pre_apply_lbamap,
+            &consumed,
+            &input_claim_ranges,
+            new_ulid,
+        );
+        let covered = LbaRanges::from_claims(&entries);
+        let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
+            .iter()
+            .flat_map(|(start, length)| {
+                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+            })
+            .filter(|x| consumed.contains(&x.claimant_ulid))
+            .filter_map(|x| {
+                covered
+                    .first_gap_in(x.range_start, x.range_end)
+                    .map(|(from, to)| (from, to, x.claimant_ulid))
+            })
+            .collect();
+        if let Some(identity) = refusal_identity(DROPPED_CLAIM, &dropped, inputs.len()) {
+            let detail = dropped
+                .iter()
+                .take(REFUSAL_SAMPLE_LIMIT)
+                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::error!(
+                "plan {new_ulid}: refusing fold — {} lba run(s) are claimed by an input this \
+                 apply consumes and are absent from the output, so the plan read them dead while \
+                 the volume still serves them, first {}: [{detail}]; dropping output and plan; \
+                 {identity}",
+                dropped.len(),
+                dropped.len().min(REFUSAL_SAMPLE_LIMIT),
+            );
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&plan_path);
+            self.assert_volume_invariants("apply_plan_apply_result_dropped_claim");
             return Ok(StagedApply::Cancelled);
         }
 
@@ -1842,6 +2053,64 @@ impl Volume {
         self.assert_volume_invariants("apply_plan_apply_result_applied");
 
         Ok(StagedApply::Applied)
+    }
+
+    /// Stress-only invariant: every live claim held by a segment this
+    /// apply consumes lies inside the union of that segment's entry LBA
+    /// ranges.
+    ///
+    /// It is what makes the dropped-claim refusal's bounded walk
+    /// complete rather than merely cheap. That walk queries the map over
+    /// the inputs' own entry ranges, so a claim keyed to an input from
+    /// outside them is one the refusal cannot see, and a fold that drops
+    /// it reports clean.
+    ///
+    /// A claim reaches the map by registering an entry, and a split only
+    /// narrows a range inside the original, so the property holds by
+    /// construction. `LbaMap::set_claimant_if_matches` is the one path
+    /// that re-keys claims rather than registering them, and it promotes
+    /// a predecessor entry whole — including the part below the range it
+    /// was handed. Its callers promote WAL writes, whose `insert` has
+    /// already split any overlapping predecessor at that boundary, so
+    /// the promoted claim is keyed at or above it. This asserts that
+    /// rather than resting on it.
+    fn assert_claims_within_input_ranges(
+        &self,
+        pre_apply: &lbamap::LbaMap,
+        consumed: &std::collections::HashSet<Ulid>,
+        input_claim_ranges: &[(u64, u32)],
+        new_ulid: Ulid,
+    ) {
+        if !crate::volume_invariants_enabled() {
+            return;
+        }
+        let within = LbaRanges::new(
+            input_claim_ranges
+                .iter()
+                .map(|(start, length)| (*start, start + *length as u64))
+                .collect(),
+        );
+        let outside: Vec<(u64, u64, Ulid)> = pre_apply
+            .iter_entries_with_claimant()
+            .filter(|(_, _, _, _, claimant)| consumed.contains(claimant))
+            .filter_map(|(lba, length, _, _, claimant)| {
+                within
+                    .first_gap_in(lba, lba + length as u64)
+                    .map(|(from, to)| (from, to, claimant))
+            })
+            .collect();
+        if !outside.is_empty() {
+            let mut msg = format!(
+                "claims-within-input-ranges invariant violation during [plan {new_ulid} apply]: \
+                 {} claim(s) held by a consumed input sit outside its entry ranges, so the \
+                 dropped-claim refusal's bounded walk cannot see them",
+                outside.len()
+            );
+            for (from, to, claimant) in outside.iter().take(REFUSAL_SAMPLE_LIMIT) {
+                msg.push_str(&format!("\n  lba={from}..{to} held-by={claimant}"));
+            }
+            panic!("{msg}");
+        }
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic

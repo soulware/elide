@@ -280,6 +280,12 @@ pub struct GcPlanApplyResult {
     /// `(hash, kind, input_ulid)` — the raw material for the to-remove and
     /// stale-cancel sets.
     pub input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)>,
+    /// LBA range of every claim-making entry from each input's `.idx` at
+    /// dispatch time. Bounds the apply's coverage check to the ranges a
+    /// consumed input can hold a live claim over, so it needs no walk of
+    /// the whole map. Every kind that stakes a claim is here, `DedupRef`
+    /// and `Zero` included, which `input_old_entries` filters out.
+    pub input_claim_ranges: Vec<(u64, u32)>,
     /// Hashes `entries` carries forward (`ExtentIndex::carried_hashes`),
     /// the protect-set for the to-remove derivation.
     pub carried_hashes: Blake3HashSet,

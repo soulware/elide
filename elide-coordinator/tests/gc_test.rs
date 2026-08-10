@@ -2817,28 +2817,23 @@ fn a_fold_over_an_undrained_write_loses_to_it_on_remount() {
     );
 }
 
-/// The GC apply and the disk rebuild install claims by different rules,
-/// and only the completeness of `gc_fork`'s liveness view keeps them
-/// agreeing. This pins what the disagreement costs.
+/// A plan carrying a hash another tier has superseded is refused at the
+/// merge, by the short-claim check in `apply_plan_apply_result`.
 ///
 /// The apply merges through `LbaMap::insert_consuming_inputs`: a fold
 /// takes a sub-range only from a claimant it consumes, so a write held by
-/// any other segment survives it. The rebuild merges through
-/// `register_entry_if_newer`, where the highest claimant ULID wins
-/// outright — and a bucket ULID is minted after every segment on disk, so
-/// a fold outranks the write it folded over. The two rules meet the same
-/// answer only because a plan never carries a hash something else has
-/// already superseded, which is what `gc_fork`'s liveness rebuild
-/// (`gc.rs`, `rebuild_segments` + `replay_wal_into_lbamap`) guarantees.
+/// any other segment blocks it and the entry claims fewer LBA blocks than
+/// it covers. That shortfall is the signal. The disk rebuild has no way to
+/// reach the same answer, admitting by highest claimant ULID with a bucket
+/// ULID minted above every segment on disk, so committing the fold would
+/// buy a volume that reads correctly until its next mount serves the
+/// superseded content. That is #914's signature.
 ///
-/// Hiding the undrained segment across the `gc_fork` call blinds exactly
-/// that view, and the plan then carries the superseded hash. The live
-/// apply holds the line and the volume reads correctly for as long as it
-/// stays up. The next mount reads the fold. That is #914's signature — a
-/// structurally perfect page holding older content, surfacing only after
-/// a remount — and nothing between the plan and the read logs a word.
+/// Hiding the undrained segment across the `gc_fork` call blinds the
+/// liveness view `gc_fork` builds from `rebuild_segments` plus a WAL
+/// replay, which is what otherwise keeps a plan off a superseded hash.
 #[test]
-fn a_blinded_liveness_view_makes_the_apply_and_the_rebuild_disagree() {
+fn a_fold_carrying_a_superseded_hash_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir = dir.path();
 
@@ -2901,22 +2896,37 @@ fn a_blinded_liveness_view_makes_the_apply_and_the_rebuild_disagree() {
         "gc_fork must emit a plan over the sparse segment"
     );
 
-    assert_eq!(vol.apply_gc_handoffs().unwrap(), 1);
     assert_eq!(
-        vol.read(1, 1).expect("lba=1 after the apply").as_slice(),
+        vol.apply_gc_handoffs().unwrap(),
+        0,
+        "the fold must be refused, not counted as applied"
+    );
+    assert!(
+        !fork_dir.join("gc").join(u_gc.to_string()).exists(),
+        "a refused fold commits no bare gc/<output>"
+    );
+    assert!(
+        !fork_dir.join("gc").join(format!("{u_gc}.plan")).exists(),
+        "a refused fold drops its plan, leaving the next pass to \
+         re-derive against a liveness view that sees the write"
+    );
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the refusal").as_slice(),
         d.as_slice(),
-        "the apply's merge rule holds the write against a fold that \
-         carries the superseded hash"
+        "the write stands"
     );
 
     drop(vol);
     let vol = Volume::open(fork_dir, fork_dir).unwrap();
     assert_eq!(
         vol.read(1, 1).expect("lba=1 after remount").as_slice(),
-        b.as_slice(),
-        "the rebuild prefers the fold, so the remount serves the \
-         superseded content the live volume refused to serve. Reaching \
-         this line means the two rules disagree, which is what makes \
-         gc_fork's liveness view load-bearing"
+        d.as_slice(),
+        "with no fold committed the rebuild has nothing to prefer over \
+         the write, so the remount agrees with the live volume"
+    );
+    assert_eq!(
+        vol.read(0, 1).expect("lba=0 after remount").as_slice(),
+        c.as_slice(),
+        "lba=0 must still read the overwrite after remount"
     );
 }
