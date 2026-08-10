@@ -969,9 +969,16 @@ fn rebuild_segments_inner(
         // visit order — the segment mint is monotonic, so the highest
         // claimant is the newest write: a bare `gc/<U>` output shadows
         // its lower-ULID inputs, and a write minted after a concurrent
-        // GC output wins over it. This is the rule the live map applies
-        // incrementally (`insert_if_newer`), so the rebuild computes
-        // the same winners the live path maintained.
+        // GC output wins over it.
+        //
+        // The write path maintains that rule incrementally
+        // (`insert_if_newer`). A GC plan apply merges by the stricter
+        // `insert_consuming_inputs`, which keeps the range of any
+        // claimant it does not consume whatever the ULIDs say. Both
+        // reach the same winners because a plan carries no hash
+        // another tier has superseded, and `gc_fork` deriving its
+        // liveness from a full rebuild plus a WAL replay is what makes
+        // that hold.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
         if segments.is_empty() {

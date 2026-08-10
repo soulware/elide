@@ -1852,11 +1852,16 @@ impl Volume {
     /// operations later as a stale-cancel or oracle mismatch.
     ///
     /// Panics on any difference from the rebuild, in content or claimant.
-    /// Apply installs claims by the rebuild's highest-ULID-wins rule (a
-    /// same-hash lower-ULID claim is adopted, not preserved — see
-    /// `LbaMap::insert_consuming_inputs`), so the two agree by
-    /// construction and a claimant difference is a real defect, not a
-    /// benign ordering hint.
+    /// Where an apply installs, it stamps the claimant the rebuild would
+    /// (a same-hash lower-ULID claim is adopted, not preserved — see
+    /// `LbaMap::insert_consuming_inputs`), so a claimant difference is a
+    /// real defect rather than a benign ordering hint.
+    ///
+    /// The admission rules differ. A GC apply keeps the range of any
+    /// claimant it does not consume; the rebuild gives it to the highest
+    /// ULID. The two reach the same winners while a plan carries no hash
+    /// another tier has superseded, and this assert is what catches them
+    /// parting.
     ///
     /// Deliberately **not** called from `write` / `write_zeroes` — those
     /// are high-frequency incremental `lbamap.insert` updates that have
