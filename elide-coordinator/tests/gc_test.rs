@@ -2188,3 +2188,735 @@ fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
         "lba=0 must read the overwrite"
     );
 }
+
+/// Where the intervening write sits on disk when the machine dies.
+#[derive(Clone, Copy, Debug)]
+enum WriteTier {
+    /// In the open `wal/<u>` only.
+    Wal,
+    /// Flushed to `pending/open/<u>`, upload and promote never ran.
+    Pending,
+    /// Uploaded and promoted, so `index/<u>.idx` exists.
+    Promoted,
+}
+
+/// A write acknowledged after a GC plan was emitted must survive that
+/// plan applying on the far side of a crash.
+///
+/// This is the #914 window. A plan carrying the pre-write content sits
+/// unapplied in `gc/`; the guest then overwrites an LBA the plan carries
+/// and the write is acknowledged; the machine dies; the restarted daemon
+/// rebuilds its read state from disk and applies the plan against it. The
+/// fold must lose to the newer claim, and the *rebuild* must agree — a
+/// fresh mount is what read the damage in #914, so the assertion after the
+/// second reopen is the one that matters.
+///
+/// The live path's guard is `LbaMap::insert_consuming_inputs`: the plan
+/// installs only where the sitting claimant is an input it consumes, or
+/// holds the same hash at a lower ULID. The claim the write leaves behind
+/// is neither, whichever tier it reached before the crash — hence the
+/// three tiers, which differ in what the post-crash rebuild walks to
+/// recover that claim (WAL replay, `pending/open/`, `index/`).
+fn write_after_plan_survives_post_crash_apply(tier: WriteTier) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    let a = prand_bytes(1, 4096);
+    let b = prand_bytes(2, 4096);
+    let c = prand_bytes(3, 4096);
+    let d = prand_bytes(4, 4096);
+
+    // S1 holds A at lba=0 and B at lba=1. S2's overwrite of lba=0 kills
+    // A, leaving S1 sparse and so eligible, with B the one entry the
+    // plan carries.
+    vol.write(0, &a).unwrap();
+    vol.write(1, &b).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    vol.write(0, &c).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let plan_path = fork_dir.join("gc").join(format!("{u_gc}.plan"));
+    assert!(
+        plan_path.exists(),
+        "gc_fork must emit a plan over the sparse input — without one \
+         there is no unapplied plan to carry across the crash"
+    );
+
+    // The guest write the plan does not know about, taken to `tier` and
+    // acknowledged.
+    vol.write(1, &d).unwrap();
+    match tier {
+        WriteTier::Wal => vol.fsync().unwrap(),
+        WriteTier::Pending => {
+            vol.flush_wal().unwrap();
+        }
+        WriteTier::Promoted => {
+            vol.flush_wal().unwrap();
+            rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+        }
+    }
+
+    // The machine dies. Every byte written is on disk; the read state is
+    // not.
+    drop(vol);
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the crash").as_slice(),
+        d.as_slice(),
+        "{tier:?}: the rebuild must recover the acknowledged write"
+    );
+
+    assert_eq!(
+        vol.apply_gc_handoffs().unwrap(),
+        1,
+        "{tier:?}: the plan must apply against the rebuilt read state"
+    );
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the apply").as_slice(),
+        d.as_slice(),
+        "{tier:?}: the fold carries the pre-write content and must lose \
+         to the newer claim"
+    );
+    assert_eq!(
+        vol.read(0, 1).expect("lba=0 after the apply").as_slice(),
+        c.as_slice(),
+        "{tier:?}: lba=0 must still read the overwrite"
+    );
+
+    // The #914 read: a fresh mount, so the lbamap comes from the disk
+    // rebuild rather than the incremental merge the apply just did.
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after remount").as_slice(),
+        d.as_slice(),
+        "{tier:?}: the disk rebuild must agree with the apply's merge — \
+         a fold that wins here is a lost acknowledged write (#914)"
+    );
+    assert_eq!(
+        vol.read(0, 1).expect("lba=0 after remount").as_slice(),
+        c.as_slice(),
+        "{tier:?}: lba=0 must still read the overwrite after remount"
+    );
+}
+
+#[test]
+fn write_in_wal_survives_post_crash_plan_apply() {
+    write_after_plan_survives_post_crash_apply(WriteTier::Wal);
+}
+
+#[test]
+fn write_in_pending_survives_post_crash_plan_apply() {
+    write_after_plan_survives_post_crash_apply(WriteTier::Pending);
+}
+
+#[test]
+fn promoted_write_survives_post_crash_plan_apply() {
+    write_after_plan_survives_post_crash_apply(WriteTier::Promoted);
+}
+
+/// Upload a bare GC output to `store`, the one step of
+/// `apply_done_handoffs` that is not a volume method. The promote and
+/// finalize either side of it route through the `Volume` directly, which
+/// keeps its read state authoritative where the control-socket path would
+/// write `index/` behind its back.
+async fn upload_gc_output(
+    fork_dir: &std::path::Path,
+    output: ulid::Ulid,
+    vol_ulid: ulid::Ulid,
+    store: &Arc<dyn ObjectStore>,
+) {
+    let body = fork_dir.join("gc").join(output.to_string());
+    let data = fs::read(&body).unwrap_or_else(|e| panic!("reading {}: {e}", body.display()));
+    let key = elide_coordinator::upload::segment_key(vol_ulid, output);
+    store
+        .put(&key, bytes::Bytes::from(data).into())
+        .await
+        .unwrap();
+}
+
+/// The #914 shape with the claimant a GC output of an earlier pass.
+///
+/// Every failing LBA in #914 resolved to a compaction output applied
+/// thirty seconds ahead of the kill, and the plan that applied on the far
+/// side of the crash took that output as an input. So the state the
+/// post-crash apply derives against is itself the product of a completed
+/// GC pass, not of a plain drain.
+///
+/// Two passes build that: pass 1 folds a sparse segment and its output is
+/// uploaded, promoted and its inputs cleaned up, making it the claimant of
+/// the surviving LBA. Killing one of its two entries makes it sparse in
+/// turn, so pass 2 takes it as an input. The write then lands over the
+/// entry pass 2 carries, and the crash falls between the plan and its
+/// apply.
+#[test]
+fn write_over_a_gc_output_survives_a_later_plan_applying_after_a_crash() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    // lba 0..5 in S1; overwriting 0..3 leaves it two-of-six live, well
+    // under the 0.70 density threshold.
+    let orig: Vec<Vec<u8>> = (0..6).map(|i| prand_bytes(10 + i, 4096)).collect();
+    for (lba, block) in orig.iter().enumerate() {
+        vol.write(lba as u64, block).unwrap();
+    }
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    let over: Vec<Vec<u8>> = (0..4).map(|i| prand_bytes(20 + i, 4096)).collect();
+    for (lba, block) in over.iter().enumerate() {
+        vol.write(lba as u64, block).unwrap();
+    }
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    // Pass 1, carried all the way through the coordinator's upload,
+    // promote and input cleanup so its output is a promoted segment.
+    let u1 = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u1]).unwrap();
+    assert!(
+        fork_dir.join("gc").join(format!("{u1}.plan")).exists(),
+        "pass 1 must emit a plan over the sparse segment"
+    );
+    assert_eq!(vol.apply_gc_handoffs().unwrap(), 1);
+    rt.block_on(upload_gc_output(fork_dir, u1, ulid::Ulid::nil(), &store));
+    vol.promote_segment(u1).unwrap();
+    simulate_coord_cache_evict(fork_dir);
+    vol.finalize_gc_handoff(u1).unwrap();
+
+    // Kill one of the output's two entries so it is sparse itself.
+    let over4 = prand_bytes(31, 4096);
+    vol.write(4, &over4).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    let u2 = vol.gc_checkpoint_for_test().unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u2]).unwrap();
+    let plan_path = fork_dir.join("gc").join(format!("{u2}.plan"));
+    assert!(plan_path.exists(), "pass 2 must emit a plan");
+    let plan = elide_core::rewrite_plan::RewritePlan::read(&plan_path).unwrap();
+    assert!(
+        plan.inputs().contains(&u1),
+        "pass 2 must take pass 1's output as an input — otherwise this \
+         test never builds the #914 shape. inputs: {:?}",
+        plan.inputs(),
+    );
+
+    // The acknowledged write over the entry pass 2 carries, then the kill.
+    let late = prand_bytes(99, 4096);
+    vol.write(5, &late).unwrap();
+    vol.fsync().unwrap();
+    drop(vol);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(5, 1).expect("lba=5 after the crash").as_slice(),
+        late.as_slice(),
+        "the rebuild must recover the acknowledged write"
+    );
+    assert_eq!(
+        vol.apply_gc_handoffs().unwrap(),
+        1,
+        "pass 2's plan must apply against the rebuilt read state"
+    );
+    assert_eq!(
+        vol.read(5, 1).expect("lba=5 after the apply").as_slice(),
+        late.as_slice(),
+        "the fold carries the pre-write content and must lose to the \
+         newer claim"
+    );
+
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(5, 1).expect("lba=5 after remount").as_slice(),
+        late.as_slice(),
+        "the disk rebuild must agree with the apply's merge — a fold that \
+         wins here is a lost acknowledged write (#914)"
+    );
+    for (lba, block) in over.iter().enumerate() {
+        assert_eq!(
+            vol.read(lba as u64, 1)
+                .unwrap_or_else(|e| panic!("lba={lba} after remount: {e}"))
+                .as_slice(),
+            block.as_slice(),
+            "lba={lba} must read its overwrite after remount"
+        );
+    }
+    assert_eq!(
+        vol.read(4, 1).expect("lba=4 after remount").as_slice(),
+        over4.as_slice(),
+        "lba=4 must read the overwrite that made the output sparse"
+    );
+}
+
+/// Segments sitting in `pending/open/`, in the order a drain promotes them.
+fn pending_ulids(fork_dir: &std::path::Path) -> Vec<ulid::Ulid> {
+    elide_core::segment::read_ulid_dir_sorted(&elide_core::segment::pending_open_dir(fork_dir))
+        .unwrap_or_default()
+}
+
+/// A GC pass emits one plan per bucket and the volume applies them in a
+/// loop. #914 was a kill landing inside that loop: of four plans minted in
+/// the same millisecond, two applied and two were left on disk, to apply
+/// nine seconds later against a read state rebuilt from scratch.
+///
+/// That leaves a state no single-plan test reaches. The applied half's
+/// outputs are bare `gc/<u>` files — committed on the volume, never
+/// uploaded, never promoted, so their inputs still hold an
+/// `index/<input>.idx` — and the rebuild has to fold them in alongside
+/// `index/` before the surviving plan derives against the result. A write
+/// acknowledged in that window must survive the second half applying.
+///
+/// Two buckets come from the entry cap rather than the byte cap: each
+/// group's segment carries several thousand scattered zero extents, so
+/// two of them exceed `SWEEP_ENTRY_CAP` and cannot share a bucket, while
+/// a handful of data extents (three of four overwritten) supply the
+/// sparsity that admits them.
+#[test]
+fn a_plan_set_split_by_a_crash_keeps_the_acknowledged_write() {
+    /// Enough live entries per group that two groups exceed the 8192-entry
+    /// bucket cap.
+    const ZEROS_PER_GROUP: u64 = 5000;
+    const DATA_BASE: u64 = 50_000;
+    const GROUP_STRIDE: u64 = 100_000;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    // One segment per group. The zero extents are strided so they stay
+    // separate entries rather than coalescing into one run.
+    let mut group_segments: Vec<Vec<ulid::Ulid>> = Vec::new();
+    let survivor = |grp: u64| DATA_BASE + grp * GROUP_STRIDE + 3;
+    for grp in 0..2u64 {
+        let base = grp * GROUP_STRIDE;
+        for i in 0..ZEROS_PER_GROUP {
+            vol.write_zeroes(base + i * 2, 1).unwrap();
+        }
+        for k in 0..4u64 {
+            vol.write(DATA_BASE + base + k, &prand_bytes(grp * 100 + k, 4096))
+                .unwrap();
+        }
+        vol.flush_wal().unwrap();
+        group_segments.push(pending_ulids(fork_dir));
+        rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+    }
+
+    // Three of each group's four data extents die, leaving both segments
+    // sparse and one surviving extent per group for a plan to carry.
+    let over: Vec<Vec<u8>> = (0..2u64)
+        .flat_map(|grp| (0..3u64).map(move |k| prand_bytes(500 + grp * 100 + k, 4096)))
+        .collect();
+    for grp in 0..2u64 {
+        for k in 0..3u64 {
+            vol.write(
+                DATA_BASE + grp * GROUP_STRIDE + k,
+                &over[(grp * 3 + k) as usize],
+            )
+            .unwrap();
+        }
+    }
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    let buckets = vol.gc_checkpoint_buckets_for_test(2).unwrap();
+    let stats = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        buckets.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        stats.buckets_emitted, 2,
+        "the pass must emit two plans — with one there is no set for the \
+         crash to split"
+    );
+
+    // The volume applies plans in filename order, so a kill inside the
+    // loop leaves the later one. Hold it back over the apply.
+    let gc_dir = fork_dir.join("gc");
+    let mut plan_names: Vec<String> = fs::read_dir(&gc_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| n.ends_with(".plan"))
+        .collect();
+    plan_names.sort();
+    let held = gc_dir.join(plan_names.pop().unwrap());
+    let held_plan = elide_core::rewrite_plan::RewritePlan::read(&held).unwrap();
+    let held_inputs = held_plan.inputs();
+    let applied_plan =
+        elide_core::rewrite_plan::RewritePlan::read(&gc_dir.join(&plan_names[0])).unwrap();
+    assert!(
+        applied_plan
+            .inputs()
+            .iter()
+            .all(|u| !held_inputs.contains(u)),
+        "the two plans must consume disjoint inputs — a shared input makes \
+         the second apply a divergence case, not a split set"
+    );
+
+    // Whichever group the held plan covers is where the write must land:
+    // an LBA that plan carries the pre-write content for.
+    let held_group = (0..2u64)
+        .find(|g| {
+            group_segments[*g as usize]
+                .iter()
+                .any(|u| held_inputs.contains(u))
+        })
+        .expect("the held plan must consume one of the two group segments");
+    let write_lba = survivor(held_group);
+
+    let holding = dir.path().join("held.plan");
+    fs::rename(&held, &holding).unwrap();
+    assert_eq!(
+        vol.apply_gc_handoffs().unwrap(),
+        1,
+        "the first half of the set applies before the kill"
+    );
+
+    // The applied half is committed on the volume and nothing more: no
+    // upload, no promote, so its inputs keep their `index/<input>.idx`.
+    let applied_output = buckets
+        .iter()
+        .find(|u| gc_dir.join(u.to_string()).exists())
+        .copied()
+        .expect("the applied half must leave a bare gc/<output>");
+    for input in applied_plan.inputs() {
+        assert!(
+            fork_dir.join("index").join(format!("{input}.idx")).exists(),
+            "input {input} of the applied half must keep its idx — the \
+             promote that deletes it never ran"
+        );
+    }
+
+    // The acknowledged write, then the kill.
+    let late = prand_bytes(4242, 4096);
+    vol.write(write_lba, &late).unwrap();
+    vol.fsync().unwrap();
+    fs::rename(&holding, &held).unwrap();
+    drop(vol);
+
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(write_lba, 1)
+            .expect("the write lba after the crash")
+            .as_slice(),
+        late.as_slice(),
+        "the rebuild must recover the acknowledged write alongside the \
+         bare output {applied_output}"
+    );
+
+    assert_eq!(
+        vol.apply_gc_handoffs().unwrap(),
+        1,
+        "the held plan must apply against the rebuilt read state"
+    );
+    assert_eq!(
+        vol.read(write_lba, 1)
+            .expect("the write lba after the apply")
+            .as_slice(),
+        late.as_slice(),
+        "the second half carries the pre-write content and must lose to \
+         the newer claim"
+    );
+
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(write_lba, 1)
+            .expect("the write lba after remount")
+            .as_slice(),
+        late.as_slice(),
+        "the disk rebuild must agree with the apply's merge — a fold that \
+         wins here is a lost acknowledged write (#914)"
+    );
+
+    // The other group's survivor and every overwrite come through both
+    // halves of the set unchanged.
+    let other_group = 1 - held_group;
+    assert_eq!(
+        vol.read(survivor(other_group), 1)
+            .expect("the other group's survivor")
+            .as_slice(),
+        prand_bytes(other_group * 100 + 3, 4096).as_slice(),
+        "the half that applied before the kill must still serve its \
+         carried extent"
+    );
+    for grp in 0..2u64 {
+        for k in 0..3u64 {
+            let lba = DATA_BASE + grp * GROUP_STRIDE + k;
+            assert_eq!(
+                vol.read(lba, 1)
+                    .unwrap_or_else(|e| panic!("lba={lba} after remount: {e}"))
+                    .as_slice(),
+                over[(grp * 3 + k) as usize].as_slice(),
+                "lba={lba} must read its overwrite after remount"
+            );
+        }
+    }
+    for grp in 0..2u64 {
+        let base = grp * GROUP_STRIDE;
+        for i in [0u64, ZEROS_PER_GROUP / 2, ZEROS_PER_GROUP - 1] {
+            let lba = base + i * 2;
+            assert_eq!(
+                vol.read(lba, 1)
+                    .unwrap_or_else(|e| panic!("zero lba={lba} after remount: {e}"))
+                    .as_slice(),
+                [0u8; 4096].as_slice(),
+                "zero lba={lba} must stay zero after remount"
+            );
+        }
+    }
+}
+
+/// An undrained write is a segment `collect_stats` will not consider as a
+/// candidate, sitting at a ULID *below* the bucket ULID the checkpoint
+/// mints after it. `gc_fork` reaches it anyway: its liveness view is a
+/// full `rebuild_segments` over the ancestor chain plus a WAL replay, so
+/// the hash the write superseded is dead in that view and the plan drops
+/// it rather than carrying it forward.
+///
+/// [`a_blinded_liveness_view_makes_the_apply_and_the_rebuild_disagree`]
+/// is the same arrangement with that view blinded, and is what says why
+/// this matters.
+#[test]
+fn a_fold_over_an_undrained_write_loses_to_it_on_remount() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    let a = prand_bytes(1, 4096);
+    let b = prand_bytes(2, 4096);
+    let c = prand_bytes(3, 4096);
+    let d = prand_bytes(4, 4096);
+
+    vol.write(0, &a).unwrap();
+    vol.write(1, &b).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    vol.write(0, &c).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    // D lands at lba=1 and stops at `pending/open/`. Only the drain moves
+    // it to `index/`, and the drain does not run.
+    vol.write(1, &d).unwrap();
+    vol.flush_wal().unwrap();
+    let pending = pending_ulids(fork_dir);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the write must be sitting in pending/open — with an empty \
+         pending dir this test asserts nothing"
+    );
+
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    assert!(
+        u_gc > pending[0],
+        "the checkpoint must mint above the undrained segment {} — that \
+         ordering is the whole point of this test",
+        pending[0]
+    );
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let plan_path = fork_dir.join("gc").join(format!("{u_gc}.plan"));
+    assert!(
+        plan_path.exists(),
+        "gc_fork must emit a plan over the sparse segment"
+    );
+
+    assert_eq!(vol.apply_gc_handoffs().unwrap(), 1);
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the apply").as_slice(),
+        d.as_slice(),
+        "the fold carries B and must lose to the undrained write"
+    );
+
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after remount").as_slice(),
+        d.as_slice(),
+        "the disk rebuild must reach the same answer as the apply — the \
+         fold's higher ULID must not win over the undrained write (#914)"
+    );
+    assert_eq!(
+        vol.read(0, 1).expect("lba=0 after remount").as_slice(),
+        c.as_slice(),
+        "lba=0 must still read the overwrite after remount"
+    );
+}
+
+/// The GC apply and the disk rebuild install claims by different rules,
+/// and only the completeness of `gc_fork`'s liveness view keeps them
+/// agreeing. This pins what the disagreement costs.
+///
+/// The apply merges through `LbaMap::insert_consuming_inputs`: a fold
+/// takes a sub-range only from a claimant it consumes, so a write held by
+/// any other segment survives it. The rebuild merges through
+/// `register_entry_if_newer`, where the highest claimant ULID wins
+/// outright — and a bucket ULID is minted after every segment on disk, so
+/// a fold outranks the write it folded over. The two rules meet the same
+/// answer only because a plan never carries a hash something else has
+/// already superseded, which is what `gc_fork`'s liveness rebuild
+/// (`gc.rs`, `rebuild_segments` + `replay_wal_into_lbamap`) guarantees.
+///
+/// Hiding the undrained segment across the `gc_fork` call blinds exactly
+/// that view, and the plan then carries the superseded hash. The live
+/// apply holds the line and the volume reads correctly for as long as it
+/// stays up. The next mount reads the fold. That is #914's signature — a
+/// structurally perfect page holding older content, surfacing only after
+/// a remount — and nothing between the plan and the read logs a word.
+#[test]
+fn a_blinded_liveness_view_makes_the_apply_and_the_rebuild_disagree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+
+    elide_core::signing::generate_keypair(
+        fork_dir,
+        elide_core::signing::VOLUME_KEY_FILE,
+        elide_core::signing::VOLUME_PUB_FILE,
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut vol = Volume::open(fork_dir, fork_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let gc_config = make_gc_config();
+
+    let a = prand_bytes(1, 4096);
+    let b = prand_bytes(2, 4096);
+    let c = prand_bytes(3, 4096);
+    let d = prand_bytes(4, 4096);
+
+    vol.write(0, &a).unwrap();
+    vol.write(1, &b).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    vol.write(0, &c).unwrap();
+    vol.flush_wal().unwrap();
+    rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
+
+    vol.write(1, &d).unwrap();
+    vol.flush_wal().unwrap();
+    let pending = pending_ulids(fork_dir);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the write must be sitting in pending/open — with an empty \
+         pending dir this test asserts nothing"
+    );
+
+    let u_gc = vol.gc_checkpoint_for_test().unwrap();
+    assert!(
+        u_gc > pending[0],
+        "the checkpoint must mint above the undrained segment {} — the \
+         rebuild's rule only prefers the fold when it outranks the write",
+        pending[0]
+    );
+
+    // Blind the liveness view for the duration of the plan.
+    let hidden_src = elide_core::segment::pending_open_dir(fork_dir).join(pending[0].to_string());
+    let hidden_dst = dir.path().join("hidden.seg");
+    fs::rename(&hidden_src, &hidden_dst).unwrap();
+    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    fs::rename(&hidden_dst, &hidden_src).unwrap();
+    assert!(
+        fork_dir.join("gc").join(format!("{u_gc}.plan")).exists(),
+        "gc_fork must emit a plan over the sparse segment"
+    );
+
+    assert_eq!(vol.apply_gc_handoffs().unwrap(), 1);
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after the apply").as_slice(),
+        d.as_slice(),
+        "the apply's merge rule holds the write against a fold that \
+         carries the superseded hash"
+    );
+
+    drop(vol);
+    let vol = Volume::open(fork_dir, fork_dir).unwrap();
+    assert_eq!(
+        vol.read(1, 1).expect("lba=1 after remount").as_slice(),
+        b.as_slice(),
+        "the rebuild prefers the fold, so the remount serves the \
+         superseded content the live volume refused to serve. Reaching \
+         this line means the two rules disagree, which is what makes \
+         gc_fork's liveness view load-bearing"
+    );
+}
