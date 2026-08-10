@@ -122,23 +122,11 @@ pub struct ClassifyCtx<'a> {
     pub segment_id: Ulid,
 }
 
-/// Classify one input entry. Pure function; result is one of
-/// [`EntryClassification`]'s variants.
-///
-/// `Zero` entries are handled separately — they do not have an
-/// `extent_index` slot of their own and use `ZERO_HASH` as a sentinel.
-/// All other body-owning kinds (`Data` / `Inline` / `DedupRef` / `Delta`)
-/// share the same matching-blocks-vs-total-blocks accounting; the kind
-/// only matters for the dead branch (whether to demote to Canonical or
-/// drop).
-///
-/// `CanonicalData` / `CanonicalInline` have `lba_length == 0` and make no
-/// LBA claim, so the matching-blocks accounting does not apply to them.
-/// They are decided on hash liveness alone: kept when something still
-/// resolves against their body, dropped as garbage otherwise.
 /// Whether the input segment still owns the extent-index home for
 /// `entry.hash`. Recipe kinds live in the deltas map, everything else
-/// in the data map.
+/// in the data map. Steers only the fully-dead branch, between
+/// [`EntryClassification::Drop`] and
+/// [`EntryClassification::DemoteToCanonical`].
 fn owns_home(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> bool {
     if entry.kind.is_delta() {
         ctx.extent_index
@@ -151,13 +139,54 @@ fn owns_home(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> bool {
     }
 }
 
+/// True when the run's payload anchor agrees with the input entry's. At
+/// LBA L in run `r` the lbamap resolves "body block P + (L -
+/// r.range_start)" where P is `r.payload_block_offset`; the input entry
+/// resolves "body block L - entry.start_lba". These agree iff
+/// `(r.range_start - entry.start_lba) == r.payload_block_offset`.
+///
+/// Same-hash runs with different anchors (a `DedupRef` at start=25
+/// referring to the same body as a DATA at start=24) carry different
+/// bytes for partially-overlapping LBAs even though the composite hash is
+/// identical, so they must not count as matching.
+fn anchor_matches(entry: &SegmentEntry, r: &ExtentRead) -> bool {
+    r.range_start.checked_sub(entry.start_lba) == Some(r.payload_block_offset as u64)
+}
+
+/// A run keeps its input entry alive when hash and anchor agree and this
+/// segment is the LBA's claimant. The claimant decides because a hash can
+/// sit at the same LBAs under two segments — a later one writing
+/// identical bytes, a rewrite carrying content forward — and exactly one
+/// of them holds the claim. Reading the other as live would emit an output
+/// entry for LBAs this segment does not own, which the apply refuses while
+/// the committed output keeps the claim at a higher ULID, leaving the live
+/// map and a rebuild in permanent disagreement.
+fn block_is_live(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>, r: &ExtentRead) -> bool {
+    r.hash == entry.hash && anchor_matches(entry, r) && r.claimant_ulid == ctx.segment_id
+}
+
+/// Classify one input entry. Pure function; result is one of
+/// [`EntryClassification`]'s variants.
+///
+/// `Zero` entries take their own branch: their hash is the `ZERO_HASH`
+/// sentinel and they hold no `extent_index` slot, so liveness is the
+/// surviving sub-run list alone. All other body-owning kinds (`Data` /
+/// `Inline` / `DedupRef` / `Delta`) share the same
+/// matching-blocks-vs-total-blocks accounting; the kind only matters for
+/// the dead branch (whether to demote to Canonical or drop).
+///
+/// `CanonicalData` / `CanonicalInline` have `lba_length == 0` and make no
+/// LBA claim, so the matching-blocks accounting does not apply to them.
+/// They are decided on hash liveness alone: kept when something still
+/// resolves against their body, dropped as garbage otherwise.
 pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClassification {
     if entry.kind == EntryKind::Zero {
+        debug_assert_eq!(entry.hash, ZERO_HASH);
         let end_lba = entry.start_lba + entry.lba_length as u64;
         let live_runs: Vec<ExtentRead> = ctx
             .lba_map
             .extents_in_range(entry.start_lba, end_lba)
-            .filter(|r| r.hash == ZERO_HASH)
+            .filter(|r| block_is_live(entry, ctx, r))
             .collect();
         return EntryClassification::ZeroSubRuns(live_runs);
     }
@@ -188,40 +217,9 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
         .lba_map
         .extents_in_range(entry.start_lba, end_lba)
         .collect();
-    // A run "matches" the input entry when its hash matches AND its
-    // anchor agrees: the run's `payload_block_offset` for `range_start`
-    // equals the entry's offset for that LBA. Same-hash runs with
-    // different anchors (e.g. a `DedupRef` at start=25 referring to
-    // the same body as a DATA at start=24) represent different bytes
-    // for partially-overlapping LBAs, even though the composite hash
-    // is identical, so they must NOT count as matching.
-    //
-    // Concretely: at LBA L in run `r`, the lbamap says
-    // "body block P + (L - r.range_start)" where P =
-    // r.payload_block_offset. The input entry says "body block
-    // L - entry.start_lba". These agree iff
-    // (r.range_start - entry.start_lba) == r.payload_block_offset.
-    let anchor_matches = |r: &ExtentRead| -> bool {
-        let delta = r.range_start.checked_sub(entry.start_lba);
-        delta == Some(r.payload_block_offset as u64)
-    };
-    // A run keeps this entry alive when its hash and anchor agree and this
-    // segment is the LBA's claimant. The claimant decides because a hash
-    // can sit at the same LBAs under two segments — a later one writing
-    // identical bytes, a rewrite carrying content forward — and exactly
-    // one of them holds the claim. Reading the other as live would emit an
-    // output entry for LBAs this segment does not own, which the apply
-    // refuses while the committed output keeps the claim at a higher ULID,
-    // leaving the live map and a rebuild in permanent disagreement.
-    //
-    // `owns_home` names the extent index's body owner and steers only the
-    // fully-dead branch between Drop and DemoteToCanonical.
-    let block_is_live = |r: &ExtentRead| -> bool {
-        r.hash == entry.hash && anchor_matches(r) && r.claimant_ulid == ctx.segment_id
-    };
     let matching_blocks: u64 = runs
         .iter()
-        .filter(|r| block_is_live(r))
+        .filter(|r| block_is_live(entry, ctx, r))
         .map(|r| r.range_end - r.range_start)
         .sum();
     let total_blocks = entry.lba_length as u64;
@@ -242,9 +240,10 @@ pub fn classify_entry(entry: &SegmentEntry, ctx: &ClassifyCtx<'_>) -> EntryClass
     } else {
         // Partial-LBA death. Build the live sub-run list once; per-kind
         // logic decides how the caller turns it into output records.
-        // Use the same anchor-aware filter so split sub-runs only
-        // include LBAs whose anchor agrees with the input entry.
-        let live_runs: Arc<[ExtentRead]> = runs.into_iter().filter(|r| block_is_live(r)).collect();
+        let live_runs: Arc<[ExtentRead]> = runs
+            .into_iter()
+            .filter(|r| block_is_live(entry, ctx, r))
+            .collect();
         match entry.kind {
             EntryKind::Data | EntryKind::Inline => EntryClassification::PartialDeath {
                 live_runs,
@@ -321,6 +320,66 @@ mod tests {
             body_section_start: 0,
             inline_data: None,
         }
+    }
+
+    /// Classify a Zero entry against `lba_map` as seen from `seg`, and
+    /// reduce the surviving sub-runs to their LBA ranges.
+    fn zero_runs(start_lba: u64, lba_length: u32, lba_map: &LbaMap, seg: Ulid) -> Vec<(u64, u64)> {
+        let index = ExtentIndex::default();
+        let ctx = ClassifyCtx {
+            lba_map,
+            extent_index: &index,
+            live_hashes: &Blake3HashSet::default(),
+            segment_id: seg,
+        };
+        match classify_entry(&SegmentEntry::new_zero(start_lba, lba_length), &ctx) {
+            EntryClassification::ZeroSubRuns(runs) => {
+                runs.iter().map(|r| (r.range_start, r.range_end)).collect()
+            }
+            other => panic!("expected ZeroSubRuns, got {other:?}"),
+        }
+    }
+
+    /// A Zero entry claims LBAs like any other kind, so its liveness runs
+    /// through the same claimant test. A zeroed run another segment holds
+    /// the claim on belongs to that segment's rewrite. Counting it here
+    /// emits an output entry for LBAs this segment does not own, which the
+    /// apply refuses while the committed output keeps the claim at a higher
+    /// ULID.
+    #[test]
+    fn zero_run_claimed_by_another_segment_is_dead() {
+        let seg = Ulid::new();
+        let other = Ulid::new();
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(100, 10, ZERO_HASH, other);
+
+        assert!(zero_runs(100, 10, &lba_map, seg).is_empty());
+    }
+
+    /// The claim this segment does hold survives.
+    #[test]
+    fn zero_run_this_segment_claims_is_live() {
+        let seg = Ulid::new();
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(100, 10, ZERO_HASH, seg);
+
+        assert_eq!(zero_runs(100, 10, &lba_map, seg), vec![(100, 110)]);
+    }
+
+    /// Two Zero entries in one segment overlap: entries apply in order, so
+    /// the later one owns the shared tail. Both carry this segment's
+    /// claimant, so only the anchor separates them, and without it each
+    /// entry would claim the overlap and the output would hold two entries
+    /// for the same LBAs.
+    #[test]
+    fn overlapping_zero_entries_split_on_the_anchor() {
+        let seg = Ulid::new();
+        let mut lba_map = LbaMap::new();
+        lba_map.insert(100, 10, ZERO_HASH, seg);
+        lba_map.insert(105, 10, ZERO_HASH, seg);
+
+        assert_eq!(zero_runs(100, 10, &lba_map, seg), vec![(100, 105)]);
+        assert_eq!(zero_runs(105, 10, &lba_map, seg), vec![(105, 115)]);
     }
 
     /// While something still resolves against a canonical's body — a
