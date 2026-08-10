@@ -503,6 +503,45 @@ fn apply_promoted_partition(
 /// line. The count it reports is separate and unbounded.
 pub(in crate::volume) const REFUSAL_SAMPLE_LIMIT: usize = 8;
 
+/// A fold refused because the plan disagreed with the live map about an
+/// LBA. `SUPERSEDED_CARRY` is the plan claiming one it should not,
+/// `DROPPED_CLAIM` one it should have carried.
+const SUPERSEDED_CARRY: &str = "superseded_carry";
+const DROPPED_CLAIM: &str = "dropped_claim";
+
+/// Machine-readable identity for a refusal, appended to its ERROR line.
+///
+/// Two refusals name the same fault iff `refusal`, `held_by` and
+/// `anchor_lba` all match, which is what lets recurrence be correlated
+/// from the tick log with nothing retained across ticks.
+///
+/// Reading it: the same three on consecutive GC ticks means the
+/// coordinator's disk-derived view and the volume's live map disagree
+/// about that LBA in a way that re-deriving does not fix, so the volume
+/// should be run under `ELIDE_VOLUME_INVARIANTS=1` for
+/// `assert_lbamap_consistent` to name the divergence. A different anchor,
+/// or none next tick, is a scan that raced a mutation and has healed.
+///
+/// `held_by` is the segment holding the disputed claim, which no refused
+/// fold can move, so it survives the re-bucketing between passes that
+/// makes the input set unstable. `runs` and `blocks` say whether the
+/// fault is growing. The plan ULID is minted per pass and identifies
+/// nothing across ticks, so it stays in the prose.
+///
+/// `None` when `runs` is empty, which is the no-refusal case.
+fn refusal_identity(kind: &str, runs: &[(u64, u64, Ulid)], inputs: usize) -> Option<String> {
+    // Iteration order over `runs` follows the inputs' index order and so
+    // shifts with bucket composition. The minimum names the same LBA
+    // whatever order they arrive in.
+    let (anchor_lba, _, held_by) = runs.iter().min_by_key(|(from, _, _)| *from)?;
+    let blocks: u64 = runs.iter().map(|(from, to, _)| to - from).sum();
+    Some(format!(
+        "refusal={kind} held_by={held_by} anchor_lba={anchor_lba} runs={} blocks={blocks} \
+         inputs={inputs}",
+        runs.len(),
+    ))
+}
+
 /// Disjoint half-open LBA ranges, ascending, for coverage queries.
 struct LbaRanges(Vec<(u64, u64)>);
 
@@ -1874,26 +1913,26 @@ impl Volume {
         // superseded, which is what `gc_fork` building liveness from a
         // full rebuild plus a WAL replay exists to prevent. Refusing
         // keeps the two in step and leaves the next pass to re-derive.
-        let superseded: Vec<(u64, Ulid)> = blocked
+        let superseded: Vec<(u64, u64, Ulid)> = blocked
             .iter()
             .flat_map(|(start, length)| {
                 pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
             })
             .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
-            .map(|x| (x.range_start, x.claimant_ulid))
+            .map(|x| (x.range_start, x.range_end, x.claimant_ulid))
             .collect();
-        if !superseded.is_empty() {
+        if let Some(identity) = refusal_identity(SUPERSEDED_CARRY, &superseded, inputs.len()) {
             let detail = superseded
                 .iter()
                 .take(REFUSAL_SAMPLE_LIMIT)
-                .map(|(lba, claimant)| format!("lba={lba} held-by={claimant}"))
+                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             log::error!(
                 "plan {new_ulid}: refusing fold — {} lba run(s) carried by the plan are held by \
                  a lower-ULID claimant this apply does not consume, so the plan carries a hash \
                  another tier has superseded and a rebuild would prefer the fold, first {}: \
-                 [{detail}]; dropping output and plan",
+                 [{detail}]; dropping output and plan; {identity}",
                 superseded.len(),
                 superseded.len().min(REFUSAL_SAMPLE_LIMIT),
             );
@@ -1940,8 +1979,7 @@ impl Volume {
                     .map(|(from, to)| (from, to, x.claimant_ulid))
             })
             .collect();
-        if !dropped.is_empty() {
-            let blocks: u64 = dropped.iter().map(|(from, to, _)| to - from).sum();
+        if let Some(identity) = refusal_identity(DROPPED_CLAIM, &dropped, inputs.len()) {
             let detail = dropped
                 .iter()
                 .take(REFUSAL_SAMPLE_LIMIT)
@@ -1949,10 +1987,10 @@ impl Volume {
                 .collect::<Vec<_>>()
                 .join(", ");
             log::error!(
-                "plan {new_ulid}: refusing fold — {} lba run(s) totalling {blocks} block(s) are \
-                 claimed by an input this apply consumes and are absent from the output, so the \
-                 plan read them dead while the volume still serves them, first {}: [{detail}]; \
-                 dropping output and plan",
+                "plan {new_ulid}: refusing fold — {} lba run(s) are claimed by an input this \
+                 apply consumes and are absent from the output, so the plan read them dead while \
+                 the volume still serves them, first {}: [{detail}]; dropping output and plan; \
+                 {identity}",
                 dropped.len(),
                 dropped.len().min(REFUSAL_SAMPLE_LIMIT),
             );

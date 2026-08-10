@@ -5792,3 +5792,82 @@ mod lba_ranges {
         );
     }
 }
+
+/// The refusal identity is what lets recurrence be correlated across
+/// ticks, so it has to name the same LBA whatever order the runs arrive
+/// in. Bucket composition shifts between passes and the iteration order
+/// follows it.
+mod refusal_identity {
+    use super::super::{DROPPED_CLAIM, refusal_identity};
+    use ulid::Ulid;
+
+    fn ulid(n: u64) -> Ulid {
+        Ulid::from_parts(n, 0)
+    }
+
+    /// More runs than the detail sample names, deliberately: a
+    /// regression to "the first element" or "the first sampled element"
+    /// has to fail here.
+    fn runs() -> Vec<(u64, u64, Ulid)> {
+        vec![
+            (900, 902, ulid(9)),
+            (500, 501, ulid(5)),
+            (700, 705, ulid(7)),
+            (100, 104, ulid(1)),
+            (800, 801, ulid(8)),
+            (300, 302, ulid(3)),
+            (600, 601, ulid(6)),
+            (400, 401, ulid(4)),
+            (200, 203, ulid(2)),
+            (1000, 1001, ulid(10)),
+        ]
+    }
+
+    #[test]
+    fn the_anchor_is_the_lowest_lba_not_the_first_run() {
+        let identity = refusal_identity(DROPPED_CLAIM, &runs(), 3).unwrap();
+        assert!(
+            identity.contains("anchor_lba=100"),
+            "anchor must be the minimum across every run: {identity}"
+        );
+    }
+
+    #[test]
+    fn held_by_names_the_claimant_of_the_anchor_run() {
+        let identity = refusal_identity(DROPPED_CLAIM, &runs(), 3).unwrap();
+        assert!(
+            identity.contains(&format!("held_by={}", ulid(1))),
+            "held_by must come from the run the anchor came from: {identity}"
+        );
+    }
+
+    #[test]
+    fn reordering_the_runs_leaves_the_identity_unchanged() {
+        let forward = refusal_identity(DROPPED_CLAIM, &runs(), 3).unwrap();
+        let mut reversed = runs();
+        reversed.reverse();
+        assert_eq!(
+            forward,
+            refusal_identity(DROPPED_CLAIM, &reversed, 3).unwrap()
+        );
+        let mut sorted = runs();
+        sorted.sort_unstable();
+        assert_eq!(
+            forward,
+            refusal_identity(DROPPED_CLAIM, &sorted, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn blocks_totals_every_run_and_runs_counts_them() {
+        let identity = refusal_identity(DROPPED_CLAIM, &runs(), 3).unwrap();
+        // 2+1+5+4+1+2+1+1+3+1
+        assert!(identity.contains("blocks=21"), "{identity}");
+        assert!(identity.contains("runs=10"), "{identity}");
+    }
+
+    #[test]
+    fn no_runs_is_no_refusal() {
+        assert!(refusal_identity(DROPPED_CLAIM, &[], 3).is_none());
+    }
+}
