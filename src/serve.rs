@@ -39,6 +39,30 @@ pub fn install_sigusr1_handler() {
     }
 }
 
+/// Turn a panic on any thread into process death.
+///
+/// The volume's threads share one fate: the actor owns the volume mutex
+/// and the worker's job sender, and every ublk queue worker reaches the
+/// volume through the actor. A thread that unwinds by itself leaves the
+/// queue workers taking guest I/O and completing each command with EIO,
+/// which a mounted filesystem reads as a failing disk.
+///
+/// Abort hands that to the supervisor, which restarts the volume, and to
+/// the kernel's ublk daemon-exit detection, which parks the device in
+/// QUIESCED so `USER_RECOVERY` reissues the guest's I/O across the
+/// restart. Acked writes are durable in the WAL, so the abort keeps
+/// every promise already made.
+///
+/// The default hook runs first, so the message and backtrace reach
+/// stderr ahead of the abort.
+pub fn abort_on_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        std::process::abort();
+    }));
+}
+
 #[cfg(target_os = "linux")]
 fn shutdown_sigset() -> nix::sys::signal::SigSet {
     let mut s = nix::sys::signal::SigSet::empty();
@@ -126,6 +150,7 @@ pub fn spawn_signal_watcher(
 /// Used when the coordinator supervises a volume for IPC purposes
 /// only — no client is attached and no ublk device is requested.
 pub fn run_volume_ipc_only(dir: &Path, fetch_inputs: crate::VolumeFetchInputs) -> io::Result<()> {
+    abort_on_panic();
     block_shutdown_signals()?;
     install_sigusr1_handler();
 

@@ -543,6 +543,8 @@ mod imp {
         size_bytes: u64,
         fetch_inputs: crate::VolumeFetchInputs,
     ) -> Result<(), super::UblkRunError> {
+        crate::serve::abort_on_panic();
+
         // Set before any thread is spawned: task flags are inherited on
         // clone, so every later thread starts flagged (libublk's queue
         // threads clear it and are re-asserted in q_handler). Failure is
