@@ -77,7 +77,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -1682,11 +1682,18 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
+    // Records insert unconditionally, so the replay is last-write-wins and
+    // the file order decides the answer. WAL filenames are ULIDs, so sorting
+    // by name puts older epochs first, matching `Volume::open`.
+    let mut wal_files: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            wal_files.push(entry.path());
         }
+    }
+    wal_files.sort_unstable_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for path in wal_files {
         let Some(wal_ulid) = path
             .file_name()
             .and_then(|n| n.to_str())
