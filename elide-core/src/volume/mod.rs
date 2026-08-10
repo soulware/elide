@@ -1397,12 +1397,18 @@ impl Volume {
     /// up the actor machinery.  See [`GcCheckpointUlids`] for why both
     /// ULIDs are minted before any I/O.
     pub fn gc_checkpoint_for_test(&mut self) -> io::Result<Ulid> {
-        let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(1);
+        Ok(self.gc_checkpoint_buckets_for_test(1)?.remove(0))
+    }
+
+    /// [`Volume::gc_checkpoint_for_test`] over `max_buckets` buckets, for
+    /// tests driving a multi-bucket pass.
+    pub fn gc_checkpoint_buckets_for_test(&mut self, max_buckets: usize) -> io::Result<Vec<Ulid>> {
+        let GcCheckpointUlids { u_buckets, u_flush } = self.mint_gc_checkpoint_ulids(max_buckets);
         // Flush the current WAL to pending/ under u_flush. If the WAL is
         // empty (or absent), the file is deleted/skipped and u_flush is unused.
         self.flush_wal_to_pending_as(u_flush)?;
         self.assert_volume_invariants("gc_checkpoint_for_test");
-        Ok(u_buckets[0])
+        Ok(u_buckets)
     }
 
     /// `gc_checkpoint_for_test` variant modelling a checkpoint whose WAL
