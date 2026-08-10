@@ -503,6 +503,57 @@ fn apply_promoted_partition(
 /// line. The count it reports is separate and unbounded.
 pub(in crate::volume) const REFUSAL_SAMPLE_LIMIT: usize = 8;
 
+/// Disjoint half-open LBA ranges, ascending, for coverage queries.
+struct LbaRanges(Vec<(u64, u64)>);
+
+impl LbaRanges {
+    /// The union of the LBA ranges `entries` stakes a claim over.
+    /// Canonical-only kinds carry a body for dedup resolution and claim
+    /// nothing, so they contribute no range.
+    fn from_claims(entries: &[segment::SegmentEntry]) -> Self {
+        let mut ranges: Vec<(u64, u64)> = entries
+            .iter()
+            .filter(|e| !e.kind.is_canonical_only())
+            .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
+            .collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        Self(merged)
+    }
+
+    /// The first sub-range of `[start, end)` this set leaves uncovered.
+    fn first_gap_in(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        let mut cursor = start;
+        // The predecessor is the only range that can cover `cursor` from
+        // below, and each subsequent range starts at or after it.
+        let from = self.0.partition_point(|(s, _)| *s <= cursor);
+        for (s, e) in &self.0[from.saturating_sub(1)..] {
+            if *s > cursor {
+                break;
+            }
+            cursor = cursor.max(*e);
+            if cursor >= end {
+                return None;
+            }
+        }
+        (cursor < end).then_some((
+            cursor,
+            end.min(self.next_start_after(cursor).unwrap_or(end)),
+        ))
+    }
+
+    fn next_start_after(&self, lba: u64) -> Option<u64> {
+        let i = self.0.partition_point(|(s, _)| *s <= lba);
+        self.0.get(i).map(|(s, _)| *s)
+    }
+}
+
 /// Unresolvable lbamap claims found by
 /// [`Volume::unresolvable_lbamap_hashes`]: how many there are, and the
 /// first few for the log line. `total` is the severity signal —
@@ -1590,6 +1641,7 @@ impl Volume {
             entries,
             inputs,
             input_old_entries,
+            input_claim_ranges,
             carried_hashes,
             entry_hashes,
             handoff_inline,
@@ -1841,6 +1893,59 @@ impl Volume {
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_superseded");
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // The mirror of the check above. That one catches a fold claiming
+        // an LBA it should not; this one catches a fold dropping an LBA
+        // it should have carried. A claim the plan was right to drop
+        // cannot still name a consumed input, because dropping it as dead
+        // means something else overwrote it and that something is the
+        // claimant. So a live claim held by an input over a range the
+        // output does not cover says the plan read that LBA as dead while
+        // the volume still serves it.
+        //
+        // The fold consumes its inputs, so on the next open that claim
+        // has no segment to come from and the LBA reverts to whatever
+        // older layer still holds it, or reads as a hole.
+        //
+        // Coverage is taken over LBA ranges rather than per entry: two of
+        // an input's entries can cover one LBA, the earlier dead on the
+        // anchor and dropped, with the later one carried.
+        let covered = LbaRanges::from_claims(&entries);
+        let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
+            .iter()
+            .flat_map(|(start, length)| {
+                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+            })
+            .filter(|x| consumed.contains(&x.claimant_ulid))
+            .filter_map(|x| {
+                covered
+                    .first_gap_in(x.range_start, x.range_end)
+                    .map(|(from, to)| (from, to, x.claimant_ulid))
+            })
+            .collect();
+        if !dropped.is_empty() {
+            let blocks: u64 = dropped.iter().map(|(from, to, _)| to - from).sum();
+            let detail = dropped
+                .iter()
+                .take(REFUSAL_SAMPLE_LIMIT)
+                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::error!(
+                "plan {new_ulid}: refusing fold — {} lba run(s) totalling {blocks} block(s) are \
+                 claimed by an input this apply consumes and are absent from the output, so the \
+                 plan read them dead while the volume still serves them, first {}: [{detail}]; \
+                 dropping output and plan",
+                dropped.len(),
+                dropped.len().min(REFUSAL_SAMPLE_LIMIT),
+            );
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&plan_path);
+            self.assert_volume_invariants("apply_plan_apply_result_dropped_claim");
             return Ok(StagedApply::Cancelled);
         }
 

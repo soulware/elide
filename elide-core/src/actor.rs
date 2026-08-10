@@ -2372,6 +2372,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
     // and deltas-map slots need the same to_remove cleanup when the
     // input segment is consumed.
     let mut input_old_entries: Vec<(blake3::Hash, segment::EntryKind, Ulid)> = Vec::new();
+    let mut input_claim_ranges: Vec<(u64, u32)> = Vec::new();
     for input_ulid in &inputs {
         let idx_path = index_dir.join(format!("{input_ulid}.idx"));
         let parsed = match segment::read_segment_index(&idx_path) {
@@ -2383,6 +2384,9 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         for e in &old_entries {
             if e.kind.owns_extent_hash() {
                 input_old_entries.push((e.hash, e.kind, *input_ulid));
+            }
+            if !e.kind.is_canonical_only() {
+                input_claim_ranges.push((e.start_lba, e.lba_length));
             }
         }
     }
@@ -2414,6 +2418,7 @@ pub fn execute_gc_plan_apply(job: GcPlanApplyJob) -> io::Result<GcPlanApplyResul
         entries: written_entries,
         inputs,
         input_old_entries,
+        input_claim_ranges,
         carried_hashes,
         entry_hashes,
         handoff_inline,
@@ -2436,6 +2441,7 @@ fn cancelled_result(
         entries: Vec::new(),
         inputs,
         input_old_entries: Vec::new(),
+        input_claim_ranges: Vec::new(),
         carried_hashes: Default::default(),
         entry_hashes: Default::default(),
         handoff_inline: Vec::new(),

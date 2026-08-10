@@ -5695,3 +5695,66 @@ fn a_promoted_flush_above_a_pending_write_still_fires() {
 
     vol.assert_pending_above_committed("promoted_flush_test");
 }
+
+/// `LbaRanges` backs the apply's coverage refusal, and a gap it fails to
+/// report is a fold committed over a claim the volume still serves.
+mod lba_ranges {
+    use super::super::LbaRanges;
+
+    fn ranges(v: &[(u64, u64)]) -> LbaRanges {
+        LbaRanges(v.to_vec())
+    }
+
+    #[test]
+    fn an_empty_set_covers_nothing() {
+        assert_eq!(ranges(&[]).first_gap_in(4, 9), Some((4, 9)));
+    }
+
+    #[test]
+    fn an_exact_cover_leaves_no_gap() {
+        assert_eq!(ranges(&[(4, 9)]).first_gap_in(4, 9), None);
+    }
+
+    #[test]
+    fn a_wider_cover_leaves_no_gap() {
+        assert_eq!(ranges(&[(0, 20)]).first_gap_in(4, 9), None);
+    }
+
+    #[test]
+    fn a_covered_head_reports_the_tail() {
+        assert_eq!(ranges(&[(4, 7)]).first_gap_in(4, 9), Some((7, 9)));
+    }
+
+    #[test]
+    fn a_covered_tail_reports_the_head() {
+        assert_eq!(ranges(&[(7, 9)]).first_gap_in(4, 9), Some((4, 7)));
+    }
+
+    #[test]
+    fn a_hole_reports_the_hole_alone() {
+        assert_eq!(ranges(&[(0, 5), (7, 20)]).first_gap_in(4, 9), Some((5, 7)));
+    }
+
+    #[test]
+    fn abutting_ranges_cover_across_the_join() {
+        assert_eq!(ranges(&[(4, 6), (6, 9)]).first_gap_in(4, 9), None);
+    }
+
+    #[test]
+    fn a_range_starting_beyond_the_query_is_no_cover() {
+        assert_eq!(ranges(&[(20, 30)]).first_gap_in(4, 9), Some((4, 9)));
+    }
+
+    #[test]
+    fn a_range_ending_below_the_query_is_no_cover() {
+        assert_eq!(ranges(&[(0, 2)]).first_gap_in(4, 9), Some((4, 9)));
+    }
+
+    #[test]
+    fn the_first_gap_is_reported_when_several_follow() {
+        assert_eq!(
+            ranges(&[(4, 5), (6, 7), (8, 9)]).first_gap_in(4, 9),
+            Some((5, 6))
+        );
+    }
+}
