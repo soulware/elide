@@ -1719,6 +1719,7 @@ impl Volume {
         let pre_apply_index = Arc::clone(&self.extent_index);
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
         let mut merge = Duration::ZERO;
+        let mut blocked: Vec<(u64, u32)> = Vec::new();
         let gate_start = Instant::now();
         let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
             let merge_start = Instant::now();
@@ -1762,7 +1763,10 @@ impl Volume {
             // `gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush`.
             let lbamap = Arc::make_mut(&mut vol.lbamap);
             for e in &entries {
-                lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+                let took = lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+                if !e.kind.is_canonical_only() && took < e.lba_length {
+                    blocked.push((e.start_lba, e.lba_length));
+                }
             }
             merge = merge_start.elapsed();
             Ok(())
@@ -1793,6 +1797,50 @@ impl Volume {
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_refused");
+            return Ok(StagedApply::Cancelled);
+        }
+
+        // A carried entry that took fewer LBA blocks than it covers ran
+        // into a claimant this apply does not consume. Above `new_ulid`
+        // that is the ordinary plan-then-write race: the rebuild admits
+        // by highest claimant ULID, so it prefers the same claimant the
+        // merge just did and the two agree.
+        //
+        // Below `new_ulid` they part. The rebuild hands the range to the
+        // fold, so committing buys a volume that reads correctly until
+        // its next mount serves content the merge had refused. Reaching
+        // that means the plan carried a hash another tier had already
+        // superseded, which is what `gc_fork` building liveness from a
+        // full rebuild plus a WAL replay exists to prevent. Refusing
+        // keeps the two in step and leaves the next pass to re-derive.
+        let superseded: Vec<(u64, Ulid)> = blocked
+            .iter()
+            .flat_map(|(start, length)| {
+                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+            })
+            .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
+            .map(|x| (x.range_start, x.claimant_ulid))
+            .collect();
+        if !superseded.is_empty() {
+            let detail = superseded
+                .iter()
+                .take(REFUSAL_SAMPLE_LIMIT)
+                .map(|(lba, claimant)| format!("lba={lba} held-by={claimant}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::error!(
+                "plan {new_ulid}: refusing fold — {} lba run(s) carried by the plan are held by \
+                 a lower-ULID claimant this apply does not consume, so the plan carries a hash \
+                 another tier has superseded and a rebuild would prefer the fold, first {}: \
+                 [{detail}]; dropping output and plan",
+                superseded.len(),
+                superseded.len().min(REFUSAL_SAMPLE_LIMIT),
+            );
+            self.extent_index = pre_apply_index;
+            self.lbamap = pre_apply_lbamap;
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&plan_path);
+            self.assert_volume_invariants("apply_plan_apply_result_superseded");
             return Ok(StagedApply::Cancelled);
         }
 
