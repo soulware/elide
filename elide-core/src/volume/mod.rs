@@ -39,7 +39,8 @@ use ulid::Ulid;
 use crate::{
     blake3_id_hasher::Blake3HashSet,
     extentindex::{self, BodySource},
-    lbamap, rewrite_plan,
+    lbamap::{self, LbaMap},
+    rewrite_plan,
     segment::{self, EntryKind},
     segment_cache,
     ulid_mint::UlidMint,
@@ -140,6 +141,21 @@ pub const ZERO_HASH: blake3::Hash = blake3::Hash::from_bytes([0u8; 32]);
 /// for sweep/repack/delta_repack/promote passes without unbounded
 /// memory growth on large volumes.
 const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
+
+/// How many diverging LBAs `assert_lbamap_consistent` names before it
+/// stops looking. Enough to show whether a drift is one LBA or a whole
+/// claimed range, which is the distinction that identifies its cause.
+const DIVERGENCE_REPORT_CAP: usize = 8;
+
+/// One LBA where the in-memory map and the on-disk projection disagree,
+/// on the content stored there or on which segment claims it.
+struct Diverge {
+    lba: u64,
+    mem_hash: Option<blake3::Hash>,
+    disk_hash: Option<blake3::Hash>,
+    mem_claimant: Option<Ulid>,
+    disk_claimant: Option<Ulid>,
+}
 
 /// A segment entry whose stored bytes are still in the WAL, travelling with the
 /// location of those bytes until [`materialise_pending_bodies`] reunites them.
@@ -2149,6 +2165,62 @@ impl Volume {
             return;
         }
         self.lbamap.debug_assert_claim_counts();
+        let first = match self.disk_lbamap_projection() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("assert_lbamap_consistent[{caller}]: rebuild failed: {e}");
+                return;
+            }
+        };
+        let candidates = self.diverging_lbas(&first);
+        if candidates.is_empty() {
+            return;
+        }
+        let second = match self.disk_lbamap_projection() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("assert_lbamap_consistent[{caller}]: confirming rebuild failed: {e}");
+                return;
+            }
+        };
+        let confirmed: Vec<Diverge> = candidates
+            .iter()
+            .filter_map(|d| self.divergence_at(&second, d.lba))
+            .collect();
+        if confirmed.is_empty() {
+            eprintln!(
+                "assert_lbamap_consistent[{caller}]: {} LBA(s) diverged on one disk read and \
+                 agreed on the next — the tree moved between the two",
+                candidates.len()
+            );
+            return;
+        }
+        let mut msg = format!(
+            "lbamap drift after [{caller}]: {} LBA(s) diverge from the disk rebuild \
+             on content or claimant, on two consecutive reads",
+            confirmed.len()
+        );
+        for d in &confirmed {
+            msg.push_str(&format!(
+                "\n  lba={} in_memory=({:?}, {:?}) disk_rebuild=({:?}, {:?})",
+                d.lba,
+                d.mem_hash.map(|h| h.to_hex().to_string()),
+                d.mem_claimant.map(|u| u.to_string()),
+                d.disk_hash.map(|h| h.to_hex().to_string()),
+                d.disk_claimant.map(|u| u.to_string()),
+            ));
+        }
+        panic!("{msg}");
+    }
+
+    /// The volume's LBA map as the on-disk state projects it: a full
+    /// segment rebuild with every WAL replayed on top.
+    ///
+    /// Read file by file from a tree the worker thread is also writing,
+    /// so the result is a composite of the states it passed through
+    /// rather than any one of them. A caller comparing against it treats
+    /// a single disagreement as a question, not an answer.
+    fn disk_lbamap_projection(&self) -> io::Result<LbaMap> {
         let mut chain: Vec<(PathBuf, Option<String>)> = self
             .ancestor_layers
             .iter()
@@ -2159,13 +2231,7 @@ impl Volume {
         // per-segment cost and we don't need it for an in-memory consistency
         // check (signatures were already verified at Volume::open time, and
         // on-disk segments are immutable after creation).
-        let mut fresh = match lbamap::rebuild_segments_unverified(&chain) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("assert_lbamap_consistent[{caller}]: rebuild failed: {e}");
-                return;
-            }
-        };
+        let mut fresh = lbamap::rebuild_segments_unverified(&chain)?;
         let wal_dir = self.base_dir.join("wal");
         if let Ok(entries) = fs::read_dir(&wal_dir) {
             for entry in entries.flatten() {
@@ -2208,58 +2274,45 @@ impl Volume {
                 }
             }
         }
+        Ok(fresh)
+    }
 
-        struct Diverge {
-            lba: u64,
-            mem_hash: Option<blake3::Hash>,
-            disk_hash: Option<blake3::Hash>,
-            mem_claimant: Option<Ulid>,
-            disk_claimant: Option<Ulid>,
+    fn divergence_at(&self, disk: &LbaMap, lba: u64) -> Option<Diverge> {
+        let mem_hash = self.lbamap.hash_at(lba);
+        let disk_hash = disk.hash_at(lba);
+        let mem_claimant = self.lbamap.claimant_at(lba);
+        let disk_claimant = disk.claimant_at(lba);
+        if mem_hash == disk_hash && mem_claimant == disk_claimant {
+            return None;
         }
-        let mut diverging: Vec<Diverge> = Vec::new();
+        Some(Diverge {
+            lba,
+            mem_hash,
+            disk_hash,
+            mem_claimant,
+            disk_claimant,
+        })
+    }
+
+    /// Up to [`DIVERGENCE_REPORT_CAP`] LBAs where memory and `disk` differ.
+    fn diverging_lbas(&self, disk: &LbaMap) -> Vec<Diverge> {
         let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (lba, _, _, _) in self.lbamap.iter_entries() {
             all_lbas.insert(lba);
         }
-        for (lba, _, _, _) in fresh.iter_entries() {
+        for (lba, _, _, _) in disk.iter_entries() {
             all_lbas.insert(lba);
         }
+        let mut diverging = Vec::new();
         for lba in all_lbas {
-            let mem_hash = self.lbamap.hash_at(lba);
-            let disk_hash = fresh.hash_at(lba);
-            let mem_claimant = self.lbamap.claimant_at(lba);
-            let disk_claimant = fresh.claimant_at(lba);
-            if mem_hash != disk_hash || mem_claimant != disk_claimant {
-                diverging.push(Diverge {
-                    lba,
-                    mem_hash,
-                    disk_hash,
-                    mem_claimant,
-                    disk_claimant,
-                });
-                if diverging.len() >= 8 {
+            if let Some(d) = self.divergence_at(disk, lba) {
+                diverging.push(d);
+                if diverging.len() >= DIVERGENCE_REPORT_CAP {
                     break;
                 }
             }
         }
-        if !diverging.is_empty() {
-            let mut msg = format!(
-                "lbamap drift after [{caller}]: {} LBA(s) diverge from the disk rebuild \
-                 on content or claimant",
-                diverging.len()
-            );
-            for d in &diverging {
-                msg.push_str(&format!(
-                    "\n  lba={} in_memory=({:?}, {:?}) disk_rebuild=({:?}, {:?})",
-                    d.lba,
-                    d.mem_hash.map(|h| h.to_hex().to_string()),
-                    d.mem_claimant.map(|u| u.to_string()),
-                    d.disk_hash.map(|h| h.to_hex().to_string()),
-                    d.disk_claimant.map(|u| u.to_string()),
-                ));
-            }
-            panic!("{msg}");
-        }
+        diverging
     }
 
     /// Stress-only invariant: every *data* pending ULID must be greater
