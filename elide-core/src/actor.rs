@@ -2603,6 +2603,7 @@ pub(crate) fn execute_promote(
     // because a delta optimisation's inputs were unavailable — while
     // conversion errors are real corruption and fail the promote.
     let mut delta_body: Vec<u8> = Vec::new();
+    let mut reserved_sources = crate::blake3_id_hasher::Blake3HashSet::default();
     if job.delta.policy.enabled {
         if let Some(prior_spec) = &job.delta.prior {
             match prior_cache.map_for(
@@ -2617,18 +2618,20 @@ pub(crate) fn execute_promote(
                         &job.delta.extent_index,
                         &job.delta.search_dirs,
                     ) {
-                        Ok((body, stats)) => {
+                        Ok((body, stats, reserved)) => {
                             if stats.entries_converted > 0 {
                                 log::info!(
-                                    "formation {}: {} delta entries vs snapshot {}, {} → {} bytes",
+                                    "formation {}: {} delta entries vs snapshot {}, {} → {} bytes, {} entries held as sources",
                                     job.segment_ulid,
                                     stats.entries_converted,
                                     prior_spec.snap_ulid,
                                     stats.original_body_bytes,
                                     stats.delta_body_bytes,
+                                    stats.entries_reserved_as_sources,
                                 );
                             }
                             delta_body = body;
+                            reserved_sources = reserved;
                         }
                         Err(e) => return Err(fail(e, job)),
                     }
@@ -2649,6 +2652,7 @@ pub(crate) fn execute_promote(
             &job.delta.referenced,
             &job.delta.search_dirs,
             &mut delta_body,
+            &reserved_sources,
         ) {
             Ok(stats) => {
                 if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {

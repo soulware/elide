@@ -1080,6 +1080,60 @@ fn gc_oracle_repro_delta_repack_phantom_inner() {
 }
 
 /// Deterministic materialisation of the minimal gc_oracle sequence CI
+/// found 2026-08-10 (seed b31455fd, `delta = true`): one formation batch
+/// converts lba 5 to a Delta against the sealed content of lba 5, and
+/// converts lba 7 — which carries exactly that content — to a Delta of
+/// its own. The second conversion strips the body the first one's source
+/// resolution needs, leaving a delta naming a delta.
+///
+/// The source read succeeds at conversion time because the WAL write at
+/// lba 7 put the hash in the DATA map, so the tier's own resolvability
+/// check passes against an index that cannot see the batch's pending
+/// conversions.
+///
+/// Under `volume-invariants` this trips
+/// `assert_lbamap_hashes_resolvable`; with the checkers off the reads
+/// below fail with "no source option resolved in extent index".
+#[test]
+fn gc_oracle_repro_delta_source_superseded_by_dedup_ref() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir = dir.path();
+    write_keypair_and_provenance(fork_dir);
+    let mut vol = open_vol(fork_dir, true);
+
+    // VariantWrite { lba: 5, base_seed: 1, tweak: 0 }
+    vol.write(5, &variant_block(1, 0)).unwrap();
+
+    // SnapshotSign
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    // VariantWrite { lba: 7, base_seed: 1, tweak: 0 }
+    vol.write(7, &variant_block(1, 0)).unwrap();
+
+    // SealedBaseVariantPair { lba_a: 0, lba_b: 5, base_seed: 0, tweak: 1 }
+    vol.write(0, &incompressible_block(0)).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(5, &incompressible_block(1)).unwrap();
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+    vol.write(0, &variant_block(0, 1)).unwrap();
+    vol.write(5, &variant_block(1, 1)).unwrap();
+
+    // BaseWrite { lba: 7, base_seed: 1 }
+    vol.write(7, &incompressible_block(1)).unwrap();
+
+    // SnapshotSign
+    let snap = vol.snapshot().unwrap();
+    vol.sign_snapshot_manifest(snap).unwrap();
+
+    simulate_upload(&mut vol, fork_dir);
+
+    assert_eq!(&vol.read(5, 1).unwrap(), &variant_block(1, 1));
+    assert_eq!(&vol.read(7, 1).unwrap(), &incompressible_block(1));
+}
+
+/// Deterministic materialisation of the minimal gc_oracle sequence CI
 /// found 2026-07-10 on the #696 merge run: a sealed base, a
 /// near-duplicate overwrite converted to a Delta at promote, then a
 /// plain overwrite of the same LBA before the drain. The drain's promote

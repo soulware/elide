@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
+use crate::blake3_id_hasher::Blake3HashSet;
 use crate::block_reader::SnapshotSourceMap;
 use crate::extentindex::{self, ExtentIndex, ExtentLocation};
 use crate::filemap::{self, Filemap};
@@ -564,6 +565,9 @@ pub struct SegmentDeltaStats {
     pub entries_converted: usize,
     pub original_body_bytes: u64,
     pub delta_body_bytes: u64,
+    /// Pendings left as `Data` because another pending in the batch
+    /// deltas against their content. See [`reserved_delta_sources`].
+    pub entries_reserved_as_sources: usize,
 }
 
 /// Full plaintext of the Data/Inline extent `hash` resolves to, for use
@@ -651,6 +655,10 @@ pub struct ResemblanceStats {
 /// A candidate can never come from this same batch, since the map is fed
 /// after a promote commits, so no conversion here can leave another
 /// conversion's source pointing at a `Delta`.
+///
+/// `reserved` carries the converse: hashes the same-LBA tier named as
+/// delta sources over this same batch, whose pendings must keep their
+/// bodies. See [`reserved_delta_sources`].
 pub fn delta_pendings_by_resemblance(
     pendings: &mut [segment::PendingEntry],
     sketches: &SketchIndex,
@@ -658,6 +666,7 @@ pub fn delta_pendings_by_resemblance(
     referenced: &crate::lbamap::ReferencedHashes,
     search_dirs: &[PathBuf],
     delta_body: &mut Vec<u8>,
+    reserved: &Blake3HashSet,
 ) -> io::Result<ResemblanceStats> {
     let mut stats = ResemblanceStats::default();
     if sketches.is_empty() {
@@ -682,6 +691,10 @@ pub fn delta_pendings_by_resemblance(
         let Some(stored) = pending.body.as_deref() else {
             continue;
         };
+        if reserved.contains(&entry.hash) {
+            stats.delta.entries_reserved_as_sources += 1;
+            continue;
+        }
 
         let child_plain = entry.codec.decode(Cow::Borrowed(stored))?;
         let child_plain: &[u8] = &child_plain;
@@ -795,16 +808,20 @@ pub fn delta_pendings_by_resemblance(
 /// left alone.
 ///
 /// Returns the delta body region (each converted entry's `delta_offset`
-/// indexes into it) and the conversion stats.
+/// indexes into it) and the conversion stats, along with the hashes this
+/// pass reserved as delta sources — see [`reserved_delta_sources`]. Pass
+/// that set to [`delta_pendings_by_resemblance`], which runs over the
+/// same batch and would otherwise convert one of them.
 pub fn delta_pendings_against_prior(
     pendings: &mut [segment::PendingEntry],
     prior: &SnapshotSourceMap,
     extent_index: &ExtentIndex,
     search_dirs: &[PathBuf],
-) -> io::Result<(Vec<u8>, SegmentDeltaStats)> {
+) -> io::Result<(Vec<u8>, SegmentDeltaStats, Blake3HashSet)> {
     let mut delta_body: Vec<u8> = Vec::new();
     let mut stats = SegmentDeltaStats::default();
     let mut source_cache = SourceCache::new();
+    let reserved = reserved_delta_sources(pendings, prior);
 
     for pending in pendings.iter_mut() {
         let entry = &pending.entry;
@@ -822,6 +839,10 @@ pub fn delta_pendings_against_prior(
         let Some(stored) = pending.body.as_deref() else {
             continue;
         };
+        if reserved.contains(&entry.hash) {
+            stats.entries_reserved_as_sources += 1;
+            continue;
+        }
 
         // Fetch source plaintext (cached per source hash — a hot file
         // being rewritten at multiple LBAs shares its dictionary).
@@ -866,7 +887,37 @@ pub fn delta_pendings_against_prior(
         pending.body = None;
     }
 
-    Ok((delta_body, stats))
+    Ok((delta_body, stats, reserved))
+}
+
+/// The hashes a formation batch must leave carrying a body.
+///
+/// Each is the prior-snapshot content some single-block pending sits on
+/// top of, so a conversion in this batch may name it as a delta source.
+/// A delta source resolves through the DATA map alone
+/// (`try_read_delta_extent` consults no other), so a pending carrying
+/// one of these hashes has to stay `Data` — converting it strips the
+/// body and leaves a delta naming a delta, which no read can resolve.
+///
+/// Computed up front over every eligible pending rather than accumulated
+/// as conversions happen: the extent index this pass consults is a
+/// snapshot taken before it, so it cannot see the batch's own
+/// conversions, and a set built as the loop runs would make the outcome
+/// depend on pending order.
+///
+/// A superset of the sources actually named — a candidate whose body is
+/// unreadable or whose delta loses the keep rule reserves its source
+/// anyway. The cost of that is one declined conversion in a batch that
+/// both rewrites an LBA and re-lands its prior content elsewhere.
+fn reserved_delta_sources(
+    pendings: &[segment::PendingEntry],
+    prior: &SnapshotSourceMap,
+) -> Blake3HashSet {
+    pendings
+        .iter()
+        .filter(|p| p.entry.kind == EntryKind::Data && p.entry.lba_length == 1)
+        .filter_map(|p| prior.hash_for_lba(p.entry.start_lba))
+        .collect()
 }
 
 #[cfg(test)]
