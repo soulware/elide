@@ -166,7 +166,9 @@ Currently in the umbrella:
 
 - **`assert_lbamap_consistent`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner).
 
-  The projection registers every artefact under one admission rule, `LbaMap::insert_unless_outranked`: the highest claimant owns an LBA, and an equal claimant overrides so records inside one WAL land in file order. That rule is what makes the projection independent of the order the artefacts are visited in, which matters because two WALs coexist while a sealed one is promoted and `fs::read_dir` returns them unordered, and because a promote leaves its WAL in place under the higher-ULID segment it just wrote.
+  The projection replays the WALs over the rebuilt segments in ULID order, each record overriding whatever holds its LBA — the same construction `Volume::open` uses. `fs::read_dir` returns the WAL listing unordered and two WALs coexist while a sealed one is promoted, so the sort is what orders them among themselves.
+
+  A WAL record overrides on content rather than on claimant rank because a WAL's ULID is the moment it was created, and it keeps taking records for as long as it stays open. A record in it can be newer than a segment minted afterwards, including the segment a promote wrote out of that same WAL, so ranking the ULIDs would hand the LBA to the segment and lose the write.
 
   On a live volume the walk also reads a tree the worker thread is writing: `execute_promote` creates `pending/` segments and `execute_repack` unlinks `index/` siblings while the actor thread walks the directories file by file. A disagreement is re-read against a second projection and only panics if it survives; one that clears logs `diverged on one disk read and agreed on the next` and returns.
 

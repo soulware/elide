@@ -220,24 +220,6 @@ impl LbaMap {
         )
     }
 
-    /// Insert except where an overlapping entry's claimant is strictly
-    /// higher. An equal claimant is overridden, so a sequence of records
-    /// carrying one claimant lands in the order it is applied.
-    ///
-    /// The admission a rebuild registers segment entries under, reached
-    /// by anything projecting on-disk artefacts into a map: it makes the
-    /// highest claimant own an LBA whatever order the artefacts are
-    /// visited in.
-    pub fn insert_unless_outranked(
-        &mut self,
-        start_lba: u64,
-        lba_length: u32,
-        hash: blake3::Hash,
-        claimant: Ulid,
-    ) -> u32 {
-        self.insert_inner_if_newer(start_lba, lba_length, hash, claimant, Blocking::Higher)
-    }
-
     /// [`insert_if_newer`] variant for rewrite apply paths (GC fold /
     /// sweep / repack): installs on a sub-range whose current claimant is
     /// one of the `consumed_inputs` this apply consumes and deletes, or
