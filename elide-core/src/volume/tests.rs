@@ -5871,3 +5871,133 @@ mod refusal_identity {
         assert!(refusal_identity(DROPPED_CLAIM, &[], 3).is_none());
     }
 }
+
+/// `replay_wals_into` backs the disk projection that
+/// `assert_lbamap_consistent` compares the in-memory map against, so a
+/// projection that picks the wrong WAL reports drift the volume does not
+/// have. Observed on the soak rig as five panics naming two WAL ULIDs,
+/// the older one winning an LBA the newer one had overwritten.
+mod wal_replay_order {
+    use super::super::{ZERO_HASH, replay_wals_into};
+    use crate::lbamap::LbaMap;
+    use crate::writelog;
+    use ulid::Ulid;
+
+    fn wal_with_data(dir: &std::path::Path, ulid: Ulid, lba: u64, fill: u8) -> blake3::Hash {
+        let payload = vec![fill; 4096];
+        let hash = blake3::hash(&payload);
+        let mut wl = writelog::WriteLog::create(&dir.join(ulid.to_string())).unwrap();
+        wl.append_data(lba, 1, &hash, writelog::WalFlags::empty(), &payload)
+            .unwrap();
+        wl.fsync().unwrap();
+        hash
+    }
+
+    /// Both WALs claim one LBA and the caller hands them over highest
+    /// first, which is an order `fs::read_dir` is free to produce.
+    #[test]
+    fn the_highest_wal_wins_an_lba_whatever_order_it_arrives_in() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let low = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let high = Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+
+        let low_hash = wal_with_data(dir.path(), low, 7, 0x11);
+        let high_hash = wal_with_data(dir.path(), high, 7, 0x22);
+        assert_ne!(low_hash, high_hash);
+
+        let mut fresh = LbaMap::new();
+        replay_wals_into(
+            vec![
+                (high, dir.path().join(high.to_string())),
+                (low, dir.path().join(low.to_string())),
+            ],
+            &mut fresh,
+        );
+
+        assert_eq!(fresh.hash_at(7), Some(high_hash));
+        assert_eq!(fresh.claimant_at(7), Some(high));
+    }
+
+    /// A promote writes a segment out of a WAL and leaves the WAL on disk
+    /// until the apply completes, so the projection sees both. The
+    /// segment carries the higher ULID and keeps the LBA.
+    #[test]
+    fn a_segment_claim_above_the_wal_survives_the_replay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_ulid = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let segment_ulid = Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+
+        wal_with_data(dir.path(), wal_ulid, 7, 0x11);
+
+        let segment_hash = blake3::hash(&[0x33u8; 4096]);
+        let mut fresh = LbaMap::new();
+        fresh.insert(7, 1, segment_hash, segment_ulid);
+
+        replay_wals_into(
+            vec![(wal_ulid, dir.path().join(wal_ulid.to_string()))],
+            &mut fresh,
+        );
+
+        assert_eq!(fresh.hash_at(7), Some(segment_hash));
+        assert_eq!(fresh.claimant_at(7), Some(segment_ulid));
+    }
+
+    /// Records inside one WAL share its claimant, so admission has to let
+    /// an equal claimant through or an LBA written twice keeps the first
+    /// value.
+    #[test]
+    fn a_second_write_to_an_lba_in_one_wal_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_ulid = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+
+        let first = vec![0x11u8; 4096];
+        let second = vec![0x22u8; 4096];
+        let first_hash = blake3::hash(&first);
+        let second_hash = blake3::hash(&second);
+        {
+            let mut wl =
+                writelog::WriteLog::create(&dir.path().join(wal_ulid.to_string())).unwrap();
+            wl.append_data(7, 1, &first_hash, writelog::WalFlags::empty(), &first)
+                .unwrap();
+            wl.append_data(7, 1, &second_hash, writelog::WalFlags::empty(), &second)
+                .unwrap();
+            wl.fsync().unwrap();
+        }
+
+        let mut fresh = LbaMap::new();
+        replay_wals_into(
+            vec![(wal_ulid, dir.path().join(wal_ulid.to_string()))],
+            &mut fresh,
+        );
+
+        assert_eq!(fresh.hash_at(7), Some(second_hash));
+    }
+
+    /// A zeroing record is a claim like any other and takes the same
+    /// ordering.
+    #[test]
+    fn a_zero_record_in_the_highest_wal_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let low = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let high = Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+
+        wal_with_data(dir.path(), low, 7, 0x11);
+        {
+            let mut wl = writelog::WriteLog::create(&dir.path().join(high.to_string())).unwrap();
+            wl.append_zero(7, 1).unwrap();
+            wl.fsync().unwrap();
+        }
+
+        let mut fresh = LbaMap::new();
+        replay_wals_into(
+            vec![
+                (high, dir.path().join(high.to_string())),
+                (low, dir.path().join(low.to_string())),
+            ],
+            &mut fresh,
+        );
+
+        assert_eq!(fresh.hash_at(7), Some(ZERO_HASH));
+        assert_eq!(fresh.claimant_at(7), Some(high));
+    }
+}

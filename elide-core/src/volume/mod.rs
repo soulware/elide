@@ -147,6 +147,48 @@ const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 /// claimed range, which is the distinction that identifies its cause.
 const DIVERGENCE_REPORT_CAP: usize = 8;
 
+/// Replay each WAL's records into `fresh` under the rebuild's admission
+/// rule, so the highest claimant owns an LBA several artefacts wrote.
+///
+/// Two WALs coexist while a sealed one is being promoted, and
+/// `fs::read_dir` hands them over in no order, so admission rather than
+/// visit order is what has to decide the winner. A promote also leaves
+/// its WAL in place until the apply completes, and the segment it wrote
+/// carries the higher ULID, so that segment keeps the LBA.
+///
+/// Records inside one WAL share its claimant and land in file order,
+/// which is what makes a second write to an LBA win over the first.
+fn replay_wals_into(wals: Vec<(Ulid, PathBuf)>, fresh: &mut LbaMap) {
+    for (wal_ulid, path) in wals {
+        let Ok((records, _)) = writelog::scan_readonly(&path) else {
+            continue;
+        };
+        for record in records {
+            match record {
+                writelog::LogRecord::Data {
+                    hash,
+                    start_lba,
+                    lba_length,
+                    ..
+                }
+                | writelog::LogRecord::Ref {
+                    hash,
+                    start_lba,
+                    lba_length,
+                } => {
+                    fresh.insert_unless_outranked(start_lba, lba_length, hash, wal_ulid);
+                }
+                writelog::LogRecord::Zero {
+                    start_lba,
+                    lba_length,
+                } => {
+                    fresh.insert_unless_outranked(start_lba, lba_length, ZERO_HASH, wal_ulid);
+                }
+            }
+        }
+    }
+}
+
 /// One LBA where the in-memory map and the on-disk projection disagree,
 /// on the content stored there or on which segment claims it.
 struct Diverge {
@@ -2234,6 +2276,7 @@ impl Volume {
         let mut fresh = lbamap::rebuild_segments_unverified(&chain)?;
         let wal_dir = self.base_dir.join("wal");
         if let Ok(entries) = fs::read_dir(&wal_dir) {
+            let mut wals: Vec<(Ulid, PathBuf)> = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -2246,33 +2289,9 @@ impl Volume {
                 else {
                     continue;
                 };
-                let Ok((records, _)) = writelog::scan_readonly(&path) else {
-                    continue;
-                };
-                for record in records {
-                    match record {
-                        writelog::LogRecord::Data {
-                            hash,
-                            start_lba,
-                            lba_length,
-                            ..
-                        }
-                        | writelog::LogRecord::Ref {
-                            hash,
-                            start_lba,
-                            lba_length,
-                        } => {
-                            fresh.insert(start_lba, lba_length, hash, wal_ulid);
-                        }
-                        writelog::LogRecord::Zero {
-                            start_lba,
-                            lba_length,
-                        } => {
-                            fresh.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
-                        }
-                    }
-                }
+                wals.push((wal_ulid, path));
             }
+            replay_wals_into(wals, &mut fresh);
         }
         Ok(fresh)
     }
