@@ -152,13 +152,18 @@ const DIVERGENCE_REPORT_CAP: usize = 8;
 ///
 /// A WAL's ULID is the moment it was created, and it collects records
 /// for as long as it stays open, so a record in it can be newer than a
-/// segment minted after it — including the segment a promote wrote out
-/// of that very WAL. Comparing ULIDs would hand such an LBA to the
-/// segment and lose the write, so a WAL record overrides unconditionally
-/// and the sort is what orders the WALs among themselves.
+/// segment whose ULID is higher. `prepare_close_generation` mints its
+/// output ULIDs above the generation it seals without rotating the WAL,
+/// so the running WAL sits below segments holding older content and
+/// governs the window until the apply. Ranking the ULIDs hands those
+/// LBAs to the segment and loses the writes, so a record overrides
+/// unconditionally and the sort orders the WALs among themselves.
 ///
-/// `Volume::open` builds the map the same way, sorting its listing and
-/// replaying each WAL over the segments.
+/// `Volume::open` reaches the same winners by a different construction:
+/// it promotes every WAL but the newest into a segment and applies those
+/// entries under the segment's own ULID, leaving one WAL to replay. The
+/// sort here covers the runtime call sites, where a promote in flight
+/// leaves its WAL on disk beside the fresh one taking writes.
 fn replay_wals_into(mut wals: Vec<(Ulid, PathBuf)>, fresh: &mut LbaMap) {
     wals.sort_by_key(|(ulid, _)| *ulid);
     for (wal_ulid, path) in wals {
