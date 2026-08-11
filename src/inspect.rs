@@ -326,9 +326,9 @@ fn print_totals(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) {
     }
 }
 
-/// Two blocks: segment-based counts, then entry-based counts. Within each,
-/// the header totals across every lifecycle stage and the rows beneath name
-/// the stage they cover.
+/// Two blocks: segment-based counts, then entry-based counts. The segment
+/// header totals every segment, and the two groups beneath each partition
+/// that same total — once by kind, once by lifecycle stage.
 fn totals_lines(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) -> Vec<String> {
     let mut out = Vec::new();
     let upload_segs = t.journal_segs_upload + t.data_segs_upload;
@@ -336,52 +336,46 @@ fn totals_lines(t: &Totals, p: &PendingSummary, journal_window_blocks: u64) -> V
     let total_segs = t.cache_files + upload_segs + open_segs;
     let journal_segs = t.journal_segs_committed + t.journal_segs_upload + t.journal_segs_open;
     let data_segs = t.data_segs_committed + t.data_segs_upload + t.data_segs_open;
+    let journal_blocks = t.journal_blocks_committed + t.journal_blocks_pending;
+    // A label column wide enough for `committed:`, the longest of the five.
+    let row = |label: &str, count: usize, tail: String| {
+        format!(
+            "    {:<11}{}{}",
+            format!("{label}:"),
+            fmt_commas(count as u64),
+            tail
+        )
+    };
 
     out.push(String::new());
     if total_segs > 0 {
-        out.push(format!(
-            "Segments: {}  ({} committed, {} upload, {} open)",
-            fmt_commas(total_segs as u64),
-            fmt_commas(t.cache_files as u64),
-            fmt_commas(upload_segs as u64),
-            fmt_commas(open_segs as u64),
-        ));
-        if journal_window_blocks > 0 || journal_segs > 0 {
+        out.push(format!("Segments: {}", fmt_commas(total_segs as u64)));
+
+        let journal_tail = if journal_window_blocks > 0 || journal_blocks > 0 {
             let window = if journal_window_blocks > 0 {
                 format!(" / {} window", fmt_commas(journal_window_blocks))
             } else {
                 String::new()
             };
-            out.push(format!(
-                "  journal: {}  ({} committed, {} upload, {} open)   {} blocks{}",
-                fmt_commas(journal_segs as u64),
-                fmt_commas(t.journal_segs_committed as u64),
-                fmt_commas(t.journal_segs_upload as u64),
-                fmt_commas(t.journal_segs_open as u64),
-                fmt_commas(t.journal_blocks_committed + t.journal_blocks_pending),
-                window,
-            ));
-            out.push(format!(
-                "  data:    {}  ({} committed, {} upload, {} open)",
-                fmt_commas(data_segs as u64),
-                fmt_commas(t.data_segs_committed as u64),
-                fmt_commas(t.data_segs_upload as u64),
-                fmt_commas(t.data_segs_open as u64),
-            ));
-        }
-    }
-    if t.wal_files > 0 || p.total_bytes() > 0 || upload_segs + open_segs > 0 {
-        out.push(format!(
-            "  upload:  {} segment{} ({})",
-            fmt_commas(upload_segs as u64),
-            if upload_segs == 1 { "" } else { "s" },
-            fmt_size(p.upload_bytes),
+            format!("   {} blocks{}", fmt_commas(journal_blocks), window)
+        } else {
+            String::new()
+        };
+        out.push("  by kind".to_owned());
+        out.push(row("journal", journal_segs, journal_tail));
+        out.push(row("data", data_segs, String::new()));
+
+        out.push("  by stage".to_owned());
+        out.push(row("committed", t.cache_files, String::new()));
+        out.push(row(
+            "upload",
+            upload_segs,
+            format!("  ({})", fmt_size(p.upload_bytes)),
         ));
-        out.push(format!(
-            "  open:    {} segment{} ({})",
-            fmt_commas(open_segs as u64),
-            if open_segs == 1 { "" } else { "s" },
-            fmt_size(p.open_bytes),
+        out.push(row(
+            "open",
+            open_segs,
+            format!("  ({})", fmt_size(p.open_bytes)),
         ));
     }
 
@@ -1250,11 +1244,14 @@ mod tests {
         assert_eq!(
             seg_block,
             vec![
-                "Segments: 74  (57 committed, 0 upload, 17 open)",
-                "  journal: 40  (32 committed, 0 upload, 8 open)   17,477 blocks / 16,384 window",
-                "  data:    34  (25 committed, 0 upload, 9 open)",
-                "  upload:  0 segments (0 B)",
-                "  open:    17 segments (47.9 MiB)",
+                "Segments: 74",
+                "  by kind",
+                "    journal:   40   17,477 blocks / 16,384 window",
+                "    data:      34",
+                "  by stage",
+                "    committed: 57",
+                "    upload:    0  (0 B)",
+                "    open:      17  (47.9 MiB)",
             ],
         );
         assert!(
@@ -1337,23 +1334,24 @@ mod tests {
         };
 
         let lines = totals_lines(&t, &p, 1_024);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l == "Segments: 13  (6 committed, 3 upload, 4 open)"),
-            "{lines:#?}",
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("  journal: 6  (2 committed, 1 upload, 3 open)")),
-            "{lines:#?}",
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l == "  data:    7  (4 committed, 2 upload, 1 open)"),
-            "{lines:#?}",
+        let seg_block: Vec<&str> = lines
+            .iter()
+            .map(|l| l.as_str())
+            .skip_while(|l| !l.starts_with("Segments:"))
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            seg_block,
+            vec![
+                "Segments: 13",
+                "  by kind",
+                "    journal:   6   0 blocks / 1,024 window",
+                "    data:      7",
+                "  by stage",
+                "    committed: 6",
+                "    upload:    3  (2.0 KiB)",
+                "    open:      4  (4.0 KiB)",
+            ],
         );
         assert!(
             !lines.iter().any(|l| l.starts_with("WAL:")),
