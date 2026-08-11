@@ -188,6 +188,14 @@ Two recurring shapes, both test-setup artifacts that don't reflect production pa
 
 Production code paths don't hit either shape — `Volume::write` populates lbamap incrementally and the production drain (`coordinator/upload.rs`) sorts by ULID.
 
+#### Preserving the state a panic names, `ELIDE_PANIC_FREEZE_DIR`
+
+A panic on any thread aborts the volume process (`serve::abort_on_panic`), the supervisor restarts it within milliseconds, and the restart folds pending segments away. The ULIDs in a panic message are gone from the disk by the time an operator reads it.
+
+Set `ELIDE_PANIC_FREEZE_DIR` to a directory and the panic hook preserves the volume's tree under `<dir>/<volume>-<unix seconds>` before it aborts, after the message reaches `volume.stderr` so the freeze carries it. Segment files are hard-linked, which holds their bytes through the original's unlink and costs no space; the WAL and the top-level files are copied, since those are appended to across the restart.
+
+The directory belongs outside `by_id/`, which the coordinator scans for volumes.
+
 ### Known gaps
 
 Open gaps in simulation coverage, documented so they are not forgotten:
