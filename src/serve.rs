@@ -54,13 +54,77 @@ pub fn install_sigusr1_handler() {
 /// every promise already made.
 ///
 /// The default hook runs first, so the message and backtrace reach
-/// stderr ahead of the abort.
-pub fn abort_on_panic() {
+/// stderr ahead of the abort, and ahead of the freeze that copies
+/// `volume.stderr` along with the rest of the tree.
+pub fn abort_on_panic(volume_dir: &Path) {
+    let dir = volume_dir.to_path_buf();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
+        if let Some(root) = std::env::var_os("ELIDE_PANIC_FREEZE_DIR") {
+            let root = std::path::PathBuf::from(root);
+            match freeze_volume_dir(&dir, &root) {
+                Ok(frozen) => eprintln!("panic freeze: {}", frozen.display()),
+                Err(e) => eprintln!("panic freeze under {} failed: {e}", root.display()),
+            }
+        }
         std::process::abort();
     }));
+}
+
+/// Preserve the volume's on-disk state under `root`, in a directory named
+/// `<volume>-<unix seconds>`.
+///
+/// The supervisor restarts a volume within milliseconds of the abort, and
+/// the restarted volume folds pending segments away. Taking the copy from
+/// inside the panic hook puts it ahead of both, which is what makes the
+/// state a panic names traceable afterwards.
+pub fn freeze_volume_dir(volume_dir: &Path, root: &Path) -> io::Result<std::path::PathBuf> {
+    let name = volume_dir
+        .file_name()
+        .ok_or_else(|| io::Error::other("volume dir has no final component"))?
+        .to_string_lossy()
+        .into_owned();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = root.join(format!("{name}-{stamp}"));
+    freeze_tree(volume_dir, &dest, false)?;
+    Ok(dest)
+}
+
+/// Recreate the tree at `src` under `dest`, hard-linking regular files
+/// where `link_files` allows it.
+///
+/// A segment's bytes are immutable once written, so a link holds the
+/// content the panic saw and keeps it through the original's unlink. The
+/// WAL and the top-level files are appended to, so those are copied.
+///
+/// The worker thread keeps unlinking through the freeze, so a file that
+/// goes between the listing and the link is skipped and the rest of the
+/// tree is still preserved.
+fn freeze_tree(src: &Path, dest: &Path, link_files: bool) -> io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            freeze_tree(&from, &to, entry.file_name() != "wal")?;
+        } else if ty.is_file() {
+            if link_files && std::fs::hard_link(&from, &to).is_ok() {
+                continue;
+            }
+            match std::fs::copy(&from, &to) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -150,7 +214,7 @@ pub fn spawn_signal_watcher(
 /// Used when the coordinator supervises a volume for IPC purposes
 /// only — no client is attached and no ublk device is requested.
 pub fn run_volume_ipc_only(dir: &Path, fetch_inputs: crate::VolumeFetchInputs) -> io::Result<()> {
-    abort_on_panic();
+    abort_on_panic(dir);
     block_shutdown_signals()?;
     install_sigusr1_handler();
 

@@ -30,13 +30,18 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 
-/// Mirror the production drain's `Full` mode: repack, then promote in
-/// ULID-ascending order — see `coordinator/src/upload.rs::drain_pending`.
+/// Mirror the production drain's `Full` mode: rotate the open
+/// generation into `pending/upload/` and repack it, then promote in
+/// ULID-ascending order — see `actor.rs::prepare_close_generation` and
+/// `coordinator/src/upload.rs::drain_pending`.
+///
+/// The rotate is what puts two generations on disk at once, which is the
+/// state `remove_consumed_inputs` asserts against.
 fn simulate_upload(vol: &mut Volume, dir: &Path) {
     let cache_dir = dir.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    let _ = vol.repack_open_for_test();
+    let _ = vol.close_generation();
 
     let mut pending_after_repack: Vec<ulid::Ulid> = Vec::new();
     for gen_dir in elide_core::segment::pending_generation_dirs(dir) {

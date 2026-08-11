@@ -166,6 +166,8 @@ Currently in the umbrella:
 
 - **`assert_lbamap_consistent`** — rebuilds the lbamap from `discover_fork_segments` + WAL replay and compares to `self.lbamap` per LBA. Catches the class of bug where a state-mutating op moves disk state without updating the in-memory mirror (e.g. promoting a pending segment changes its tier in the walk order, which can flip the per-LBA winner).
 
+  On a live volume the rebuild reads a tree the worker thread is writing: `execute_promote` creates `pending/` segments and `execute_repack` unlinks `index/` siblings while the actor thread walks the directories file by file. The projection it assembles is therefore a composite of the states the tree passed through. A disagreement is re-read against a second projection and only panics if it survives; one that clears logs `diverged on one disk read and agreed on the next` and returns. A single-LBA disagreement between adjacently minted ULIDs is the shape the walk produces on its own, and a claimed range moving wholesale is the shape a real merge-rule divergence produces.
+
 - **`assert_pending_above_committed`** — `max(committed_ulid) < min(pending_ulid)`. Structural form of the drain-ordering invariant `discover_fork_segments` walks under (committed first, then pending; pending wins last). Catches drain-ordering regressions before they surface as lbamap drift.
 
 - **`assert_extent_index_consistent`** — every hash in `self.extent_index` must point at a segment that exists somewhere on disk. Catches phantom entries (e.g. inserting `ZERO_HASH` by mistake) and entries pointing at deleted segments. Deliberately doesn't enforce specific `segment_id` agreement (in-memory and disk-rebuild legitimately diverge there because some apply paths use unconditional `insert` while rebuild uses `insert_if_absent`) and doesn't fire on "disk has more than memory" (pre-existing repack/GC-prune-ancestor behaviour, out of scope).
@@ -185,6 +187,14 @@ Two recurring shapes, both test-setup artifacts that don't reflect production pa
    *Resolution:* promote all pending segments in ULID-ascending order via `segment::read_ulid_dir_sorted`. The just-promoted ULID then stays below every remaining pending ULID and no overlapping pending peer can take over.
 
 Production code paths don't hit either shape — `Volume::write` populates lbamap incrementally and the production drain (`coordinator/upload.rs`) sorts by ULID.
+
+#### Preserving the state a panic names, `ELIDE_PANIC_FREEZE_DIR`
+
+A panic on any thread aborts the volume process (`serve::abort_on_panic`), the supervisor restarts it within milliseconds, and the restart folds pending segments away. The ULIDs in a panic message are gone from the disk by the time an operator reads it.
+
+Set `ELIDE_PANIC_FREEZE_DIR` to a directory and the panic hook preserves the volume's tree under `<dir>/<volume>-<unix seconds>` before it aborts, after the message reaches `volume.stderr` so the freeze carries it. Segment files are hard-linked, which holds their bytes through the original's unlink and costs no space; the WAL and the top-level files are copied, since those are appended to across the restart.
+
+The directory belongs outside `by_id/`, which the coordinator scans for volumes.
 
 ### Known gaps
 
