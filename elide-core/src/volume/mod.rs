@@ -1456,15 +1456,30 @@ impl Volume {
 
     /// Zero `lba_count` blocks starting at `lba`.
     ///
-    /// Appends a single ZERO WAL record covering the entire range — no hashing,
-    /// no data payload, no chunking. The LBA map entry uses `ZERO_HASH` as a
-    /// sentinel, which the read path recognises and short-circuits to return
-    /// zeros without any extent index lookup.
+    /// Appends a ZERO WAL record per journal-window run — no hashing, no data
+    /// payload, no chunking. A range crossing a window boundary commits as
+    /// boundary-aligned runs, so every record, LBA claim and segment entry it
+    /// produces is uniformly journal or stable, which is the tier purity
+    /// `PendingPartition::split_journal` classifies a pending write by. The LBA
+    /// map entry uses `ZERO_HASH` as a sentinel, which the read path recognises
+    /// and short-circuits to return zeros without any extent index lookup.
     ///
     /// Zero extents explicitly override ancestor data: a ZERO_HASH entry in the
-    /// LBA map masks any data at those LBAs in ancestor segments, unlike an
-    /// unwritten LBA range which falls through to the ancestor.
+    /// LBA map masks any data at those LBAs in ancestor segments, where an
+    /// unwritten LBA range falls through to the ancestor.
     pub fn write_zeroes(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        if self.journal.crosses_boundary(start_lba, lba_count) {
+            for (run_lba, run_len) in self.journal.split_at_boundaries(start_lba, lba_count) {
+                self.zero_commit(run_lba, run_len)?;
+            }
+            return Ok(());
+        }
+        self.zero_commit(start_lba, lba_count)
+    }
+
+    /// Commit one boundary-aligned zero run: one WAL record, one LBA claim,
+    /// one pending entry.
+    fn zero_commit(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
         let wal_ulid = {
             let open = self.ensure_wal_open()?;
             open.wal.append_zero(start_lba, lba_count)?;
@@ -1480,8 +1495,9 @@ impl Volume {
 
     /// Trim (discard) `lba_count` blocks starting at `lba`.
     ///
-    /// Implemented via `write_zeroes` — a single zero-extent WAL record with no
-    /// data payload. The whole-volume TRIM issued by `mkfs.ext4` becomes one
+    /// Implemented via `write_zeroes` — a zero-extent WAL record with no data
+    /// payload per journal-window run. The whole-volume TRIM issued by
+    /// `mkfs.ext4` runs before any window is derived, so it becomes one
     /// ~40-byte record regardless of volume size.
     pub fn trim(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
         self.write_zeroes(start_lba, lba_count)
