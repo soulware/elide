@@ -5918,33 +5918,38 @@ mod wal_replay_order {
         assert_eq!(fresh.claimant_at(7), Some(high));
     }
 
-    /// A promote writes a segment out of a WAL and leaves the WAL on disk
-    /// until the apply completes, so the projection sees both. The
-    /// segment carries the higher ULID and keeps the LBA.
+    /// A WAL's ULID is the moment it was created, and it keeps taking
+    /// records afterwards, so a record in it can be newer than a segment
+    /// minted later — the segment a promote wrote out of that same WAL.
+    /// Comparing the two ULIDs loses the write, so the record overrides.
+    ///
+    /// Observed as pg27 refusing to open on v0.1.58-rc10: the WAL held
+    /// LBAs the promoted segment above it also claimed, and a projection
+    /// that let the segment keep them disagreed with `Volume::open` on
+    /// every attempt.
     #[test]
-    fn a_segment_claim_above_the_wal_survives_the_replay() {
+    fn a_wal_record_overrides_a_segment_minted_after_the_wal() {
         let dir = tempfile::TempDir::new().unwrap();
         let wal_ulid = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
         let segment_ulid = Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        assert!(wal_ulid < segment_ulid);
 
-        wal_with_data(dir.path(), wal_ulid, 7, 0x11);
+        let wal_hash = wal_with_data(dir.path(), wal_ulid, 7, 0x11);
 
-        let segment_hash = blake3::hash(&[0x33u8; 4096]);
         let mut fresh = LbaMap::new();
-        fresh.insert(7, 1, segment_hash, segment_ulid);
+        fresh.insert(7, 1, blake3::hash(&[0x33u8; 4096]), segment_ulid);
 
         replay_wals_into(
             vec![(wal_ulid, dir.path().join(wal_ulid.to_string()))],
             &mut fresh,
         );
 
-        assert_eq!(fresh.hash_at(7), Some(segment_hash));
-        assert_eq!(fresh.claimant_at(7), Some(segment_ulid));
+        assert_eq!(fresh.hash_at(7), Some(wal_hash));
+        assert_eq!(fresh.claimant_at(7), Some(wal_ulid));
     }
 
-    /// Records inside one WAL share its claimant, so admission has to let
-    /// an equal claimant through or an LBA written twice keeps the first
-    /// value.
+    /// Records inside one WAL land in file order, so an LBA written twice
+    /// keeps the second value.
     #[test]
     fn a_second_write_to_an_lba_in_one_wal_wins() {
         let dir = tempfile::TempDir::new().unwrap();

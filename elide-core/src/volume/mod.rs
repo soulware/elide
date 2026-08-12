@@ -147,18 +147,25 @@ const SEGMENT_INDEX_CACHE_CAPACITY: usize = 64;
 /// claimed range, which is the distinction that identifies its cause.
 const DIVERGENCE_REPORT_CAP: usize = 8;
 
-/// Replay each WAL's records into `fresh` under the rebuild's admission
-/// rule, so the highest claimant owns an LBA several artefacts wrote.
+/// Replay every WAL's records into `fresh`, lowest ULID first, each
+/// record overriding whatever holds its LBA.
 ///
-/// Two WALs coexist while a sealed one is being promoted, and
-/// `fs::read_dir` hands them over in no order, so admission rather than
-/// visit order is what has to decide the winner. A promote also leaves
-/// its WAL in place until the apply completes, and the segment it wrote
-/// carries the higher ULID, so that segment keeps the LBA.
+/// A WAL's ULID is the moment it was created, and it collects records
+/// for as long as it stays open, so a record in it can be newer than a
+/// segment whose ULID is higher. `prepare_close_generation` mints its
+/// output ULIDs above the generation it seals without rotating the WAL,
+/// so the running WAL sits below segments holding older content and
+/// governs the window until the apply. Ranking the ULIDs hands those
+/// LBAs to the segment and loses the writes, so a record overrides
+/// unconditionally and the sort orders the WALs among themselves.
 ///
-/// Records inside one WAL share its claimant and land in file order,
-/// which is what makes a second write to an LBA win over the first.
-fn replay_wals_into(wals: Vec<(Ulid, PathBuf)>, fresh: &mut LbaMap) {
+/// `Volume::open` reaches the same winners by a different construction:
+/// it promotes every WAL but the newest into a segment and applies those
+/// entries under the segment's own ULID, leaving one WAL to replay. The
+/// sort here covers the runtime call sites, where a promote in flight
+/// leaves its WAL on disk beside the fresh one taking writes.
+fn replay_wals_into(mut wals: Vec<(Ulid, PathBuf)>, fresh: &mut LbaMap) {
+    wals.sort_by_key(|(ulid, _)| *ulid);
     for (wal_ulid, path) in wals {
         let Ok((records, _)) = writelog::scan_readonly(&path) else {
             continue;
@@ -176,13 +183,13 @@ fn replay_wals_into(wals: Vec<(Ulid, PathBuf)>, fresh: &mut LbaMap) {
                     start_lba,
                     lba_length,
                 } => {
-                    fresh.insert_unless_outranked(start_lba, lba_length, hash, wal_ulid);
+                    fresh.insert(start_lba, lba_length, hash, wal_ulid);
                 }
                 writelog::LogRecord::Zero {
                     start_lba,
                     lba_length,
                 } => {
-                    fresh.insert_unless_outranked(start_lba, lba_length, ZERO_HASH, wal_ulid);
+                    fresh.insert(start_lba, lba_length, ZERO_HASH, wal_ulid);
                 }
             }
         }
