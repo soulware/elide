@@ -937,6 +937,18 @@ impl Default for LbaMap {
 /// The caller (`Volume::open`) is responsible for replaying the in-progress
 /// WAL on top of the result.
 pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
+    rebuild_segments_inner(layers, true).map(|(map, _)| map)
+}
+
+/// Rebuild, also reporting the highest segment ULID the walk read.
+///
+/// `gc_fork` logs that ceiling beside the plans a pass emits. A fold refused
+/// at apply names the claimant that blocked it, and the two together say which
+/// side of the pass the fault sits on: a claimant at or below the ceiling was
+/// in the view the plan was built from, one above it was not.
+pub fn rebuild_segments_with_ceiling(
+    layers: &[(PathBuf, Option<String>)],
+) -> io::Result<(LbaMap, Option<Ulid>)> {
     rebuild_segments_inner(layers, true)
 }
 
@@ -951,14 +963,18 @@ pub fn rebuild_segments(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaM
 ///
 /// **Do not use for production rebuild paths** — they must verify.
 pub fn rebuild_segments_unverified(layers: &[(PathBuf, Option<String>)]) -> io::Result<LbaMap> {
-    rebuild_segments_inner(layers, false)
+    rebuild_segments_inner(layers, false).map(|(map, _)| map)
 }
 
 fn rebuild_segments_inner(
     layers: &[(PathBuf, Option<String>)],
     verify: bool,
-) -> io::Result<LbaMap> {
+) -> io::Result<(LbaMap, Option<Ulid>)> {
     let mut map = LbaMap::new();
+    // The highest ULID whose entries reached the map, so the ceiling names
+    // coverage rather than intent: a segment listed but skipped below is one
+    // the caller's view does not carry.
+    let mut ceiling: Option<Ulid> = None;
 
     for (fork_dir, branch_ulid) in layers {
         // `discover_fork_segments` handles the race-safe listing order
@@ -1012,13 +1028,14 @@ fn rebuild_segments_inner(
                 }
                 Err(e) => return Err(e),
             };
+            ceiling = ceiling.max(Some(sref.ulid));
             for entry in entries {
                 map.register_entry_if_newer(&entry, sref.ulid);
             }
         }
     }
 
-    Ok(map)
+    Ok((map, ceiling))
 }
 
 // --- tests ---
