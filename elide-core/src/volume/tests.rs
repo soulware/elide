@@ -1559,6 +1559,98 @@ fn formation_keeps_lz4_for_journal_bodies() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// Read the tier shape of a promoted epoch's segments, data segment first.
+fn tiered_entries(base: &Path, vol: &Volume) -> Vec<Vec<(u64, u32, bool)>> {
+    pending_ulids(base)
+        .into_iter()
+        .map(|seg| {
+            let seg_path = segment::pending_open_dir(base).join(seg.to_string());
+            let (_, entries, _) =
+                segment::read_and_verify_segment_index(&seg_path, &vol.verifying_key).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.start_lba, e.lba_length, e.journal))
+                .collect()
+        })
+        .collect()
+}
+
+/// A zero range spanning the journal window commits as boundary-aligned
+/// runs, the same shape a data write of that range takes. Each run tiers
+/// whole: the window's share reaches the journal segment, the stable LBAs
+/// either side stay in the data segment.
+#[test]
+fn a_zero_spanning_the_window_commits_as_uniform_runs() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write_zeroes(98, 20).unwrap();
+    let runs: Vec<(u64, u32)> = vol
+        .pending
+        .iter()
+        .map(|w| (w.entry.start_lba, w.entry.lba_length))
+        .collect();
+    assert_eq!(runs, vec![(98, 2), (100, 16), (116, 2)]);
+
+    vol.promote_for_test().unwrap();
+    assert_eq!(
+        tiered_entries(&base, &vol),
+        vec![vec![(98, 2, false), (116, 2, false)], vec![(100, 16, true)],],
+    );
+
+    assert_eq!(vol.read(98, 20).unwrap(), vec![0u8; 4096 * 20]);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A zero starting inside the window and running past its end keeps its
+/// stable share in the data tier. Tagged journal, that claim would ride
+/// every consolidation pass for as long as the LBAs stay live, long after
+/// the window it was filed under had wrapped.
+#[test]
+fn a_zero_leaving_the_window_keeps_its_stable_share_in_the_data_tier() {
+    let base = keyed_temp_dir();
+    set_journal_ranges(&base, vec![(100, 16)]);
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write_zeroes(110, 20).unwrap();
+    let runs: Vec<(u64, u32)> = vol
+        .pending
+        .iter()
+        .map(|w| (w.entry.start_lba, w.entry.lba_length))
+        .collect();
+    assert_eq!(runs, vec![(110, 6), (116, 14)]);
+
+    vol.promote_for_test().unwrap();
+    assert_eq!(
+        tiered_entries(&base, &vol),
+        vec![vec![(116, 14, false)], vec![(110, 6, true)]],
+    );
+
+    assert_eq!(vol.read(110, 20).unwrap(), vec![0u8; 4096 * 20]);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// Without a window there is nothing to split at, so a zero of any length
+/// stays the one record the whole-volume TRIM relies on.
+#[test]
+fn a_zero_with_no_window_stays_one_record() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    vol.write_zeroes(0, 100_000).unwrap();
+    let runs: Vec<(u64, u32)> = vol
+        .pending
+        .iter()
+        .map(|w| (w.entry.start_lba, w.entry.lba_length))
+        .collect();
+    assert_eq!(runs, vec![(0, 100_000)]);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn journal_and_home_store_separate_bodies_same_epoch() {
     let base = keyed_temp_dir();
