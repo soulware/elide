@@ -306,10 +306,12 @@ struct PromotePipeline {
     /// flush arrived; as worker results come in the actor resolves any
     /// entries whose precondition now holds.
     parked_flushes: Vec<ParkedFlush>,
-    /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting for
-    /// the GC promote (`u_flush`) to complete on the worker.  `None`
-    /// when no GC checkpoint is in progress.
-    parked_gc: Option<ParkedGcCheckpoint>,
+    /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting
+    /// either for the GC promote (`u_flush`) to complete on the worker
+    /// or, when the WAL was empty, for every promote dispatched before
+    /// the checkpoint to apply.  `None` when no GC checkpoint is in
+    /// progress.
+    parked_gc: Option<ParkedGc>,
     /// Parked `PromoteWal` replies waiting for their specific promote to
     /// complete.  Multiple can be parked if several `PromoteWal` requests
     /// arrive while the worker is busy.
@@ -381,10 +383,42 @@ struct ParkedPromoteSegment {
     reply: Sender<io::Result<()>>,
 }
 
+/// A GC checkpoint waiting on the promote pipeline.  `Flush` waits for
+/// the checkpoint's own promote (`u_flush`); `Barrier` is the empty-WAL
+/// case, waiting for promotes that were already in flight when the
+/// checkpoint arrived.  One slot for both phases keeps "at most one
+/// checkpoint in progress" a single `is_some` check.
+enum ParkedGc {
+    Flush(ParkedGcCheckpoint),
+    Barrier(ParkedGcBarrier),
+}
+
+impl ParkedGc {
+    fn into_reply(self) -> Sender<io::Result<crate::volume_ipc::GcCheckpointReply>> {
+        match self {
+            ParkedGc::Flush(p) => p.reply,
+            ParkedGc::Barrier(p) => p.reply,
+        }
+    }
+}
+
 /// State stashed while a GC checkpoint's promote is in flight.
 struct ParkedGcCheckpoint {
     u_buckets: Vec<Ulid>,
     u_flush: Ulid,
+    reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
+}
+
+/// State stashed while an empty-WAL GC checkpoint waits for promotes
+/// dispatched before it to apply.  Such a promote's claims sit in a
+/// WAL file until its apply moves them into a `pending/` segment, and
+/// the coordinator builds its liveness view by reading segments first
+/// and WALs second — a reply sent mid-flight lets the move land
+/// between those two reads, hiding the claims from both (issue #914).
+/// Released when `PromotePipeline::completed_gen >= needed_gen`.
+struct ParkedGcBarrier {
+    needed_gen: u64,
+    u_buckets: Vec<Ulid>,
     reply: Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
 }
 
@@ -724,6 +758,34 @@ impl VolumeActor {
         }
     }
 
+    /// Take the parked GC checkpoint if this promote's apply satisfies
+    /// it: the checkpoint's own `u_flush`, or — for an empty-WAL
+    /// checkpoint — the promote that brings `completed_gen` up to the
+    /// barrier's `needed_gen`.  Call after the generation bump in
+    /// [`Self::on_promote_success`].
+    fn take_satisfied_gc_checkpoint(
+        &mut self,
+        ulid: Ulid,
+    ) -> Option<(
+        Vec<Ulid>,
+        Sender<io::Result<crate::volume_ipc::GcCheckpointReply>>,
+    )> {
+        let done = self.pipeline.completed_gen;
+        let satisfied = match &self.pipeline.parked_gc {
+            Some(ParkedGc::Flush(p)) => p.u_flush == ulid,
+            Some(ParkedGc::Barrier(b)) => b.needed_gen <= done,
+            None => false,
+        };
+        if !satisfied {
+            return None;
+        }
+        match self.pipeline.parked_gc.take() {
+            Some(ParkedGc::Flush(p)) => Some((p.u_buckets, p.reply)),
+            Some(ParkedGc::Barrier(b)) => Some((b.u_buckets, b.reply)),
+            None => None,
+        }
+    }
+
     /// Dispatch a promote job to the worker thread.
     ///
     /// Calls [`Volume::prepare_promote`] to snapshot the WAL state and open
@@ -770,10 +832,11 @@ impl VolumeActor {
     /// Run the GC checkpoint prep and dispatch the promote to the worker.
     ///
     /// Mints ULIDs, opens the fresh WAL immediately (writes resume),
-    /// and dispatches the GC promote.  If the WAL is empty, completes
-    /// immediately.  The reply is parked until `PromoteComplete` for
-    /// `u_flush` arrives so that `pending/<u_flush>` is on disk before
-    /// the coordinator runs `gc_fork`.
+    /// and dispatches the GC promote.  The reply is parked until every
+    /// promote dispatched at or before the checkpoint has applied — the
+    /// checkpoint's own `u_flush` when the WAL had entries, and any
+    /// promotes already in flight when it was empty — so that each
+    /// segment is in `pending/` before the coordinator runs `gc_fork`.
     fn start_gc_checkpoint(
         &mut self,
         max_buckets: usize,
@@ -799,23 +862,23 @@ impl VolumeActor {
 
         if let Some(job) = job {
             // Dispatch to worker, park the reply.
-            self.pipeline.parked_gc = Some(ParkedGcCheckpoint {
+            self.pipeline.parked_gc = Some(ParkedGc::Flush(ParkedGcCheckpoint {
                 u_buckets,
                 u_flush,
                 reply,
-            });
+            }));
             let old_wal_path = job.old_wal_path.clone();
             if let Err(e) = self.send_worker_job(WorkerJob::Promote(job)) {
                 warn!("gc_checkpoint promote dispatch failed: {e}");
                 if let Some(parked) = self.pipeline.parked_gc.take() {
-                    let _ = parked.reply.send(Err(e));
+                    let _ = parked.into_reply().send(Err(e));
                 }
                 return;
             }
             self.pipeline.promotes_in_flight += 1;
             self.pipeline.promote_gen += 1;
             self.pipeline.inflight_old_wals.push_back(old_wal_path);
-        } else {
+        } else if self.pipeline.completed_gen >= self.pipeline.promote_gen {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
             let own_segments = Some(
@@ -825,6 +888,17 @@ impl VolumeActor {
             let _ = reply.send(Ok(crate::volume_ipc::GcCheckpointReply {
                 bucket_ulids: u_buckets,
                 own_segments,
+            }));
+        } else {
+            // WAL was empty with promotes still in flight (an autonomous
+            // threshold flush, or the retry dispatched above).  Their
+            // claims reach `pending/` only at apply, so the reply parks
+            // until the pipeline drains to the generation observed here.
+            self.publish_snapshot();
+            self.pipeline.parked_gc = Some(ParkedGc::Barrier(ParkedGcBarrier {
+                needed_gen: self.pipeline.promote_gen,
+                u_buckets,
+                reply,
             }));
         }
     }
@@ -1155,16 +1229,17 @@ impl VolumeActor {
                     Ok(()) => Ok(()),
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
                 };
-                // Complete any parked operations waiting for this ULID.
-                // GC checkpoint.
-                if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
+                // Complete any parked operations this apply satisfies.
+                // GC checkpoint: its own promote, or the last promote an
+                // empty-WAL checkpoint's barrier was waiting out.
+                if let Some((u_buckets, reply)) = self.take_satisfied_gc_checkpoint(ulid) {
                     let own_segments = Some(
                         self.lock_volume(LockSite::OwnSegments)
                             .own_segments_commitment(),
                     );
-                    let _ = parked.reply.send(clone_apply(&apply).map(|()| {
+                    let _ = reply.send(clone_apply(&apply).map(|()| {
                         crate::volume_ipc::GcCheckpointReply {
-                            bucket_ulids: parked.u_buckets,
+                            bucket_ulids: u_buckets,
                             own_segments,
                         }
                     }));
@@ -1188,12 +1263,21 @@ impl VolumeActor {
                     failure.error
                 );
                 self.on_promote_failure();
-                // Fail parked repliers waiting on this ULID promptly —
+                // Fail parked repliers waiting on this promote promptly —
                 // the coordinator retries on its next tick, and by then
                 // `retry_failed_promote` will have re-dispatched the job.
+                // A parked barrier always covers the failed promote:
+                // results arrive in dispatch order, so every result that
+                // lands while the barrier holds carries a generation at
+                // or below its `needed_gen`.
                 let clone_err = |e: &io::Error| io::Error::new(e.kind(), e.to_string());
-                if let Some(parked) = self.pipeline.parked_gc.take_if(|p| ulid == p.u_flush) {
-                    let _ = parked.reply.send(Err(clone_err(&failure.error)));
+                let gc_waiting = match &self.pipeline.parked_gc {
+                    Some(ParkedGc::Flush(p)) => p.u_flush == ulid,
+                    Some(ParkedGc::Barrier(_)) => true,
+                    None => false,
+                };
+                if gc_waiting && let Some(parked) = self.pipeline.parked_gc.take() {
+                    let _ = parked.into_reply().send(Err(clone_err(&failure.error)));
                 }
                 let mut i = 0;
                 while i < self.pipeline.parked_promote_wal.len() {
@@ -4960,6 +5044,103 @@ mod tests {
         // Let the actor drain the late results before shutdown joins
         // the worker.
         std::thread::sleep(Duration::from_millis(500));
+        client.shutdown();
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A GC checkpoint that finds an empty WAL still waits for promotes
+    /// already in flight. Their claims sit in a WAL file until the apply
+    /// moves them into `pending/`, and the coordinator reads segments
+    /// before WALs when it builds the pass's liveness view — a reply
+    /// sent mid-flight lets the move land between those two reads and
+    /// the claims vanish from both. Reconstructs the 2026-08-12 pg28
+    /// `superseded_carry` interleaving (issue #914).
+    #[test]
+    fn empty_wal_gc_checkpoint_waits_for_inflight_promote() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        client.write(0, &unique_block(1), false).unwrap();
+        let wal_files = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir.join("wal"))
+                .map(|d| d.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(wal_files(&dir), 1, "setup: the write opened a WAL");
+
+        // Occupy the worker so the promote dispatches but cannot apply.
+        let (hold_tx, hold_rx) = bounded::<()>(1);
+        client.test_dispatch_barrier(hold_rx);
+
+        // Promote the WAL behind the barrier; the reply parks on the
+        // apply, so it runs on its own thread.
+        let baseline = client.lock_stats();
+        let promote_done = {
+            let c = client.clone();
+            let (tx, rx) = bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(c.promote_wal());
+            });
+            rx
+        };
+
+        // Prep and dispatch run inside one handler invocation, so once
+        // a `PromotePrep` acquisition lands, the promote job is queued
+        // behind the barrier ahead of any request sent from here on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while client
+            .lock_stats()
+            .since(&baseline)
+            .site(LockSite::PromotePrep)
+            .acquisitions
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup: promote prep never ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The checkpoint sees an empty (fresh) WAL. Its reply must wait
+        // out the promote parked behind the barrier.
+        let checkpoint_done = {
+            let c = client.clone();
+            let (tx, rx) = bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(c.gc_checkpoint(4));
+            });
+            rx
+        };
+        assert!(
+            checkpoint_done
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "gc_checkpoint replied while the promote's claims were still WAL-only"
+        );
+
+        hold_tx.send(()).unwrap();
+        let reply = checkpoint_done
+            .recv_timeout(Duration::from_secs(30))
+            .expect("checkpoint reply after the barrier released")
+            .expect("gc_checkpoint");
+        assert!(!reply.bucket_ulids.is_empty());
+        promote_done
+            .recv_timeout(Duration::from_secs(30))
+            .expect("promote reply after the barrier released")
+            .expect("promote_wal");
+
+        // The reply implies the apply ran: the promoted WAL is unlinked,
+        // and with nothing written since, `wal/` is empty.
+        assert_eq!(
+            wal_files(&dir),
+            0,
+            "the checkpoint reply must observe the promote's apply"
+        );
+
         client.shutdown();
         actor_thread.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

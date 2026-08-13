@@ -235,18 +235,15 @@ fn failed_gc_checkpoint_promote_unblocks_later_checkpoints() {
 
     // Not rejected as concurrent — the failed checkpoint cleared its
     // parked slot. This call re-dispatches the stashed job (which fails
-    // again); its own WAL view is empty so it completes immediately.
-    handle.gc_checkpoint(2).unwrap();
-    // Barrier: flush parks on the promote generation, so once it
-    // returns the retry's failure has been processed and the job is
-    // back on the stash.
-    handle.flush().unwrap();
+    // again); its own WAL view is empty, so the reply parks on the
+    // retry and reports its failure, leaving the job back on the stash.
+    assert!(handle.gc_checkpoint(2).is_err());
 
     fs::rename(&blocked, &pending).unwrap();
 
-    // This checkpoint re-dispatches the stashed epoch, which now lands.
+    // This checkpoint re-dispatches the stashed epoch; its reply parks
+    // on that retry, so success means the epoch landed.
     handle.gc_checkpoint(2).unwrap();
-    handle.flush().unwrap();
     assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&pending).unwrap().count(), 1);
 
