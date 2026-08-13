@@ -3934,7 +3934,8 @@ impl Volume {
     /// before acting on `u_gc`.
     ///
     /// Returns `job: None` when the WAL was empty or absent (no segment
-    /// to promote). The checkpoint completes immediately in that case.
+    /// to promote). The checkpoint then has no promote of its own to
+    /// wait for.
     ///
     /// Always mints ULIDs. An earlier Idle short-circuit (cfcb132) was
     /// reverted because the coordinator's per-tick `promote_wal` IPC
