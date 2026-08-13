@@ -2366,12 +2366,12 @@ impl Volume {
     /// therefore sits below committed data by design; for the journal
     /// tier the discipline is instead that journal commits ascending
     /// among themselves, so every *committed journal* ULID must be
-    /// below every pending journal ULID. The lbamap admits claims by
-    /// claimant ULID (`register_entry_if_newer`), so rebuild winners
-    /// are independent of tier either way; this assert is a canary for
-    /// the drain ordering alone, firing structurally with a clearer
-    /// message than the lbamap drift a broken drain would eventually
-    /// cause.
+    /// below every pending journal ULID. The lbamap rebuild admits
+    /// flush claims by claimant ULID and compaction outputs under
+    /// their inputs horizon, so rebuild winners are independent of
+    /// tier either way; this assert is a canary for the drain ordering
+    /// alone, firing structurally with a clearer message than the
+    /// lbamap drift a broken drain would eventually cause.
     ///
     /// Compaction outputs are outside this ordering: a GC or repack ULID is
     /// minted at apply time and may legitimately exceed a write that was
@@ -2482,8 +2482,13 @@ impl Volume {
         // only those pay an index read.
         if let Some(j_min) = pending_journal_min {
             for (u, path) in committed.iter().filter(|(u, _)| *u > j_min) {
+                // A journal consolidation output carries an inputs list
+                // and mints above writes that were pending when its pass
+                // forked; only a drained flush violates this ordering.
                 let committed_journal = segment::read_segment_index(path)
-                    .map(|(_, entries, _)| entries.iter().any(|e| e.journal))
+                    .map(|(_, entries, inputs)| {
+                        inputs.is_empty() && entries.iter().any(|e| e.journal)
+                    })
                     .unwrap_or(false);
                 if committed_journal {
                     panic!(

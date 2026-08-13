@@ -3401,24 +3401,6 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     if journal_lifted {
         journal_candidates.sort_by_key(|c| c.seg_ulid);
 
-        // One input whose every entry survives whole: the output's bytes
-        // are the input's, so the lift links the file under the new ULID
-        // instead of rewriting it. One inode under two names costs a link
-        // and an unlink, where a rewrite reads every body, re-signs, and
-        // writes the segment again.
-        //
-        // Two names is what makes it safe. A reader resolves a `Local`
-        // body by filename, so a name that stops existing while a
-        // published snapshot still points at it reads as a missing
-        // segment. Linking leaves the input name in place until the apply
-        // publishes and `remove_consumed_inputs` unlinks it, which is the
-        // window every other consumed input already relies on.
-        let verbatim_lift = journal_candidates.len() == 1
-            && journal_candidates[0]
-                .classifications
-                .iter()
-                .all(|c| matches!(c, EntryClassification::FullyLive));
-
         let mut outputs: Vec<PlanOutput> = Vec::new();
         let mut journal_inputs: Vec<crate::volume::RepackedInput> =
             Vec::with_capacity(journal_candidates.len());
@@ -3449,34 +3431,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 .ok_or_else(|| io::Error::other("repack: no reserved journal output ulid"))?;
             let final_path = pending_dir.join(new_ulid.to_string());
 
-            let (new_body_section_start, out_entries) = if verbatim_lift {
-                let input_path = &journal_inputs[0].input_path;
-                let parsed = segment_cache.read_and_verify(input_path, &verifying_key)?;
-                std::fs::hard_link(input_path, &final_path)?;
-                segment::fsync_dir(&final_path)?;
-                let mut out_entries = parsed.entries.clone();
-                // The apply registers these entries with
-                // `InlineSource::EntryInline`, so each inline entry must
-                // carry its bytes; a parsed index leaves `inline` empty.
-                if out_entries.iter().any(|e| e.kind.is_inline()) {
-                    let inline_bytes = segment::read_inline_section(input_path)?;
-                    for e in &mut out_entries {
-                        if e.kind.is_inline() {
-                            let start = e.stored_offset as usize;
-                            let end = start + e.stored_length as usize;
-                            let bytes = inline_bytes.get(start..end).ok_or_else(|| {
-                                io::Error::other(format!(
-                                    "verbatim journal lift {new_ulid}: inline entry \
-                                     [{start}..{end}) outside the {}-byte inline section",
-                                    inline_bytes.len()
-                                ))
-                            })?;
-                            e.inline = Some(bytes.into());
-                        }
-                    }
-                }
-                (parsed.body_section_start, out_entries)
-            } else {
+            let (new_body_section_start, out_entries) = {
                 let plan = RewritePlan { new_ulid, outputs };
                 let resolver = WorkerBodyResolver {
                     base_dir: &base_dir,
@@ -3526,13 +3481,14 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     "journal consolidation output must carry no delta body"
                 );
 
+                let input_ulids: Vec<Ulid> = journal_inputs.iter().map(|i| i.input_ulid).collect();
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
                 let _ = std::fs::remove_file(&tmp_path);
                 let written = segment::write_segment_full(
                     &tmp_path,
                     entries,
                     &delta_body,
-                    &[],
+                    &input_ulids,
                     crate::sketch_enabled(),
                     signer.as_ref(),
                 )?;
@@ -3657,6 +3613,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             delta_body,
         } = materialised;
 
+        let input_ulids: Vec<Ulid> = bucket_inputs.iter().map(|i| i.input_ulid).collect();
         let new_ulid_str = new_ulid.to_string();
         let final_path = pending_dir.join(&new_ulid_str);
         let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
@@ -3665,7 +3622,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             &tmp_path,
             out_entries,
             &delta_body,
-            &[],
+            &input_ulids,
             crate::sketch_enabled(),
             signer.as_ref(),
         )?;
@@ -5070,16 +5027,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A lone all-live journal segment takes the close pass's verbatim
-    /// lift: the file is hard-linked under the output ULID and the
-    /// apply registers entries parsed from its index. Each inline entry
-    /// must reach the registration carrying its bytes — a location
-    /// without them survives reads only until the drain-promote flips
-    /// it to `Cached`, after which the demand-fetch path rejects the
-    /// inline kind. Reconstructs the 2026-08-13 pg28 spurious EIO on a
-    /// jbd2 commit block (issue #950).
+    /// A lone all-live journal segment consolidates through the same
+    /// rewrite as every other close pass, and each inline entry reaches
+    /// the apply's registration carrying its bytes — a location without
+    /// them survives reads only until the drain-promote flips it to
+    /// `Cached`, after which the demand-fetch path rejects the inline
+    /// kind. Reconstructs the 2026-08-13 pg28 spurious EIO on a jbd2
+    /// commit block (issue #950).
     #[test]
-    fn journal_inline_read_survives_verbatim_lift() {
+    fn journal_inline_read_survives_solo_consolidation() {
         let dir = temp_dir();
         drop(Volume::open(&dir, &dir).unwrap());
         let mut cfg = crate::config::VolumeConfig::read(&dir).unwrap();
@@ -5093,7 +5049,7 @@ mod tests {
 
         // One journal epoch, fully live: compressible window content
         // forms as an inline entry. Data blocks ride along so the close
-        // pass has data outputs and lifts the journal above them.
+        // pass has data outputs and carries the journal above them.
         let jblock = vec![0xAB_u8; 4096];
         client.write(1024, &jblock, false).unwrap();
         client.write(0, &unique_block(11), false).unwrap();
@@ -5116,6 +5072,12 @@ mod tests {
         segs.sort();
         assert!(!segs.is_empty(), "setup: nothing packed to upload");
         for u in &segs {
+            let (_, _, inputs) =
+                crate::segment::read_segment_index(&upload_dir.join(u.to_string())).unwrap();
+            assert!(
+                !inputs.is_empty(),
+                "close pass output {u} must record its consumed inputs"
+            );
             client.promote_segment(*u).unwrap();
         }
 
@@ -5123,7 +5085,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         reader
             .read_with_snapshot(&client.snapshot.load_full(), 1024, &mut buf)
-            .expect("journal inline read after verbatim lift and drain promote");
+            .expect("journal inline read after solo consolidation and drain promote");
         assert_eq!(buf, jblock, "journal inline read content");
 
         client.shutdown();
@@ -5133,8 +5095,8 @@ mod tests {
 
     /// A journal-window write that forms as an inline entry stays
     /// readable after the close pass's consolidation merge and the
-    /// drain-promote into the cache (the merge sibling of the verbatim
-    /// lift above; issue #950).
+    /// drain-promote into the cache (the multi-epoch sibling of the
+    /// solo consolidation above; issue #950).
     #[test]
     fn journal_inline_read_survives_cache_promote() {
         let dir = temp_dir();

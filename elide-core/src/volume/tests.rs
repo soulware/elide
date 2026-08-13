@@ -2098,12 +2098,10 @@ fn journal_consolidation_skips_lone_all_live_segment() {
 }
 
 #[test]
-fn journal_lift_carries_the_input_inode() {
-    // A lone all-live journal segment lifted above a data output is the
-    // input file under a new name: one link, no body copy. The inode is
-    // what discriminates — a rewrite would produce a fresh one.
-    use std::os::unix::fs::MetadataExt;
-
+fn journal_consolidation_records_its_input() {
+    // A lone all-live journal segment carried above a data output is
+    // rewritten as a consolidation output whose inputs table names the
+    // segment it consumed.
     let base = keyed_temp_dir();
     set_journal_ranges(&base, vec![(100, 16)]);
     let mut vol = Volume::open(&base, &base).unwrap();
@@ -2129,7 +2127,6 @@ fn journal_lift_carries_the_input_inode() {
     assert_eq!(pending_ulids(&base).len(), 3);
     let before = journal_of(&vol);
     assert_eq!(before.len(), 1);
-    let ino_before = fs::metadata(seg_path(before[0])).unwrap().ino();
 
     vol.repack_open_for_test().unwrap();
 
@@ -2137,12 +2134,13 @@ fn journal_lift_carries_the_input_inode() {
     assert_eq!(after.len(), 1);
     assert!(
         after[0] > before[0],
-        "the lift carries the journal segment to a higher ulid"
+        "the consolidation carries the journal segment to a higher ulid"
     );
+    let (_, _, inputs) = segment::read_segment_index(&seg_path(after[0])).unwrap();
     assert_eq!(
-        fs::metadata(seg_path(after[0])).unwrap().ino(),
-        ino_before,
-        "the lifted segment is the input file linked under the new ulid"
+        inputs,
+        vec![before[0]],
+        "the consolidation output records the segment it consumed"
     );
     assert!(
         !seg_path(before[0]).exists(),
@@ -5706,18 +5704,19 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
 
 /// Place a segment in `index/` at `ulid`, carrying `inputs`. A non-empty
 /// inputs list is what a compaction output records; an empty one is what a
-/// promoted flush carries.
+/// promoted flush carries. `journal` tags the entry into the journal tier.
 #[cfg(feature = "volume-invariants")]
-fn plant_committed_segment(base: &Path, ulid: ulid::Ulid, inputs: &[ulid::Ulid]) {
+fn plant_committed_segment(base: &Path, ulid: ulid::Ulid, inputs: &[ulid::Ulid], journal: bool) {
     let signer = crate::signing::load_signer(base, crate::signing::VOLUME_KEY_FILE).unwrap();
     let body = vec![0x77u8; 4096];
-    let entries = vec![segment::SegmentEntry::new_data(
+    let mut entries = vec![segment::SegmentEntry::new_data(
         blake3::hash(&body),
         4096,
         1,
         segment::Codec::None,
         body,
     )];
+    entries[0].entry.journal = journal;
     let staging = base.join(format!("{ulid}.staging"));
     segment::write_segment_full(&staging, entries, &[], inputs, false, signer.as_ref()).unwrap();
 
@@ -5757,7 +5756,7 @@ fn a_compaction_output_above_a_pending_write_is_not_a_drain_violation() {
     // Minted after the pending write, exactly as an apply-time ULID is.
     let compaction = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
     assert!(compaction > pending_min);
-    plant_committed_segment(&base, compaction, &[pending_min]);
+    plant_committed_segment(&base, compaction, &[pending_min], false);
 
     vol.assert_pending_above_committed("compaction_output_test");
 
@@ -5783,9 +5782,73 @@ fn a_promoted_flush_above_a_pending_write_still_fires() {
         .expect("the flush leaves a pending segment");
 
     let promoted = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
-    plant_committed_segment(&base, promoted, &[]);
+    plant_committed_segment(&base, promoted, &[], false);
 
     vol.assert_pending_above_committed("promoted_flush_test");
+}
+
+/// The journal-tier twin of the compaction-output case: a close pass's
+/// journal consolidation output mints above every pending segment, so a
+/// journal write that lands mid-close sits below it. The output's inputs
+/// list is what tells the check this is a consolidation, exactly as on
+/// the data side (#949, the 2026-08-13 pg28 crash-loop).
+#[cfg(feature = "volume-invariants")]
+#[test]
+fn a_journal_consolidation_output_above_a_pending_journal_write_is_not_a_drain_violation() {
+    let base = keyed_temp_dir();
+    drop(Volume::open(&base, &base).unwrap());
+    let mut cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    cfg.journal = Some(crate::config::JournalConfig {
+        ranges: crate::journal::JournalRanges::new(vec![(1024, 64)]),
+    });
+    cfg.write(&base).unwrap();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(1024, &vec![0x42u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    let pending_min = segment::read_ulid_dir_sorted(&segment::pending_open_dir(&base))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the flush leaves a pending journal segment");
+
+    let consolidation = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
+    assert!(consolidation > pending_min);
+    plant_committed_segment(&base, consolidation, &[pending_min], true);
+
+    vol.assert_pending_above_committed("journal_consolidation_test");
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// With an empty inputs list the same committed journal segment is a
+/// drained flush, and a drained journal flush above a pending journal
+/// write is the out-of-order drain the journal check exists to catch.
+#[cfg(feature = "volume-invariants")]
+#[test]
+#[should_panic(expected = "journal drain-order invariant violation")]
+fn a_promoted_journal_flush_above_a_pending_journal_write_still_fires() {
+    let base = keyed_temp_dir();
+    drop(Volume::open(&base, &base).unwrap());
+    let mut cfg = crate::config::VolumeConfig::read(&base).unwrap();
+    cfg.journal = Some(crate::config::JournalConfig {
+        ranges: crate::journal::JournalRanges::new(vec![(1024, 64)]),
+    });
+    cfg.write(&base).unwrap();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    vol.write(1024, &vec![0x42u8; 4096]).unwrap();
+    vol.flush_wal().unwrap();
+
+    let pending_min = segment::read_ulid_dir_sorted(&segment::pending_open_dir(&base))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the flush leaves a pending journal segment");
+
+    let promoted = ulid::Ulid::from_parts(pending_min.timestamp_ms() + 1_000, 7);
+    plant_committed_segment(&base, promoted, &[], true);
+
+    vol.assert_pending_above_committed("journal_flush_test");
 }
 
 /// `LbaRanges` backs the apply's coverage refusal, and a gap it fails to
