@@ -79,7 +79,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
@@ -481,7 +481,18 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .chain(std::iter::once((fork_dir.to_path_buf(), None)))
         .collect();
     let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
-    let mut lbamap = lbamap::rebuild_segments(&rebuild_chain).context("rebuilding lba map")?;
+    let (mut lbamap, view_ceiling) =
+        lbamap::rebuild_segments_with_ceiling(&rebuild_chain).context("rebuilding lba map")?;
+    // Every plan this pass emits is classified against this view, and a
+    // refusal at apply names the claimant that blocked the fold. Comparing
+    // the two ULIDs says which side the fault sits on, so the ceiling is
+    // logged whether or not a refusal follows.
+    info!(
+        "[gc] liveness view ceiling: {}",
+        view_ceiling
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+    );
 
     // Replay any in-progress WAL files into the LBA map so that hashes
     // referenced by post-checkpoint writes are visible to the liveness
