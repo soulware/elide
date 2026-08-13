@@ -3454,7 +3454,28 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 let parsed = segment_cache.read_and_verify(input_path, &verifying_key)?;
                 std::fs::hard_link(input_path, &final_path)?;
                 segment::fsync_dir(&final_path)?;
-                (parsed.body_section_start, parsed.entries.clone())
+                let mut out_entries = parsed.entries.clone();
+                // The apply registers these entries with
+                // `InlineSource::EntryInline`, so each inline entry must
+                // carry its bytes; a parsed index leaves `inline` empty.
+                if out_entries.iter().any(|e| e.kind.is_inline()) {
+                    let inline_bytes = segment::read_inline_section(input_path)?;
+                    for e in &mut out_entries {
+                        if e.kind.is_inline() {
+                            let start = e.stored_offset as usize;
+                            let end = start + e.stored_length as usize;
+                            let bytes = inline_bytes.get(start..end).ok_or_else(|| {
+                                io::Error::other(format!(
+                                    "verbatim journal lift {new_ulid}: inline entry \
+                                     [{start}..{end}) outside the {}-byte inline section",
+                                    inline_bytes.len()
+                                ))
+                            })?;
+                            e.inline = Some(bytes.into());
+                        }
+                    }
+                }
+                (parsed.body_section_start, out_entries)
             } else {
                 let plan = RewritePlan { new_ulid, outputs };
                 let resolver = WorkerBodyResolver {
@@ -5044,6 +5065,145 @@ mod tests {
         // Let the actor drain the late results before shutdown joins
         // the worker.
         std::thread::sleep(Duration::from_millis(500));
+        client.shutdown();
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A lone all-live journal segment takes the close pass's verbatim
+    /// lift: the file is hard-linked under the output ULID and the
+    /// apply registers entries parsed from its index. Each inline entry
+    /// must reach the registration carrying its bytes — a location
+    /// without them survives reads only until the drain-promote flips
+    /// it to `Cached`, after which the demand-fetch path rejects the
+    /// inline kind. Reconstructs the 2026-08-13 pg28 spurious EIO on a
+    /// jbd2 commit block (issue #950).
+    #[test]
+    fn journal_inline_read_survives_verbatim_lift() {
+        let dir = temp_dir();
+        drop(Volume::open(&dir, &dir).unwrap());
+        let mut cfg = crate::config::VolumeConfig::read(&dir).unwrap();
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: crate::journal::JournalRanges::new(vec![(1024, 64)]),
+        });
+        cfg.write(&dir).unwrap();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        // One journal epoch, fully live: compressible window content
+        // forms as an inline entry. Data blocks ride along so the close
+        // pass has data outputs and lifts the journal above them.
+        let jblock = vec![0xAB_u8; 4096];
+        client.write(1024, &jblock, false).unwrap();
+        client.write(0, &unique_block(11), false).unwrap();
+        client.promote_wal().unwrap();
+        client.write(1, &unique_block(12), false).unwrap();
+        client.promote_wal().unwrap();
+
+        let closed = client.close_generation().unwrap();
+        assert!(closed.is_some(), "setup: the close pass sealed nothing");
+
+        let upload_dir = crate::segment::pending_upload_dir(&dir);
+        let mut segs: Vec<Ulid> = std::fs::read_dir(&upload_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                Ulid::from_string(&name).ok()
+            })
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "setup: nothing packed to upload");
+        for u in &segs {
+            client.promote_segment(*u).unwrap();
+        }
+
+        let reader = client.reader();
+        let mut buf = vec![0u8; 4096];
+        reader
+            .read_with_snapshot(&client.snapshot.load_full(), 1024, &mut buf)
+            .expect("journal inline read after verbatim lift and drain promote");
+        assert_eq!(buf, jblock, "journal inline read content");
+
+        client.shutdown();
+        actor_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journal-window write that forms as an inline entry stays
+    /// readable after the close pass's consolidation merge and the
+    /// drain-promote into the cache (the merge sibling of the verbatim
+    /// lift above; issue #950).
+    #[test]
+    fn journal_inline_read_survives_cache_promote() {
+        let dir = temp_dir();
+        drop(Volume::open(&dir, &dir).unwrap());
+        let mut cfg = crate::config::VolumeConfig::read(&dir).unwrap();
+        cfg.journal = Some(crate::config::JournalConfig {
+            ranges: crate::journal::JournalRanges::new(vec![(1024, 64)]),
+        });
+        cfg.write(&dir).unwrap();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        // Two epochs of journal-window writes: compressible content
+        // forms as inline entries (jbd2 commit blocks in the field), a
+        // data block rides along in each flush. Epoch 2 overwrites one
+        // of epoch 1's window LBAs — the ring-wrap shape — so the close
+        // pass has dead journal bytes and runs a real consolidation
+        // merge that must carry epoch 1's surviving inline entry.
+        let jblock_a = vec![0xAB_u8; 4096];
+        let jblock_b = vec![0xCD_u8; 4096];
+        let jblock_c = vec![0xEF_u8; 4096];
+        client.write(1024, &jblock_a, false).unwrap();
+        client.write(1030, &jblock_c, false).unwrap();
+        client.write(0, &unique_block(9), false).unwrap();
+        client.promote_wal().unwrap();
+        client.write(1024, &jblock_b, false).unwrap();
+        client.write(1, &unique_block(10), false).unwrap();
+        client.promote_wal().unwrap();
+
+        let reader = client.reader();
+        let mut buf = vec![0u8; 4096];
+        reader
+            .read_with_snapshot(&client.snapshot.load_full(), 1030, &mut buf)
+            .expect("pre-close journal read");
+        assert_eq!(buf, jblock_c, "pre-close journal read content");
+
+        // The close pass packs the generation; the journal segments
+        // merge into one consolidation output.
+        let closed = client.close_generation().unwrap();
+        assert!(closed.is_some(), "setup: the close pass sealed nothing");
+
+        // Drain: promote every packed segment into the cache, ULID order.
+        let upload_dir = crate::segment::pending_upload_dir(&dir);
+        let mut segs: Vec<Ulid> = std::fs::read_dir(&upload_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                Ulid::from_string(&name).ok()
+            })
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "setup: nothing packed to upload");
+        for u in &segs {
+            client.promote_segment(*u).unwrap();
+        }
+
+        for (lba, want, label) in [
+            (1024u64, &jblock_b, "jblock_b"),
+            (1030u64, &jblock_c, "jblock_c carried through the merge"),
+        ] {
+            let mut buf = vec![0u8; 4096];
+            reader
+                .read_with_snapshot(&client.snapshot.load_full(), lba, &mut buf)
+                .unwrap_or_else(|e| panic!("journal read {label} after drain promote: {e}"));
+            assert_eq!(&buf, want, "journal read {label} content");
+        }
+
         client.shutdown();
         actor_thread.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
