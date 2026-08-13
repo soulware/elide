@@ -327,7 +327,7 @@ inputs_length / 16 entries, 16 bytes each:
   input_ulid    (16 bytes) — ULID of a source segment consumed to produce this output
 ```
 
-Populated only for GC outputs (the coordinator's `compact_segments` writes the sorted list of swept input ULIDs into this region). Empty for normal WAL-promote segments and demand-fetch results. The volume's apply path reads this field to derive extent-index updates from the segment itself, without consulting any sidecar manifest — the whole self-describing GC handoff protocol is built on top of this. Because the inputs table is the tail of the index section, the existing signature `Ed25519(BLAKE3(header[0..36] || index_bytes))` authenticates it without a second hash region.
+Populated for every compaction output: the coordinator's `compact_segments` and the volume's close-pass repack (data buckets and the journal consolidation) write the sorted list of consumed input ULIDs into this region. Empty for normal WAL-promote segments and demand-fetch results — an empty inputs table is what marks a segment as having arrived through the drain, which the rebuild's admission phases and the pending-above-committed invariant both key on. The volume's apply path reads this field to derive extent-index updates from the segment itself, without consulting any sidecar manifest — the whole self-describing GC handoff protocol is built on top of this. Because the inputs table is the tail of the index section, the existing signature `Ed25519(BLAKE3(header[0..36] || index_bytes))` authenticates it without a second hash region.
 
 `lba_length × 4096` always gives the uncompressed extent size. `stored_length` gives the stored (possibly compressed) size.
 

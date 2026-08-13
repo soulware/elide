@@ -77,6 +77,7 @@ enum Admission<'a> {
     Unconditional,
     IfNewer,
     ConsumingInputs(&'a HashSet<Ulid>),
+    OutputHorizon(Ulid),
 }
 
 /// Overlap-blocking rule for [`LbaMap::insert_inner_if_newer`].
@@ -90,6 +91,10 @@ enum Blocking<'a> {
     /// Structural-commit apply: see the comment in
     /// [`LbaMap::insert_inner_if_newer`].
     Consuming(&'a HashSet<Ulid>),
+    /// Rebuild admission for a compaction output: an existing claimant
+    /// above the output's view horizon (`max(inputs)`) keeps its
+    /// sub-range; see the comment in [`LbaMap::insert_inner_if_newer`].
+    AboveHorizon(Ulid),
 }
 
 /// The live in-memory LBA map.
@@ -298,6 +303,13 @@ impl LbaMap {
                 claimant,
                 inputs,
             ),
+            Admission::OutputHorizon(horizon) => self.insert_inner_if_newer(
+                entry.start_lba,
+                entry.lba_length,
+                entry.hash,
+                claimant,
+                Blocking::AboveHorizon(horizon),
+            ),
         }
     }
 
@@ -337,6 +349,21 @@ impl LbaMap {
         self.register_entry_inner(entry, claimant, Admission::ConsumingInputs(inputs))
     }
 
+    /// [`register_entry_inner`](Self::register_entry_inner) with the
+    /// rebuild admission for a compaction output whose view horizon is
+    /// `max(inputs)`: the entry claims sub-ranges whose current claimant
+    /// sits at or below the horizon — a claim the output's pass
+    /// classified — and defers to claimants above it, which name writes
+    /// flushed after the classification.
+    pub fn register_entry_with_horizon(
+        &mut self,
+        entry: &segment::SegmentEntry,
+        claimant: Ulid,
+        horizon: Ulid,
+    ) -> u32 {
+        self.register_entry_inner(entry, claimant, Admission::OutputHorizon(horizon))
+    }
+
     fn insert_inner_if_newer(
         &mut self,
         start_lba: u64,
@@ -365,6 +392,18 @@ impl LbaMap {
         // segment's own earlier entry, and a segment's entries apply in
         // order (a WAL-flush segment carries its epoch's writes in write
         // order, later entries overriding earlier ones at the same LBA).
+        // `AboveHorizon`: the rebuild's admission for a compaction
+        // output. Its claims are only as fresh as the liveness view its
+        // pass classified from, and `max(inputs)` bounds that view: every
+        // flush applied before classification sorts at or below it (the
+        // promote worker is FIFO, so apply order is mint order), and
+        // every flush applied after sorts above. A claimant above the
+        // horizon therefore names a write the pass never saw — the claim
+        // the live apply kept via `Consuming` — and blocks whatever the
+        // ULID order of claimant and output says; a claimant at or below
+        // the horizon holds a claim the pass classified dead, and the
+        // output overrides it. The equal-claimant and same-hash-below
+        // clauses carry over from `Consuming` unchanged.
         let blocks = |existing: Ulid, existing_hash: blake3::Hash| -> bool {
             match blocking {
                 Blocking::Consuming(set) => {
@@ -374,6 +413,11 @@ impl LbaMap {
                 }
                 Blocking::SameOrHigher => existing >= claimant,
                 Blocking::Higher => existing > claimant,
+                Blocking::AboveHorizon(horizon) => {
+                    !(existing <= horizon
+                        || existing == claimant
+                        || existing_hash == hash && existing < claimant)
+                }
             }
         };
 
@@ -980,21 +1024,18 @@ fn rebuild_segments_inner(
         // `discover_fork_segments` handles the race-safe listing order
         // (pending → gc → index) and returns the committed tier
         // (gc ∪ index) by ULID ascending, then pending by ULID
-        // ascending. Admission is claimant-aware, so the highest
-        // claimant ULID wins every LBA overlap independent of that
-        // visit order — the segment mint is monotonic, so the highest
-        // claimant is the newest write: a bare `gc/<U>` output shadows
-        // its lower-ULID inputs, and a write minted after a concurrent
-        // GC output wins over it.
-        //
-        // The write path maintains that rule incrementally
-        // (`insert_if_newer`). A GC plan apply merges by the stricter
-        // `insert_consuming_inputs`, which keeps the range of any
-        // claimant it does not consume whatever the ULIDs say. Both
-        // reach the same winners because a plan carries no hash
-        // another tier has superseded, and `gc_fork` deriving its
-        // liveness from a full rebuild plus a WAL replay is what makes
-        // that hold.
+        // ascending. Admission runs in two phases, both order-independent
+        // within themselves. Flush-tier segments (empty inputs list)
+        // admit by highest claimant ULID — the segment mint is monotonic,
+        // so the highest claimant is the newest write. Compaction outputs
+        // (recorded inputs list) admit afterwards, ULID ascending, under
+        // `AboveHorizon(max(inputs))`: the output overrides claims its
+        // pass classified and defers to claims flushed after the
+        // classification, mirroring the `insert_consuming_inputs` rule
+        // the live apply enforced. ULID order alone cannot express that
+        // rule here — a pass's outputs can mint above a flush that landed
+        // mid-pass, and admitting them by ULID would resurrect the stale
+        // claim the live apply refused.
         let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
 
         if segments.is_empty() {
@@ -1012,12 +1053,13 @@ fn rebuild_segments_inner(
             None
         };
 
+        let mut outputs: Vec<(Ulid, Ulid, Vec<segment::SegmentEntry>)> = Vec::new();
         for sref in &segments {
             let parsed = match &vk {
                 Some(vk) => segment::read_and_verify_segment_index(&sref.path, vk),
                 None => segment::read_segment_index(&sref.path),
             };
-            let (_bss, entries, _inputs) = match parsed {
+            let (_bss, entries, inputs) = match parsed {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     warn!(
@@ -1029,8 +1071,19 @@ fn rebuild_segments_inner(
                 Err(e) => return Err(e),
             };
             ceiling = ceiling.max(Some(sref.ulid));
-            for entry in entries {
-                map.register_entry_if_newer(&entry, sref.ulid);
+            match inputs.iter().max().copied() {
+                Some(horizon) => outputs.push((sref.ulid, horizon, entries)),
+                None => {
+                    for entry in entries {
+                        map.register_entry_if_newer(&entry, sref.ulid);
+                    }
+                }
+            }
+        }
+        outputs.sort_by_key(|(ulid, _, _)| *ulid);
+        for (ulid, horizon, entries) in outputs {
+            for entry in &entries {
+                map.register_entry_with_horizon(entry, ulid, horizon);
             }
         }
     }
@@ -1228,6 +1281,55 @@ mod tests {
         let inputs: HashSet<Ulid> = [u(5)].into_iter().collect();
         map.register_entry_consuming_inputs(&delta_entry(0, 4, h(2), h(9)), u(3), &inputs);
         assert_eq!(map.lookup(0), Some((h(2), 0)));
+    }
+
+    /// A claimant above the output's view horizon names a write its pass
+    /// never classified: it keeps the range whatever the ULID order of
+    /// claimant and output says (u(20) < u(30) here).
+    #[test]
+    fn register_with_horizon_defers_to_claimant_above_horizon() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(2), u(20));
+        let installed = map.register_entry_with_horizon(
+            &entry(segment::EntryKind::Data, 0, 4, h(1)),
+            u(30),
+            u(10),
+        );
+        assert_eq!(installed, 0);
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+        map.debug_assert_claim_counts();
+    }
+
+    /// A claimant at or below the horizon holds a claim the output's pass
+    /// classified dead; the output overrides it.
+    #[test]
+    fn register_with_horizon_overrides_claimant_below_horizon() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(3), u(5));
+        let installed = map.register_entry_with_horizon(
+            &entry(segment::EntryKind::Data, 0, 4, h(1)),
+            u(30),
+            u(10),
+        );
+        assert_eq!(installed, 4);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        map.debug_assert_claim_counts();
+    }
+
+    /// Same hash above the horizon: identical bytes, so the output adopts
+    /// the claim under its higher ULID and no read changes.
+    #[test]
+    fn register_with_horizon_adopts_same_hash_above_horizon() {
+        let mut map = LbaMap::new();
+        map.insert(0, 4, h(1), u(20));
+        let installed = map.register_entry_with_horizon(
+            &entry(segment::EntryKind::Data, 0, 4, h(1)),
+            u(30),
+            u(10),
+        );
+        assert_eq!(installed, 4);
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        map.debug_assert_claim_counts();
     }
 
     // --- insert / lookup unit tests ---
@@ -1454,6 +1556,117 @@ mod tests {
         // walk visits the pending segment after it.
         assert_eq!(map.lookup(5), Some((h(2), 0)));
         assert_eq!(map.lookup(9), Some((h(2), 4)));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The 2026-08-13 pg28 straddler shape (#949): a flush lands
+    /// mid-close, the pack output mints above it carrying an input's
+    /// claim the flush superseded. The live apply kept the flush's claim
+    /// (`insert_consuming_inputs`); the rebuild must reach the same
+    /// winner, and the output's recorded inputs horizon is what lets it.
+    #[test]
+    fn rebuild_output_defers_to_flush_above_its_horizon() {
+        use crate::segment::SegmentEntry;
+
+        let base = temp_dir();
+        let pending = crate::segment::pending_open_dir(&base);
+        let index = base.join("index");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::create_dir_all(&index).unwrap();
+        let signer = write_test_pub(&base);
+
+        // The straddler flush: newer content at [0, 10), pending, minted
+        // above the consumed input "01B..." and below the output "01D...".
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(2),
+                0,
+                10,
+                segment::Codec::None,
+                vec![0u8; 40960],
+            )];
+            segment::write_segment(
+                &pending.join("01CCCCCCCCCCCCCCCCCCCCCCCC"),
+                entries,
+                signer.as_ref(),
+            )
+            .unwrap();
+        }
+
+        // The pack output: committed, carries the consumed input's stale
+        // claim at [0, 10) under a ULID above the straddler.
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(1),
+                0,
+                10,
+                segment::Codec::None,
+                vec![0u8; 40960],
+            )];
+            let scratch = base.join("01DDDDDDDDDDDDDDDDDDDDDDDD.seg");
+            let inputs = [Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap()];
+            segment::write_gc_segment(&scratch, entries, &inputs, signer.as_ref()).unwrap();
+            segment::extract_idx(&scratch, &index.join("01DDDDDDDDDDDDDDDDDDDDDDDD.idx")).unwrap();
+            std::fs::remove_file(&scratch).unwrap();
+        }
+
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
+
+        assert_eq!(map.lookup(0), Some((h(2), 0)));
+        assert_eq!(map.lookup(9), Some((h(2), 9)));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The everyday post-GC state: an old segment still on disk holds a
+    /// claim the (since unlinked) input had superseded. The old claimant
+    /// sits below the output's inputs horizon, so the output overrides it.
+    #[test]
+    fn rebuild_output_overrides_stale_claim_below_its_horizon() {
+        use crate::segment::SegmentEntry;
+
+        let base = temp_dir();
+        let index = base.join("index");
+        std::fs::create_dir_all(&index).unwrap();
+        let signer = write_test_pub(&base);
+
+        // The old segment: its [0, 10) claim was superseded by the input
+        // "01B..." that the output consumed.
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(3),
+                0,
+                10,
+                segment::Codec::None,
+                vec![0u8; 40960],
+            )];
+            let scratch = base.join("01AAAAAAAAAAAAAAAAAAAAAAAA.seg");
+            segment::write_segment(&scratch, entries, signer.as_ref()).unwrap();
+            segment::extract_idx(&scratch, &index.join("01AAAAAAAAAAAAAAAAAAAAAAAA.idx")).unwrap();
+            std::fs::remove_file(&scratch).unwrap();
+        }
+
+        // The pack output carrying the input's live claim at [0, 10).
+        {
+            let entries = vec![SegmentEntry::new_data(
+                h(1),
+                0,
+                10,
+                segment::Codec::None,
+                vec![0u8; 40960],
+            )];
+            let scratch = base.join("01DDDDDDDDDDDDDDDDDDDDDDDD.seg");
+            let inputs = [Ulid::from_string("01BBBBBBBBBBBBBBBBBBBBBBBB").unwrap()];
+            segment::write_gc_segment(&scratch, entries, &inputs, signer.as_ref()).unwrap();
+            segment::extract_idx(&scratch, &index.join("01DDDDDDDDDDDDDDDDDDDDDDDD.idx")).unwrap();
+            std::fs::remove_file(&scratch).unwrap();
+        }
+
+        let map = rebuild_segments(&[(base.clone(), None)]).unwrap();
+
+        assert_eq!(map.lookup(0), Some((h(1), 0)));
+        assert_eq!(map.lookup(9), Some((h(1), 9)));
 
         std::fs::remove_dir_all(base).unwrap();
     }
