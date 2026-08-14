@@ -16,11 +16,8 @@
 //! increment when the mutex is free, and reads the clock only on the
 //! acquisitions that actually blocked.
 //!
-//! A hold and the waits it caused are two quantities, and the drain
-//! counters carry a third — the time a queue of parked writers takes to
-//! clear once the hold releases. A hold of half a second whose queue
-//! clears in half a second costs a guest a whole second, and only the
-//! drain accounts for the second half of it.
+//! The drain counters measure how long a queue of parked writers takes
+//! to clear once the hold releases.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -139,9 +136,14 @@ struct SiteCounters {
     /// survives the window it happened in.
     peak_hold_nanos: AtomicU64,
     /// Holds of this site that released with writers parked behind them.
+    arms: AtomicU64,
+    /// Those arms an emptied queue closed out; the drain figures below
+    /// cover these.
     drains: AtomicU64,
-    /// Writers parked at the moment those holds released.
+    /// Writers parked when those holds released.
     drain_queued: AtomicU64,
+    /// Writers that parked between release and the queue emptying.
+    drain_joined: AtomicU64,
     /// Time those queues took to clear after release.
     drain_nanos: AtomicU64,
     window_max_drain_nanos: AtomicU64,
@@ -150,28 +152,23 @@ struct SiteCounters {
 
 /// The hold whose queue is still draining.
 ///
-/// One slot suffices, because the writers parked behind a hold are ahead
-/// of any actor-side section that has yet to ask for the mutex, so a
-/// queue clears before the next hold can leave one. A hold arming over a
-/// slot whose queue never emptied replaces it, which undercounts a
-/// pathological overlap rather than attributing it twice.
+/// One slot, replaced by any hold that releases into a queue while it is
+/// outstanding. `arms` against `drains` counts the replacements.
 #[derive(Default)]
 struct ArmedDrain {
     /// Index into [`LockStats::sites`] of the site that released.
     site: AtomicUsize,
-    /// Nanos since [`LockStats::base`] at release, or zero when no queue
-    /// is outstanding.
+    /// Nanos since [`LockStats::base`] at release, zero when no queue is
+    /// outstanding.
     release_nanos: AtomicU64,
     /// Writers parked at that moment.
     queued: AtomicU64,
+    /// Writers that have parked since.
+    joined: AtomicU64,
 }
 
 /// Upper edges of the guest write-wait histogram, in milliseconds. A wait
 /// past the last edge lands in an overflow bucket.
-///
-/// A total and a maximum read alike whether one write waited 100ms or a
-/// thousand did, which is the distinction that separates a single stall
-/// from a sustained one.
 const WAIT_BUCKET_EDGES_MS: [u64; 5] = [1, 10, 100, 1_000, 10_000];
 
 /// One bucket per edge, plus the overflow.
@@ -214,8 +211,7 @@ struct WriteCounters {
     wait_nanos: AtomicU64,
     window_max_wait_nanos: AtomicU64,
     peak_wait_nanos: AtomicU64,
-    /// Writes parked on the mutex right now. Read by a releasing hold to
-    /// size the queue behind it, and watched for zero to time the drain.
+    /// Writes parked on the mutex right now.
     waiting: AtomicU64,
     /// Distribution of the waits, by [`wait_bucket`].
     wait_buckets: [AtomicU64; WAIT_BUCKETS],
@@ -230,8 +226,7 @@ pub struct LockStats {
     sites: [SiteCounters; LockSite::COUNT],
     writes: WriteCounters,
     armed: ArmedDrain,
-    /// Origin for the nanosecond stamps in [`ArmedDrain`], so an instant
-    /// fits an atomic.
+    /// Origin for the nanosecond stamps in [`ArmedDrain`].
     base: Instant,
 }
 
@@ -264,22 +259,20 @@ impl LockStats {
             .fetch_max(hold_nanos, Ordering::Relaxed);
     }
 
-    /// Arm the drain measurement for a hold that is about to release.
-    ///
-    /// Called from the guard's drop while the mutex is still held, so the
-    /// stamp lands before any parked writer can wake. `queued` is read
-    /// here rather than accumulated during the hold, because a write that
-    /// is still parked has not reached [`Self::record_write_blocked`] yet
-    /// and so counts nowhere else.
-    ///
-    /// A hold that released with an empty queue arms nothing.
+    /// Arm the drain for a hold about to release, sized by the writers
+    /// parked now. Must be called with the mutex still held. An empty
+    /// queue arms nothing.
     pub fn arm_drain(&self, site: LockSite) {
         let queued = self.writes.waiting.load(Ordering::Acquire);
         if queued == 0 {
             return;
         }
+        self.sites[site.index()]
+            .arms
+            .fetch_add(1, Ordering::Relaxed);
         self.armed.site.store(site.index(), Ordering::Relaxed);
         self.armed.queued.store(queued, Ordering::Relaxed);
+        self.armed.joined.store(0, Ordering::Relaxed);
         self.armed
             .release_nanos
             .store(self.now_nanos(), Ordering::Release);
@@ -293,12 +286,15 @@ impl LockStats {
         self.writes.acquisitions.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a guest write that is about to park on the mutex.
-    ///
-    /// Paired with the [`Self::record_write_blocked`] that follows it, so
-    /// the gauge between the two is the queue a holder sees.
+    /// Count a guest write about to park on the mutex, and its arrival
+    /// into any queue already standing. Paired with the
+    /// [`Self::record_write_blocked`] that follows it, so the gauge
+    /// between the two is the queue a holder sees.
     pub fn record_write_parking(&self) {
         self.writes.waiting.fetch_add(1, Ordering::Release);
+        if self.armed.release_nanos.load(Ordering::Acquire) != 0 {
+            self.armed.joined.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Count a guest write that blocked, and for how long it did.
@@ -306,10 +302,7 @@ impl LockStats {
     /// A write reaching here has already parked, so the clock reads that
     /// produced `wait` are orders below what it is being charged.
     ///
-    /// The write that leaves the queue empty closes out whatever drain is
-    /// armed, which is why the tail is measured here rather than by the
-    /// thread that released the mutex — that thread has moved on, and
-    /// watching for a zero from it would mean polling.
+    /// The write that leaves the queue empty closes out the armed drain.
     pub fn record_write_blocked(&self, wait: Duration) {
         let nanos = wait.as_nanos() as u64;
         self.writes.acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -329,9 +322,7 @@ impl LockStats {
     }
 
     /// Fold the armed drain in, called by the write that emptied the
-    /// queue. A drain armed after that write parked belongs to a queue
-    /// this write is not the last of, and the swap leaves it for whoever
-    /// is.
+    /// queue. The swap leaves a later arm for the next such write.
     fn close_drain(&self) {
         let release = self.armed.release_nanos.swap(0, Ordering::AcqRel);
         if release == 0 {
@@ -339,10 +330,12 @@ impl LockStats {
         }
         let tail = self.now_nanos().saturating_sub(release);
         let queued = self.armed.queued.load(Ordering::Relaxed);
+        let joined = self.armed.joined.load(Ordering::Relaxed);
         let site = self.armed.site.load(Ordering::Relaxed);
         let counters = &self.sites[site];
         counters.drains.fetch_add(1, Ordering::Relaxed);
         counters.drain_queued.fetch_add(queued, Ordering::Relaxed);
+        counters.drain_joined.fetch_add(joined, Ordering::Relaxed);
         counters.drain_nanos.fetch_add(tail, Ordering::Relaxed);
         counters
             .window_max_drain_nanos
@@ -383,7 +376,9 @@ impl LockStats {
                     self.sites[i].window_max_hold_nanos.load(Ordering::Relaxed)
                 },
                 peak_hold_nanos: self.sites[i].peak_hold_nanos.load(Ordering::Relaxed),
+                arms: self.sites[i].arms.load(Ordering::Relaxed),
                 drains: self.sites[i].drains.load(Ordering::Relaxed),
+                drain_joined: self.sites[i].drain_joined.load(Ordering::Relaxed),
                 drain_queued: self.sites[i].drain_queued.load(Ordering::Relaxed),
                 drain_nanos: self.sites[i].drain_nanos.load(Ordering::Relaxed),
                 max_drain_nanos: if close_window {
@@ -424,9 +419,14 @@ pub struct SiteSnapshot {
     /// Longest single hold since the volume opened.
     pub peak_hold_nanos: u64,
     /// Holds that released with guest writes parked behind them.
+    pub arms: u64,
+    /// Those arms an emptied queue closed out; the drain figures below
+    /// cover these.
     pub drains: u64,
-    /// Writes parked at the moment those holds released.
+    /// Writes parked when those holds released.
     pub drain_queued: u64,
+    /// Writes that parked between release and the queue emptying.
+    pub drain_joined: u64,
     /// Time those queues took to clear once the mutex was free.
     pub drain_nanos: u64,
     /// Longest single drain within the window this snapshot covers.
@@ -495,10 +495,14 @@ impl LockStatsSnapshot {
                     .saturating_sub(earlier.sites[i].hold_nanos),
                 max_hold_nanos: self.sites[i].max_hold_nanos,
                 peak_hold_nanos: self.sites[i].peak_hold_nanos,
+                arms: self.sites[i].arms.saturating_sub(earlier.sites[i].arms),
                 drains: self.sites[i].drains.saturating_sub(earlier.sites[i].drains),
                 drain_queued: self.sites[i]
                     .drain_queued
                     .saturating_sub(earlier.sites[i].drain_queued),
+                drain_joined: self.sites[i]
+                    .drain_joined
+                    .saturating_sub(earlier.sites[i].drain_joined),
                 drain_nanos: self.sites[i]
                     .drain_nanos
                     .saturating_sub(earlier.sites[i].drain_nanos),
@@ -578,11 +582,13 @@ impl LockStatsSnapshot {
                 millis(s.max_hold_nanos),
                 millis(s.wait_nanos),
             ));
-            if s.drains > 0 {
+            if s.arms > 0 {
                 out.push_str(&format!(
-                    " drain={}x/{}w {:.1}ms max={:.1}ms",
+                    " arms={} drains={} queued={} joined={} drained={:.1}ms max={:.1}ms",
+                    s.arms,
                     s.drains,
                     s.drain_queued,
+                    s.drain_joined,
                     millis(s.drain_nanos),
                     millis(s.max_drain_nanos),
                 ));
@@ -903,10 +909,8 @@ mod tests {
         assert!(report.contains("writes n=1 blocked=1"), "got: {report}");
     }
 
-    /// The tail is the quantity a hold and a wait both miss. It is
-    /// attributed to the site that released, sized by the queue standing
-    /// at that moment, and measured from the release rather than from the
-    /// acquisition.
+    /// A drain is attributed to the site that released, sized by the
+    /// queue standing at that moment, and timed from the release.
     #[test]
     fn a_drain_is_timed_from_the_release_that_left_the_queue() {
         let stats = LockStats::default();
@@ -942,8 +946,66 @@ mod tests {
         );
     }
 
-    /// A hold nobody waited on leaves no queue, so there is no tail to
-    /// attribute and the next drain belongs to whichever hold does.
+    /// A hold releasing into a queue that already stands replaces the
+    /// arm holding it, and the arms-to-drains shortfall counts that.
+    #[test]
+    fn an_arm_over_a_standing_queue_shows_as_a_shortfall() {
+        let stats = LockStats::default();
+        stats.record_write_parking();
+        stats.record_write_parking();
+
+        stats.record(
+            LockSite::RepackApply,
+            Duration::ZERO,
+            Duration::from_millis(600),
+        );
+        stats.arm_drain(LockSite::RepackApply);
+        stats.record(
+            LockSite::PublishSnapshot,
+            Duration::ZERO,
+            Duration::from_micros(50),
+        );
+        stats.arm_drain(LockSite::PublishSnapshot);
+
+        stats.record_write_blocked(Duration::from_millis(600));
+        stats.record_write_blocked(Duration::from_millis(601));
+
+        let snap = stats.snapshot();
+        let repack = snap.site(LockSite::RepackApply);
+        let publish = snap.site(LockSite::PublishSnapshot);
+        assert_eq!(repack.arms, 1);
+        assert_eq!(repack.drains, 0, "its arm was replaced");
+        assert_eq!(publish.arms, 1);
+        assert_eq!(publish.drains, 1, "the surviving arm closed");
+
+        let report = snap.report().expect("sites acquired");
+        assert!(
+            report.contains("arms=1 drains=0"),
+            "the replaced arm is visible: {report}"
+        );
+    }
+
+    /// `queued` samples once at the release, so writes arriving during
+    /// the tail count as joined.
+    #[test]
+    fn writes_joining_a_standing_queue_are_counted() {
+        let stats = LockStats::default();
+        stats.record_write_parking();
+        stats.arm_drain(LockSite::RepackApply);
+
+        stats.record_write_parking();
+        stats.record_write_parking();
+        stats.record_write_blocked(Duration::from_millis(5));
+        stats.record_write_blocked(Duration::from_millis(4));
+        stats.record_write_blocked(Duration::from_millis(3));
+
+        let site = stats.snapshot().site(LockSite::RepackApply);
+        assert_eq!(site.drains, 1);
+        assert_eq!(site.drain_queued, 1, "one writer stood at the release");
+        assert_eq!(site.drain_joined, 2, "two more joined before it cleared");
+    }
+
+    /// A hold nobody waited on leaves no queue and no tail to time.
     #[test]
     fn a_hold_with_an_empty_queue_arms_nothing() {
         let stats = LockStats::default();
@@ -960,8 +1022,7 @@ mod tests {
         assert_eq!(stats.snapshot().site(LockSite::GcPlanApply).drains, 0);
     }
 
-    /// The drain outlives its window on the same terms as the maxima
-    /// beside it, and the totals subtract.
+    /// A drain windows and peaks on the same terms as a hold.
     #[test]
     fn a_drain_windows_like_a_hold() {
         let stats = LockStats::default();
@@ -984,8 +1045,7 @@ mod tests {
         );
     }
 
-    /// A total and a maximum read alike for one long wait and for many,
-    /// so the report carries the spread that tells them apart.
+    /// The spread separates one long wait from many.
     #[test]
     fn the_wait_spread_separates_one_stall_from_many() {
         let stats = LockStats::default();

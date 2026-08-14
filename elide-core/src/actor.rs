@@ -458,10 +458,8 @@ const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// time, which is quiet whatever the sites add up to.
 const LOCK_REPORT_FLOOR: Duration = Duration::from_millis(5);
 
-/// How often the lock report is due. The actor checks the deadline on
-/// every pass of its loop, so the cadence holds under load, where the
-/// select's ready arms would otherwise crowd out a timer arm and stretch
-/// a window to whatever the scheduler allowed.
+/// How often the lock report is due, checked on every pass of the actor
+/// loop.
 const LOCK_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Acquire the volume mutex.
@@ -555,9 +553,7 @@ impl Drop for TimedGuard<'_> {
     fn drop(&mut self) {
         self.stats
             .record(self.site, self.wait, self.acquired.elapsed());
-        // `guard` is a field, so it drops after this body: the mutex is
-        // still held here and the arm lands before any parked writer
-        // wakes to run the queue down.
+        // `guard` is a field, so the mutex is still held here.
         self.stats.arm_drain(self.site);
     }
 }
@@ -1182,8 +1178,8 @@ impl VolumeActor {
         let Some(tx) = self.worker_tx.clone() else {
             return Err(io::Error::other("worker not running"));
         };
-        // Stamped once, ahead of any retry, so the wait covers the whole
-        // time from the actor deciding to dispatch.
+        // Stamped ahead of any retry, so the wait covers the whole
+        // dispatch.
         let mut job = QueuedJob {
             queued_at: Instant::now(),
             job,
@@ -1200,10 +1196,8 @@ impl VolumeActor {
                             return Err(io::Error::other("worker result channel closed"));
                         }
                     }
-                    // The actor is the parked party here, waiting on a
-                    // worker that is busy and then applying its result
-                    // under the volume mutex. Both halves sit between a
-                    // guest write and the actor taking its next request.
+                    // What the actor waited for a worker slot, before
+                    // applying a result under the volume mutex.
                     let waited = parked.elapsed();
                     if waited >= WORKER_QUEUE_WAIT_FLOOR {
                         info!(
@@ -1532,10 +1526,6 @@ impl VolumeActor {
     /// [`LOCK_REPORT_FLOOR`] keeps its counters and rolls into the next
     /// one, so a quiet volume stays silent and the line that does come
     /// out covers everything since the last, over the span it names.
-    ///
-    /// Called on a deadline rather than from a select arm, so a busy
-    /// volume reports on the same cadence as a quiet one and the windows
-    /// line up against an external timeline.
     fn report_lock_stats(&mut self) {
         if self.lock_stats_marked.elapsed() < LOCK_REPORT_INTERVAL {
             return;
@@ -2380,20 +2370,14 @@ impl VolumeReader {
 // Worker thread
 // ---------------------------------------------------------------------------
 
-/// A job with the instant the actor handed it to the channel.
-///
-/// One thread serves every job, so a job's wait is the tail of whatever
-/// runs ahead of it. A promote sitting behind a close pass is what turns
-/// that queue into write latency, so the worker reports the wait against
-/// the job kind that paid it.
+/// A job with the instant the actor handed it to the channel, which the
+/// single worker thread reads back as the wait behind the jobs ahead.
 struct QueuedJob {
     queued_at: Instant,
     job: WorkerJob,
 }
 
-/// Queue wait a job reports at `info`. A shorter wait reports at `debug`,
-/// since a job taken straight off an idle thread says nothing about
-/// contention.
+/// Queue wait a job reports at `info`. A shorter wait reports at `debug`.
 const WORKER_QUEUE_WAIT_FLOOR: Duration = Duration::from_millis(50);
 
 /// Long-lived worker thread that processes off-actor jobs (WAL promotes,
@@ -3066,15 +3050,12 @@ struct ScannedSegment {
     all_live: bool,
 }
 
-/// Where one [`execute_repack`] pass spent, phase by phase, logged when
-/// it returns.
+/// Where one [`execute_repack`] pass spent, phase by phase.
 ///
-/// Three of the phases read the same inputs, so they are counted apart.
-/// `scan` is the parse and signature verify every candidate pays before
-/// admission decides. `reread` is what an admitted candidate pays again
-/// to be classified, which the segment-index cache absorbs while the
-/// generation fits inside it. `prep` is the per-bucket `MaterialiseCtx`,
-/// which reads each input's index a third time.
+/// `scan`, `reread` and `prep` each read the inputs, and are counted
+/// apart: the parse and signature verify before admission, the reread an
+/// admitted candidate is classified from, and the per-bucket
+/// `MaterialiseCtx`.
 #[derive(Default)]
 struct PassCost {
     scan: Duration,
@@ -3237,8 +3218,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
 
     let mut stats = CompactionStats::default();
     let mut cost = PassCost::default();
-    // Which generation this pass ran over, so its lines read alongside
-    // the apply's.
+    // The generation this pass ran over, as its lines name it.
     let generation = pending_dir
         .file_name()
         .and_then(|s| s.to_str())
