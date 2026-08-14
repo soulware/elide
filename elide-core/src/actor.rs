@@ -246,7 +246,7 @@ pub struct VolumeActor {
     /// Sender for dispatching jobs to the worker thread.
     /// `Option` so shutdown can `take()` it, dropping the sender to signal
     /// the worker to exit.
-    worker_tx: Option<Sender<WorkerJob>>,
+    worker_tx: Option<Sender<QueuedJob>>,
     /// Receiver for results from the worker thread.
     /// Third arm in the `select!` loop.
     worker_rx: Receiver<WorkerResult>,
@@ -458,6 +458,12 @@ const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// time, which is quiet whatever the sites add up to.
 const LOCK_REPORT_FLOOR: Duration = Duration::from_millis(5);
 
+/// How often the lock report is due. The actor checks the deadline on
+/// every pass of its loop, so the cadence holds under load, where the
+/// select's ready arms would otherwise crowd out a timer arm and stretch
+/// a window to whatever the scheduler allowed.
+const LOCK_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Acquire the volume mutex.
 ///
 /// Poisoning would mean library code panicked while holding the lock —
@@ -494,6 +500,7 @@ fn lock_volume_for_write<'a>(
         }
         Err(contended) => drop(contended),
     }
+    stats.record_write_parking();
     let requested = Instant::now();
     let guard = lock_volume(volume);
     stats.record_write_blocked(requested.elapsed());
@@ -548,6 +555,10 @@ impl Drop for TimedGuard<'_> {
     fn drop(&mut self) {
         self.stats
             .record(self.site, self.wait, self.acquired.elapsed());
+        // `guard` is a field, so it drops after this body: the mutex is
+        // still held here and the arm lands before any parked writer
+        // wakes to run the queue down.
+        self.stats.arm_drain(self.site);
     }
 }
 
@@ -1171,17 +1182,36 @@ impl VolumeActor {
         let Some(tx) = self.worker_tx.clone() else {
             return Err(io::Error::other("worker not running"));
         };
-        let mut job = job;
+        // Stamped once, ahead of any retry, so the wait covers the whole
+        // time from the actor deciding to dispatch.
+        let mut job = QueuedJob {
+            queued_at: Instant::now(),
+            job,
+        };
         loop {
             match tx.try_send(job) {
                 Ok(()) => return Ok(()),
                 Err(crossbeam_channel::TrySendError::Full(j)) => {
                     job = j;
+                    let parked = Instant::now();
                     match self.worker_rx.recv() {
                         Ok(result) => self.handle_worker_result(result),
                         Err(_) => {
                             return Err(io::Error::other("worker result channel closed"));
                         }
+                    }
+                    // The actor is the parked party here, waiting on a
+                    // worker that is busy and then applying its result
+                    // under the volume mutex. Both halves sit between a
+                    // guest write and the actor taking its next request.
+                    let waited = parked.elapsed();
+                    if waited >= WORKER_QUEUE_WAIT_FLOOR {
+                        info!(
+                            "worker queue full: {} dispatch waited {:.0}ms for a slot, \
+                             applying a result inline",
+                            job.job.label(),
+                            waited.as_secs_f64() * 1e3,
+                        );
                     }
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -1502,7 +1532,14 @@ impl VolumeActor {
     /// [`LOCK_REPORT_FLOOR`] keeps its counters and rolls into the next
     /// one, so a quiet volume stays silent and the line that does come
     /// out covers everything since the last, over the span it names.
+    ///
+    /// Called on a deadline rather than from a select arm, so a busy
+    /// volume reports on the same cadence as a quiet one and the windows
+    /// line up against an external timeline.
     fn report_lock_stats(&mut self) {
+        if self.lock_stats_marked.elapsed() < LOCK_REPORT_INTERVAL {
+            return;
+        }
         let window = self.lock_stats.snapshot().since(&self.lock_stats_reported);
         if !window.worth_reporting(LOCK_REPORT_FLOOR) {
             return;
@@ -1534,6 +1571,7 @@ impl VolumeActor {
     pub fn run(mut self) {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
+            self.report_lock_stats();
             crossbeam_channel::select! {
                 recv(self.rx) -> msg => {
                     let req = match msg {
@@ -1733,7 +1771,6 @@ impl VolumeActor {
                     self.dispatch_promote();
                     // Apply any pending GC plan handoffs inline.
                     self.start_gc_handoffs(None);
-                    self.report_lock_stats();
                 }
             }
         }
@@ -2343,15 +2380,34 @@ impl VolumeReader {
 // Worker thread
 // ---------------------------------------------------------------------------
 
+/// A job with the instant the actor handed it to the channel.
+///
+/// One thread serves every job, so a job's wait is the tail of whatever
+/// runs ahead of it. A promote sitting behind a close pass is what turns
+/// that queue into write latency, so the worker reports the wait against
+/// the job kind that paid it.
+struct QueuedJob {
+    queued_at: Instant,
+    job: WorkerJob,
+}
+
+/// Queue wait a job reports at `info`. A shorter wait reports at `debug`,
+/// since a job taken straight off an idle thread says nothing about
+/// contention.
+const WORKER_QUEUE_WAIT_FLOOR: Duration = Duration::from_millis(50);
+
 /// Long-lived worker thread that processes off-actor jobs (WAL promotes,
 /// GC handoff re-signs, etc.).
 ///
 /// Receives jobs via `job_rx`, executes each, and sends the result back on
 /// `result_tx`.  Exits when `job_rx` disconnects (actor dropped the sender)
 /// or `result_tx` disconnects (actor gone).
-fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
+fn worker_thread(job_rx: Receiver<QueuedJob>, result_tx: Sender<WorkerResult>) {
     let mut prior_cache = PriorSourceCache::default();
-    while let Ok(job) = job_rx.recv() {
+    while let Ok(QueuedJob { queued_at, job }) = job_rx.recv() {
+        let label = job.label();
+        let waited = queued_at.elapsed();
+        let started = Instant::now();
         let msg = match job {
             WorkerJob::Promote(job) => {
                 WorkerResult::Promote(execute_promote(job, &mut prior_cache))
@@ -2373,6 +2429,20 @@ fn worker_thread(job_rx: Receiver<WorkerJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::Barrier
             }
         };
+        let ran = started.elapsed();
+        if waited >= WORKER_QUEUE_WAIT_FLOOR {
+            info!(
+                "worker: {label} waited {:.0}ms for the thread, ran {:.0}ms",
+                waited.as_secs_f64() * 1e3,
+                ran.as_secs_f64() * 1e3,
+            );
+        } else {
+            debug!(
+                "worker: {label} waited {:.0}ms for the thread, ran {:.0}ms",
+                waited.as_secs_f64() * 1e3,
+                ran.as_secs_f64() * 1e3,
+            );
+        }
         if result_tx.send(msg).is_err() {
             break;
         }
@@ -2996,6 +3066,26 @@ struct ScannedSegment {
     all_live: bool,
 }
 
+/// Where one [`execute_repack`] pass spent, phase by phase, logged when
+/// it returns.
+///
+/// Three of the phases read the same inputs, so they are counted apart.
+/// `scan` is the parse and signature verify every candidate pays before
+/// admission decides. `reread` is what an admitted candidate pays again
+/// to be classified, which the segment-index cache absorbs while the
+/// generation fits inside it. `prep` is the per-bucket `MaterialiseCtx`,
+/// which reads each input's index a third time.
+#[derive(Default)]
+struct PassCost {
+    scan: Duration,
+    reread: Duration,
+    classify: Duration,
+    prep: Duration,
+    materialise: Duration,
+    write: Duration,
+    body: crate::rewrite_apply::MaterialiseCost,
+}
+
 /// What [`admit_within_budget`] decided, with the counts the pass logs.
 struct Admission {
     admitted: Vec<ScannedSegment>,
@@ -3146,6 +3236,14 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     let cache_dir = base_dir.join("cache");
 
     let mut stats = CompactionStats::default();
+    let mut cost = PassCost::default();
+    // Which generation this pass ran over, so its lines read alongside
+    // the apply's.
+    let generation = pending_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pending")
+        .to_string();
 
     // Phase 1a — scan: parse + verify every non-floor segment and measure
     // it. Parsing is what identifies the journal tier, so every candidate
@@ -3158,6 +3256,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     // classifier from calling entries the snapshot predates dead and the
     // apply from deleting their files (`docs/finding-cargo-build-stale-read.md`).
     // The `floor` gate excludes segments frozen by the latest snapshot.
+    let scan_start = Instant::now();
     let mut scanned: Vec<ScannedSegment> = Vec::new();
     for seg_path in &seg_paths {
         let seg_filename = seg_path
@@ -3208,6 +3307,9 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             all_live,
         });
     }
+    cost.scan = scan_start.elapsed();
+    let scanned_count = scanned.len();
+    let scanned_bytes: u64 = scanned.iter().map(|s| s.stored_bytes).sum();
 
     // Admission — a budget on the work the pass takes on, spent
     // smallest-first across the data segments. Each one admitted folds
@@ -3227,6 +3329,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         turned_away,
         turned_away_bytes,
     } = admit_within_budget(scanned, work_budget);
+    let admitted_count = admitted.len();
     if turned_away > 0 {
         log::info!(
             "repack: {spent} bytes of data segments admitted against a {work_budget} byte \
@@ -3239,13 +3342,16 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
     let mut candidates: Vec<RepackCandidate> = Vec::new();
     let mut journal_candidates: Vec<RepackCandidate> = Vec::new();
     for scan in admitted {
+        let reread_start = Instant::now();
         let parsed = match segment_cache.read_and_verify(&scan.seg_path, &verifying_key) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
+        cost.reread += reread_start.elapsed();
         let entries = &parsed.entries;
 
+        let classify_start = Instant::now();
         let classify_ctx = ClassifyCtx {
             lba_map: &lbamap_snapshot,
             extent_index: &extent_index_snapshot,
@@ -3306,6 +3412,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .filter(|e| e.kind.owns_extent_hash())
             .map(|e| e.hash)
             .collect();
+        cost.classify += classify_start.elapsed();
 
         let candidate = RepackCandidate {
             seg_path: scan.seg_path,
@@ -3440,6 +3547,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                     extent_index: &extent_index_snapshot,
                 };
                 let plan_inputs = plan.inputs();
+                let prep_start = Instant::now();
                 let ctx = match MaterialiseCtx::new_for_pending(
                     &base_dir,
                     &pending_dir,
@@ -3455,6 +3563,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                         )));
                     }
                 };
+                cost.prep += prep_start.elapsed();
+                let materialise_start = Instant::now();
                 let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
                     Ok(m) => m,
                     Err(MaterialiseOutcome::Io(e)) => return Err(e),
@@ -3464,6 +3574,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                         )));
                     }
                 };
+                cost.materialise += materialise_start.elapsed();
+                cost.body += ctx.cost();
                 drop(ctx);
 
                 let Materialised {
@@ -3484,6 +3596,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 let input_ulids: Vec<Ulid> = journal_inputs.iter().map(|i| i.input_ulid).collect();
                 let tmp_path = pending_dir.join(format!("{new_ulid}.tmp"));
                 let _ = std::fs::remove_file(&tmp_path);
+                let write_start = Instant::now();
                 let written = segment::write_segment_full(
                     &tmp_path,
                     entries,
@@ -3494,6 +3607,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 )?;
                 std::fs::rename(&tmp_path, &final_path)?;
                 segment::fsync_dir(&final_path)?;
+                cost.write += write_start.elapsed();
                 written
             };
             stats.new_segments += 1;
@@ -3582,6 +3696,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             extent_index: &extent_index_snapshot,
         };
         let plan_inputs = plan.inputs();
+        let prep_start = Instant::now();
         let ctx = match MaterialiseCtx::new_for_pending(
             &base_dir,
             &pending_dir,
@@ -3597,6 +3712,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 )));
             }
         };
+        cost.prep += prep_start.elapsed();
+        let materialise_start = Instant::now();
         let materialised = match rewrite_apply::materialise_plan(&plan, &ctx) {
             Ok(m) => m,
             Err(MaterialiseOutcome::Io(e)) => return Err(e),
@@ -3606,6 +3723,8 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 )));
             }
         };
+        cost.materialise += materialise_start.elapsed();
+        cost.body += ctx.cost();
         drop(ctx);
 
         let Materialised {
@@ -3618,6 +3737,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         let final_path = pending_dir.join(&new_ulid_str);
         let tmp_path = pending_dir.join(format!("{new_ulid_str}.tmp"));
         let _ = std::fs::remove_file(&tmp_path);
+        let write_start = Instant::now();
         let (new_body_section_start, out_entries) = segment::write_segment_full(
             &tmp_path,
             out_entries,
@@ -3628,6 +3748,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         )?;
         std::fs::rename(&tmp_path, &final_path)?;
         segment::fsync_dir(&final_path)?;
+        cost.write += write_start.elapsed();
         stats.new_segments += 1;
         stats.bytes_freed += bucket_bytes_freed;
 
@@ -3642,6 +3763,31 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             journal: false,
         });
     }
+
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    log::info!(
+        "repack {generation}: scanned {scanned_count} segment(s) / {scanned_bytes} stored bytes \
+         in {:.1}ms, admitted {admitted_count}, reread={:.1}ms classify={:.1}ms",
+        ms(cost.scan),
+        ms(cost.reread),
+        ms(cost.classify),
+    );
+    log::info!(
+        "repack {generation}: {} output(s) prep={:.1}ms materialise={:.1}ms write={:.1}ms; \
+         bodies read={:.1}ms/{}B verify={:.1}ms/{}B decode={:.1}ms/{}B recompress={:.1}ms/{}B",
+        stats.new_segments,
+        ms(cost.prep),
+        ms(cost.materialise),
+        ms(cost.write),
+        ms(cost.body.read),
+        cost.body.read_bytes,
+        ms(cost.body.verify),
+        cost.body.verify_bytes,
+        ms(cost.body.decode),
+        cost.body.decode_bytes,
+        ms(cost.body.recompress),
+        cost.body.recompress_bytes,
+    );
 
     Ok(RepackResult {
         stats,
@@ -3876,7 +4022,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     let (tx, rx) = bounded(64);
 
     // Worker channels: job channel bounded at 4, result channel matched.
-    let (worker_job_tx, worker_job_rx) = bounded::<WorkerJob>(4);
+    let (worker_job_tx, worker_job_rx) = bounded::<QueuedJob>(4);
     let (worker_result_tx, worker_result_rx) = bounded::<WorkerResult>(4);
     let worker_handle = std::thread::Builder::new()
         .name("volume-worker".into())

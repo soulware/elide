@@ -15,11 +15,13 @@
 //! tests can mock the trait against an in-memory tree.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ulid::Ulid;
 
@@ -46,6 +48,43 @@ struct InputState {
 pub struct Materialised {
     pub entries: Vec<PendingEntry>,
     pub delta_body: Vec<u8>,
+}
+
+/// Where a materialisation spent, accumulated on the ctx as the plan
+/// emits and read back by the caller through [`MaterialiseCtx::cost`].
+///
+/// Each phase pairs a duration with the bytes it moved, so a report reads
+/// as a rate. Every byte count is measured where the phase sees it —
+/// `read` counts what came off disk, `verify` and `decode` what they fed
+/// to the codec, `recompress` the plaintext handed to the encoder.
+///
+/// `verify` is the decode-and-hash a carried body pays for its integrity
+/// check, which is the whole per-byte cost of a copy-through rewrite.
+/// `decode` and `recompress` are what a partial-death entry pays on top,
+/// to reach plaintext it can slice and to re-encode each surviving run.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MaterialiseCost {
+    pub read: Duration,
+    pub read_bytes: u64,
+    pub verify: Duration,
+    pub verify_bytes: u64,
+    pub decode: Duration,
+    pub decode_bytes: u64,
+    pub recompress: Duration,
+    pub recompress_bytes: u64,
+}
+
+impl std::ops::AddAssign for MaterialiseCost {
+    fn add_assign(&mut self, rhs: Self) {
+        self.read += rhs.read;
+        self.read_bytes += rhs.read_bytes;
+        self.verify += rhs.verify;
+        self.verify_bytes += rhs.verify_bytes;
+        self.decode += rhs.decode;
+        self.decode_bytes += rhs.decode_bytes;
+        self.recompress += rhs.recompress;
+        self.recompress_bytes += rhs.recompress_bytes;
+    }
 }
 
 /// Error outcomes distinct from hard I/O failures. Returned when the plan
@@ -122,6 +161,8 @@ pub struct MaterialiseCtx<'a> {
     /// pass sets this, and it re-tags its output journal so the merge
     /// stays a journal→journal rewrite, never a leak into the data tier.
     allow_journal: bool,
+    /// What the plan running through this ctx has spent so far.
+    cost: Cell<MaterialiseCost>,
 }
 
 /// Segment body resolution against the volume's self + ancestor dirs and an
@@ -363,9 +404,8 @@ fn emit_keep(
             )));
         }
         EntryKind::Data => {
-            let bytes =
-                read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
-            verify_body_hash(entry, &bytes)?;
+            let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
+            verify_body_hash(ctx, entry, &bytes)?;
             out_entries.push(SegmentEntry::new_data(
                 entry.hash,
                 entry.start_lba,
@@ -376,7 +416,7 @@ fn emit_keep(
         }
         EntryKind::Inline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(entry, bytes)?;
+            verify_body_hash(ctx, entry, bytes)?;
             out_entries.push(SegmentEntry::new_data(
                 entry.hash,
                 entry.start_lba,
@@ -386,15 +426,14 @@ fn emit_keep(
             ));
         }
         EntryKind::CanonicalData => {
-            let bytes =
-                read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
-            verify_body_hash(entry, &bytes)?;
+            let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
+            verify_body_hash(ctx, entry, &bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(entry, bytes)?;
+            verify_body_hash(ctx, entry, bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
@@ -431,13 +470,8 @@ fn carry_delta_blobs(
 ) -> Result<Vec<segment::DeltaOption>, MaterialiseOutcome> {
     let mut new_options = Vec::with_capacity(entry.delta_options.len());
     for opt in &entry.delta_options {
-        let blob = read_input_delta_blob(
-            input_ulid,
-            state,
-            opt.delta_offset,
-            opt.delta_length,
-            ctx.resolver,
-        )?;
+        let blob =
+            read_input_delta_blob(input_ulid, state, opt.delta_offset, opt.delta_length, ctx)?;
         let new_offset = delta_body.len() as u64;
         delta_body.extend_from_slice(&blob);
         let mut new_opt = opt.clone();
@@ -479,15 +513,14 @@ fn emit_canonical(
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     match entry.kind {
         EntryKind::Data | EntryKind::CanonicalData => {
-            let bytes =
-                read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
-            verify_body_hash(entry, &bytes)?;
+            let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
+            verify_body_hash(ctx, entry, &bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::Inline | EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(entry, bytes)?;
+            verify_body_hash(ctx, entry, bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
@@ -551,9 +584,10 @@ fn emit_run(
     // takes the same gate every other producer of body plaintext takes.
     // `allow_journal` marks a journal-to-journal rewrite, which is the only
     // way a run here covers journal-tier bytes.
-    let (codec, body) = match crate::volume::compress_body(slice, ctx.allow_journal)
-        .map_err(MaterialiseOutcome::from)?
-    {
+    let encode_start = Instant::now();
+    let encoded = crate::volume::compress_body(slice, ctx.allow_journal);
+    ctx.charge_recompress(encode_start.elapsed(), slice.len() as u64);
+    let (codec, body) = match encoded.map_err(MaterialiseOutcome::from)? {
         Some(pair) => pair,
         None => (Codec::None, slice.to_vec()),
     };
@@ -598,15 +632,14 @@ fn compute_composite_body(
     let (state, entry) = input_entry(ctx, input_ulid, entry_idx)?;
     let body: Vec<u8> = match entry.kind {
         EntryKind::Data => {
-            let stored =
-                read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx.resolver)?;
-            verify_body_hash(entry, &stored)?;
-            decode_body(Cow::Owned(stored), entry.codec)?
+            let stored = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
+            verify_body_hash(ctx, entry, &stored)?;
+            decode_body(ctx, Cow::Owned(stored), entry.codec)?
         }
         EntryKind::Inline => {
             let stored = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(entry, stored)?;
-            decode_body(Cow::Borrowed(stored), entry.codec)?
+            verify_body_hash(ctx, entry, stored)?;
+            decode_body(ctx, Cow::Borrowed(stored), entry.codec)?
         }
         EntryKind::DedupRef => resolve_body_by_hash_decompressed(&entry.hash, ctx)?,
         EntryKind::Delta => {
@@ -622,13 +655,8 @@ fn compute_composite_body(
                     )))
                 })?;
             let base = resolve_body_by_hash_decompressed(&opt.source_hash, ctx)?;
-            let blob = read_input_delta_blob(
-                input_ulid,
-                state,
-                opt.delta_offset,
-                opt.delta_length,
-                ctx.resolver,
-            )?;
+            let blob =
+                read_input_delta_blob(input_ulid, state, opt.delta_offset, opt.delta_length, ctx)?;
             let composite = crate::delta_compute::apply_delta(&base, &blob).map_err(|e| {
                 MaterialiseOutcome::from(MaterialiseError::Internal(format!(
                     "apply_delta failed (input={input_ulid} idx={entry_idx}): {e}"
@@ -672,11 +700,16 @@ fn compute_composite_body(
     Ok(body)
 }
 
-fn decode_body(stored: Cow<'_, [u8]>, codec: Codec) -> Result<Vec<u8>, MaterialiseOutcome> {
-    codec
-        .decode(stored)
-        .map(Cow::into_owned)
-        .map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(e.to_string())))
+fn decode_body(
+    ctx: &MaterialiseCtx<'_>,
+    stored: Cow<'_, [u8]>,
+    codec: Codec,
+) -> Result<Vec<u8>, MaterialiseOutcome> {
+    let stored_len = stored.len() as u64;
+    let start = Instant::now();
+    let decoded = codec.decode(stored).map(Cow::into_owned);
+    ctx.charge_decode(start.elapsed(), stored_len);
+    decoded.map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(e.to_string())))
 }
 
 /// Resolve the uncompressed body for `hash` via the merged extent index and
@@ -697,7 +730,7 @@ fn resolve_body_by_hash_decompressed(
         .clone();
 
     if let Some(idata) = &loc.inline_data {
-        return decode_body(Cow::Borrowed(idata), loc.codec);
+        return decode_body(ctx, Cow::Borrowed(idata), loc.codec);
     }
 
     let (path, layout) =
@@ -707,7 +740,7 @@ fn resolve_body_by_hash_decompressed(
     let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; loc.body_length as usize];
     f.read_exact_at(&mut buf, seek)?;
-    decode_body(Cow::Owned(buf), loc.codec)
+    decode_body(ctx, Cow::Owned(buf), loc.codec)
 }
 
 /// Read the stored (possibly compressed) bytes for a Data-kind entry in an
@@ -724,7 +757,7 @@ fn read_input_extent_stored_bytes(
     entry_idx: u32,
     state: &InputState,
     entry: &SegmentEntry,
-    resolver: &dyn BodyResolver,
+    ctx: &MaterialiseCtx<'_>,
 ) -> Result<Vec<u8>, MaterialiseOutcome> {
     if !entry.kind.has_body_bytes()
         || matches!(entry.kind, EntryKind::Inline | EntryKind::CanonicalInline)
@@ -735,10 +768,11 @@ fn read_input_extent_stored_bytes(
         ))
         .into());
     }
+    let start = Instant::now();
     // Input segments are always `BodyOnly` in production (their body has
     // been promoted to cache) or `FullSegment` while still in pending/wal
     // (pre-promotion). Either layout is acceptable; the resolver tells us.
-    let (path, layout) = resolver.find_segment(
+    let (path, layout) = ctx.resolver.find_segment(
         input_ulid,
         state.body_section_start,
         BodySource::Cached(entry_idx),
@@ -747,6 +781,7 @@ fn read_input_extent_stored_bytes(
     let f = fs::File::open(&path)?;
     let mut buf = vec![0u8; entry.stored_length as usize];
     f.read_exact_at(&mut buf, seek)?;
+    ctx.charge_read(start.elapsed(), buf.len() as u64);
     Ok(buf)
 }
 
@@ -788,9 +823,10 @@ fn read_input_delta_blob(
     state: &InputState,
     delta_offset: u64,
     delta_length: u32,
-    resolver: &dyn BodyResolver,
+    ctx: &MaterialiseCtx<'_>,
 ) -> Result<Vec<u8>, MaterialiseOutcome> {
-    match resolver.locate_segment_unchecked(input_ulid) {
+    let start = Instant::now();
+    let buf = match ctx.resolver.locate_segment_unchecked(input_ulid) {
         Some((path, SegmentBodyLayout::FullSegment)) => {
             let seek = SegmentBodyLayout::FullSegment
                 .body_section_file_offset(state.body_section_start)
@@ -799,22 +835,30 @@ fn read_input_delta_blob(
             let f = fs::File::open(&path)?;
             let mut buf = vec![0u8; delta_length as usize];
             f.read_exact_at(&mut buf, seek)?;
-            Ok(buf)
+            buf
         }
         Some((_, SegmentBodyLayout::BodyOnly)) | None => {
             // Delta lives in a sibling `cache/<id>.delta` file (or is
             // demand-fetched by the resolver on miss).
-            let f = resolver.open_delta_body(input_ulid)?;
+            let f = ctx.resolver.open_delta_body(input_ulid)?;
             let mut buf = vec![0u8; delta_length as usize];
             f.read_exact_at(&mut buf, delta_offset)?;
-            Ok(buf)
+            buf
         }
-    }
+    };
+    ctx.charge_read(start.elapsed(), buf.len() as u64);
+    Ok(buf)
 }
 
-fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> Result<(), MaterialiseOutcome> {
-    segment::verify_body_hash(entry, body)
-        .map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!("{e}"))))
+fn verify_body_hash(
+    ctx: &MaterialiseCtx<'_>,
+    entry: &SegmentEntry,
+    body: &[u8],
+) -> Result<(), MaterialiseOutcome> {
+    let start = Instant::now();
+    let verified = segment::verify_body_hash(entry, body);
+    ctx.charge_verify(start.elapsed(), body.len() as u64);
+    verified.map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!("{e}"))))
 }
 
 impl<'a> MaterialiseCtx<'a> {
@@ -834,6 +878,7 @@ impl<'a> MaterialiseCtx<'a> {
             extent_index,
             resolver,
             allow_journal: false,
+            cost: Cell::default(),
         })
     }
 
@@ -855,6 +900,7 @@ impl<'a> MaterialiseCtx<'a> {
             extent_index,
             resolver,
             allow_journal: false,
+            cost: Cell::default(),
         })
     }
 
@@ -864,6 +910,39 @@ impl<'a> MaterialiseCtx<'a> {
     pub fn allowing_journal(mut self) -> Self {
         self.allow_journal = true;
         self
+    }
+
+    /// What the plans materialised through this ctx have spent.
+    pub fn cost(&self) -> MaterialiseCost {
+        self.cost.get()
+    }
+
+    fn charge_read(&self, elapsed: Duration, bytes: u64) {
+        let mut cost = self.cost.get();
+        cost.read += elapsed;
+        cost.read_bytes += bytes;
+        self.cost.set(cost);
+    }
+
+    fn charge_verify(&self, elapsed: Duration, bytes: u64) {
+        let mut cost = self.cost.get();
+        cost.verify += elapsed;
+        cost.verify_bytes += bytes;
+        self.cost.set(cost);
+    }
+
+    fn charge_decode(&self, elapsed: Duration, bytes: u64) {
+        let mut cost = self.cost.get();
+        cost.decode += elapsed;
+        cost.decode_bytes += bytes;
+        self.cost.set(cost);
+    }
+
+    fn charge_recompress(&self, elapsed: Duration, bytes: u64) {
+        let mut cost = self.cost.get();
+        cost.recompress += elapsed;
+        cost.recompress_bytes += bytes;
+        self.cost.set(cost);
     }
 }
 
