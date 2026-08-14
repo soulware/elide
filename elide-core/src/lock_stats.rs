@@ -213,6 +213,12 @@ struct WriteCounters {
     peak_wait_nanos: AtomicU64,
     /// Writes parked on the mutex right now.
     waiting: AtomicU64,
+    /// Deepest that queue got. Its ceiling is the number of threads that
+    /// can be inside a write at once, so a `queued` figure sitting at
+    /// this high-water mark is a bound on the measurement rather than a
+    /// property of the hold.
+    window_max_waiting: AtomicU64,
+    peak_waiting: AtomicU64,
     /// Distribution of the waits, by [`wait_bucket`].
     wait_buckets: [AtomicU64; WAIT_BUCKETS],
 }
@@ -291,7 +297,11 @@ impl LockStats {
     /// [`Self::record_write_blocked`] that follows it, so the gauge
     /// between the two is the queue a holder sees.
     pub fn record_write_parking(&self) {
-        self.writes.waiting.fetch_add(1, Ordering::Release);
+        let depth = self.writes.waiting.fetch_add(1, Ordering::Release) + 1;
+        self.writes
+            .window_max_waiting
+            .fetch_max(depth, Ordering::Relaxed);
+        self.writes.peak_waiting.fetch_max(depth, Ordering::Relaxed);
         if self.armed.release_nanos.load(Ordering::Acquire) != 0 {
             self.armed.joined.fetch_add(1, Ordering::Relaxed);
         }
@@ -400,6 +410,12 @@ impl LockStats {
                     self.writes.window_max_wait_nanos.load(Ordering::Relaxed)
                 },
                 peak_wait_nanos: self.writes.peak_wait_nanos.load(Ordering::Relaxed),
+                max_waiting: if close_window {
+                    self.writes.window_max_waiting.swap(0, Ordering::Relaxed)
+                } else {
+                    self.writes.window_max_waiting.load(Ordering::Relaxed)
+                },
+                peak_waiting: self.writes.peak_waiting.load(Ordering::Relaxed),
                 wait_buckets: std::array::from_fn(|i| {
                     self.writes.wait_buckets[i].load(Ordering::Relaxed)
                 }),
@@ -445,6 +461,10 @@ pub struct WriteSnapshot {
     pub max_wait_nanos: u64,
     /// Longest single wait since the volume opened.
     pub peak_wait_nanos: u64,
+    /// Deepest the parked-write queue got within the window.
+    pub max_waiting: u64,
+    /// Deepest it has got since the volume opened.
+    pub peak_waiting: u64,
     /// Waits by magnitude, bucketed on [`WAIT_BUCKET_EDGES_MS`].
     pub wait_buckets: [u64; WAIT_BUCKETS],
 }
@@ -521,6 +541,8 @@ impl LockStatsSnapshot {
                     .saturating_sub(earlier.writes.wait_nanos),
                 max_wait_nanos: self.writes.max_wait_nanos,
                 peak_wait_nanos: self.writes.peak_wait_nanos,
+                max_waiting: self.writes.max_waiting,
+                peak_waiting: self.writes.peak_waiting,
                 wait_buckets: std::array::from_fn(|i| {
                     self.writes.wait_buckets[i].saturating_sub(earlier.writes.wait_buckets[i])
                 }),
@@ -603,12 +625,15 @@ impl LockStatsSnapshot {
         }
         if self.writes.acquisitions > 0 {
             out.push_str(&format!(
-                "; writes n={} blocked={} wait={:.1}ms max={:.1}ms peak={:.1}ms",
+                "; writes n={} blocked={} wait={:.1}ms max={:.1}ms peak={:.1}ms \
+                 maxq={} peakq={}",
                 self.writes.acquisitions,
                 self.writes.blocked,
                 millis(self.writes.wait_nanos),
                 millis(self.writes.max_wait_nanos),
                 millis(self.writes.peak_wait_nanos),
+                self.writes.max_waiting,
+                self.writes.peak_waiting,
             ));
             let spread: Vec<String> = self
                 .writes
@@ -983,6 +1008,27 @@ mod tests {
             report.contains("arms=1 drains=0"),
             "the replaced arm is visible: {report}"
         );
+    }
+
+    /// The queue's high-water mark bounds every `queued` figure, so a
+    /// window reports it beside them.
+    #[test]
+    fn the_queue_depth_high_water_mark_is_reported() {
+        let stats = LockStats::default();
+        stats.record_write_parking();
+        stats.record_write_parking();
+        stats.record_write_parking();
+        stats.record_write_blocked(Duration::from_millis(1));
+        stats.record_write_blocked(Duration::from_millis(1));
+        stats.record_write_parking();
+        stats.record_write_blocked(Duration::from_millis(1));
+        stats.record_write_blocked(Duration::from_millis(1));
+
+        let writes = stats.snapshot().writes();
+        assert_eq!(writes.max_waiting, 3);
+        assert_eq!(writes.peak_waiting, 3);
+        let report = stats.snapshot().report().expect("the writes acquired");
+        assert!(report.contains("maxq=3 peakq=3"), "got: {report}");
     }
 
     /// `queued` samples once at the release, so writes arriving during
