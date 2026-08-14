@@ -50,18 +50,13 @@ pub struct Materialised {
     pub delta_body: Vec<u8>,
 }
 
-/// Where a materialisation spent, accumulated on the ctx as the plan
-/// emits and read back by the caller through [`MaterialiseCtx::cost`].
+/// Where a materialisation spent, accumulated on the ctx and read back
+/// through [`MaterialiseCtx::cost`].
 ///
-/// Each phase pairs a duration with the bytes it moved, so a report reads
-/// as a rate. Every byte count is measured where the phase sees it —
-/// `read` counts what came off disk, `verify` and `decode` what they fed
-/// to the codec, `recompress` the plaintext handed to the encoder.
-///
-/// `verify` is the decode-and-hash a carried body pays for its integrity
-/// check, which is the whole per-byte cost of a copy-through rewrite.
-/// `decode` and `recompress` are what a partial-death entry pays on top,
-/// to reach plaintext it can slice and to re-encode each surviving run.
+/// Each phase pairs a duration with the bytes it moved. `read` counts
+/// what came off disk, `verify` the decode-and-hash of a carried body,
+/// `decode` the plaintext a partial-death entry is sliced from, and
+/// `recompress` the plaintext handed to the encoder.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MaterialiseCost {
     pub read: Duration,
@@ -161,7 +156,7 @@ pub struct MaterialiseCtx<'a> {
     /// pass sets this, and it re-tags its output journal so the merge
     /// stays a journal→journal rewrite, never a leak into the data tier.
     allow_journal: bool,
-    /// What the plan running through this ctx has spent so far.
+    /// What the plans run through this ctx have spent.
     cost: Cell<MaterialiseCost>,
 }
 

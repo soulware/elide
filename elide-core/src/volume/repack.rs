@@ -34,13 +34,11 @@ pub(crate) const JOURNAL_CONSOLIDATION_ULIDS: usize = 1;
 /// objects rather than holding the next cut behind one long job.
 const REPACK_CLOSE_WORK_BYTES: u64 = 4 * crate::actor::REPACK_TARGET_LIVE;
 
-/// How many input ULIDs a bucket's log line names before it summarises
-/// the rest by count. A pass over a large generation packs tens of inputs
-/// into one bucket, and the leading ULIDs identify it.
+/// How many input ULIDs a bucket.s log line names before it summarises
+/// the rest by count.
 const LOGGED_INPUT_ULIDS: usize = 4;
 
-/// Name a bucket's inputs for a log line, capped at
-/// [`LOGGED_INPUT_ULIDS`].
+/// Name a bucket.s inputs for a log line.
 fn format_inputs(inputs: &[RepackedInput]) -> String {
     let mut out = inputs
         .iter()
@@ -427,8 +425,8 @@ impl Volume {
             .unwrap_or("pending");
 
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
-        // Summed across buckets. One hold of the volume mutex spans this
-        // whole loop, so the totals are what a guest write waits.
+        // Summed across buckets, which one hold of the volume mutex
+        // spans.
         let (mut derive_total, mut header_total) = (Duration::ZERO, Duration::ZERO);
         let (mut merge_total, mut gate_total) = (Duration::ZERO, Duration::ZERO);
         let buckets_start = Instant::now();
@@ -667,10 +665,7 @@ impl Volume {
         segment::fsync_dir(&pending_dir)?;
         if !buckets.is_empty() {
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
-            // What the four phases leave unaccounted — the CAS bookkeeping
-            // around them, a refused bucket's rollback, the per-input cache
-            // eviction and the hash-set work each bucket does outside its
-            // timed spans.
+            // What the four phases leave unaccounted.
             let other = buckets_total
                 .saturating_sub(derive_total)
                 .saturating_sub(header_total)
