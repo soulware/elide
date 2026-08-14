@@ -667,15 +667,26 @@ impl Volume {
         segment::fsync_dir(&pending_dir)?;
         if !buckets.is_empty() {
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            // What the four phases leave unaccounted — the CAS bookkeeping
+            // around them, a refused bucket's rollback, the per-input cache
+            // eviction and the hash-set work each bucket does outside its
+            // timed spans.
+            let other = buckets_total
+                .saturating_sub(derive_total)
+                .saturating_sub(header_total)
+                .saturating_sub(merge_total)
+                .saturating_sub(gate_total);
             log::info!(
                 "repack {generation}: apply pass {} bucket(s) in {:.1}ms \
-                 (derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms), fsync={:.1}ms",
+                 (derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms other={:.1}ms), \
+                 fsync={:.1}ms",
                 buckets.len(),
                 ms(buckets_total),
                 ms(derive_total),
                 ms(header_total),
                 ms(merge_total),
                 ms(gate_total),
+                ms(other),
                 ms(fsync_start.elapsed()),
             );
         }

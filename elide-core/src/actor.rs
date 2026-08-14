@@ -458,6 +458,12 @@ const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// time, which is quiet whatever the sites add up to.
 const LOCK_REPORT_FLOOR: Duration = Duration::from_millis(5);
 
+/// How often the lock report is due. The actor checks the deadline on
+/// every pass of its loop, so the cadence holds under load, where the
+/// select's ready arms would otherwise crowd out a timer arm and stretch
+/// a window to whatever the scheduler allowed.
+const LOCK_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Acquire the volume mutex.
 ///
 /// Poisoning would mean library code panicked while holding the lock —
@@ -494,6 +500,7 @@ fn lock_volume_for_write<'a>(
         }
         Err(contended) => drop(contended),
     }
+    stats.record_write_parking();
     let requested = Instant::now();
     let guard = lock_volume(volume);
     stats.record_write_blocked(requested.elapsed());
@@ -548,6 +555,10 @@ impl Drop for TimedGuard<'_> {
     fn drop(&mut self) {
         self.stats
             .record(self.site, self.wait, self.acquired.elapsed());
+        // `guard` is a field, so it drops after this body: the mutex is
+        // still held here and the arm lands before any parked writer
+        // wakes to run the queue down.
+        self.stats.arm_drain(self.site);
     }
 }
 
@@ -1182,11 +1193,25 @@ impl VolumeActor {
                 Ok(()) => return Ok(()),
                 Err(crossbeam_channel::TrySendError::Full(j)) => {
                     job = j;
+                    let parked = Instant::now();
                     match self.worker_rx.recv() {
                         Ok(result) => self.handle_worker_result(result),
                         Err(_) => {
                             return Err(io::Error::other("worker result channel closed"));
                         }
+                    }
+                    // The actor is the parked party here, waiting on a
+                    // worker that is busy and then applying its result
+                    // under the volume mutex. Both halves sit between a
+                    // guest write and the actor taking its next request.
+                    let waited = parked.elapsed();
+                    if waited >= WORKER_QUEUE_WAIT_FLOOR {
+                        info!(
+                            "worker queue full: {} dispatch waited {:.0}ms for a slot, \
+                             applying a result inline",
+                            job.job.label(),
+                            waited.as_secs_f64() * 1e3,
+                        );
                     }
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -1507,7 +1532,14 @@ impl VolumeActor {
     /// [`LOCK_REPORT_FLOOR`] keeps its counters and rolls into the next
     /// one, so a quiet volume stays silent and the line that does come
     /// out covers everything since the last, over the span it names.
+    ///
+    /// Called on a deadline rather than from a select arm, so a busy
+    /// volume reports on the same cadence as a quiet one and the windows
+    /// line up against an external timeline.
     fn report_lock_stats(&mut self) {
+        if self.lock_stats_marked.elapsed() < LOCK_REPORT_INTERVAL {
+            return;
+        }
         let window = self.lock_stats.snapshot().since(&self.lock_stats_reported);
         if !window.worth_reporting(LOCK_REPORT_FLOOR) {
             return;
@@ -1539,6 +1571,7 @@ impl VolumeActor {
     pub fn run(mut self) {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
+            self.report_lock_stats();
             crossbeam_channel::select! {
                 recv(self.rx) -> msg => {
                     let req = match msg {
@@ -1738,7 +1771,6 @@ impl VolumeActor {
                     self.dispatch_promote();
                     // Apply any pending GC plan handoffs inline.
                     self.start_gc_handoffs(None);
-                    self.report_lock_stats();
                 }
             }
         }
