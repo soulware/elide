@@ -34,6 +34,30 @@ pub(crate) const JOURNAL_CONSOLIDATION_ULIDS: usize = 1;
 /// objects rather than holding the next cut behind one long job.
 const REPACK_CLOSE_WORK_BYTES: u64 = 4 * crate::actor::REPACK_TARGET_LIVE;
 
+/// How many input ULIDs a bucket's log line names before it summarises
+/// the rest by count. A pass over a large generation packs tens of inputs
+/// into one bucket, and the leading ULIDs identify it.
+const LOGGED_INPUT_ULIDS: usize = 4;
+
+/// Name a bucket's inputs for a log line, capped at
+/// [`LOGGED_INPUT_ULIDS`].
+fn format_inputs(inputs: &[RepackedInput]) -> String {
+    let mut out = inputs
+        .iter()
+        .take(LOGGED_INPUT_ULIDS)
+        .map(|i| i.input_ulid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Some(rest) = inputs
+        .len()
+        .checked_sub(LOGGED_INPUT_ULIDS)
+        .filter(|n| *n > 0)
+    {
+        out.push_str(&format!(",+{rest} more"));
+    }
+    out
+}
+
 /// Results from a single compaction run.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CompactionStats {
@@ -403,6 +427,11 @@ impl Volume {
             .unwrap_or("pending");
 
         let mut consumed_inputs: Vec<PathBuf> = Vec::new();
+        // Summed across buckets. One hold of the volume mutex spans this
+        // whole loop, so the totals are what a guest write waits.
+        let (mut derive_total, mut header_total) = (Duration::ZERO, Duration::ZERO);
+        let (mut merge_total, mut gate_total) = (Duration::ZERO, Duration::ZERO);
+        let buckets_start = Instant::now();
         // Rebuilt from what this pass saw: the journal segments it left
         // in place, plus each journal bucket's outcome as the loop below
         // resolves it — the output for a bucket that landed, the inputs
@@ -421,12 +450,7 @@ impl Volume {
             let bucket_input_ulids: std::collections::HashSet<Ulid> =
                 bucket.inputs.iter().map(|i| i.input_ulid).collect();
 
-            let inputs_fmt = bucket
-                .inputs
-                .iter()
-                .map(|i| i.input_ulid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+            let inputs_fmt = format_inputs(&bucket.inputs);
 
             // Stale-liveness refusal, mirroring the GC plan apply: the
             // worker classified against a prep-time lbamap snapshot, so a
@@ -564,6 +588,10 @@ impl Volume {
                 Ok(())
             })?;
             let gate_check = gate_start.elapsed().saturating_sub(merge);
+            derive_total += derive;
+            header_total += header;
+            merge_total += merge;
+            gate_total += gate_check;
 
             if let ResolvabilityGate::Refused(orphaned) = gate {
                 let detail = orphaned
@@ -634,13 +662,21 @@ impl Volume {
             }
         }
 
+        let buckets_total = buckets_start.elapsed();
         let fsync_start = Instant::now();
         segment::fsync_dir(&pending_dir)?;
         if !buckets.is_empty() {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
             log::info!(
-                "repack {generation}: apply pass {} bucket(s), fsync={:.1}ms",
+                "repack {generation}: apply pass {} bucket(s) in {:.1}ms \
+                 (derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms), fsync={:.1}ms",
                 buckets.len(),
-                fsync_start.elapsed().as_secs_f64() * 1e3,
+                ms(buckets_total),
+                ms(derive_total),
+                ms(header_total),
+                ms(merge_total),
+                ms(gate_total),
+                ms(fsync_start.elapsed()),
             );
         }
 

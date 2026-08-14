@@ -382,6 +382,22 @@ pub enum WorkerJob {
     Barrier(crossbeam_channel::Receiver<()>),
 }
 
+impl WorkerJob {
+    /// Name of the job kind, for the worker's queue-wait line.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Promote(_) => "promote",
+            Self::GcPlan(_) => "gc-plan",
+            Self::PromoteSegment(_) => "promote-segment",
+            Self::CloseGeneration(_) => "close-generation",
+            Self::SignSnapshotManifest(_) => "sign-snapshot-manifest",
+            Self::Reclaim(_) => "reclaim",
+            #[cfg(test)]
+            Self::Barrier(_) => "barrier",
+        }
+    }
+}
+
 /// Result returned by the worker thread to the actor. `PromoteSegment` carries
 /// the target ULID out-of-band, so a failed job still matches its parked reply.
 pub enum WorkerResult {
