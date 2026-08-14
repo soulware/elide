@@ -122,8 +122,8 @@ mod imp {
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, Ordering};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use crossbeam_channel::{Receiver, Sender, unbounded};
     use libublk::BufDesc;
@@ -790,6 +790,10 @@ mod imp {
         // VolumeClient is Send + Sync + Clone, so it satisfies run_target's
         // queue-handler bound directly. Each queue thread constructs a pool
         // of VolumeReaders (one per worker) from its VolumeClient clone.
+        let io_stats = Arc::new(IoStats::default());
+        let io_report_stop = Arc::new(AtomicBool::new(false));
+        spawn_io_reporter(Arc::clone(&io_stats), Arc::clone(&io_report_stop));
+
         let q_handler = {
             let client = client.clone();
             move |qid, dev: &UblkDev| {
@@ -801,7 +805,7 @@ mod imp {
                 // the same prctl already succeeded at process startup and
                 // CAP_SYS_RESOURCE is never dropped.
                 set_io_flusher().expect("PR_SET_IO_FLUSHER re-assert on queue thread");
-                q_fn(qid, dev, client.clone());
+                q_fn(qid, dev, client.clone(), Arc::clone(&io_stats));
             }
         };
 
@@ -830,8 +834,11 @@ mod imp {
         // detecting that the kernel device went away from another
         // context. The `run_target` Result is propagated for the latter
         // case; the signal path never reaches here.
-        ctrl.run_target(tgt_init, q_handler, wait_hook)
-            .map_err(|e| io::Error::other(format!("ublk run_target: {e}")))?;
+        let served = ctrl
+            .run_target(tgt_init, q_handler, wait_hook)
+            .map_err(|e| io::Error::other(format!("ublk run_target: {e}")));
+        io_report_stop.store(true, Ordering::Relaxed);
+        served?;
         Ok(())
     }
 
@@ -904,10 +911,148 @@ mod imp {
         op == UBLK_IO_OP_READ || op == UBLK_IO_OP_WRITE
     }
 
+    /// Upper edges of the service-time histogram, in milliseconds. Anything
+    /// past the last edge lands in an overflow bucket.
+    const SERVICE_BUCKET_EDGES_MS: [u64; 6] = [1, 5, 25, 100, 500, 2_000];
+
+    /// One bucket per edge, plus the overflow.
+    const SERVICE_BUCKETS: usize = SERVICE_BUCKET_EDGES_MS.len() + 1;
+
+    fn service_bucket(d: Duration) -> usize {
+        let ms = d.as_millis() as u64;
+        SERVICE_BUCKET_EDGES_MS
+            .iter()
+            .position(|edge| ms < *edge)
+            .unwrap_or(SERVICE_BUCKETS - 1)
+    }
+
+    fn service_bucket_label(i: usize) -> String {
+        if i < SERVICE_BUCKETS - 1 {
+            format!("<{}ms", SERVICE_BUCKET_EDGES_MS[i])
+        } else {
+            format!(">={}ms", SERVICE_BUCKET_EDGES_MS[SERVICE_BUCKETS - 2])
+        }
+    }
+
+    /// One op class's service times, in nanoseconds.
+    #[derive(Default)]
+    struct OpStats {
+        count: AtomicU64,
+        nanos: AtomicU64,
+        window_max_nanos: AtomicU64,
+        peak_nanos: AtomicU64,
+        buckets: [AtomicU64; SERVICE_BUCKETS],
+    }
+
+    impl OpStats {
+        fn record(&self, service: Duration) {
+            let nanos = service.as_nanos() as u64;
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.nanos.fetch_add(nanos, Ordering::Relaxed);
+            self.window_max_nanos.fetch_max(nanos, Ordering::Relaxed);
+            self.peak_nanos.fetch_max(nanos, Ordering::Relaxed);
+            self.buckets[service_bucket(service)].fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Read and reset the window, returning `None` when nothing was
+        /// recorded.
+        fn take_window(&self) -> Option<String> {
+            let count = self.count.swap(0, Ordering::Relaxed);
+            let nanos = self.nanos.swap(0, Ordering::Relaxed);
+            let max = self.window_max_nanos.swap(0, Ordering::Relaxed);
+            let peak = self.peak_nanos.load(Ordering::Relaxed);
+            if count == 0 {
+                return None;
+            }
+            let ms = |n: u64| n as f64 / 1e6;
+            let spread: Vec<String> = self
+                .buckets
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| match b.swap(0, Ordering::Relaxed) {
+                    0 => None,
+                    n => Some(format!("{}={n}", service_bucket_label(i))),
+                })
+                .collect();
+            Some(format!(
+                "n={count} mean={:.2}ms max={:.1}ms peak={:.1}ms [{}]",
+                ms(nanos) / count as f64,
+                ms(max),
+                ms(peak),
+                spread.join(" "),
+            ))
+        }
+    }
+
+    /// Service time as the device sees it, from the kernel handing a
+    /// request to a tag until that tag commits the result. Spans the wait
+    /// for a free worker, whose queue the depth figures measure.
+    #[derive(Default)]
+    struct IoStats {
+        write: OpStats,
+        read: OpStats,
+        flush: OpStats,
+        window_max_queue_depth: AtomicU64,
+        peak_queue_depth: AtomicU64,
+    }
+
+    impl IoStats {
+        fn record(&self, op: u32, service: Duration) {
+            match op {
+                UBLK_IO_OP_WRITE => self.write.record(service),
+                UBLK_IO_OP_READ => self.read.record(service),
+                UBLK_IO_OP_FLUSH => self.flush.record(service),
+                _ => {}
+            }
+        }
+
+        fn record_queue_depth(&self, depth: u64) {
+            self.window_max_queue_depth
+                .fetch_max(depth, Ordering::Relaxed);
+            self.peak_queue_depth.fetch_max(depth, Ordering::Relaxed);
+        }
+
+        fn report(&self) {
+            let write = self.write.take_window();
+            let read = self.read.take_window();
+            let flush = self.flush.take_window();
+            if write.is_none() && read.is_none() && flush.is_none() {
+                return;
+            }
+            let mut out = format!(
+                "[ublk io] jobq_max={} jobq_peak={}",
+                self.window_max_queue_depth.swap(0, Ordering::Relaxed),
+                self.peak_queue_depth.load(Ordering::Relaxed),
+            );
+            for (label, stats) in [("write", write), ("read", read), ("flush", flush)] {
+                if let Some(s) = stats {
+                    out.push_str(&format!("; {label} {s}"));
+                }
+            }
+            tracing::info!("{out}");
+        }
+    }
+
+    /// How often the service-time report is emitted, matching the volume's
+    /// lock report so the two windows align.
+    const IO_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Emit [`IoStats::report`] every [`IO_REPORT_INTERVAL`] until `stop`.
+    fn spawn_io_reporter(stats: Arc<IoStats>, stop: Arc<AtomicBool>) {
+        let _ = std::thread::Builder::new()
+            .name("ublk-io-report".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(IO_REPORT_INTERVAL);
+                    stats.report();
+                }
+            });
+    }
+
     /// Per-queue entry point. Runs on a dedicated thread spawned by
     /// libublk's `run_target`. Owns the queue's io_uring, the worker pool,
     /// and the per-tag async tasks.
-    fn q_fn(qid: u16, dev: &UblkDev, client: VolumeClient) {
+    fn q_fn(qid: u16, dev: &UblkDev, client: VolumeClient, io_stats: Arc<IoStats>) {
         let queue = match UblkQueue::new(qid, dev) {
             Ok(q) => Rc::new(q),
             Err(e) => {
@@ -942,8 +1087,9 @@ mod imp {
         for tag in 0..QUEUE_DEPTH {
             let q = queue.clone();
             let job_tx = job_tx.clone();
+            let io_stats = Arc::clone(&io_stats);
             tasks.push(executor.spawn(async move {
-                match io_task(&q, tag, job_tx).await {
+                match io_task(&q, tag, job_tx, io_stats).await {
                     Ok(()) => {}
                     Err(UblkError::QueueIsDown) => {}
                     Err(e) => tracing::error!("ublk queue {qid} tag {tag} task error: {e}"),
@@ -977,7 +1123,12 @@ mod imp {
     /// full queue lifetime. Each iteration: receive one I/O command from the
     /// kernel (via prep/commit), hand it to a worker, await completion via
     /// the eventfd, commit the result back.
-    async fn io_task(q: &UblkQueue<'_>, tag: u16, job_tx: Sender<Job>) -> Result<(), UblkError> {
+    async fn io_task(
+        q: &UblkQueue<'_>,
+        tag: u16,
+        job_tx: Sender<Job>,
+        io_stats: Arc<IoStats>,
+    ) -> Result<(), UblkError> {
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
         let efd = make_eventfd().map_err(UblkError::IOError)?;
         let result = Arc::new(AtomicI32::new(0));
@@ -989,6 +1140,9 @@ mod imp {
             .await?;
 
         loop {
+            // The kernel has handed this tag a request; the commit below
+            // ends the service time it is charged.
+            let submitted = Instant::now();
             let iod = *q.get_iod(tag);
             let op = iod.op_flags & 0xff;
             let fua = iod.op_flags & UBLK_IO_F_FUA != 0;
@@ -1026,6 +1180,7 @@ mod imp {
                     // Worker pool has gone away — treat as shutdown.
                     return Err(UblkError::QueueIsDown);
                 }
+                io_stats.record_queue_depth(job_tx.len() as u64);
 
                 // Wait for the worker to signal completion on our eventfd.
                 // The POLL_ADD CQE is reaped by libublk's event loop (same
@@ -1048,6 +1203,7 @@ mod imp {
                 -libc::EINVAL
             };
 
+            io_stats.record(op, submitted.elapsed());
             q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
                 .await?;
         }
