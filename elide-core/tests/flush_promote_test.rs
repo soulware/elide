@@ -1,14 +1,12 @@
-// Regression tests for the FLUSH / promote interaction after moving
-// the old-WAL fsync off the actor thread (see `execute_promote` and
-// `VolumeActor::park_or_resolve_flush`).
+// Regression tests for the FLUSH / promote interaction (see
+// `execute_promote` and the `VolumeRequest::Flush` handler).
 //
-// The actor no longer fsyncs the old WAL at the 32 MiB threshold.
-// Instead the fsync happens on the worker as the first step of the
-// promote, and `VolumeRequest::Flush` parks on a promote generation
-// counter until every promote dispatched before the flush has
-// completed.  These tests verify that property: after `handle.flush()`
-// returns, any promote triggered by a prior write is on disk and the
-// old WAL file has been cleaned up.
+// The worker fsyncs the old WAL as the first step of each promote,
+// and `VolumeRequest::Flush` fsyncs the current WAL plus every
+// rotated WAL the promote pipeline still owns, all on the actor
+// thread.  These tests verify that contract: after `handle.flush()`
+// returns, every prior write is durable, and promotes complete on
+// the worker in their own time.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,14 +35,11 @@ fn incompressible_block(i: u64) -> Vec<u8> {
 }
 
 /// After writing enough to cross the 32 MiB threshold and then
-/// issuing FLUSH, the pending/ segment must be on disk and the old
-/// WAL file deleted before `handle.flush()` returns.
-///
-/// This is the load-bearing property of the off-actor fsync change:
-/// FLUSH still guarantees durability of every prior write even though
-/// the fsync + segment write now happen on the worker thread.
+/// issuing FLUSH, the flush returns on its own fsyncs while the
+/// dispatched promote completes on the worker in its own time: the
+/// pending/ segment lands and the old WAL is deleted shortly after.
 #[test]
-fn flush_waits_for_in_flight_promote_to_complete() {
+fn promote_completes_after_flush_returns() {
     let dir = tempfile::TempDir::new().unwrap();
     let fork_dir: PathBuf = dir.path().to_owned();
     let (handle, actor_thread) = open_actor(&fork_dir);
@@ -58,35 +53,36 @@ fn flush_waits_for_in_flight_promote_to_complete() {
             .unwrap();
     }
 
-    // FLUSH: must wait for the dispatched promote's old-WAL fsync
-    // (and, in this implementation, the entire promote) to complete.
+    // FLUSH: fsyncs the current WAL and the promote's rotated WAL on
+    // the actor, independent of the promote's progress.
     handle.flush().unwrap();
 
-    // After flush returns we expect:
-    //   - pending/<ulid> exists (segment committed by the worker)
-    //   - exactly one wal/ file (the fresh one opened during prep)
-    let pending_count = fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
-        .unwrap()
-        .filter(|e| {
-            let e = e.as_ref().unwrap();
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            !s.ends_with(".tmp") && !s.starts_with('.')
-        })
-        .count();
-    assert!(
-        pending_count >= 1,
-        "expected at least one committed pending/ segment after flush, got {pending_count}"
-    );
-
-    let wal_count = fs::read_dir(fork_dir.join("wal"))
-        .unwrap()
-        .filter(|e| e.is_ok())
-        .count();
-    assert_eq!(
-        wal_count, 1,
-        "expected exactly one WAL file after flush (old one should be deleted)"
-    );
+    // The promote drains on the worker: pending/<ulid> committed, old
+    // WAL deleted, one fresh WAL remaining.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let pending_count = fs::read_dir(elide_core::segment::pending_open_dir(&fork_dir))
+            .unwrap()
+            .filter(|e| {
+                let e = e.as_ref().unwrap();
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                !s.ends_with(".tmp") && !s.starts_with('.')
+            })
+            .count();
+        let wal_count = fs::read_dir(fork_dir.join("wal"))
+            .unwrap()
+            .filter(|e| e.is_ok())
+            .count();
+        if pending_count >= 1 && wal_count == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "promote never drained: pending={pending_count} wal={wal_count}"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
 
     drop(handle);
     actor_thread.join().unwrap();
@@ -209,6 +205,42 @@ fn failed_promote_is_retried_without_restart() {
     drop(handle);
     actor_thread.join().unwrap();
 
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(0, 256).unwrap(), block);
+}
+
+/// A flush issued while a failed promote sits stashed for retry fsyncs
+/// the stashed epoch's WAL and acks Ok, and the epoch survives a
+/// crash + reopen from that WAL alone.
+#[test]
+fn flush_covers_stashed_failed_promote() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+
+    let block = incompressible_block(5);
+    let pending = elide_core::segment::pending_open_dir(&fork_dir);
+    let blocked = fork_dir.join("pending.blocked");
+    {
+        let (handle, actor_thread) = open_actor(&fork_dir);
+        handle.write(0, &block, false).unwrap();
+
+        fs::rename(&pending, &blocked).unwrap();
+
+        // The promote fails and the job is stashed; its WAL file is the
+        // durable copy of the epoch.
+        assert!(handle.promote_wal().is_err());
+        assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 1);
+
+        // The flush covers the stashed epoch by fsyncing its WAL; the
+        // promote's own error stays with the PromoteWal reply above.
+        handle.flush().unwrap();
+
+        drop(handle);
+        actor_thread.join().unwrap();
+    }
+    fs::rename(&blocked, &pending).unwrap();
+
+    // Reopen replays the stashed epoch's WAL.
     let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
     assert_eq!(vol.read(0, 256).unwrap(), block);
 }

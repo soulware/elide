@@ -439,10 +439,11 @@ mod imp {
     ///   1. Spawn a watchdog thread that force-exits after
     ///      `SHUTDOWN_FLUSH_TIMEOUT` so a wedged actor cannot block exit.
     ///   2. Best-effort `client.flush()` (a durability barrier that fsyncs
-    ///      the WAL and waits for any in-flight promote's old-WAL fsync).
-    ///      Anything the actor accepted before this call is durable;
-    ///      anything still in flight after it is reissued by the kernel
-    ///      from its `UBLK_F_USER_RECOVERY_REISSUE` buffer on next serve.
+    ///      the current WAL and every rotated WAL with a promote still in
+    ///      flight). Anything the actor accepted before this call is
+    ///      durable; a mid-promote epoch is replayed from its WAL at next
+    ///      open, and in-flight guest ops are reissued by the kernel from
+    ///      its `UBLK_F_USER_RECOVERY_REISSUE` buffer on next serve.
     ///   3. `_exit(0)`. Queue threads, control socket, actor thread are
     ///      all killed; their fds are reaped by the kernel, the io_uring
     ///      fds close, and the kernel parks the device.
