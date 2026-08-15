@@ -1850,13 +1850,21 @@ impl Volume {
                 stale_cancel.len(),
                 describe_stale_cancel(&stale_cancel, &self.lbamap),
             );
-            diagnose_stale_cancel_legacy(
-                &self.base_dir,
-                &self.ancestor_layers,
-                &self.lbamap,
-                &stale_cancel,
-                &self.base_dir.join("index"),
-            );
+            // Cancelling is one of the two mechanisms `NoDanglingDeltaSource`
+            // needs (docs/testing.md), so it fires whenever a delta increfs
+            // its source between plan prep and apply. The warning above
+            // reports that from state already in hand; the diagnostic below
+            // rebuilds the lbamap from every segment on disk, which belongs
+            // with the other drift detectors on the invariants switch.
+            if crate::volume_invariants_enabled() {
+                diagnose_stale_cancel(
+                    &self.base_dir,
+                    &self.ancestor_layers,
+                    &self.lbamap,
+                    &stale_cancel,
+                    &self.base_dir.join("index"),
+                );
+            }
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             // No rebuild: cancel means no segment was committed and no
@@ -4068,7 +4076,10 @@ pub fn read_plan_for_apply(plan_path: &Path, new_ulid: Ulid) -> Option<rewrite_p
 
 /// Rebuild the lbamap from disk and compare against the live in-memory
 /// lbamap at each cancelled LBA. Logs only; never mutates volume state.
-fn diagnose_stale_cancel_legacy(
+///
+/// `AGREE` marks a genuine live reference, `DIVERGE` an in-memory lbamap
+/// that drifted from what a rebuild produces.
+fn diagnose_stale_cancel(
     base_dir: &Path,
     ancestor_layers: &[AncestorLayer],
     in_memory: &lbamap::LbaMap,
