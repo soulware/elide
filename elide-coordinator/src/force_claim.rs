@@ -1420,7 +1420,7 @@ mod tests {
                         source_hash: h1,
                         delta_offset: 0,
                         delta_length: blob.len() as u32,
-                        delta_hash: blake3::hash(&blob),
+                        delta_hash: elide_core::segment::stored_hash(&blob),
                     }],
                 ),
             )];

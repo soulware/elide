@@ -20,6 +20,7 @@
 // Index section layout:
 //   [entry_count × 64 bytes: base entries]
 //   [sketch table: sketch_length(4) u32 le, then sketch_length bytes of records]
+//   [stored-hash table: stored_hash_length(4) u32 le, then that many bytes of records]
 //   [delta table: variable-length, only present when entries have HAS_DELTAS]
 //   [inputs table: inputs_length bytes, 16 bytes per input ULID] — populated only for GC outputs
 //
@@ -39,18 +40,26 @@
 //   codec         (1 byte)   see Codec; names the codec of the stored bytes
 //   reserved      (6 bytes)  must be zero
 //
-// Delta table (appended after base entries within index section):
+// Stored-hash table (after the sketch table, before the delta table):
+//   stored_hash_length (4 bytes) u32 le — byte length of the records that follow
+//   per body-bearing entry (4 + 16 bytes):
+//     entry_index (4 bytes)  u32 le — index of the base entry
+//     tag         (16 bytes) truncated BLAKE3 over the entry's stored bytes
+//                            (authenticates the body and inline sections,
+//                            which the signature does not cover)
+//
+// Delta table (appended after the stored-hash table within index section):
 //   per entry with deltas:
 //     entry_index  (4 bytes) u32 le — index of the base entry
 //     delta_count  (1 byte)  number of delta options
-//     per delta option (45 bytes):
+//     per delta option (61 bytes):
 //       source_hash    (32 bytes) BLAKE3 hash of the dictionary extent
 //       option_flags   (1 byte)   bit 0: FLAG_DELTA_INLINE (reserved)
 //       delta_offset   (8 bytes)  u64 le — offset within delta body section
 //       delta_length   (4 bytes)  u32 le — byte length in delta body
-//       delta_hash     (32 bytes) blake3 hash of the compressed delta blob
-//                                 (authenticates the bytes in the delta body
-//                                 section; verified on demand-fetch)
+//       delta_hash     (16 bytes) truncated BLAKE3 over the compressed delta
+//                                 blob (authenticates the bytes in the delta
+//                                 body section; verified on demand-fetch)
 //
 // Body section: raw concatenated extent bytes, no framing.
 // Data entries have real body bytes. DedupRef and Zero entries contribute nothing
@@ -85,7 +94,7 @@ use crate::chunk_tree;
 
 // --- constants ---
 
-pub const MAGIC: &[u8; 8] = b"ELIDSEG\x09";
+pub const MAGIC: &[u8; 8] = b"ELIDSEG\x0a";
 pub const HEADER_LEN: u64 = 100;
 /// Number of header bytes covered by the signature, excluding the signature field itself.
 const HEADER_SIGNED_PREFIX: usize = 36;
@@ -299,11 +308,33 @@ const IDX_ENTRY_LEN: u32 = 64;
 
 /// Size of one serialized delta option in the delta table:
 /// source_hash(32) + option_flags(1) + delta_offset(8) + delta_length(4) +
-/// delta_hash(32) = 77 bytes.
-const DELTA_OPTION_LEN: u32 = 77;
+/// delta_hash(16) = 61 bytes.
+const DELTA_OPTION_LEN: u32 = 61;
 
 /// Size of one delta table entry header: entry_index(4) + delta_count(1) = 5 bytes.
 const DELTA_TABLE_ENTRY_HEADER: u32 = 5;
+
+/// Byte length of an integrity tag over stored bytes.
+///
+/// The body, inline and delta sections lie outside the segment signature, so
+/// each of them is authenticated by a tag that the signed index carries. A tag
+/// is only ever checked against bytes already located by other means, never
+/// used as an identity: dedup, lookup and delta-source selection all key on
+/// [`SegmentEntry::hash`], which stays a full 32-byte BLAKE3. Collision
+/// resistance is therefore not a property these tags need, and the attack they
+/// face is second preimage against a value the signature fixes.
+pub const STORED_HASH_LEN: usize = 16;
+
+/// A truncated BLAKE3 over stored bytes. See [`STORED_HASH_LEN`].
+pub type StoredHash = [u8; STORED_HASH_LEN];
+
+/// The tag over `stored`.
+pub fn stored_hash(stored: &[u8]) -> StoredHash {
+    let full = blake3::hash(stored);
+    let mut tag = [0u8; STORED_HASH_LEN];
+    tag.copy_from_slice(&full.as_bytes()[..STORED_HASH_LEN]);
+    tag
+}
 
 /// Extents whose stored (compressed) size is strictly below this go into the
 /// segment's inline section rather than the body section. Inline data lives in
@@ -337,6 +368,19 @@ fn sketch_section_length(entries: &[SegmentEntry]) -> u32 {
     SKETCH_PREFIX_LEN + records * SKETCH_RECORD_LEN
 }
 
+/// Byte length of the stored-hash section length prefix (`u32`).
+const STORED_HASH_PREFIX_LEN: u32 = 4;
+/// Byte length of one stored-hash record: entry_index(4) + tag.
+const STORED_HASH_RECORD_LEN: u32 = 4 + STORED_HASH_LEN as u32;
+
+/// Byte length of the stored-hash section: the length prefix plus one record
+/// per entry carrying a tag. A record per body-bearing entry rather than a
+/// field on every base entry, so DedupRef, Zero and Delta entries cost nothing.
+fn stored_hash_section_length(entries: &[SegmentEntry]) -> u32 {
+    let records = entries.iter().filter(|e| e.stored_hash.is_some()).count() as u32;
+    STORED_HASH_PREFIX_LEN + records * STORED_HASH_RECORD_LEN
+}
+
 /// Compute the byte length of the base entries + sketch table + delta
 /// table region.
 ///
@@ -349,7 +393,7 @@ fn entries_region_length(entries: &[SegmentEntry]) -> u32 {
         .filter(|e| !e.delta_options.is_empty())
         .map(|e| DELTA_TABLE_ENTRY_HEADER + e.delta_options.len() as u32 * DELTA_OPTION_LEN)
         .sum();
-    base + sketch_section_length(entries) + delta_table
+    base + sketch_section_length(entries) + stored_hash_section_length(entries) + delta_table
 }
 
 /// Length in bytes of the input ULID table for a given input count.
@@ -715,12 +759,12 @@ pub struct DeltaOption {
     pub delta_offset: u64,
     /// Byte length of the delta blob in the delta body section.
     pub delta_length: u32,
-    /// BLAKE3 hash of the compressed delta blob at
+    /// Tag over the compressed delta blob at
     /// `[delta_offset, delta_offset + delta_length)` in the delta body
     /// section. Authenticates the delta bytes (which are otherwise outside
     /// the signed region) so demand-fetch can verify what it pulls from the
-    /// object store before writing to the local cache.
-    pub delta_hash: blake3::Hash,
+    /// object store before writing to the local cache. See [`STORED_HASH_LEN`].
+    pub delta_hash: StoredHash,
 }
 
 /// One entry in the in-memory representation of a segment's index section.
@@ -773,6 +817,12 @@ pub struct SegmentEntry {
     /// Data/CanonicalData entries the producer sketched; `None` for every
     /// other kind. Carried unchanged through GC copy-through.
     pub sketch: Option<crate::sketch::Sketch>,
+    /// Tag over this entry's stored bytes, persisted in the index's
+    /// stored-hash table. Set by the segment write from the bytes it puts in
+    /// the file, so a tag always describes what is on disk. `None` on an
+    /// entry built in memory and not yet written; every body-bearing entry
+    /// read back from a segment carries one. See [`STORED_HASH_LEN`].
+    pub stored_hash: Option<StoredHash>,
 }
 
 /// A [`SegmentEntry`] paired with its body bytes while a segment is being
@@ -833,6 +883,7 @@ impl SegmentEntry {
                 delta_options: Vec::new(),
                 journal: false,
                 sketch: None,
+                stored_hash: None,
             },
             body,
         }
@@ -871,6 +922,7 @@ impl SegmentEntry {
             delta_options: Vec::new(),
             journal: false,
             sketch: None,
+            stored_hash: None,
         }
     }
 
@@ -893,6 +945,7 @@ impl SegmentEntry {
             delta_options: Vec::new(),
             journal: false,
             sketch: None,
+            stored_hash: None,
         }
     }
 
@@ -910,6 +963,7 @@ impl SegmentEntry {
             delta_options: Vec::new(),
             journal: false,
             sketch: None,
+            stored_hash: None,
         }
     }
 
@@ -969,6 +1023,7 @@ impl SegmentEntry {
             delta_options,
             journal: false,
             sketch: None,
+            stored_hash: None,
         }
     }
 }
@@ -1099,6 +1154,20 @@ pub fn write_segment_full(
         entry.sketch = crate::sketch::compute(&raw);
     }
 
+    // Tag every body-bearing entry with the bytes this write puts in the file,
+    // so the index describes what lands on disk rather than what a caller
+    // believed it was handing over. The checks above have already established
+    // that each of these kinds carries its bytes.
+    for (entry, body) in entries.iter_mut().zip(bodies.iter()) {
+        entry.stored_hash = match entry.kind {
+            EntryKind::Data | EntryKind::CanonicalData => body.as_deref().map(stored_hash),
+            EntryKind::Inline | EntryKind::CanonicalInline => {
+                entry.inline.as_deref().map(stored_hash)
+            }
+            _ => None,
+        };
+    }
+
     let (entries_region, inline_length, body_length) = assign_offsets(&mut entries);
     let inputs_region = inputs_region_length(inputs);
     let index_length = entries_region + inputs_region;
@@ -1111,6 +1180,7 @@ pub fn write_segment_full(
         write_index_entry(&mut index_buf, entry)?;
     }
     write_sketch_section(&mut index_buf, &entries)?;
+    write_stored_hash_section(&mut index_buf, &entries)?;
     write_delta_table(&mut index_buf, &entries)?;
     for input in inputs {
         index_buf.extend_from_slice(&input.to_bytes());
@@ -1265,6 +1335,22 @@ fn write_sketch_section<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Re
     Ok(())
 }
 
+/// Write the stored-hash section: a `u32` length prefix followed by one
+/// record (`entry_index` + tag) per entry carrying a tag. Placed after the
+/// sketch section and before the delta table. The prefix lets the parser
+/// find the delta table without walking the records.
+fn write_stored_hash_section<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Result<()> {
+    let records = entries.iter().filter(|e| e.stored_hash.is_some()).count() as u32;
+    w.write_all(&(records * STORED_HASH_RECORD_LEN).to_le_bytes())?; // length prefix: 4
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(tag) = &entry.stored_hash {
+            w.write_all(&(i as u32).to_le_bytes())?; // entry_index: 4
+            w.write_all(tag)?; // STORED_HASH_LEN
+        }
+    }
+    Ok(())
+}
+
 /// Write the delta table: entries with delta options, appended after the
 /// fixed-size base entries within the index section.
 fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Result<()> {
@@ -1279,7 +1365,7 @@ fn write_delta_table<W: Write>(w: &mut W, entries: &[SegmentEntry]) -> io::Resul
             w.write_all(&[0u8])?; // option_flags: 1
             w.write_all(&opt.delta_offset.to_le_bytes())?; // 8
             w.write_all(&opt.delta_length.to_le_bytes())?; // 4
-            w.write_all(opt.delta_hash.as_bytes())?; // 32
+            w.write_all(&opt.delta_hash)?; // STORED_HASH_LEN
         }
     }
     Ok(())
@@ -1364,6 +1450,7 @@ pub fn rewrite_with_deltas(
         write_index_entry(&mut new_index_buf, entry)?;
     }
     write_sketch_section(&mut new_index_buf, &entries)?;
+    write_stored_hash_section(&mut new_index_buf, &entries)?;
     write_delta_table(&mut new_index_buf, &entries)?;
     for input in &inputs {
         new_index_buf.extend_from_slice(&input.to_bytes());
@@ -1785,12 +1872,14 @@ fn parse_index_section(
             delta_options: Vec::new(),
             journal: flags.contains(SegmentFlags::JOURNAL),
             sketch: None,
+            stored_hash: None,
         });
     }
 
-    // Pass 1.5: parse the sketch section (length prefix + records), which
-    // sits between the base entries and the delta table.
+    // Pass 1.5: parse the sketch and stored-hash sections (length prefix +
+    // records each), which sit between the base entries and the delta table.
     parse_sketch_section(entries_data, &mut pos, &mut entries)?;
+    parse_stored_hash_section(entries_data, &mut pos, &mut entries)?;
     let delta_table_start = pos;
 
     // Pass 2: parse delta table (after the sketch section, before inputs).
@@ -1909,6 +1998,54 @@ fn parse_sketch_section(
     Ok(())
 }
 
+/// Parse the stored-hash section and attach each tag to its entry.
+///
+/// Every body-bearing entry must carry one. A segment whose index omits a tag
+/// for stored bytes it addresses is rejected here rather than at the read that
+/// would have gone unverified.
+fn parse_stored_hash_section(
+    data: &[u8],
+    pos: &mut usize,
+    entries: &mut [SegmentEntry],
+) -> io::Result<()> {
+    let section_len = u32::from_le_bytes(read_fixed(data, pos)?) as usize;
+    let record_end = pos.checked_add(section_len).ok_or_else(|| {
+        io::Error::other(format!(
+            "stored-hash section length {section_len} overflows"
+        ))
+    })?;
+    if record_end > data.len() {
+        return Err(io::Error::other(format!(
+            "stored-hash section length {section_len} exceeds index region"
+        )));
+    }
+    if !section_len.is_multiple_of(STORED_HASH_RECORD_LEN as usize) {
+        return Err(io::Error::other(format!(
+            "stored-hash section length {section_len} is not a multiple of {STORED_HASH_RECORD_LEN}"
+        )));
+    }
+    while *pos < record_end {
+        let entry_index = u32::from_le_bytes(read_fixed(data, pos)?) as usize;
+        let tag: StoredHash = read_fixed(data, pos)?;
+        if entry_index >= entries.len() {
+            return Err(io::Error::other(format!(
+                "stored-hash table entry_index {entry_index} out of range ({})",
+                entries.len()
+            )));
+        }
+        entries[entry_index].stored_hash = Some(tag);
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.kind.has_body_bytes() && entry.stored_hash.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("entry {i} ({:?}) has no stored-hash tag", entry.kind),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse the delta table from the index section, starting at `table_start`.
 ///
 /// Each delta table entry: entry_index(4) + delta_count(1) + N × 77 bytes
@@ -1943,7 +2080,7 @@ fn parse_delta_table(
             let _option_flags = read_u8(data, &mut pos)?;
             let delta_offset = u64::from_le_bytes(read_fixed(data, &mut pos)?);
             let delta_length = u32::from_le_bytes(read_fixed(data, &mut pos)?);
-            let delta_hash = blake3::Hash::from_bytes(read_fixed(data, &mut pos)?);
+            let delta_hash: StoredHash = read_fixed(data, &mut pos)?;
             let end = delta_offset
                 .checked_add(delta_length as u64)
                 .ok_or_else(|| {
@@ -2074,18 +2211,6 @@ pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8])
     Ok(())
 }
 
-/// Verify that `body` hashes to `entry.hash`.
-///
-/// `body` is the stored bytes as they appear in the segment — if the entry
-/// is marked compressed, `body` is lz4-compressed and is decompressed here
-/// before hashing. The declared hash is always computed over the 4 KiB-
-/// aligned uncompressed block content (see `Volume::write`).
-///
-/// Non-body kinds (`DedupRef`, `Zero`, `Delta`) return `Ok(())` — they carry
-/// no body and their integrity is guaranteed by the segment signature.
-///
-/// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
-/// distinguish corruption from unrelated I/O failures.
 /// Verify a delta blob against the signed `delta_hash` from a `DeltaOption`.
 ///
 /// The delta body section is outside the segment signature, so the
@@ -2096,7 +2221,7 @@ pub fn populate_inline_bodies(entries: &mut [SegmentEntry], inline_bytes: &[u8])
 ///
 /// Returns `io::ErrorKind::InvalidData` on mismatch.
 pub fn verify_delta_blob_hash(option: &DeltaOption, blob: &[u8]) -> io::Result<()> {
-    let computed = blake3::hash(blob);
+    let computed = stored_hash(blob);
     if computed == option.delta_hash {
         Ok(())
     } else {
@@ -2105,21 +2230,76 @@ pub fn verify_delta_blob_hash(option: &DeltaOption, blob: &[u8]) -> io::Result<(
             format!(
                 "delta blob hash mismatch len={}B: declared={} computed={}",
                 blob.len(),
-                &option.delta_hash.to_hex()[..16],
-                &computed.to_hex()[..16],
+                stored_hash_hex(&option.delta_hash),
+                stored_hash_hex(&computed),
             ),
         ))
     }
 }
 
-pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
-    if !matches!(
-        entry.kind,
-        EntryKind::Data | EntryKind::Inline | EntryKind::CanonicalData | EntryKind::CanonicalInline
-    ) {
+/// Hex rendering of a stored-hash tag, for diagnostics and error text.
+pub fn stored_hash_hex(tag: &StoredHash) -> String {
+    tag.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Verify `stored` against the entry's stored-hash tag.
+///
+/// For bytes that move without being decoded, which is what a GC
+/// copy-through does. The tag lives in the signed index and covers the bytes
+/// as they sit in the file, so this authenticates them against the signature
+/// without running the codec.
+///
+/// Non-body kinds carry no stored bytes and return `Ok(())`. A body-bearing
+/// entry with no tag is an error: [`parse_stored_hash_section`] rejects such
+/// a segment, so reaching here means the entry was built in memory and never
+/// written.
+///
+/// Returns `io::ErrorKind::InvalidData` on mismatch so callers can
+/// distinguish corruption from unrelated I/O failures.
+pub fn verify_stored_hash(entry: &SegmentEntry, stored: &[u8]) -> io::Result<()> {
+    if !entry.kind.has_body_bytes() {
         return Ok(());
     }
-    let computed = blake3::hash(&entry.codec.decode(Cow::Borrowed(body))?);
+    let Some(declared) = entry.stored_hash else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "entry at lba={} ({:?}) has no stored-hash tag to verify against",
+                entry.start_lba, entry.kind
+            ),
+        ));
+    };
+    let computed = stored_hash(stored);
+    if computed == declared {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stored hash mismatch at lba={} len={}B: declared={} computed={}",
+                entry.start_lba,
+                stored.len(),
+                stored_hash_hex(&declared),
+                stored_hash_hex(&computed),
+            ),
+        ))
+    }
+}
+
+/// Verify decoded bytes against `entry.hash`.
+///
+/// The end-to-end check: `entry.hash` names the content, so this holds the
+/// plaintext to the identity the index records and every other component
+/// resolves by. Call it wherever the plaintext is produced anyway.
+///
+/// Non-body kinds return `Ok(())`.
+///
+/// Returns `io::ErrorKind::InvalidData` on mismatch.
+pub fn verify_plaintext_hash(entry: &SegmentEntry, plain: &[u8]) -> io::Result<()> {
+    if !entry.kind.has_body_bytes() {
+        return Ok(());
+    }
+    let computed = blake3::hash(plain);
     if computed == entry.hash {
         Ok(())
     } else {
@@ -2128,12 +2308,24 @@ pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
             format!(
                 "body hash mismatch at lba={} len={}B: declared={} computed={}",
                 entry.start_lba,
-                body.len(),
+                plain.len(),
                 &entry.hash.to_hex()[..16],
                 &computed.to_hex()[..16],
             ),
         ))
     }
+}
+
+/// Decode `body` and verify the plaintext against `entry.hash`.
+///
+/// `body` is the stored bytes as they appear in the segment, in the form
+/// `entry.codec` names. For callers holding stored bytes that want the
+/// end-to-end check.
+pub fn verify_body_hash(entry: &SegmentEntry, body: &[u8]) -> io::Result<()> {
+    if !entry.kind.has_body_bytes() {
+        return Ok(());
+    }
+    verify_plaintext_hash(entry, &entry.codec.decode(Cow::Borrowed(body))?)
 }
 
 // --- promotion ---
@@ -3370,6 +3562,87 @@ mod tests {
     }
 
     #[test]
+    fn stored_hash_tags_the_bytes_the_write_put_on_disk() {
+        let path = temp_path(".seg");
+        let (signer, vk) = test_signer();
+
+        let body = entropy_bytes(0, 8192);
+        let tiny = vec![7u8; 32];
+        let entries = vec![
+            SegmentEntry::new_data(blake3::hash(&body), 0, 2, Codec::None, body.clone()),
+            SegmentEntry::new_data(blake3::hash(&tiny), 2, 1, Codec::None, tiny.clone()),
+            PendingEntry::from_entry(SegmentEntry::new_dedup_ref(blake3::hash(b"anc"), 3, 1)),
+            PendingEntry::from_entry(SegmentEntry::new_zero(4, 1)),
+        ];
+
+        let (_, written) = write_segment(&path, entries, signer.as_ref()).unwrap();
+        assert_eq!(written[0].stored_hash, Some(stored_hash(&body)));
+        assert_eq!(written[2].stored_hash, None, "dedup ref carries no tag");
+        assert_eq!(written[3].stored_hash, None, "zero carries no tag");
+
+        let (_, read_back, _) = read_and_verify_segment_index(&path, &vk).unwrap();
+        assert_eq!(read_back[0].stored_hash, Some(stored_hash(&body)));
+        assert_eq!(read_back[1].stored_hash, written[1].stored_hash);
+        assert_eq!(read_back[2].stored_hash, None);
+        assert_eq!(read_back[3].stored_hash, None);
+
+        verify_stored_hash(&read_back[0], &body).unwrap();
+        let mut flipped = body.clone();
+        flipped[100] ^= 1;
+        let err = verify_stored_hash(&read_back[0], &flipped).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("stored hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verify_stored_hash_fails_closed_without_a_tag() {
+        let data = vec![3u8; 4096];
+        let pending = SegmentEntry::new_data(blake3::hash(&data), 0, 1, Codec::None, data.clone());
+        assert_eq!(pending.entry.stored_hash, None);
+        let err = verify_stored_hash(&pending.entry, &data).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no stored-hash tag"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_a_body_entry_whose_tag_is_missing() {
+        let data = vec![9u8; 4096];
+        let mut entry =
+            SegmentEntry::new_data(blake3::hash(&data), 0, 1, Codec::None, data.clone()).entry;
+        entry.stored_offset = 0;
+        entry.stored_length = data.len() as u32;
+        entry.stored_hash = None;
+
+        let entries = [entry];
+        let mut index = Vec::new();
+        write_index_entry(&mut index, &entries[0]).unwrap();
+        write_sketch_section(&mut index, &entries).unwrap();
+        write_stored_hash_section(&mut index, &entries).unwrap();
+        write_delta_table(&mut index, &entries).unwrap();
+
+        let err = parse_index_section(&index, 1, 0, data.len() as u64, 0, 0).unwrap_err();
+        assert!(err.to_string().contains("no stored-hash tag"), "{err}");
+    }
+
+    #[test]
+    fn delta_blob_verifies_against_the_truncated_tag() {
+        let blob = entropy_bytes(4, 1024);
+        let option = DeltaOption {
+            source_hash: blake3::hash(b"src"),
+            delta_offset: 0,
+            delta_length: blob.len() as u32,
+            delta_hash: stored_hash(&blob),
+        };
+        assert_eq!(option.delta_hash.len(), STORED_HASH_LEN);
+        verify_delta_blob_hash(&option, &blob).unwrap();
+
+        let mut flipped = blob.clone();
+        flipped[7] ^= 1;
+        let err = verify_delta_blob_hash(&option, &flipped).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn roundtrip_sketch() {
         let path = temp_path(".seg");
         let (signer, vk) = test_signer();
@@ -3448,7 +3721,7 @@ mod tests {
                 source_hash: hash0,
                 delta_offset: 0,
                 delta_length: blob.len() as u32,
-                delta_hash: blake3::hash(blob),
+                delta_hash: stored_hash(blob),
             }],
         )];
         rewrite_with_deltas(&seg_path, &delta_path, &deltas, blob, signer.as_ref()).unwrap();
@@ -4291,7 +4564,7 @@ mod tests {
         let source_hash = blake3::hash(b"source-extent");
         let delta_blob = b"compressed-delta-data";
         let delta_body = delta_blob.to_vec();
-        let delta_hash = blake3::hash(delta_blob);
+        let delta_hash = stored_hash(delta_blob);
 
         let deltas = vec![(
             0,
@@ -4373,7 +4646,7 @@ mod tests {
             source_hash,
             delta_offset: 0,
             delta_length: 128,
-            delta_hash: blake3::hash(b"delta-blob-bytes"),
+            delta_hash: stored_hash(b"delta-blob-bytes"),
         };
 
         let entries = vec![
@@ -4441,7 +4714,7 @@ mod tests {
             source_hash,
             delta_offset: 0,
             delta_length: delta_body.len() as u32,
-            delta_hash: blake3::hash(&delta_body),
+            delta_hash: stored_hash(&delta_body),
         };
 
         let entry =
@@ -4487,19 +4760,19 @@ mod tests {
                 source_hash: blake3::hash(b"source-a"),
                 delta_offset: 0,
                 delta_length: 100,
-                delta_hash: blake3::hash(b"blob-a"),
+                delta_hash: stored_hash(b"blob-a"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-b"),
                 delta_offset: 100,
                 delta_length: 200,
-                delta_hash: blake3::hash(b"blob-b"),
+                delta_hash: stored_hash(b"blob-b"),
             },
             DeltaOption {
                 source_hash: blake3::hash(b"source-c"),
                 delta_offset: 300,
                 delta_length: 50,
-                delta_hash: blake3::hash(b"blob-c"),
+                delta_hash: stored_hash(b"blob-c"),
             },
         ];
 

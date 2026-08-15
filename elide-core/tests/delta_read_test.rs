@@ -106,7 +106,7 @@ fn delta_entry_end_to_end_decompression() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -181,7 +181,7 @@ fn refused_duplicate_encoding_reads_through_the_incumbent_home() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
 
     // ── P: parent DATA at [0, 8). X: the child's delta encoding at
@@ -329,7 +329,7 @@ fn delta_entry_roundtrip_from_drained_cache() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -432,7 +432,7 @@ fn delta_entry_demand_fetch_from_pull_host() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -593,7 +593,7 @@ fn block_reader_read_block_dispatches_to_delta() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -682,7 +682,7 @@ fn delta_read_populates_dmat_and_second_read_matches() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -812,7 +812,7 @@ fn a_dmat_record_that_fails_to_decode_is_re_materialised() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     write_segment_with_delta_body(
         &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}")),
@@ -906,7 +906,7 @@ fn readers_share_one_dmat_instance() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     write_segment_with_delta_body(
         &elide_core::segment::pending_open_dir(&vol_dir).join(format!("{delta_seg_ulid}")),

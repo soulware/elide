@@ -54,6 +54,7 @@ fn entry(start_lba: u64, hash: blake3::Hash) -> SegmentEntry {
         delta_options: Vec::new(),
         journal: false,
         sketch: None,
+        stored_hash: None,
     }
 }
 

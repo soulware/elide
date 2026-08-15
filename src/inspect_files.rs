@@ -153,7 +153,7 @@ pub fn inspect_segment(path: &Path) -> std::io::Result<()> {
                 opt.source_hash.to_hex(),
                 opt.delta_offset,
                 opt.delta_length,
-                opt.delta_hash.to_hex(),
+                elide_core::segment::stored_hash_hex(&opt.delta_hash),
             );
         }
     }

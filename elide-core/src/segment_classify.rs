@@ -296,7 +296,7 @@ mod tests {
                 source_hash: blake3::hash(b"source"),
                 delta_offset: 0,
                 delta_length: 64,
-                delta_hash: blake3::hash(b"blob"),
+                delta_hash: crate::segment::stored_hash(b"blob"),
             }],
         )
     }

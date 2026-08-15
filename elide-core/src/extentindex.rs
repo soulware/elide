@@ -1685,7 +1685,7 @@ mod tests {
             source_hash: h(source),
             delta_offset: 0,
             delta_length: 16,
-            delta_hash: h(source ^ 0xff),
+            delta_hash: crate::segment::stored_hash(&[source ^ 0xff; 32]),
         }
     }
 

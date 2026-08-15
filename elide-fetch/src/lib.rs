@@ -1834,7 +1834,7 @@ mod tests {
         // record its hash in the option, build the segment, then tamper the
         // blob in the stored object.
         let delta_blob = vec![0x77u8; 256];
-        let delta_hash = blake3::hash(&delta_blob);
+        let delta_hash = elide_core::segment::stored_hash(&delta_blob);
         let option = DeltaOption {
             source_hash: blake3::hash(b"source"),
             delta_offset: 0,
