@@ -3768,10 +3768,8 @@ impl Volume {
         // The old WAL's fsync is deferred to the worker thread (see
         // `execute_promote`), so that the actor returns to the select
         // loop without blocking on disk I/O.  `VolumeActor::Flush`
-        // parks on the promote generation counter until the worker
-        // has completed any in-flight promote, preserving FLUSH's
-        // durability contract while letting the actor keep processing
-        // writes in the meantime.
+        // fsyncs rotated WALs itself, so FLUSH's durability contract
+        // holds while the promote is still in flight.
 
         let segment_ulid = self.mint.next();
         Ok(Some(self.take_wal_into_promote_job(segment_ulid)?))

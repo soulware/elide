@@ -290,36 +290,30 @@ pub struct VolumeActor {
 }
 
 /// Promote-pipeline bookkeeping: dispatch/completion generations for
-/// the flush-durability barrier, plus replies parked on specific
-/// promotes.
+/// the empty-WAL GC checkpoint barrier, plus replies parked on
+/// specific promotes.
 #[derive(Default)]
 struct PromotePipeline {
     /// Number of promote jobs dispatched but not yet applied.
     promotes_in_flight: usize,
     /// Monotonic counter, incremented on every `WorkerJob::Promote`
     /// dispatch (post-write threshold, `PromoteWal`, `GcCheckpoint`).
-    /// Used together with `completed_gen` to park `Flush` replies
-    /// until every promote dispatched *before* the flush has had its
-    /// old-WAL fsync completed by the worker.
+    /// Used together with `completed_gen` to hold an empty-WAL GC
+    /// checkpoint until every promote dispatched *before* it has
+    /// applied.
     promote_gen: u64,
     /// Monotonic counter, incremented on every `WorkerResult::Promote`
-    /// (success *or* error) received from the worker.  For errors the
-    /// actor performs a fallback fsync itself before bumping the
-    /// counter, so `completed_gen >= needed_gen` always implies every
-    /// promote dispatched at or before `needed_gen` has had its old
-    /// WAL made durable.
+    /// (success *or* error) received from the worker, after the
+    /// success path's apply.  `completed_gen >= needed_gen` means
+    /// every promote dispatched at or before `needed_gen` has either
+    /// applied or failed and errored its waiters.
     completed_gen: u64,
-    /// FIFO queue of old WAL paths for promotes currently dispatched
-    /// but not yet completed.  Matches the worker's strict dispatch
-    /// order (single thread, bounded FIFO channel).  Popped on every
-    /// worker result; the error path re-fsyncs the popped path on the
-    /// actor thread as a fallback before bumping `completed_gen`.
+    /// FIFO queue of rotated WAL paths for promotes currently
+    /// dispatched but not yet completed.  Matches the worker's strict
+    /// dispatch order (single thread, bounded FIFO channel), and is
+    /// popped on every worker result.  `Flush` fsyncs each path so its
+    /// ack covers the epochs these promotes carry.
     inflight_old_wals: VecDeque<PathBuf>,
-    /// `Flush` replies parked until `completed_gen >= needed_gen`.
-    /// Each entry records the `promote_gen` snapshot at the time the
-    /// flush arrived; as worker results come in the actor resolves any
-    /// entries whose precondition now holds.
-    parked_flushes: Vec<ParkedFlush>,
     /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting
     /// either for the GC promote (`u_flush`) to complete on the worker
     /// or, when the WAL was empty, for every promote dispatched before
@@ -383,15 +377,6 @@ struct ParkedPromoteWal {
     reply: Sender<io::Result<()>>,
 }
 
-/// State stashed while a `Flush` waits for an in-flight promote's
-/// old-WAL fsync to complete on the worker.  Released when
-/// `PromotePipeline::completed_gen >= needed_gen`.
-struct ParkedFlush {
-    needed_gen: u64,
-    reply: Sender<io::Result<()>>,
-    parked_at: Instant,
-}
-
 /// One segment of a flush, summed over a report window.
 #[derive(Default, Clone)]
 struct FlushSegment {
@@ -420,32 +405,33 @@ impl FlushSegment {
 /// Where guest FLUSHes spent their time over a report window.
 ///
 /// A flush is serial segments: waiting in the actor mailbox, taking the
-/// volume mutex for the WAL handle, the fsync, and — when a promote is in
-/// flight — parking until that promote applies. The device boundary sees
-/// only the sum, so each segment is timed separately here. The actor owns
-/// this exclusively, so the counters are plain fields.
+/// volume mutex for the WAL handle, the fsync of the current WAL, and —
+/// when rotated WALs have promotes in flight or stashed for retry — the
+/// fsync of each of those. The device boundary sees only the sum, so
+/// each segment is timed separately here. The actor owns this
+/// exclusively, so the counters are plain fields.
 #[derive(Default, Clone)]
 pub(crate) struct FlushCost {
     /// Flushes that reached the end of their fsync in this window.
     n: u64,
-    /// Of those, how many then parked on an in-flight promote.
-    parked: u64,
+    /// Of those, how many found rotated WALs to fsync.
+    rotated: u64,
     mailbox: FlushSegment,
     lock: FlushSegment,
     fsync: FlushSegment,
-    park: FlushSegment,
+    rotated_fsync: FlushSegment,
 }
 
 impl FlushCost {
     fn report(&self) -> String {
         format!(
-            "n={} parked={}; mailbox {}; lock {}; fsync {}; park {}",
+            "n={} rotated={}; mailbox {}; lock {}; fsync {}; rotated-fsync {}",
             self.n,
-            self.parked,
+            self.rotated,
             self.mailbox.report(self.n),
             self.lock.report(self.n),
             self.fsync.report(self.n),
-            self.park.report(self.parked),
+            self.rotated_fsync.report(self.rotated),
         )
     }
 }
@@ -744,84 +730,28 @@ impl VolumeActor {
         Ok(stats)
     }
 
-    /// `Flush` arrives.  The current WAL has already been fsynced
-    /// by the caller; here we decide whether the reply can go out
-    /// immediately or must wait for an in-flight promote's old-WAL
-    /// fsync on the worker.
-    fn park_or_resolve_flush(&mut self, reply: Sender<io::Result<()>>, synced: Instant) {
-        if self.pipeline.completed_gen >= self.pipeline.promote_gen {
-            let _ = reply.send(Ok(()));
-        } else {
-            self.pipeline.parked_flushes.push(ParkedFlush {
-                needed_gen: self.pipeline.promote_gen,
-                reply,
-                parked_at: synced,
-            });
+    /// Fsync every rotated WAL the promote pipeline still owns — in
+    /// flight on the worker or stashed for retry — so a flush ack
+    /// covers the epochs those WALs carry.
+    fn sync_rotated_wals(&self) -> io::Result<()> {
+        let stashed = self
+            .pipeline
+            .failed_promotes
+            .iter()
+            .map(|j| &j.old_wal_path);
+        for path in self.pipeline.inflight_old_wals.iter().chain(stashed) {
+            std::fs::File::open(path).and_then(|f| f.sync_data())?;
         }
+        Ok(())
     }
 
-    /// Called after the actor has finished applying a successful
-    /// `Promote(Ok(..))` result — extent index CAS'd, old WAL deleted,
-    /// snapshot republished.  Pops the FIFO head of
-    /// `inflight_old_wals` (matching the worker's dispatch order),
-    /// bumps `completed_gen`, and resolves any parked flushes whose
-    /// precondition now holds.  The worker already fsynced the old
-    /// WAL, so no extra I/O is needed here.  Resolving *after*
-    /// `apply_promote` ensures callers of `Flush` observe the
-    /// housekeeping state (old WAL deleted, new snapshot published)
-    /// and not just the durability barrier.
-    fn on_promote_success(&mut self) {
+    /// Called on each `WorkerResult::Promote` — after the apply for a
+    /// success, before the retry stash for a failure.  Pops the FIFO
+    /// head of `inflight_old_wals` (matching the worker's dispatch
+    /// order) and bumps `completed_gen`.
+    fn on_promote_result(&mut self) {
         self.pipeline.inflight_old_wals.pop_front();
         self.pipeline.completed_gen += 1;
-        self.resolve_parked_flushes(Ok(()));
-    }
-
-    /// Called after each worker-result `Promote(Err(..))`.  The
-    /// worker may or may not have fsynced the old WAL before failing,
-    /// so we perform a best-effort fallback fsync on the actor thread
-    /// to guarantee that `completed_gen` advancing implies durability
-    /// of every write that was in the old WAL at dispatch time.
-    fn on_promote_failure(&mut self) {
-        let outcome = if let Some(path) = self.pipeline.inflight_old_wals.pop_front() {
-            match std::fs::File::open(&path).and_then(|f| f.sync_data()) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    warn!("fallback fsync of {} failed: {e}", path.display());
-                    Err(io::Error::other(format!(
-                        "promote failed and fallback WAL fsync failed: {e}"
-                    )))
-                }
-            }
-        } else {
-            // Shouldn't happen — every dispatch pushes a path — but
-            // don't panic in library code.  Treat as "nothing to
-            // fsync" which is vacuously durable.
-            Ok(())
-        };
-        self.pipeline.completed_gen += 1;
-        self.resolve_parked_flushes(outcome);
-    }
-
-    /// Drain `parked_flushes` of any entry whose `needed_gen` is now
-    /// satisfied by `completed_gen`, delivering `outcome` to each.
-    /// Entries whose `needed_gen` is still in the future stay parked.
-    fn resolve_parked_flushes(&mut self, outcome: io::Result<()>) {
-        let done = self.pipeline.completed_gen;
-        let mut i = 0;
-        while i < self.pipeline.parked_flushes.len() {
-            if self.pipeline.parked_flushes[i].needed_gen <= done {
-                let parked = self.pipeline.parked_flushes.swap_remove(i);
-                self.flush_cost.parked += 1;
-                self.flush_cost.park.record(parked.parked_at.elapsed());
-                let reply_outcome = match &outcome {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
-                };
-                let _ = parked.reply.send(reply_outcome);
-            } else {
-                i += 1;
-            }
-        }
     }
 
     /// Forward the result of a completed `promote_segment` job to the
@@ -1320,10 +1250,7 @@ impl VolumeActor {
                     error!("apply of promoted segment {ulid} failed: {e}");
                 }
                 self.publish_snapshot();
-                // Resolve parked flushes only after apply + publish
-                // so the caller observes the old WAL deleted and the
-                // new snapshot visible — not just the durability barrier.
-                self.on_promote_success();
+                self.on_promote_result();
 
                 let clone_apply = |apply: &io::Result<()>| match apply {
                     Ok(()) => Ok(()),
@@ -1362,7 +1289,7 @@ impl VolumeActor {
                     "worker promote of segment {ulid} failed: {}; stashed for retry",
                     failure.error
                 );
-                self.on_promote_failure();
+                self.on_promote_result();
                 // Fail parked repliers waiting on this promote promptly —
                 // the coordinator retries on its next tick, and by then
                 // `retry_failed_promote` will have re-dispatched the job.
@@ -1681,17 +1608,15 @@ impl VolumeActor {
                             }
                         }
                         VolumeRequest::Flush { reply, queued } => {
-                            // Flush = WAL fsync + wait for any in-flight
-                            // promote's old-WAL fsync to complete on the
-                            // worker.  The actor stays on the select loop
-                            // during the wait — new writes continue to flow
-                            // onto the fresh WAL, matching how a real block
-                            // device keeps accepting commands while a FLUSH
-                            // is in flight at the controller.
+                            // Flush = fsync of the current WAL plus every
+                            // rotated WAL the promote pipeline still owns,
+                            // all on the actor thread, so the ack is
+                            // bounded by fsync cost alone.
                             //
-                            // Promote dispatch shares this thread, so the
-                            // WAL this handle names stays the one the flush
-                            // must cover.
+                            // Promote dispatch, apply, and retry stash all
+                            // share this thread, so the handle plus the
+                            // pipeline's rotated set cover every epoch that
+                            // exists while this handler runs.
                             let picked_up = Instant::now();
                             let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
                             let locked = Instant::now();
@@ -1701,12 +1626,14 @@ impl VolumeActor {
                             self.flush_cost.mailbox.record(picked_up - queued);
                             self.flush_cost.lock.record(locked - picked_up);
                             self.flush_cost.fsync.record(synced - locked);
-                            match outcome {
-                                Ok(()) => self.park_or_resolve_flush(reply, synced),
-                                Err(e) => {
-                                    let _ = reply.send(Err(e));
-                                }
+                            let rotated = self.pipeline.inflight_old_wals.len()
+                                + self.pipeline.failed_promotes.len();
+                            let outcome = outcome.and_then(|()| self.sync_rotated_wals());
+                            if rotated > 0 {
+                                self.flush_cost.rotated += 1;
+                                self.flush_cost.rotated_fsync.record(synced.elapsed());
                             }
+                            let _ = reply.send(outcome);
                         }
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
@@ -5046,11 +4973,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A flush that waits on the promote pipeline lands in `park`, and one
-    /// that does not lands in the segments it actually walked. The log line
-    /// is read as an attribution, so each segment has to name its own time.
+    /// A flush with a promote in flight fsyncs the rotated WAL itself
+    /// and acks while the promote is still queued on the worker; the
+    /// cost report attributes that fsync to `rotated-fsync`.
     #[test]
-    fn flush_cost_attributes_park_separately() {
+    fn flush_syncs_rotated_wal_without_waiting_on_promote() {
         let dir = temp_dir();
         let volume = Volume::open(&dir, &dir).unwrap();
         let (actor, client) = spawn(volume);
@@ -5061,10 +4988,10 @@ mod tests {
 
         let quiet = client.test_flush_cost();
         assert!(quiet.n >= 1, "setup: the flush was counted");
-        assert_eq!(quiet.parked, 0, "nothing was in flight to park on");
-        assert_eq!(quiet.park.max, Duration::ZERO);
+        assert_eq!(quiet.rotated, 0, "no rotated WALs existed yet");
+        assert_eq!(quiet.rotated_fsync.max, Duration::ZERO);
 
-        // Occupy the worker so a promote dispatches but cannot apply.
+        // Occupy the worker so a promote dispatches but cannot run.
         let (hold_tx, hold_rx) = bounded::<()>(1);
         client.test_dispatch_barrier(hold_rx);
 
@@ -5093,44 +5020,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        // The promote is queued behind the barrier, so this flush parks.
-        let flush_done = {
-            let c = client.clone();
-            let (tx, rx) = bounded(1);
-            std::thread::spawn(move || {
-                let _ = tx.send(c.flush());
-            });
-            rx
-        };
-
-        // `n` ticks when the fsync returns, one step before the park, so
-        // it is the signal that the flush has reached the parking point.
-        while client.test_flush_cost().n <= quiet.n {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "setup: the flush never reached its fsync"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        let held = Duration::from_millis(150);
-        std::thread::sleep(held);
-        hold_tx.send(()).unwrap();
-        promote_done.recv().unwrap().unwrap();
-        flush_done.recv().unwrap().unwrap();
+        // The promote is queued behind the barrier. The flush covers
+        // its rotated WAL by fsyncing it on the actor, so this call
+        // returns while the barrier still holds the worker.
+        client.flush().unwrap();
 
         let after = client.test_flush_cost();
-        assert_eq!(after.parked, 1, "the second flush parked");
+        assert_eq!(after.rotated, 1, "the flush found a rotated WAL");
         assert!(
-            after.park.max >= held,
-            "park covers the wait for the promote: {:?} < {held:?}",
-            after.park.max,
+            after.rotated_fsync.max > Duration::ZERO,
+            "the rotated WAL's fsync was timed"
         );
-        assert!(
-            after.fsync.max < held,
-            "the wait belongs to park, not to the fsync: {:?}",
-            after.fsync.max,
-        );
+
+        hold_tx.send(()).unwrap();
+        promote_done.recv().unwrap().unwrap();
 
         client.shutdown();
         drop(client);
