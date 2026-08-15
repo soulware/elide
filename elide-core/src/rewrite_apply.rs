@@ -53,10 +53,11 @@ pub struct Materialised {
 /// Where a materialisation spent, accumulated on the ctx and read back
 /// through [`MaterialiseCtx::cost`].
 ///
-/// Each phase pairs a duration with the bytes it moved. `read` counts
-/// what came off disk, `verify` the decode-and-hash of a carried body,
-/// `decode` the plaintext a partial-death entry is sliced from, and
-/// `recompress` the plaintext handed to the encoder.
+/// Each phase pairs a duration with the bytes it moved. `read` counts what
+/// came off disk, `verify` the bytes fed to a hash, `decode` the stored bytes
+/// run through the codec, and `recompress` the plaintext handed to the
+/// encoder. Hashing and decoding are charged apart, so the two halves of a
+/// verification are read off directly rather than inferred from each other.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MaterialiseCost {
     pub read: Duration,
@@ -400,7 +401,7 @@ fn emit_keep(
         }
         EntryKind::Data => {
             let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
-            verify_body_hash(ctx, entry, &bytes)?;
+            verify_stored(ctx, entry, &bytes)?;
             out_entries.push(SegmentEntry::new_data(
                 entry.hash,
                 entry.start_lba,
@@ -411,7 +412,7 @@ fn emit_keep(
         }
         EntryKind::Inline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(ctx, entry, bytes)?;
+            verify_stored(ctx, entry, bytes)?;
             out_entries.push(SegmentEntry::new_data(
                 entry.hash,
                 entry.start_lba,
@@ -422,13 +423,13 @@ fn emit_keep(
         }
         EntryKind::CanonicalData => {
             let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
-            verify_body_hash(ctx, entry, &bytes)?;
+            verify_stored(ctx, entry, &bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(ctx, entry, bytes)?;
+            verify_stored(ctx, entry, bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
@@ -509,13 +510,13 @@ fn emit_canonical(
     match entry.kind {
         EntryKind::Data | EntryKind::CanonicalData => {
             let bytes = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
-            verify_body_hash(ctx, entry, &bytes)?;
+            verify_stored(ctx, entry, &bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes);
             out_entries.push(built.into_canonical());
         }
         EntryKind::Inline | EntryKind::CanonicalInline => {
             let bytes = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(ctx, entry, bytes)?;
+            verify_stored(ctx, entry, bytes)?;
             let built = SegmentEntry::new_data(entry.hash, 0, 0, entry.codec, bytes.to_vec());
             out_entries.push(built.into_canonical());
         }
@@ -628,13 +629,15 @@ fn compute_composite_body(
     let body: Vec<u8> = match entry.kind {
         EntryKind::Data => {
             let stored = read_input_extent_stored_bytes(input_ulid, entry_idx, state, entry, ctx)?;
-            verify_body_hash(ctx, entry, &stored)?;
-            decode_body(ctx, Cow::Owned(stored), entry.codec)?
+            let plain = decode_body(ctx, Cow::Owned(stored), entry.codec)?;
+            verify_plaintext(ctx, entry, &plain)?;
+            plain
         }
         EntryKind::Inline => {
             let stored = read_input_inline_stored_bytes(state, entry)?;
-            verify_body_hash(ctx, entry, stored)?;
-            decode_body(ctx, Cow::Borrowed(stored), entry.codec)?
+            let plain = decode_body(ctx, Cow::Borrowed(stored), entry.codec)?;
+            verify_plaintext(ctx, entry, &plain)?;
+            plain
         }
         EntryKind::DedupRef => resolve_body_by_hash_decompressed(&entry.hash, ctx)?,
         EntryKind::Delta => {
@@ -845,14 +848,33 @@ fn read_input_delta_blob(
     Ok(buf)
 }
 
-fn verify_body_hash(
+/// Verify stored bytes that are about to be copied without being decoded.
+///
+/// The tag covers the bytes as they sit in the input, which is what a
+/// copy-through moves, so the codec never runs.
+fn verify_stored(
     ctx: &MaterialiseCtx<'_>,
     entry: &SegmentEntry,
-    body: &[u8],
+    stored: &[u8],
 ) -> Result<(), MaterialiseOutcome> {
     let start = Instant::now();
-    let verified = segment::verify_body_hash(entry, body);
-    ctx.charge_verify(start.elapsed(), body.len() as u64);
+    let verified = segment::verify_stored_hash(entry, stored);
+    ctx.charge_verify(start.elapsed(), stored.len() as u64);
+    verified.map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!("{e}"))))
+}
+
+/// Verify decoded bytes against the content hash the index records.
+///
+/// For the paths that produce the plaintext anyway, where holding it to
+/// `entry.hash` is what stops a bad decode reaching a durable segment.
+fn verify_plaintext(
+    ctx: &MaterialiseCtx<'_>,
+    entry: &SegmentEntry,
+    plain: &[u8],
+) -> Result<(), MaterialiseOutcome> {
+    let start = Instant::now();
+    let verified = segment::verify_plaintext_hash(entry, plain);
+    ctx.charge_verify(start.elapsed(), plain.len() as u64);
     verified.map_err(|e| MaterialiseOutcome::from(MaterialiseError::BodyIntegrity(format!("{e}"))))
 }
 
@@ -1420,7 +1442,7 @@ mod tests {
             source_hash: blake3::hash(b"x"),
             delta_offset: 0,
             delta_length: 0,
-            delta_hash: blake3::hash(b""),
+            delta_hash: crate::segment::stored_hash(b""),
         }
     }
 }

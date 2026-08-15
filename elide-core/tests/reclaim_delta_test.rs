@@ -106,7 +106,7 @@ fn reclaim_rewrites_bloated_delta_as_thin_delta() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -344,7 +344,7 @@ fn reclaim_rewrites_bloated_data_as_delta_when_source_pinned() {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: delta50_blob.len() as u32,
-            delta_hash: blake3::hash(&delta50_blob),
+            delta_hash: elide_core::segment::stored_hash(&delta50_blob),
         }],
     ))];
     write_segment_with_delta_body(
@@ -609,7 +609,7 @@ fn scanner_surfaces_bloated_delta_hash() {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: delta_blob.len() as u32,
-            delta_hash: blake3::hash(&delta_blob),
+            delta_hash: elide_core::segment::stored_hash(&delta_blob),
         }],
     ))];
     write_segment_with_delta_body(&delta_path, delta_entries, &delta_blob, signer.as_ref())

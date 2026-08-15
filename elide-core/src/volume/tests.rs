@@ -5164,7 +5164,7 @@ fn delta_materialisation_hash_mismatch_errors() {
                 source_hash: parent_hash,
                 delta_offset: 0,
                 delta_length: blob.len() as u32,
-                delta_hash: blake3::hash(&blob),
+                delta_hash: crate::segment::stored_hash(&blob),
             }],
         ),
     )];
@@ -5326,7 +5326,7 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
             source_hash,
             delta_offset: 0,
             delta_length: 8,
-            delta_hash: blake3::hash(b"blob"),
+            delta_hash: crate::segment::stored_hash(b"blob"),
         }],
     );
     Arc::make_mut(&mut vol.extent_index)

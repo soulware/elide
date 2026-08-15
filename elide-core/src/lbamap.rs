@@ -1148,6 +1148,7 @@ mod tests {
             delta_options: Vec::new(),
             journal: false,
             sketch: None,
+            stored_hash: None,
         }
     }
 
@@ -1162,7 +1163,7 @@ mod tests {
             source_hash: source,
             delta_offset: 0,
             delta_length: 0,
-            delta_hash: h(0),
+            delta_hash: crate::segment::stored_hash(&[0u8; 32]),
         }];
         e
     }
@@ -1761,13 +1762,13 @@ mod tests {
                 source_hash: source_a,
                 delta_offset: 0,
                 delta_length: 16,
-                delta_hash: blake3::hash(b"blob-a"),
+                delta_hash: crate::segment::stored_hash(b"blob-a"),
             },
             DeltaOption {
                 source_hash: source_b,
                 delta_offset: 16,
                 delta_length: 16,
-                delta_hash: blake3::hash(b"blob-b"),
+                delta_hash: crate::segment::stored_hash(b"blob-b"),
             },
         ];
 

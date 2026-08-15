@@ -100,7 +100,7 @@ fn setup_delta_volume() -> (
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,
@@ -256,7 +256,7 @@ fn reclaim_delta_output_flips_body_source_on_promote() {
         source_hash: parent_hash,
         delta_offset: 0,
         delta_length: delta_blob.len() as u32,
-        delta_hash: blake3::hash(&delta_blob),
+        delta_hash: elide_core::segment::stored_hash(&delta_blob),
     };
     let delta_entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
         child_hash,

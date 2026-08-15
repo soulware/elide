@@ -3661,7 +3661,7 @@ mod tests {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: delta_blob.len() as u32,
-            delta_hash: blake3::hash(&delta_blob),
+            delta_hash: elide_core::segment::stored_hash(&delta_blob),
         };
         // The filler beside it is killed outright below, which is what
         // gives this segment reclaimable bytes and so a reason to sweep.
@@ -3843,7 +3843,7 @@ mod tests {
                     source_hash,
                     delta_offset: 0,
                     delta_length: blob.len() as u32,
-                    delta_hash: blake3::hash(&blob),
+                    delta_hash: elide_core::segment::stored_hash(&blob),
                 };
                 let entries = vec![PendingEntry::from_entry(SegmentEntry::new_delta(
                     child_hash,
@@ -4002,7 +4002,7 @@ mod tests {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: blob.len() as u32,
-            delta_hash: blake3::hash(&blob),
+            delta_hash: elide_core::segment::stored_hash(&blob),
         };
         let entries = vec![
             PendingEntry::from_entry(elide_core::segment::SegmentEntry::new_delta(
@@ -4178,7 +4178,7 @@ mod tests {
                 source_hash: parent_hash,
                 delta_offset: 0,
                 delta_length: delta_blob.len() as u32,
-                delta_hash: blake3::hash(&delta_blob),
+                delta_hash: elide_core::segment::stored_hash(&delta_blob),
             };
             let filler_bytes = filler(start_lba as u8 | 1);
             let entries = vec![
@@ -4325,7 +4325,7 @@ mod tests {
             source_hash: parent_hash,
             delta_offset: 0,
             delta_length: delta_blob.len() as u32,
-            delta_hash: blake3::hash(&delta_blob),
+            delta_hash: elide_core::segment::stored_hash(&delta_blob),
         };
         // The filler beside it is killed outright below, which is what
         // gives this segment reclaimable bytes and so a reason to sweep.

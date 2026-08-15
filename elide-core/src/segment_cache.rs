@@ -187,6 +187,7 @@ mod tests {
                 delta_options: Vec::new(),
                 journal: false,
                 sketch: None,
+                stored_hash: None,
             },
             body: Some(vec![0xAB; 8]),
         }

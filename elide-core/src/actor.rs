@@ -4509,7 +4509,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                     if delta_blob.len() < bytes.len() {
                         let delta_offset = delta_body.len() as u64;
                         let delta_length = delta_blob.len() as u32;
-                        let delta_hash = blake3::hash(&delta_blob);
+                        let delta_hash = segment::stored_hash(&delta_blob);
                         delta_body.extend_from_slice(&delta_blob);
 
                         entries.push(segment::PendingEntry::from_entry(
@@ -4592,7 +4592,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
 
                 let delta_offset = delta_body.len() as u64;
                 let delta_length = delta_blob.len() as u32;
-                let delta_hash = blake3::hash(&delta_blob);
+                let delta_hash = segment::stored_hash(&delta_blob);
                 delta_body.extend_from_slice(&delta_blob);
 
                 entries.push(segment::PendingEntry::from_entry(

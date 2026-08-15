@@ -207,7 +207,7 @@ Each segment is a **single file** both locally and in S3. The same format is use
 
 ```
 [Header: 100 bytes]
-  magic          (8 bytes)  — "ELIDSEG\x08"
+  magic          (8 bytes)  — "ELIDSEG\x0a"
   entry_count    (4 bytes)  — number of index entries (u32 le)
   index_length   (4 bytes)  — byte length of index section (u32 le)
   inline_length  (4 bytes)  — byte length of inline section (u32 le); 0 if none
@@ -269,7 +269,7 @@ Chunk offsets are the prefix sum of the stored lengths, so they are not stored. 
 
 A read verifies what it serves and only that: bytes of a chunk the read does not touch are not checked, because the reader takes that chunk's chaining value from the table rather than recomputing it.
 
-The index section has four parts in order: fixed-size base entries, a sketch table, a delta table, and an inputs table.
+The index section has five parts in order: fixed-size base entries, a sketch table, a stored-hash table, a delta table, and an inputs table.
 
 **Base entries** (`entry_count × 64 bytes`):
 
@@ -298,18 +298,33 @@ per sketched entry (36 bytes):
 
 The length prefix is always present, so every segment carries the field even when no entry is sketched. Records appear in base-entry order and only for entries that carry a sketch, which is Data and CanonicalData entries at or above 32 KiB that are not journal-tier and carry no delta. Each feature is a minhash over content-defined sampled windows of the entry's decompressed bytes; the number of features two entries share estimates their resemblance, which is how the delta producer finds a dictionary source by content rather than by LBA or path. See [delta-compression.md](design/delta-compression.md).
 
-**Delta table** (appended after the sketch table, variable-length):
+**Stored-hash table** (appended after the sketch table):
+
+```
+stored_hash_length (4 bytes) — byte length of the records that follow (u32 le)
+per body-bearing entry (20 bytes):
+  entry_index      (4 bytes)  — index of the base entry (u32 le)
+  tag              (16 bytes) — truncated BLAKE3 over the entry's stored bytes
+```
+
+The signature covers `header[0..36] || index_section`, so the body and inline sections are outside it and each entry's tag is what binds its stored bytes to the signed index. A record per body-bearing entry rather than a field on every base entry, so DedupRef, Zero and Delta entries cost nothing. Parsing rejects a segment in which a body-bearing entry has no tag.
+
+A tag is only ever checked against bytes already located by other means, never used as an identity: dedup, lookup and delta-source selection all key on the base entry's 32-byte `hash`. Collision resistance is therefore not a property a tag needs, and the attack it faces is second preimage against a value the signature fixes, so 16 bytes is what these carry.
+
+The tags are what let a GC copy-through move an extent without decoding it. Bytes copied verbatim are checked against the tag; wherever the plaintext is produced anyway, it is checked against the base entry's `hash` instead. See [operations.md](operations.md).
+
+**Delta table** (appended after the stored-hash table, variable-length):
 
 ```
 Per entry with deltas:
   entry_index     (4 bytes)  — index of the base entry (u32 le)
   delta_count     (1 byte)   — number of delta options (≥1)
-  per delta option (77 bytes):
+  per delta option (61 bytes):
     source_hash   (32 bytes) — BLAKE3 hash of the source extent
     option_flags  (1 byte)   — bit 0: FLAG_DELTA_INLINE (reserved)
     delta_offset  (8 bytes)  — byte offset within delta body section (u64 le)
     delta_length  (4 bytes)  — byte length in delta body (u32 le)
-    delta_hash    (32 bytes) — BLAKE3 hash of the compressed delta blob;
+    delta_hash    (16 bytes) — truncated BLAKE3 over the compressed delta blob;
                                authenticates the delta bytes at
                                [delta_offset, delta_offset + delta_length)
                                (the delta body section is outside the segment
@@ -318,7 +333,7 @@ Per entry with deltas:
                                demand-fetch before the blob is cached)
 ```
 
-The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - (4 + sketch_length) - inputs_length`.
+The delta table is only present when at least one entry has `FLAG_HAS_DELTAS` set. Its total length is `index_length - (entry_count × 64) - (4 + sketch_length) - (4 + stored_hash_length) - inputs_length`.
 
 **Inputs table** (appended after the delta table, at the tail of the index section):
 

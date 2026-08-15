@@ -425,7 +425,7 @@ fn maybe_rewrite_segment(
 
         let delta_offset = delta_body.len() as u64;
         let delta_length = delta_blob.len() as u32;
-        let delta_hash = blake3::hash(&delta_blob);
+        let delta_hash = crate::segment::stored_hash(&delta_blob);
         delta_body.extend_from_slice(&delta_blob);
 
         stats.original_body_bytes += entry.stored_length as u64;
@@ -768,7 +768,7 @@ pub fn delta_pendings_by_resemblance(
 
         let delta_offset = delta_body.len() as u64;
         let delta_length = delta_blob.len() as u32;
-        let delta_hash = blake3::hash(&delta_blob);
+        let delta_hash = crate::segment::stored_hash(&delta_blob);
         delta_body.extend_from_slice(&delta_blob);
 
         stats.delta.original_body_bytes += entry.stored_length as u64;
@@ -866,7 +866,7 @@ pub fn delta_pendings_against_prior(
 
         let delta_offset = delta_body.len() as u64;
         let delta_length = delta_blob.len() as u32;
-        let delta_hash = blake3::hash(&delta_blob);
+        let delta_hash = crate::segment::stored_hash(&delta_blob);
         delta_body.extend_from_slice(&delta_blob);
 
         stats.original_body_bytes += entry.stored_length as u64;
