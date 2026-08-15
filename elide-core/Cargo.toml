@@ -11,6 +11,7 @@ bitflags       = "2"
 blake3         = "1"
 chrono         = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 crossbeam-channel = "0.5"
+parking_lot    = "0.12"
 ext4-view      = { version = "0.9", features = ["std"] }
 imbl           = "7"
 log            = "0.4"
