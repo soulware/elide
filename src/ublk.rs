@@ -954,41 +954,74 @@ mod imp {
             self.buckets[service_bucket(service)].fetch_add(1, Ordering::Relaxed);
         }
 
-        /// Read and reset the window, returning `None` when nothing was
-        /// recorded.
-        fn take_window(&self) -> Option<String> {
-            let count = self.count.swap(0, Ordering::Relaxed);
-            let nanos = self.nanos.swap(0, Ordering::Relaxed);
-            let max = self.window_max_nanos.swap(0, Ordering::Relaxed);
-            let peak = self.peak_nanos.load(Ordering::Relaxed);
-            if count == 0 {
-                return None;
+        /// Read and reset the window, stamped with the queue it came from.
+        fn take_window(&self, qid: u16) -> OpWindow {
+            let mut window = OpWindow {
+                count: self.count.swap(0, Ordering::Relaxed),
+                nanos: self.nanos.swap(0, Ordering::Relaxed),
+                max_nanos: self.window_max_nanos.swap(0, Ordering::Relaxed),
+                max_qid: qid,
+                peak_nanos: self.peak_nanos.load(Ordering::Relaxed),
+                buckets: [0; SERVICE_BUCKETS],
+            };
+            for (slot, bucket) in window.buckets.iter_mut().zip(&self.buckets) {
+                *slot = bucket.swap(0, Ordering::Relaxed);
             }
+            window
+        }
+    }
+
+    /// One op class's window, summable across queues. `max_qid` names the
+    /// queue `max_nanos` came from.
+    #[derive(Default)]
+    struct OpWindow {
+        count: u64,
+        nanos: u64,
+        max_nanos: u64,
+        max_qid: u16,
+        peak_nanos: u64,
+        buckets: [u64; SERVICE_BUCKETS],
+    }
+
+    impl OpWindow {
+        fn merge(&mut self, other: &OpWindow) {
+            self.count += other.count;
+            self.nanos += other.nanos;
+            if other.max_nanos > self.max_nanos {
+                self.max_nanos = other.max_nanos;
+                self.max_qid = other.max_qid;
+            }
+            self.peak_nanos = self.peak_nanos.max(other.peak_nanos);
+            for (slot, n) in self.buckets.iter_mut().zip(other.buckets) {
+                *slot += n;
+            }
+        }
+
+        fn format(&self) -> String {
             let ms = |n: u64| n as f64 / 1e6;
             let spread: Vec<String> = self
                 .buckets
                 .iter()
                 .enumerate()
-                .filter_map(|(i, b)| match b.swap(0, Ordering::Relaxed) {
-                    0 => None,
-                    n => Some(format!("{}={n}", service_bucket_label(i))),
-                })
+                .filter(|(_, n)| **n > 0)
+                .map(|(i, n)| format!("{}={n}", service_bucket_label(i)))
                 .collect();
-            Some(format!(
-                "n={count} mean={:.2}ms max={:.1}ms peak={:.1}ms [{}]",
-                ms(nanos) / count as f64,
-                ms(max),
-                ms(peak),
+            format!(
+                "n={} mean={:.2}ms max={:.1}ms(q{}) peak={:.1}ms [{}]",
+                self.count,
+                ms(self.nanos) / self.count as f64,
+                ms(self.max_nanos),
+                self.max_qid,
+                ms(self.peak_nanos),
                 spread.join(" "),
-            ))
+            )
         }
     }
 
-    /// Service time as the device sees it, from the kernel handing a
-    /// request to a tag until that tag commits the result. Spans the wait
-    /// for a free worker, whose queue the depth figures measure.
+    /// One queue's counters, aligned so no two queues share a cache line.
     #[derive(Default)]
-    struct IoStats {
+    #[repr(align(64))]
+    struct QueueStats {
         write: OpStats,
         read: OpStats,
         flush: OpStats,
@@ -996,7 +1029,7 @@ mod imp {
         peak_queue_depth: AtomicU64,
     }
 
-    impl IoStats {
+    impl QueueStats {
         fn record(&self, op: u32, service: Duration) {
             match op {
                 UBLK_IO_OP_WRITE => self.write.record(service),
@@ -1011,22 +1044,59 @@ mod imp {
                 .fetch_max(depth, Ordering::Relaxed);
             self.peak_queue_depth.fetch_max(depth, Ordering::Relaxed);
         }
+    }
+
+    /// Service time as the device sees it, from the kernel handing a
+    /// request to a tag until that tag commits the result. Spans the wait
+    /// for a free worker, whose queue the depth figures measure.
+    ///
+    /// Counters are per queue, so a report attributes a depth or a service
+    /// time to the queue that produced it. Every recording call runs on that
+    /// queue's own thread.
+    #[derive(Default)]
+    struct IoStats {
+        queues: [QueueStats; MAX_QUEUES as usize],
+    }
+
+    impl IoStats {
+        /// `pick_nr_queues` caps the count at `MAX_QUEUES`, so the clamp
+        /// never fires.
+        fn queue(&self, qid: u16) -> &QueueStats {
+            &self.queues[(qid as usize).min(self.queues.len() - 1)]
+        }
 
         fn report(&self) {
-            let write = self.write.take_window();
-            let read = self.read.take_window();
-            let flush = self.flush.take_window();
-            if write.is_none() && read.is_none() && flush.is_none() {
+            let mut write = OpWindow::default();
+            let mut read = OpWindow::default();
+            let mut flush = OpWindow::default();
+            let mut served = Vec::with_capacity(self.queues.len());
+            let mut depth_max = Vec::with_capacity(self.queues.len());
+            let mut depth_peak = Vec::with_capacity(self.queues.len());
+            for (qid, queue) in self.queues.iter().enumerate() {
+                let qid = qid as u16;
+                let w = queue.write.take_window(qid);
+                let r = queue.read.take_window(qid);
+                let f = queue.flush.take_window(qid);
+                served.push(w.count + r.count + f.count);
+                write.merge(&w);
+                read.merge(&r);
+                flush.merge(&f);
+                depth_max.push(queue.window_max_queue_depth.swap(0, Ordering::Relaxed));
+                depth_peak.push(queue.peak_queue_depth.load(Ordering::Relaxed));
+            }
+            if write.count == 0 && read.count == 0 && flush.count == 0 {
                 return;
             }
+            let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
             let mut out = format!(
-                "[ublk io] jobq_max={} jobq_peak={}",
-                self.window_max_queue_depth.swap(0, Ordering::Relaxed),
-                self.peak_queue_depth.load(Ordering::Relaxed),
+                "[ublk io] served=[{}] jobq_max=[{}] jobq_peak=[{}]",
+                list(&served),
+                list(&depth_max),
+                list(&depth_peak),
             );
-            for (label, stats) in [("write", write), ("read", read), ("flush", flush)] {
-                if let Some(s) = stats {
-                    out.push_str(&format!("; {label} {s}"));
+            for (label, window) in [("write", &write), ("read", &read), ("flush", &flush)] {
+                if window.count > 0 {
+                    out.push_str(&format!("; {label} {}", window.format()));
                 }
             }
             tracing::info!("{out}");
@@ -1089,7 +1159,7 @@ mod imp {
             let job_tx = job_tx.clone();
             let io_stats = Arc::clone(&io_stats);
             tasks.push(executor.spawn(async move {
-                match io_task(&q, tag, job_tx, io_stats).await {
+                match io_task(&q, qid, tag, job_tx, io_stats).await {
                     Ok(()) => {}
                     Err(UblkError::QueueIsDown) => {}
                     Err(e) => tracing::error!("ublk queue {qid} tag {tag} task error: {e}"),
@@ -1125,6 +1195,7 @@ mod imp {
     /// the eventfd, commit the result back.
     async fn io_task(
         q: &UblkQueue<'_>,
+        qid: u16,
         tag: u16,
         job_tx: Sender<Job>,
         io_stats: Arc<IoStats>,
@@ -1180,7 +1251,7 @@ mod imp {
                     // Worker pool has gone away — treat as shutdown.
                     return Err(UblkError::QueueIsDown);
                 }
-                io_stats.record_queue_depth(job_tx.len() as u64);
+                io_stats.queue(qid).record_queue_depth(job_tx.len() as u64);
 
                 // Wait for the worker to signal completion on our eventfd.
                 // The POLL_ADD CQE is reaped by libublk's event loop (same
@@ -1203,7 +1274,7 @@ mod imp {
                 -libc::EINVAL
             };
 
-            io_stats.record(op, submitted.elapsed());
+            io_stats.queue(qid).record(op, submitted.elapsed());
             q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
                 .await?;
         }
@@ -1760,6 +1831,69 @@ mod imp {
             let n = pick_nr_queues();
             assert!(n >= 1);
             assert!(n <= MAX_QUEUES);
+        }
+
+        #[test]
+        fn each_queue_records_into_its_own_slot() {
+            let stats = IoStats::default();
+            stats
+                .queue(0)
+                .record(UBLK_IO_OP_WRITE, Duration::from_millis(3));
+            stats
+                .queue(1)
+                .record(UBLK_IO_OP_WRITE, Duration::from_millis(70));
+            stats.queue(1).record_queue_depth(24);
+
+            let q0 = stats.queues[0].write.take_window(0);
+            let q1 = stats.queues[1].write.take_window(1);
+            assert_eq!((q0.count, q1.count), (1, 1));
+            assert_eq!(q0.max_nanos, Duration::from_millis(3).as_nanos() as u64);
+            assert_eq!(q1.max_nanos, Duration::from_millis(70).as_nanos() as u64);
+            assert_eq!(
+                stats.queues[1]
+                    .window_max_queue_depth
+                    .load(Ordering::Relaxed),
+                24
+            );
+            assert_eq!(
+                stats.queues[0]
+                    .window_max_queue_depth
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
+
+        #[test]
+        fn merged_window_sums_counts_and_keeps_the_worst_max() {
+            let stats = IoStats::default();
+            stats
+                .queue(0)
+                .record(UBLK_IO_OP_READ, Duration::from_millis(3));
+            stats
+                .queue(2)
+                .record(UBLK_IO_OP_READ, Duration::from_millis(70));
+
+            let mut merged = OpWindow::default();
+            for (qid, queue) in stats.queues.iter().enumerate() {
+                merged.merge(&queue.read.take_window(qid as u16));
+            }
+            assert_eq!(merged.count, 2);
+            assert_eq!(
+                merged.max_nanos,
+                Duration::from_millis(70).as_nanos() as u64
+            );
+            assert_eq!(merged.max_qid, 2);
+            assert_eq!(merged.buckets[service_bucket(Duration::from_millis(3))], 1);
+            assert_eq!(merged.buckets[service_bucket(Duration::from_millis(70))], 1);
+        }
+
+        #[test]
+        fn queue_slots_do_not_share_a_cache_line() {
+            let stats = IoStats::default();
+            let a = &stats.queues[0] as *const QueueStats as usize;
+            let b = &stats.queues[1] as *const QueueStats as usize;
+            assert!(b - a >= 64, "queue slots are {} bytes apart", b - a);
+            assert_eq!(a % 64, 0);
         }
 
         #[test]
