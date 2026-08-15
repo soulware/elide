@@ -137,6 +137,10 @@ pub enum ReapStop {
 pub(crate) enum VolumeRequest {
     Flush {
         reply: Sender<io::Result<()>>,
+        /// Stamped by the caller before the send, so the actor can
+        /// separate time the request spent in the mailbox from the work
+        /// it does once picked up.
+        queued: Instant,
     },
     /// Fire-and-forget signal from a direct writer that the WAL may have
     /// crossed the promote threshold.  The actor checks `needs_promote()`
@@ -211,6 +215,12 @@ pub(crate) enum VolumeRequest {
         park: crossbeam_channel::Receiver<()>,
         holds: Vec<crossbeam_channel::Receiver<()>>,
     },
+    /// Test seam: read the flush segment counters as the next `[flush]`
+    /// line would find them.
+    #[cfg(test)]
+    TestFlushCost {
+        reply: Sender<FlushCost>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +283,10 @@ pub struct VolumeActor {
     lock_stats_reported: LockStatsSnapshot,
     /// When that mark was taken, which is the span the next line covers.
     lock_stats_marked: Instant,
+    /// Flush segment timings since the last `[flush]` line.
+    flush_cost: FlushCost,
+    /// When that line last went out, which is the span the next one covers.
+    flush_marked: Instant,
 }
 
 /// Promote-pipeline bookkeeping: dispatch/completion generations for
@@ -375,6 +389,65 @@ struct ParkedPromoteWal {
 struct ParkedFlush {
     needed_gen: u64,
     reply: Sender<io::Result<()>>,
+    parked_at: Instant,
+}
+
+/// One segment of a flush, summed over a report window.
+#[derive(Default, Clone)]
+struct FlushSegment {
+    sum: Duration,
+    max: Duration,
+}
+
+impl FlushSegment {
+    fn record(&mut self, d: Duration) {
+        self.sum += d;
+        if d > self.max {
+            self.max = d;
+        }
+    }
+
+    fn report(&self, n: u64) -> String {
+        let mean = if n == 0 {
+            0.0
+        } else {
+            self.sum.as_secs_f64() * 1e3 / n as f64
+        };
+        format!("mean={mean:.2}ms max={:.1}ms", self.max.as_secs_f64() * 1e3)
+    }
+}
+
+/// Where guest FLUSHes spent their time over a report window.
+///
+/// A flush is serial segments: waiting in the actor mailbox, taking the
+/// volume mutex for the WAL handle, the fsync, and — when a promote is in
+/// flight — parking until that promote applies. The device boundary sees
+/// only the sum, so each segment is timed separately here. The actor owns
+/// this exclusively, so the counters are plain fields.
+#[derive(Default, Clone)]
+pub(crate) struct FlushCost {
+    /// Flushes that reached the end of their fsync in this window.
+    n: u64,
+    /// Of those, how many then parked on an in-flight promote.
+    parked: u64,
+    mailbox: FlushSegment,
+    lock: FlushSegment,
+    fsync: FlushSegment,
+    park: FlushSegment,
+}
+
+impl FlushCost {
+    fn report(&self) -> String {
+        format!(
+            "n={} parked={}; mailbox {}; lock {}; fsync {}; park {}",
+            self.n,
+            self.parked,
+            self.mailbox.report(self.n),
+            self.lock.report(self.n),
+            self.fsync.report(self.n),
+            self.park.report(self.parked),
+        )
+    }
 }
 
 /// State stashed while a `promote_segment` job is on the worker thread.
@@ -675,13 +748,14 @@ impl VolumeActor {
     /// by the caller; here we decide whether the reply can go out
     /// immediately or must wait for an in-flight promote's old-WAL
     /// fsync on the worker.
-    fn park_or_resolve_flush(&mut self, reply: Sender<io::Result<()>>) {
+    fn park_or_resolve_flush(&mut self, reply: Sender<io::Result<()>>, synced: Instant) {
         if self.pipeline.completed_gen >= self.pipeline.promote_gen {
             let _ = reply.send(Ok(()));
         } else {
             self.pipeline.parked_flushes.push(ParkedFlush {
                 needed_gen: self.pipeline.promote_gen,
                 reply,
+                parked_at: synced,
             });
         }
     }
@@ -737,6 +811,8 @@ impl VolumeActor {
         while i < self.pipeline.parked_flushes.len() {
             if self.pipeline.parked_flushes[i].needed_gen <= done {
                 let parked = self.pipeline.parked_flushes.swap_remove(i);
+                self.flush_cost.parked += 1;
+                self.flush_cost.park.record(parked.parked_at.elapsed());
                 let reply_outcome = match &outcome {
                     Ok(()) => Ok(()),
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
@@ -1546,6 +1622,28 @@ impl VolumeActor {
         self.lock_stats_marked = Instant::now();
     }
 
+    /// Log which segment of the flush path the window's guest FLUSHes
+    /// spent their time in, and move the mark.
+    ///
+    /// The device boundary times a flush end to end, so a tail there is
+    /// unattributable on its own; this line splits the same interval into
+    /// the four segments a flush passes through.
+    fn report_flush_cost(&mut self) {
+        if self.flush_marked.elapsed() < LOCK_REPORT_INTERVAL {
+            return;
+        }
+        if self.flush_cost.n > 0 {
+            info!(
+                "[flush {}] {}s: {}",
+                self.volume_label(),
+                self.flush_marked.elapsed().as_secs(),
+                self.flush_cost.report(),
+            );
+        }
+        self.flush_cost = FlushCost::default();
+        self.flush_marked = Instant::now();
+    }
+
     /// The volume's directory name, which is its ULID under `by_id/`.
     ///
     /// Every volume server on a host writes to the same log, so the
@@ -1562,6 +1660,7 @@ impl VolumeActor {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
             self.report_lock_stats();
+            self.report_flush_cost();
             crossbeam_channel::select! {
                 recv(self.rx) -> msg => {
                     let req = match msg {
@@ -1581,7 +1680,7 @@ impl VolumeActor {
                                 self.dispatch_promote();
                             }
                         }
-                        VolumeRequest::Flush { reply } => {
+                        VolumeRequest::Flush { reply, queued } => {
                             // Flush = WAL fsync + wait for any in-flight
                             // promote's old-WAL fsync to complete on the
                             // worker.  The actor stays on the select loop
@@ -1593,9 +1692,17 @@ impl VolumeActor {
                             // Promote dispatch shares this thread, so the
                             // WAL this handle names stays the one the flush
                             // must cover.
+                            let picked_up = Instant::now();
                             let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
-                            match sync_wal_handle(handle) {
-                                Ok(()) => self.park_or_resolve_flush(reply),
+                            let locked = Instant::now();
+                            let outcome = sync_wal_handle(handle);
+                            let synced = Instant::now();
+                            self.flush_cost.n += 1;
+                            self.flush_cost.mailbox.record(picked_up - queued);
+                            self.flush_cost.lock.record(locked - picked_up);
+                            self.flush_cost.fsync.record(synced - locked);
+                            match outcome {
+                                Ok(()) => self.park_or_resolve_flush(reply, synced),
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
                                 }
@@ -1734,6 +1841,10 @@ impl VolumeActor {
                             if let Err(e) = self.send_worker_job(WorkerJob::Barrier(hold)) {
                                 warn!("test barrier dispatch failed: {e}");
                             }
+                        }
+                        #[cfg(test)]
+                        VolumeRequest::TestFlushCost { reply } => {
+                            let _ = reply.send(self.flush_cost.clone());
                         }
                         #[cfg(test)]
                         VolumeRequest::TestParkThenDispatchBarriers { park, holds } => {
@@ -2020,7 +2131,10 @@ impl VolumeClient {
     pub fn flush(&self) -> io::Result<()> {
         let (reply_tx, reply_rx) = bounded(1);
         self.tx
-            .send(VolumeRequest::Flush { reply: reply_tx })
+            .send(VolumeRequest::Flush {
+                reply: reply_tx,
+                queued: Instant::now(),
+            })
             .map_err(|_| io::Error::other("volume actor channel closed"))?;
         reply_rx
             .recv()
@@ -2058,6 +2172,16 @@ impl VolumeClient {
     #[cfg(test)]
     pub(crate) fn test_dispatch_barrier(&self, hold: crossbeam_channel::Receiver<()>) {
         let _ = self.tx.send(VolumeRequest::TestDispatchBarrier { hold });
+    }
+
+    /// Test seam: the flush segment counters accumulated so far.
+    #[cfg(test)]
+    pub(crate) fn test_flush_cost(&self) -> FlushCost {
+        let (reply_tx, reply_rx) = bounded(1);
+        let _ = self
+            .tx
+            .send(VolumeRequest::TestFlushCost { reply: reply_tx });
+        reply_rx.recv().unwrap_or_default()
     }
 
     /// Test seam: park the actor in-handler until `park` fires, then
@@ -4025,6 +4149,8 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         lock_stats: Arc::clone(&lock_stats),
         lock_stats_reported: LockStatsSnapshot::default(),
         lock_stats_marked: Instant::now(),
+        flush_cost: FlushCost::default(),
+        flush_marked: Instant::now(),
     };
 
     let client = VolumeClient {
@@ -4917,6 +5043,98 @@ mod tests {
         let recovered = Volume::open(&dir, &dir).unwrap();
         assert_eq!(recovered.read(5, 1).unwrap(), block);
         assert_eq!(recovered.read(6, 1).unwrap(), after);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A flush that waits on the promote pipeline lands in `park`, and one
+    /// that does not lands in the segments it actually walked. The log line
+    /// is read as an attribution, so each segment has to name its own time.
+    #[test]
+    fn flush_cost_attributes_park_separately() {
+        let dir = temp_dir();
+        let volume = Volume::open(&dir, &dir).unwrap();
+        let (actor, client) = spawn(volume);
+        let actor_thread = std::thread::spawn(move || actor.run());
+
+        client.write(0, &unique_block(1), false).unwrap();
+        client.flush().unwrap();
+
+        let quiet = client.test_flush_cost();
+        assert!(quiet.n >= 1, "setup: the flush was counted");
+        assert_eq!(quiet.parked, 0, "nothing was in flight to park on");
+        assert_eq!(quiet.park.max, Duration::ZERO);
+
+        // Occupy the worker so a promote dispatches but cannot apply.
+        let (hold_tx, hold_rx) = bounded::<()>(1);
+        client.test_dispatch_barrier(hold_rx);
+
+        let baseline = client.lock_stats();
+        let promote_done = {
+            let c = client.clone();
+            let (tx, rx) = bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(c.promote_wal());
+            });
+            rx
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while client
+            .lock_stats()
+            .since(&baseline)
+            .site(LockSite::PromotePrep)
+            .acquisitions
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup: promote prep never ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The promote is queued behind the barrier, so this flush parks.
+        let flush_done = {
+            let c = client.clone();
+            let (tx, rx) = bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(c.flush());
+            });
+            rx
+        };
+
+        // `n` ticks when the fsync returns, one step before the park, so
+        // it is the signal that the flush has reached the parking point.
+        while client.test_flush_cost().n <= quiet.n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setup: the flush never reached its fsync"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let held = Duration::from_millis(150);
+        std::thread::sleep(held);
+        hold_tx.send(()).unwrap();
+        promote_done.recv().unwrap().unwrap();
+        flush_done.recv().unwrap().unwrap();
+
+        let after = client.test_flush_cost();
+        assert_eq!(after.parked, 1, "the second flush parked");
+        assert!(
+            after.park.max >= held,
+            "park covers the wait for the promote: {:?} < {held:?}",
+            after.park.max,
+        );
+        assert!(
+            after.fsync.max < held,
+            "the wait belongs to park, not to the fsync: {:?}",
+            after.fsync.max,
+        );
+
+        client.shutdown();
+        drop(client);
+        actor_thread.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
