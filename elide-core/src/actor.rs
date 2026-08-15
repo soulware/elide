@@ -775,7 +775,7 @@ impl VolumeActor {
     /// it: the checkpoint's own `u_flush`, or — for an empty-WAL
     /// checkpoint — the promote that brings `completed_gen` up to the
     /// barrier's `needed_gen`.  Call after the generation bump in
-    /// [`Self::on_promote_success`].
+    /// [`Self::on_promote_result`].
     fn take_satisfied_gc_checkpoint(
         &mut self,
         ulid: Ulid,
@@ -803,7 +803,8 @@ impl VolumeActor {
     ///
     /// Calls [`Volume::prepare_promote`] to snapshot the WAL state and open
     /// a fresh WAL, then sends the job to the worker.  No-op if the WAL
-    /// is empty.  Logs and returns on error.
+    /// is empty.  A failed dispatch logs and leaves the job stashed for
+    /// retry.
     fn dispatch_promote(&mut self) {
         self.retry_failed_promote();
         let job = match self.lock_volume(LockSite::PromotePrep).prepare_promote() {
@@ -814,14 +815,31 @@ impl VolumeActor {
                 return;
             }
         };
-        let old_wal_path = job.old_wal_path.clone();
-        if let Err(e) = self.send_worker_job(WorkerJob::Promote(job)) {
-            warn!("promote dispatch failed: {e}");
-            return;
+        if let Err(e) = self.send_promote_job(job) {
+            warn!("promote dispatch failed: {e}; stashed for retry");
         }
-        self.pipeline.promotes_in_flight += 1;
-        self.pipeline.promote_gen += 1;
-        self.pipeline.inflight_old_wals.push_back(old_wal_path);
+    }
+
+    /// Dispatch a promote job to the worker and register it in the
+    /// pipeline (in-flight count, generation, rotated WAL path). A
+    /// failed dispatch stashes the job for retry instead, so its
+    /// rotated WAL stays in the flush fsync set.
+    fn send_promote_job(&mut self, job: PromoteJob) -> io::Result<()> {
+        let old_wal_path = job.old_wal_path.clone();
+        match self.send_worker_job(WorkerJob::Promote(job)) {
+            Ok(()) => {
+                self.pipeline.promotes_in_flight += 1;
+                self.pipeline.promote_gen += 1;
+                self.pipeline.inflight_old_wals.push_back(old_wal_path);
+                Ok(())
+            }
+            Err((e, job)) => {
+                if let WorkerJob::Promote(job) = *job {
+                    self.pipeline.failed_promotes.push_back(Box::new(job));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Re-dispatch the oldest stashed failed promote, if any. Returns
@@ -831,14 +849,10 @@ impl VolumeActor {
     fn retry_failed_promote(&mut self) -> Option<Ulid> {
         let job = self.pipeline.failed_promotes.pop_front()?;
         let ulid = job.segment_ulid;
-        let old_wal_path = job.old_wal_path.clone();
-        if let Err(e) = self.send_worker_job(WorkerJob::Promote(*job)) {
+        if let Err(e) = self.send_promote_job(*job) {
             warn!("failed-promote retry dispatch failed: {e}");
             return None;
         }
-        self.pipeline.promotes_in_flight += 1;
-        self.pipeline.promote_gen += 1;
-        self.pipeline.inflight_old_wals.push_back(old_wal_path);
         Some(ulid)
     }
 
@@ -880,17 +894,12 @@ impl VolumeActor {
                 u_flush,
                 reply,
             }));
-            let old_wal_path = job.old_wal_path.clone();
-            if let Err(e) = self.send_worker_job(WorkerJob::Promote(job)) {
-                warn!("gc_checkpoint promote dispatch failed: {e}");
+            if let Err(e) = self.send_promote_job(job) {
+                warn!("gc_checkpoint promote dispatch failed: {e}; stashed for retry");
                 if let Some(parked) = self.pipeline.parked_gc.take() {
                     let _ = parked.into_reply().send(Err(e));
                 }
-                return;
             }
-            self.pipeline.promotes_in_flight += 1;
-            self.pipeline.promote_gen += 1;
-            self.pipeline.inflight_old_wals.push_back(old_wal_path);
         } else if self.pipeline.completed_gen >= self.pipeline.promote_gen {
             // WAL was empty — fresh WAL already opened by prepare_gc_checkpoint.
             self.publish_snapshot();
@@ -992,7 +1001,7 @@ impl VolumeActor {
             let job = self
                 .lock_volume(LockSite::GcPlanPrep)
                 .prepare_plan_apply(plan_path, new_ulid, plan);
-            if let Err(e) = self.send_worker_job(WorkerJob::GcPlan(job)) {
+            if let Err((e, _)) = self.send_worker_job(WorkerJob::GcPlan(job)) {
                 warn!("gc plan dispatch failed: {e}");
                 if let Some(reply) = parked.reply.take() {
                     let _ = reply.send(Err(e));
@@ -1090,7 +1099,7 @@ impl VolumeActor {
         // The rotate moved the segments readers resolve through, so
         // republish before the pass starts rewriting them.
         self.publish_snapshot();
-        if let Err(e) = self.send_worker_job(WorkerJob::CloseGeneration(job)) {
+        if let Err((e, _)) = self.send_worker_job(WorkerJob::CloseGeneration(job)) {
             warn!("close generation dispatch failed: {e}");
             let _ = reply.send(Err(e));
             return;
@@ -1123,22 +1132,18 @@ impl VolumeActor {
         // reclaim's apply. Per-run admission (`register_entry_if_newer`)
         // reads that as an ordinary intervening mutation, which is what
         // lets the two applies stay in dispatch order with no deferral.
-        if let Some(flush) = flush {
-            let old_wal_path = flush.old_wal_path.clone();
-            if let Err(e) = self.send_worker_job(WorkerJob::Promote(flush)) {
-                warn!("reclaim flush dispatch failed: {e}");
-                let _ = reply.send(Err(e));
-                return;
-            }
-            self.pipeline.promotes_in_flight += 1;
-            self.pipeline.promote_gen += 1;
-            self.pipeline.inflight_old_wals.push_back(old_wal_path);
+        if let Some(flush) = flush
+            && let Err(e) = self.send_promote_job(flush)
+        {
+            warn!("reclaim flush dispatch failed: {e}; stashed for retry");
+            let _ = reply.send(Err(e));
+            return;
         }
         // Prep took the WAL, so the extent index the readers see still
         // points hashes at it. Republish so a reader picks up the
         // snapshot the promote's apply will move off.
         self.publish_snapshot();
-        if let Err(e) = self.send_worker_job(WorkerJob::Reclaim(job)) {
+        if let Err((e, _)) = self.send_worker_job(WorkerJob::Reclaim(job)) {
             warn!("reclaim dispatch failed: {e}");
             let _ = reply.send(Err(e));
             return;
@@ -1160,7 +1165,7 @@ impl VolumeActor {
         let job = self
             .lock_volume(LockSite::SnapshotPrep)
             .prepare_sign_snapshot_manifest_kind(snap_ulid, kind);
-        if let Err(e) = self.send_worker_job(WorkerJob::SignSnapshotManifest(job)) {
+        if let Err((e, _)) = self.send_worker_job(WorkerJob::SignSnapshotManifest(job)) {
             warn!("sign_snapshot_manifest dispatch failed: {e}");
             let _ = reply.send(Err(e));
             return;
@@ -1180,9 +1185,9 @@ impl VolumeActor {
     /// plan dispatches the next handoff in its batch). The nesting is
     /// bounded: GC plans are single-flight, so the drained queue can
     /// hold at most one further GcPlan result.
-    fn send_worker_job(&mut self, job: WorkerJob) -> io::Result<()> {
+    fn send_worker_job(&mut self, job: WorkerJob) -> Result<(), (io::Error, Box<WorkerJob>)> {
         let Some(tx) = self.worker_tx.clone() else {
-            return Err(io::Error::other("worker not running"));
+            return Err((io::Error::other("worker not running"), Box::new(job)));
         };
         // Stamped ahead of any retry, so the wait covers the whole
         // dispatch.
@@ -1199,7 +1204,10 @@ impl VolumeActor {
                     match self.worker_rx.recv() {
                         Ok(result) => self.handle_worker_result(result),
                         Err(_) => {
-                            return Err(io::Error::other("worker result channel closed"));
+                            return Err((
+                                io::Error::other("worker result channel closed"),
+                                Box::new(job.job),
+                            ));
                         }
                     }
                     // What the actor waited for a worker slot, before
@@ -1214,8 +1222,8 @@ impl VolumeActor {
                         );
                     }
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    return Err(io::Error::other("worker channel closed"));
+                Err(crossbeam_channel::TrySendError::Disconnected(j)) => {
+                    return Err((io::Error::other("worker channel closed"), Box::new(j.job)));
                 }
             }
         }
@@ -1626,13 +1634,18 @@ impl VolumeActor {
                             self.flush_cost.mailbox.record(picked_up - queued);
                             self.flush_cost.lock.record(locked - picked_up);
                             self.flush_cost.fsync.record(synced - locked);
-                            let rotated = self.pipeline.inflight_old_wals.len()
-                                + self.pipeline.failed_promotes.len();
-                            let outcome = outcome.and_then(|()| self.sync_rotated_wals());
-                            if rotated > 0 {
+                            let outcome = outcome.and_then(|()| {
+                                let rotated = self.pipeline.inflight_old_wals.len()
+                                    + self.pipeline.failed_promotes.len();
+                                if rotated == 0 {
+                                    return Ok(());
+                                }
+                                let swept = Instant::now();
+                                let r = self.sync_rotated_wals();
                                 self.flush_cost.rotated += 1;
-                                self.flush_cost.rotated_fsync.record(synced.elapsed());
-                            }
+                                self.flush_cost.rotated_fsync.record(swept.elapsed());
+                                r
+                            });
                             let _ = reply.send(outcome);
                         }
                         VolumeRequest::PromoteWal { reply } => {
@@ -1643,12 +1656,8 @@ impl VolumeActor {
                             match prep {
                                 Ok(Some(job)) => {
                                     let ulid = job.segment_ulid;
-                                    let old_wal_path = job.old_wal_path.clone();
-                                    match self.send_worker_job(WorkerJob::Promote(job)) {
+                                    match self.send_promote_job(job) {
                                         Ok(()) => {
-                                            self.pipeline.promotes_in_flight += 1;
-                                            self.pipeline.promote_gen += 1;
-                                            self.pipeline.inflight_old_wals.push_back(old_wal_path);
                                             self.pipeline.parked_promote_wal.push(
                                                 ParkedPromoteWal { segment_ulid: ulid, reply },
                                             );
@@ -1717,7 +1726,7 @@ impl VolumeActor {
                                                 ParkedPromoteSegment { ulid, reply },
                                             );
                                         }
-                                        Err(e) => {
+                                        Err((e, _)) => {
                                             let _ = reply.send(Err(e));
                                         }
                                     }
@@ -1765,7 +1774,7 @@ impl VolumeActor {
                         }
                         #[cfg(test)]
                         VolumeRequest::TestDispatchBarrier { hold } => {
-                            if let Err(e) = self.send_worker_job(WorkerJob::Barrier(hold)) {
+                            if let Err((e, _)) = self.send_worker_job(WorkerJob::Barrier(hold)) {
                                 warn!("test barrier dispatch failed: {e}");
                             }
                         }
@@ -1777,7 +1786,7 @@ impl VolumeActor {
                         VolumeRequest::TestParkThenDispatchBarriers { park, holds } => {
                             let _ = park.recv();
                             for hold in holds {
-                                if let Err(e) = self.send_worker_job(WorkerJob::Barrier(hold)) {
+                                if let Err((e, _)) = self.send_worker_job(WorkerJob::Barrier(hold)) {
                                     warn!("test barrier dispatch failed: {e}");
                                 }
                             }

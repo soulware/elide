@@ -209,6 +209,42 @@ fn failed_promote_is_retried_without_restart() {
     assert_eq!(vol.read(0, 256).unwrap(), block);
 }
 
+/// A flush issued while a failed promote sits stashed for retry fsyncs
+/// the stashed epoch's WAL and acks Ok, and the epoch survives a
+/// crash + reopen from that WAL alone.
+#[test]
+fn flush_covers_stashed_failed_promote() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir: PathBuf = dir.path().to_owned();
+
+    let block = incompressible_block(5);
+    let pending = elide_core::segment::pending_open_dir(&fork_dir);
+    let blocked = fork_dir.join("pending.blocked");
+    {
+        let (handle, actor_thread) = open_actor(&fork_dir);
+        handle.write(0, &block, false).unwrap();
+
+        fs::rename(&pending, &blocked).unwrap();
+
+        // The promote fails and the job is stashed; its WAL file is the
+        // durable copy of the epoch.
+        assert!(handle.promote_wal().is_err());
+        assert_eq!(fs::read_dir(fork_dir.join("wal")).unwrap().count(), 1);
+
+        // The flush covers the stashed epoch by fsyncing its WAL; the
+        // promote's own error stays with the PromoteWal reply above.
+        handle.flush().unwrap();
+
+        drop(handle);
+        actor_thread.join().unwrap();
+    }
+    fs::rename(&blocked, &pending).unwrap();
+
+    // Reopen replays the stashed epoch's WAL.
+    let vol = Volume::open(&fork_dir, &fork_dir).unwrap();
+    assert_eq!(vol.read(0, 256).unwrap(), block);
+}
+
 /// A GC-checkpoint promote failure must resolve the parked checkpoint
 /// reply with the error (previously it hung forever and every later
 /// checkpoint was rejected as "concurrent gc_checkpoint not allowed"),

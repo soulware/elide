@@ -986,9 +986,9 @@ impl Volume {
 
         // Promote every non-latest WAL to a fresh segment so the volume
         // returns to its "one active WAL" invariant before we open the
-        // actor. This path fires when a crash or the off-actor worker
-        // (Landing 3) leaves multiple WAL files behind; in normal single-
-        // WAL operation the loop body never executes.
+        // actor. This path fires whenever the previous process ended
+        // with promotes in flight or stashed — a crash, or a stop while
+        // the worker was mid-promote — leaving multiple WAL files.
         //
         // The freshly-minted segment ULID is strictly > any wal_floor or
         // segment_floor (mint monotonicity), so it never collides with an
@@ -3301,8 +3301,12 @@ impl Volume {
     /// ULID" invariant `ensure_wal_open` maintains.
     fn restore_failed_promote(&mut self, job: PromoteJob) -> io::Result<()> {
         let new_ulid = self.mint.next();
-        let new_path = self.base_dir.join("wal").join(new_ulid.to_string());
+        let wal_dir = self.base_dir.join("wal");
+        let new_path = wal_dir.join(new_ulid.to_string());
         fs::rename(&job.old_wal_path, &new_path)?;
+        // Recovery finds the epoch under its new name only once the
+        // rename's directory entry is durable.
+        crate::segment::fsync_dir(&wal_dir)?;
         let size = fs::metadata(&new_path)?.len();
         let wal = writelog::WriteLog::reopen(&new_path, size)?;
 

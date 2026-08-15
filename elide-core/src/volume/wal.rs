@@ -174,6 +174,10 @@ pub(super) fn create_fresh_wal(
 ) -> io::Result<(writelog::WriteLog, Ulid, PathBuf)> {
     let path = wal_dir.join(ulid.to_string());
     let wal = writelog::WriteLog::create(&path)?;
+    // The directory entry must be as durable as the records: recovery
+    // finds WALs by enumerating wal/, and a flush ack anchors on the
+    // rotated file being found there.
+    crate::segment::fsync_dir(wal_dir)?;
     log::info!("new WAL {ulid}");
     Ok((wal, ulid, path))
 }
