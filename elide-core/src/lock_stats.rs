@@ -198,9 +198,10 @@ fn wait_bucket_label(i: usize) -> String {
 /// The guest write path's acquisitions, kept apart from the labelled
 /// sites because a different quantity is measured.
 ///
-/// A write records what it waited and nothing about what it held, so
-/// there is no hold to rank it by and no hold column that would read as
-/// zero when it means unmeasured.
+/// A write is ranked by what it waited rather than what it held: the
+/// waits are what the guest sees. The hold is summed and its window
+/// maximum kept, which is what sizes the cost of yielding an actor loop
+/// to the queue standing behind it.
 #[derive(Default)]
 struct WriteCounters {
     acquisitions: AtomicU64,
@@ -211,6 +212,11 @@ struct WriteCounters {
     wait_nanos: AtomicU64,
     window_max_wait_nanos: AtomicU64,
     peak_wait_nanos: AtomicU64,
+    /// What the guest held across all of those acquisitions. This is what
+    /// an actor loop pays to let the queue through between two units of
+    /// its own work.
+    hold_nanos: AtomicU64,
+    window_max_hold_nanos: AtomicU64,
     /// Writes parked on the mutex right now.
     waiting: AtomicU64,
     /// Deepest that queue got. Its ceiling is the number of threads that
@@ -331,6 +337,18 @@ impl LockStats {
         }
     }
 
+    /// Record what one guest write held the mutex for, on its release.
+    ///
+    /// Charged by every write, contended or not, so the mean covers the
+    /// uncontended holds an actor loop would be waiting on too.
+    pub fn record_write_hold(&self, hold: Duration) {
+        let nanos = hold.as_nanos() as u64;
+        self.writes.hold_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.writes
+            .window_max_hold_nanos
+            .fetch_max(nanos, Ordering::Relaxed);
+    }
+
     /// Fold the armed drain in, called by the write that emptied the
     /// queue. The swap leaves a later arm for the next such write.
     fn close_drain(&self) {
@@ -410,6 +428,12 @@ impl LockStats {
                     self.writes.window_max_wait_nanos.load(Ordering::Relaxed)
                 },
                 peak_wait_nanos: self.writes.peak_wait_nanos.load(Ordering::Relaxed),
+                hold_nanos: self.writes.hold_nanos.load(Ordering::Relaxed),
+                max_hold_nanos: if close_window {
+                    self.writes.window_max_hold_nanos.swap(0, Ordering::Relaxed)
+                } else {
+                    self.writes.window_max_hold_nanos.load(Ordering::Relaxed)
+                },
                 max_waiting: if close_window {
                     self.writes.window_max_waiting.swap(0, Ordering::Relaxed)
                 } else {
@@ -461,6 +485,10 @@ pub struct WriteSnapshot {
     pub max_wait_nanos: u64,
     /// Longest single wait since the volume opened.
     pub peak_wait_nanos: u64,
+    /// What the guest held across `acquisitions`, and the longest single
+    /// hold within the window.
+    pub hold_nanos: u64,
+    pub max_hold_nanos: u64,
     /// Deepest the parked-write queue got within the window.
     pub max_waiting: u64,
     /// Deepest it has got since the volume opened.
@@ -541,6 +569,11 @@ impl LockStatsSnapshot {
                     .saturating_sub(earlier.writes.wait_nanos),
                 max_wait_nanos: self.writes.max_wait_nanos,
                 peak_wait_nanos: self.writes.peak_wait_nanos,
+                hold_nanos: self
+                    .writes
+                    .hold_nanos
+                    .saturating_sub(earlier.writes.hold_nanos),
+                max_hold_nanos: self.writes.max_hold_nanos,
                 max_waiting: self.writes.max_waiting,
                 peak_waiting: self.writes.peak_waiting,
                 wait_buckets: std::array::from_fn(|i| {
@@ -626,12 +659,14 @@ impl LockStatsSnapshot {
         if self.writes.acquisitions > 0 {
             out.push_str(&format!(
                 "; writes n={} blocked={} wait={:.1}ms max={:.1}ms peak={:.1}ms \
-                 maxq={} peakq={}",
+                 held={:.1}ms maxheld={:.1}ms maxq={} peakq={}",
                 self.writes.acquisitions,
                 self.writes.blocked,
                 millis(self.writes.wait_nanos),
                 millis(self.writes.max_wait_nanos),
                 millis(self.writes.peak_wait_nanos),
+                millis(self.writes.hold_nanos),
+                millis(self.writes.max_hold_nanos),
                 self.writes.max_waiting,
                 self.writes.peak_waiting,
             ));
@@ -932,6 +967,41 @@ mod tests {
         stats.record_write_blocked(Duration::from_millis(4));
         let report = stats.snapshot().report().expect("the writes acquired");
         assert!(report.contains("writes n=1 blocked=1"), "got: {report}");
+    }
+
+    /// Every write charges its hold, whether or not it waited: an actor
+    /// loop yielding to the queue pays the uncontended holds too, so a
+    /// sum over the blocked ones alone would under-size the yield.
+    #[test]
+    fn a_write_charges_its_hold_whether_or_not_it_waited() {
+        let stats = LockStats::default();
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(2));
+        stats.record_write_parking();
+        stats.record_write_blocked(Duration::from_millis(9));
+        stats.record_write_hold(Duration::from_millis(5));
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.writes.hold_nanos, 7_000_000);
+        assert_eq!(snap.writes.max_hold_nanos, 5_000_000);
+        let report = snap.report().expect("the writes acquired");
+        assert!(report.contains("held=7.0ms maxheld=5.0ms"), "got: {report}");
+    }
+
+    /// The window maximum resets with the window while the sum keeps
+    /// running, matching how the wait figures either side of it read.
+    #[test]
+    fn the_window_hold_maximum_resets_and_the_sum_does_not() {
+        let stats = LockStats::default();
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(6));
+        assert_eq!(stats.take_window().writes.max_hold_nanos, 6_000_000);
+
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(1));
+        let snap = stats.snapshot();
+        assert_eq!(snap.writes.max_hold_nanos, 1_000_000);
+        assert_eq!(snap.writes.hold_nanos, 7_000_000);
     }
 
     /// A drain is attributed to the site that released, sized by the

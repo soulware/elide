@@ -544,19 +544,20 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
 /// has parked, and the two clock reads charged to it are far below the
 /// wait they measure.
 ///
-/// The guest's hold goes unmeasured: it would cost a third clock read per
-/// write to record the one quantity here that no writer waits on.
+/// The returned guard charges what the write held on drop. An actor loop
+/// that yields to the queue standing behind it pays that hold once per
+/// waiting write, so it is the term that sizes the yield.
 fn lock_volume_for_write<'a>(
     volume: &'a Arc<Mutex<Volume>>,
-    stats: &LockStats,
-) -> MutexGuard<'a, Volume> {
+    stats: &'a LockStats,
+) -> WriteGuard<'a> {
     // A poisoned mutex comes back from `try_lock` *acquired*, inside the
     // error, so the result is consumed here rather than held across the
     // blocking acquisition below — which would deadlock against itself.
     match volume.try_lock() {
         Ok(guard) => {
             stats.record_write_uncontended();
-            return guard;
+            return WriteGuard::new(guard, stats);
         }
         Err(contended) => drop(contended),
     }
@@ -564,7 +565,44 @@ fn lock_volume_for_write<'a>(
     let requested = Instant::now();
     let guard = lock_volume(volume);
     stats.record_write_blocked(requested.elapsed());
-    guard
+    WriteGuard::new(guard, stats)
+}
+
+/// A guest write's hold on the volume mutex, charged on drop.
+pub(crate) struct WriteGuard<'a> {
+    guard: MutexGuard<'a, Volume>,
+    stats: &'a LockStats,
+    acquired: Instant,
+}
+
+impl<'a> WriteGuard<'a> {
+    fn new(guard: MutexGuard<'a, Volume>, stats: &'a LockStats) -> Self {
+        Self {
+            guard,
+            stats,
+            acquired: Instant::now(),
+        }
+    }
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = Volume;
+
+    fn deref(&self) -> &Volume {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Volume {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.stats.record_write_hold(self.acquired.elapsed());
+    }
 }
 
 /// Sync a WAL file handle taken under the volume mutex, on a caller that
