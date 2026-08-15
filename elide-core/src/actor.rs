@@ -287,6 +287,9 @@ pub struct VolumeActor {
     flush_cost: FlushCost,
     /// When that line last went out, which is the span the next one covers.
     flush_marked: Instant,
+    /// When the stashed-promotes warning last went out, so a persistent
+    /// failure repeats on the report cadence.
+    stash_marked: Instant,
 }
 
 /// Promote-pipeline bookkeeping: dispatch/completion generations for
@@ -1579,6 +1582,26 @@ impl VolumeActor {
         self.flush_marked = Instant::now();
     }
 
+    /// Warn while failed promotes sit stashed for retry, on the report
+    /// cadence, so a persistent failure (e.g. disk full) stays visible
+    /// beyond the single line each failure logs.  Every stashed epoch
+    /// is a wal/ file held on disk until a retry promotes it.
+    fn report_stashed_promotes(&mut self) {
+        if self.stash_marked.elapsed() < LOCK_REPORT_INTERVAL {
+            return;
+        }
+        self.stash_marked = Instant::now();
+        if let Some(oldest) = self.pipeline.failed_promotes.front() {
+            warn!(
+                "[promote {}] {} promote(s) stashed for retry; oldest segment {} (wal {})",
+                self.volume_label(),
+                self.pipeline.failed_promotes.len(),
+                oldest.segment_ulid,
+                oldest.old_wal_ulid,
+            );
+        }
+    }
+
     /// The volume's directory name, which is its ULID under `by_id/`.
     ///
     /// Every volume server on a host writes to the same log, so the
@@ -1596,6 +1619,7 @@ impl VolumeActor {
         loop {
             self.report_lock_stats();
             self.report_flush_cost();
+            self.report_stashed_promotes();
             crossbeam_channel::select! {
                 recv(self.rx) -> msg => {
                     let req = match msg {
@@ -4087,6 +4111,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         lock_stats_marked: Instant::now(),
         flush_cost: FlushCost::default(),
         flush_marked: Instant::now(),
+        stash_marked: Instant::now(),
     };
 
     let client = VolumeClient {
