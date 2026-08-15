@@ -20,6 +20,7 @@
 //
 // See docs/architecture.md — "Concurrency model" for rationale and design.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -27,7 +28,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -526,13 +527,13 @@ const LOCK_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Acquire the volume mutex.
 ///
-/// Poisoning would mean library code panicked while holding the lock —
-/// forbidden by CLAUDE.md's "no panic in library paths" rule.  Once
-/// poisoned, the volume's in-memory state is mid-mutation and the
-/// caller's thread is already doomed; we surface that with a clear
-/// message rather than continuing on broken state.
+/// `parking_lot`'s mutex is the one here because it can release to a
+/// waiting thread rather than to whoever wins the next acquisition — see
+/// [`TimedGuard::fair`]. It also tracks no poison state, so a caller that
+/// panicked mid-mutation leaves the lock takeable; CLAUDE.md's "no panic
+/// in library paths" rule is what keeps that from happening.
 fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
-    volume.lock().expect("volume mutex poisoned")
+    volume.lock()
 }
 
 /// Acquire the volume mutex for a guest write, timing the wait only when
@@ -551,15 +552,9 @@ fn lock_volume_for_write<'a>(
     volume: &'a Arc<Mutex<Volume>>,
     stats: &'a LockStats,
 ) -> WriteGuard<'a> {
-    // A poisoned mutex comes back from `try_lock` *acquired*, inside the
-    // error, so the result is consumed here rather than held across the
-    // blocking acquisition below — which would deadlock against itself.
-    match volume.try_lock() {
-        Ok(guard) => {
-            stats.record_write_uncontended();
-            return WriteGuard::new(guard, stats);
-        }
-        Err(contended) => drop(contended),
+    if let Some(guard) = volume.try_lock() {
+        stats.record_write_uncontended();
+        return WriteGuard::new(guard, stats);
     }
     stats.record_write_parking();
     let requested = Instant::now();
@@ -628,24 +623,50 @@ fn sync_wal_handle(handle: Option<Arc<fs::File>>) -> io::Result<()> {
 /// Three clock reads per acquisition, which is why the guest write path
 /// acquires through [`lock_volume_for_write`] instead.
 pub(crate) struct TimedGuard<'a> {
-    guard: MutexGuard<'a, Volume>,
+    /// `Some` for the whole borrow; taken in `drop`, which is the only
+    /// place that needs the guard by value, so no deref sees `None`.
+    guard: Option<MutexGuard<'a, Volume>>,
     stats: &'a LockStats,
     site: LockSite,
     wait: Duration,
     acquired: Instant,
+    fair: bool,
+}
+
+impl TimedGuard<'_> {
+    /// Release to a thread already waiting rather than to whoever wins
+    /// the next acquisition.
+    ///
+    /// For an actor loop that re-acquires immediately. The mutex hands
+    /// the lock back to the running thread by default, so such a loop
+    /// holds a guest write off for the sum of its iterations even though
+    /// each hold is short — measured at 541.7 ms across twelve holds of
+    /// 58 ms or less. A guest write's own hold averages 0.100 ms, so the
+    /// queue this lets through costs the loop well under a millisecond
+    /// per iteration.
+    fn fair(mut self) -> Self {
+        self.fair = true;
+        self
+    }
 }
 
 impl std::ops::Deref for TimedGuard<'_> {
     type Target = Volume;
 
     fn deref(&self) -> &Volume {
-        &self.guard
+        // Taken only by `drop`, which consumes the guard.
+        self.guard
+            .as_ref()
+            .expect("volume guard outlives its borrow")
     }
 }
 
 impl std::ops::DerefMut for TimedGuard<'_> {
     fn deref_mut(&mut self) -> &mut Volume {
-        &mut self.guard
+        // Taken only by `drop`, which consumes the guard.
+        self.guard
+            .as_mut()
+            .expect("volume guard outlives its borrow")
     }
 }
 
@@ -655,6 +676,11 @@ impl Drop for TimedGuard<'_> {
             .record(self.site, self.wait, self.acquired.elapsed());
         // `guard` is a field, so the mutex is still held here.
         self.stats.arm_drain(self.site);
+        match (self.guard.take(), self.fair) {
+            (Some(guard), true) => MutexGuard::unlock_fair(guard),
+            // Releases to whichever thread wins the next acquisition.
+            (guard, _) => drop(guard),
+        }
     }
 }
 
@@ -709,7 +735,8 @@ impl VolumeActor {
         let guard = lock_volume(&self.volume);
         let acquired = Instant::now();
         TimedGuard {
-            guard,
+            guard: Some(guard),
+            fair: false,
             stats: &self.lock_stats,
             site,
             wait: acquired.saturating_duration_since(requested),
@@ -760,17 +787,19 @@ impl VolumeActor {
     /// older snapshot recover via the `NotFound` retry in
     /// [`VolumeReader::read_with_snapshot`].
     ///
-    /// Each bucket takes the volume mutex on its own. A close pass
-    /// carries ten or more buckets of ~10k entries, and registering
-    /// those entries is the bulk of the work, so one hold across the
-    /// pass blocks guest writes for as long as all of them together.
-    /// Guest writes take the mutex between buckets instead, and the
-    /// single publish at the end keeps readers seeing the whole pass at
-    /// once.
+    /// Each bucket takes the volume mutex on its own, and releases it to
+    /// a waiting guest write. A close pass carries ten or more buckets of
+    /// ~10k entries, and registering those entries is the bulk of the
+    /// work, so one hold across the pass blocks guest writes for as long
+    /// as all of them together — and releasing without the fair handoff
+    /// costs them the same, since this loop would win the lock straight
+    /// back. The single publish at the end keeps readers seeing the whole
+    /// pass at once.
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let (mut acc, buckets) = RepackApply::new(result);
         for bucket in &buckets {
             self.lock_volume(LockSite::RepackApply)
+                .fair()
                 .apply_repack_bucket(bucket, &mut acc)?;
         }
         let (stats, consumed_inputs) = self
@@ -1509,8 +1538,12 @@ impl VolumeActor {
             return;
         }
         self.parked.handoff_in_flight = false;
+        // Plans arrive in batches the actor folds back to back, so this
+        // releases to a waiting guest write for the same reason the
+        // repack bucket loop does.
         let applied = self
             .lock_volume(LockSite::GcPlanApply)
+            .fair()
             .apply_plan_apply_result(*result);
         match applied {
             Ok(crate::volume::StagedApply::Applied) => {
@@ -4757,6 +4790,33 @@ mod tests {
             out.extend_from_slice(&z.to_le_bytes());
         }
         out
+    }
+
+    /// A fair release frees the mutex and still charges the hold.
+    ///
+    /// The guard keeps its lock in an `Option` so `drop` can hand it over
+    /// by value; a release that failed to take it would leave the mutex
+    /// held for the rest of the process.
+    #[test]
+    fn a_fair_release_frees_the_mutex_and_charges_the_hold() {
+        let dir = temp_dir();
+        let volume = Arc::new(Mutex::new(Volume::open(&dir, &dir).unwrap()));
+        let stats = LockStats::default();
+
+        drop(TimedGuard {
+            guard: Some(lock_volume(&volume)),
+            stats: &stats,
+            site: LockSite::RepackApply,
+            wait: Duration::ZERO,
+            acquired: Instant::now(),
+            fair: true,
+        });
+
+        assert!(
+            volume.try_lock().is_some(),
+            "a fair release left the mutex held"
+        );
+        assert_eq!(stats.snapshot().site(LockSite::RepackApply).acquisitions, 1);
     }
 
     /// Writes publish a snapshot, so `flush_gen` moves and a reader

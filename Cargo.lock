@@ -1343,6 +1343,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "nix 0.31.2",
+ "parking_lot",
  "proptest",
  "rand_core 0.6.4",
  "serde",
