@@ -91,8 +91,8 @@ pub use reclaim::{
     ReclaimedEntry, scan_reclaim_candidates,
 };
 pub use repack::{
-    CloseGenerationPrep, CompactionStats, RepackJob, RepackResult, RepackedBucket, RepackedInput,
-    RepackedOutput,
+    CloseGenerationPrep, CompactionStats, RepackApply, RepackJob, RepackResult, RepackedBucket,
+    RepackedInput, RepackedOutput,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 

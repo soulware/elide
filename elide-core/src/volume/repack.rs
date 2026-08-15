@@ -174,6 +174,56 @@ pub struct RepackResult {
     pub journal_untouched: Vec<Ulid>,
 }
 
+/// Cross-bucket state for one repack apply pass.
+///
+/// Holds what spans the buckets — the running stats, the consumed input
+/// paths, the rebuilt journal set and the phase timings — so a caller can
+/// apply one bucket at a time under its own hold of the volume mutex.
+pub struct RepackApply {
+    stats: CompactionStats,
+    consumed_inputs: Vec<PathBuf>,
+    /// Rebuilt from what the pass sees: the journal segments it leaves in
+    /// place, plus each journal bucket's outcome as it is applied — the
+    /// output for a bucket that lands, the inputs for one that is refused.
+    pending_journal: std::collections::BTreeSet<Ulid>,
+    /// The generation directory the pass ran over — `pending/open/` for
+    /// the tick's pass, `pending/upload/` for the close pass.
+    pending_dir: PathBuf,
+    buckets: usize,
+    derive_total: Duration,
+    header_total: Duration,
+    merge_total: Duration,
+    gate_total: Duration,
+    /// Summed time spent inside the buckets.
+    in_bucket: Duration,
+}
+
+impl RepackApply {
+    /// Split a worker result into the buckets to apply and the state that
+    /// spans them.
+    pub fn new(result: RepackResult) -> (Self, Vec<RepackedBucket>) {
+        let RepackResult {
+            stats,
+            buckets,
+            pending_dir,
+            journal_untouched,
+        } = result;
+        let acc = Self {
+            stats,
+            consumed_inputs: Vec::new(),
+            pending_journal: journal_untouched.into_iter().collect(),
+            pending_dir,
+            buckets: 0,
+            derive_total: Duration::ZERO,
+            header_total: Duration::ZERO,
+            merge_total: Duration::ZERO,
+            gate_total: Duration::ZERO,
+            in_bucket: Duration::ZERO,
+        };
+        (acc, buckets)
+    }
+}
+
 impl Volume {
     /// Run the packing engine over whatever `pending/open/` holds —
     /// the engine's test seam. Production packs once, at the close
@@ -375,9 +425,34 @@ impl Volume {
     }
 
     /// Apply phase of `repack` — runs on the actor thread after the
-    /// worker returns.
+    /// worker returns, one bucket at a time.
     ///
-    /// Each bucket's in-memory merge runs behind
+    /// The consumed input files are returned, not deleted: the caller
+    /// must publish its read snapshot first and then pass them to
+    /// [`Self::remove_consumed_inputs`] — deleting before publishing
+    /// would leave the currently-published snapshot pointing at
+    /// unlinked files, failing concurrent reads with `NotFound`.
+    pub fn apply_repack_result(
+        &mut self,
+        result: RepackResult,
+    ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
+        let (mut acc, buckets) = RepackApply::new(result);
+        for bucket in &buckets {
+            self.apply_repack_bucket(bucket, &mut acc)?;
+        }
+        self.finish_repack_apply(acc)
+    }
+
+    /// Apply one bucket, folding its outcome into `acc`.
+    ///
+    /// A bucket is a self-contained unit of the apply: it derives its own
+    /// footprint, runs its own resolvability gate, and probes stale
+    /// liveness against the counts it finds when it runs. A reference
+    /// minted between two buckets is what that probe refuses on, so a
+    /// caller holding the volume mutex per bucket reaches the same
+    /// outcomes as one holding it across the pass.
+    ///
+    /// The in-memory merge runs behind
     /// [`Self::mutate_gated_on_resolvability`]:
     ///   - CAS-remove dropped owned hashes (`current loc.segment_id ==
     ///     input_ulid`); concurrent writers that re-pointed the hash
@@ -395,288 +470,296 @@ impl Volume {
     /// deleted, the inputs stay, and the next repack pass — whose
     /// prep snapshot includes the new reference — carries the hash.
     ///
-    /// Applied buckets queue `pending/<input_ulid>` into the returned
-    /// unlink list (for all-dead buckets too — `output: None`). The
+    /// An applied bucket queues `pending/<input_ulid>` into `acc`'s
+    /// unlink list (for an all-dead bucket too — `output: None`). The
     /// worker has already written `pending/<new_ulid>` separately.
     /// Each input's file-cache fd is evicted.
-    ///
-    /// The consumed input files are returned, not deleted: the caller
-    /// must publish its read snapshot first and then pass them to
-    /// [`Self::remove_consumed_inputs`] — deleting before publishing
-    /// would leave the currently-published snapshot pointing at
-    /// unlinked files, failing concurrent reads with `NotFound`.
-    pub fn apply_repack_result(
+    pub fn apply_repack_bucket(
         &mut self,
-        result: RepackResult,
-    ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
-        let RepackResult {
-            mut stats,
-            buckets,
-            pending_dir,
-            journal_untouched,
-        } = result;
+        bucket: &RepackedBucket,
+        acc: &mut RepackApply,
+    ) -> io::Result<()> {
+        let started = Instant::now();
+        acc.buckets += 1;
+        let outcome = self.apply_repack_bucket_inner(bucket, acc);
+        acc.in_bucket += started.elapsed();
+        outcome
+    }
 
+    fn apply_repack_bucket_inner(
+        &mut self,
+        bucket: &RepackedBucket,
+        acc: &mut RepackApply,
+    ) -> io::Result<()> {
         // Which generation this pass ran over — `open` for the tick's
         // pass, `upload` for the close pass. Both reach here through
         // `execute_repack`, so the logs below name it to tell them apart.
-        let generation = pending_dir
+        let generation = acc
+            .pending_dir
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("pending");
 
-        let mut consumed_inputs: Vec<PathBuf> = Vec::new();
-        // Summed across buckets, which one hold of the volume mutex
-        // spans.
-        let (mut derive_total, mut header_total) = (Duration::ZERO, Duration::ZERO);
-        let (mut merge_total, mut gate_total) = (Duration::ZERO, Duration::ZERO);
-        let buckets_start = Instant::now();
-        // Rebuilt from what this pass saw: the journal segments it left
-        // in place, plus each journal bucket's outcome as the loop below
-        // resolves it — the output for a bucket that landed, the inputs
-        // for one that was refused.
-        let mut pending_journal: std::collections::BTreeSet<Ulid> =
-            journal_untouched.into_iter().collect();
+        let derive_start = Instant::now();
+        let carried_hashes = bucket
+            .output
+            .as_ref()
+            .map(|o| extentindex::ExtentIndex::carried_hashes(&o.out_entries))
+            .unwrap_or_default();
 
-        for bucket in &buckets {
-            let derive_start = Instant::now();
-            let carried_hashes = bucket
-                .output
-                .as_ref()
-                .map(|o| extentindex::ExtentIndex::carried_hashes(&o.out_entries))
-                .unwrap_or_default();
+        let bucket_input_ulids: std::collections::HashSet<Ulid> =
+            bucket.inputs.iter().map(|i| i.input_ulid).collect();
 
-            let bucket_input_ulids: std::collections::HashSet<Ulid> =
-                bucket.inputs.iter().map(|i| i.input_ulid).collect();
+        let inputs_fmt = format_inputs(&bucket.inputs);
 
-            let inputs_fmt = format_inputs(&bucket.inputs);
-
-            // Stale-liveness refusal, mirroring the GC plan apply: the
-            // worker classified against a prep-time lbamap snapshot, so a
-            // reference minted since — a dedup claim, or a promoted delta
-            // naming an input-owned hash as its source — can make a hash
-            // this bucket drops live again. A delta source makes no LBA
-            // claim, so the resolvability gate cannot see it; the liveness
-            // check here is what refuses the bucket. Liveness is probed
-            // against the maintained counts as each bucket reaches it, so
-            // an earlier bucket's landing counts.
-            let stale: Vec<blake3::Hash> = bucket
-                .inputs
-                .iter()
-                .flat_map(|input| {
-                    input.owned_hashes.iter().filter(|hash| {
-                        if carried_hashes.contains(*hash) {
-                            return false;
-                        }
-                        let still_at_input = self
+        // Stale-liveness refusal, mirroring the GC plan apply: the
+        // worker classified against a prep-time lbamap snapshot, so a
+        // reference minted since — a dedup claim, or a promoted delta
+        // naming an input-owned hash as its source — can make a hash
+        // this bucket drops live again. A delta source makes no LBA
+        // claim, so the resolvability gate cannot see it; the liveness
+        // check here is what refuses the bucket. Liveness is probed
+        // against the maintained counts as each bucket reaches it, so
+        // an earlier bucket's landing counts.
+        let stale: Vec<blake3::Hash> = bucket
+            .inputs
+            .iter()
+            .flat_map(|input| {
+                input.owned_hashes.iter().filter(|hash| {
+                    if carried_hashes.contains(*hash) {
+                        return false;
+                    }
+                    let still_at_input = self
+                        .extent_index
+                        .lookup(hash)
+                        .is_some_and(|loc| loc.segment_id == input.input_ulid)
+                        || self
                             .extent_index
-                            .lookup(hash)
-                            .is_some_and(|loc| loc.segment_id == input.input_ulid)
-                            || self
-                                .extent_index
-                                .lookup_delta(hash)
-                                .is_some_and(|loc| loc.segment_id == input.input_ulid);
-                        still_at_input
-                            && (self.lbamap.is_referenced(hash)
-                                || self.extent_index.is_named_delta_source(hash))
-                    })
+                            .lookup_delta(hash)
+                            .is_some_and(|loc| loc.segment_id == input.input_ulid);
+                    still_at_input
+                        && (self.lbamap.is_referenced(hash)
+                            || self.extent_index.is_named_delta_source(hash))
                 })
-                .copied()
-                .collect();
-            if !stale.is_empty() {
-                log::warn!(
-                    "repack {generation} [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
+            })
+            .copied()
+            .collect();
+        if !stale.is_empty() {
+            log::warn!(
+                "repack {generation} [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
                      hash(es) became referenced after classification, first {}; \
                      dropping output and keeping inputs",
-                    stale.len(),
-                    stale[0].to_hex(),
-                );
-                stats.buckets_refused += 1;
-                if let Some(out) = &bucket.output {
-                    let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
-                }
-                if bucket.journal {
-                    pending_journal.extend(bucket.inputs.iter().map(|i| i.input_ulid));
-                }
-                continue;
-            }
-
-            // Every hash whose resolvability this bucket can change: the
-            // inputs' owned hashes it removes, the journal-tier hashes
-            // of the segments it purges, and the output's entries.
-            let mut footprint: crate::blake3_id_hasher::Blake3HashSet = bucket
-                .inputs
-                .iter()
-                .flat_map(|input| input.owned_hashes.iter().copied())
-                .collect();
-            for input in &bucket.inputs {
-                footprint.extend(self.extent_index.journal_hashes(input.input_ulid));
-            }
+                stale.len(),
+                stale[0].to_hex(),
+            );
+            acc.stats.buckets_refused += 1;
             if let Some(out) = &bucket.output {
-                footprint.extend(out.out_entries.iter().map(|e| e.hash));
+                let _ = fs::remove_file(acc.pending_dir.join(out.new_ulid.to_string()));
             }
-            let derive = derive_start.elapsed();
+            if bucket.journal {
+                acc.pending_journal
+                    .extend(bucket.inputs.iter().map(|i| i.input_ulid));
+            }
+            return Ok(());
+        }
 
-            let header_start = Instant::now();
-            let delta_body_source = match &bucket.output {
-                Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
-                    &pending_dir.join(out.new_ulid.to_string()),
-                    &out.out_entries,
-                    out.new_body_section_start,
-                )?),
-                None => None,
-            };
-            let header = header_start.elapsed();
+        // Every hash whose resolvability this bucket can change: the
+        // inputs' owned hashes it removes, the journal-tier hashes
+        // of the segments it purges, and the output's entries.
+        let mut footprint: crate::blake3_id_hasher::Blake3HashSet = bucket
+            .inputs
+            .iter()
+            .flat_map(|input| input.owned_hashes.iter().copied())
+            .collect();
+        for input in &bucket.inputs {
+            footprint.extend(self.extent_index.journal_hashes(input.input_ulid));
+        }
+        if let Some(out) = &bucket.output {
+            footprint.extend(out.out_entries.iter().map(|e| e.hash));
+        }
+        let derive = derive_start.elapsed();
 
-            let mut extents_removed = 0usize;
-            let mut merge = Duration::ZERO;
-            let gate_start = Instant::now();
-            let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
-                let merge_start = Instant::now();
-                let index = Arc::make_mut(&mut vol.extent_index);
+        let header_start = Instant::now();
+        let delta_body_source = match &bucket.output {
+            Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
+                &acc.pending_dir.join(out.new_ulid.to_string()),
+                &out.out_entries,
+                out.new_body_section_start,
+            )?),
+            None => None,
+        };
+        let header = header_start.elapsed();
 
-                // Per-input CAS-remove for hashes the bucket's output
-                // didn't carry — gated on the specific input's ULID so
-                // a concurrent writer that re-pointed the hash wins.
-                for input in &bucket.inputs {
-                    extents_removed += index.remove_input_owned(
-                        input.input_ulid,
-                        &input.owned_hashes,
-                        &carried_hashes,
-                    );
-                    // Journal-tier bodies are keyed by segment, so a
-                    // consumed input's journal entries are dropped whole (a
-                    // journal segment is only ever folded as a whole-dead
-                    // tombstone; no-op for a durable input).
-                    index.purge_journal_segment(input.input_ulid);
-                    index.purge_segment_delta_sources(input.input_ulid);
+        let mut extents_removed = 0usize;
+        let mut merge = Duration::ZERO;
+        let gate_start = Instant::now();
+        let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
+            let merge_start = Instant::now();
+            let index = Arc::make_mut(&mut vol.extent_index);
+
+            // Per-input CAS-remove for hashes the bucket's output
+            // didn't carry — gated on the specific input's ULID so
+            // a concurrent writer that re-pointed the hash wins.
+            for input in &bucket.inputs {
+                extents_removed += index.remove_input_owned(
+                    input.input_ulid,
+                    &input.owned_hashes,
+                    &carried_hashes,
+                );
+                // Journal-tier bodies are keyed by segment, so a
+                // consumed input's journal entries are dropped whole (a
+                // journal segment is only ever folded as a whole-dead
+                // tombstone; no-op for a durable input).
+                index.purge_journal_segment(input.input_ulid);
+                index.purge_segment_delta_sources(input.input_ulid);
+            }
+
+            // Register carried entries against the new bucket
+            // output as the disk rebuild would, gated on the
+            // current owner being any of the bucket's inputs.
+            if let Some(out) = &bucket.output {
+                let ctx = extentindex::SegmentRegistrationCtx {
+                    segment_id: out.new_ulid,
+                    body_section_start: out.new_body_section_start,
+                    body_tier: extentindex::RegistrationBodyTier::Local,
+                    // `delta_body_source` is Some whenever `bucket.output` is.
+                    delta_body_source: delta_body_source
+                        .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
+                    inline: extentindex::InlineSource::EntryInline,
+                };
+                for (raw_idx, e) in out.out_entries.iter().enumerate() {
+                    index.register_entry_consuming_inputs(
+                        e,
+                        raw_idx as u32,
+                        &ctx,
+                        &bucket_input_ulids,
+                    )?;
                 }
 
-                // Register carried entries against the new bucket
-                // output as the disk rebuild would, gated on the
-                // current owner being any of the bucket's inputs.
-                if let Some(out) = &bucket.output {
-                    let ctx = extentindex::SegmentRegistrationCtx {
-                        segment_id: out.new_ulid,
-                        body_section_start: out.new_body_section_start,
-                        body_tier: extentindex::RegistrationBodyTier::Local,
-                        // `delta_body_source` is Some whenever `bucket.output` is.
-                        delta_body_source: delta_body_source
-                            .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
-                        inline: extentindex::InlineSource::EntryInline,
-                    };
-                    for (raw_idx, e) in out.out_entries.iter().enumerate() {
-                        index.register_entry_consuming_inputs(
-                            e,
-                            raw_idx as u32,
-                            &ctx,
-                            &bucket_input_ulids,
-                        )?;
-                    }
-
-                    let lbamap = Arc::make_mut(&mut vol.lbamap);
-                    for e in &out.out_entries {
-                        lbamap.register_entry_consuming_inputs(
-                            e,
-                            out.new_ulid,
-                            &bucket_input_ulids,
-                        );
-                    }
+                let lbamap = Arc::make_mut(&mut vol.lbamap);
+                for e in &out.out_entries {
+                    lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
                 }
-                merge = merge_start.elapsed();
-                Ok(())
-            })?;
-            let gate_check = gate_start.elapsed().saturating_sub(merge);
-            derive_total += derive;
-            header_total += header;
-            merge_total += merge;
-            gate_total += gate_check;
+            }
+            merge = merge_start.elapsed();
+            Ok(())
+        })?;
+        let gate_check = gate_start.elapsed().saturating_sub(merge);
+        acc.derive_total += derive;
+        acc.header_total += header;
+        acc.merge_total += merge;
+        acc.gate_total += gate_check;
 
-            if let ResolvabilityGate::Refused(orphaned) = gate {
-                let detail = orphaned
-                    .sample
-                    .iter()
-                    .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                log::warn!(
-                    "repack {generation} [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
+        if let ResolvabilityGate::Refused(orphaned) = gate {
+            let detail = orphaned
+                .sample
+                .iter()
+                .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::warn!(
+                "repack {generation} [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
                      would be unresolvable through the extent index after apply, first {}: \
                      [{detail}]; dropping output and keeping inputs",
-                    orphaned.total,
-                    orphaned.sample.len(),
-                );
-                stats.buckets_refused += 1;
-                if let Some(out) = &bucket.output {
-                    let _ = fs::remove_file(pending_dir.join(out.new_ulid.to_string()));
-                }
-                if bucket.journal {
-                    pending_journal.extend(bucket.inputs.iter().map(|i| i.input_ulid));
-                }
-                continue;
-            }
-
-            stats.extents_removed += extents_removed;
-
-            if let Some(out) = &bucket.output {
-                if self.last_segment_ulid < Some(out.new_ulid) {
-                    self.last_segment_ulid = Some(out.new_ulid);
-                }
-                self.has_new_segments = true;
-                if bucket.journal {
-                    pending_journal.insert(out.new_ulid);
-                }
-            }
-
-            for input in &bucket.inputs {
-                self.evict_cached_segment(input.input_ulid);
-                consumed_inputs.push(input.input_path.clone());
-            }
-
-            stats.bytes_freed += bucket.bytes_freed;
-
-            let tier = if bucket.journal {
-                "journal segment, "
-            } else {
-                ""
-            };
-            let phases = format!(
-                "derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms",
-                derive.as_secs_f64() * 1e3,
-                header.as_secs_f64() * 1e3,
-                merge.as_secs_f64() * 1e3,
-                gate_check.as_secs_f64() * 1e3,
+                orphaned.total,
+                orphaned.sample.len(),
             );
-            match &bucket.output {
-                Some(out) => log::info!(
-                    "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed; {phases})",
-                    out.new_ulid,
-                    out.out_entries.len(),
-                    bucket.bytes_freed,
-                ),
-                None => log::info!(
-                    "repack {generation}: [{inputs_fmt}] -> deleted ({tier}{} bytes freed; {phases})",
-                    bucket.bytes_freed,
-                ),
+            acc.stats.buckets_refused += 1;
+            if let Some(out) = &bucket.output {
+                let _ = fs::remove_file(acc.pending_dir.join(out.new_ulid.to_string()));
+            }
+            if bucket.journal {
+                acc.pending_journal
+                    .extend(bucket.inputs.iter().map(|i| i.input_ulid));
+            }
+            return Ok(());
+        }
+
+        acc.stats.extents_removed += extents_removed;
+
+        if let Some(out) = &bucket.output {
+            if self.last_segment_ulid < Some(out.new_ulid) {
+                self.last_segment_ulid = Some(out.new_ulid);
+            }
+            self.has_new_segments = true;
+            if bucket.journal {
+                acc.pending_journal.insert(out.new_ulid);
             }
         }
 
-        let buckets_total = buckets_start.elapsed();
+        for input in &bucket.inputs {
+            self.evict_cached_segment(input.input_ulid);
+            acc.consumed_inputs.push(input.input_path.clone());
+        }
+
+        acc.stats.bytes_freed += bucket.bytes_freed;
+
+        let tier = if bucket.journal {
+            "journal segment, "
+        } else {
+            ""
+        };
+        let phases = format!(
+            "derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms",
+            derive.as_secs_f64() * 1e3,
+            header.as_secs_f64() * 1e3,
+            merge.as_secs_f64() * 1e3,
+            gate_check.as_secs_f64() * 1e3,
+        );
+        match &bucket.output {
+            Some(out) => log::info!(
+                "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed; {phases})",
+                out.new_ulid,
+                out.out_entries.len(),
+                bucket.bytes_freed,
+            ),
+            None => log::info!(
+                "repack {generation}: [{inputs_fmt}] -> deleted ({tier}{} bytes freed; {phases})",
+                bucket.bytes_freed,
+            ),
+        }
+        Ok(())
+    }
+
+    /// Close out a repack apply pass: fsync the generation directory the
+    /// buckets wrote into, record what the journal tier now holds, and
+    /// hand back the pass totals.
+    pub fn finish_repack_apply(
+        &mut self,
+        acc: RepackApply,
+    ) -> io::Result<(CompactionStats, Vec<PathBuf>)> {
+        let RepackApply {
+            stats,
+            consumed_inputs,
+            pending_journal,
+            pending_dir,
+            buckets,
+            derive_total,
+            header_total,
+            merge_total,
+            gate_total,
+            in_bucket,
+        } = acc;
+
         let fsync_start = Instant::now();
         segment::fsync_dir(&pending_dir)?;
-        if !buckets.is_empty() {
+        if buckets > 0 {
+            let generation = pending_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pending");
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
             // What the four phases leave unaccounted.
-            let other = buckets_total
+            let other = in_bucket
                 .saturating_sub(derive_total)
                 .saturating_sub(header_total)
                 .saturating_sub(merge_total)
                 .saturating_sub(gate_total);
             log::info!(
-                "repack {generation}: apply pass {} bucket(s) in {:.1}ms \
+                "repack {generation}: apply pass {buckets} bucket(s) in {:.1}ms \
                  (derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms other={:.1}ms), \
                  fsync={:.1}ms",
-                buckets.len(),
-                ms(buckets_total),
+                ms(in_bucket),
                 ms(derive_total),
                 ms(header_total),
                 ms(merge_total),
@@ -1491,6 +1574,73 @@ mod tests {
         assert_eq!(
             vol2.read(100, 1).unwrap(),
             payload_b,
+            "reopen rebuild must agree"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_write_between_buckets_survives_the_apply() {
+        // The actor takes the volume mutex once per bucket, so a guest
+        // write reaches it between two buckets of one pass. The later
+        // bucket classified against the prep snapshot, which predates
+        // that write, so its apply must commit the write rather than
+        // the snapshot's body.
+        let base = keyed_temp_dir();
+        let mut vol = Volume::open(&base, &base).unwrap();
+
+        // The entry cap splits these four inputs over two buckets, with
+        // the 200_000 range landing in the second — see
+        // `repack_respects_entry_cap`.
+        let payload = unique_block(0xCAFE);
+        vol.write(0, &payload).unwrap();
+        vol.promote_for_test().unwrap();
+        for i in 1..=4096u64 {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+        for i in 100_000..(100_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+        for i in 200_000..(200_000u64 + 4096) {
+            vol.write(i, &payload).unwrap();
+        }
+        vol.promote_for_test().unwrap();
+
+        let job = vol
+            .prepare_pack_open_for_test()
+            .unwrap()
+            .expect("repack job");
+        let result = crate::actor::execute_repack(job).unwrap();
+        let (mut acc, buckets) = RepackApply::new(result);
+        assert!(
+            buckets.len() >= 2,
+            "this test needs a multi-bucket pass, got {}",
+            buckets.len()
+        );
+
+        let window = unique_block(0xBEEF);
+        vol.apply_repack_bucket(&buckets[0], &mut acc).unwrap();
+        vol.write(200_000, &window).unwrap();
+        for bucket in &buckets[1..] {
+            vol.apply_repack_bucket(bucket, &mut acc).unwrap();
+        }
+        let (_stats, consumed) = vol.finish_repack_apply(acc).unwrap();
+        vol.remove_consumed_inputs(&consumed).unwrap();
+
+        assert_eq!(
+            vol.read(200_000, 1).unwrap(),
+            window,
+            "the write that landed between buckets must survive the apply"
+        );
+
+        drop(vol);
+        let vol2 = Volume::open(&base, &base).unwrap();
+        assert_eq!(
+            vol2.read(200_000, 1).unwrap(),
+            window,
             "reopen rebuild must agree"
         );
 

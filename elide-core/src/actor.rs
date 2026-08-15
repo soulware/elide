@@ -45,10 +45,10 @@ use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
     PromoteSegmentPrep, PromoteSegmentResult, ReclaimCandidate, ReclaimJob, ReclaimOutcome,
-    ReclaimPrep, ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackJob, RepackResult,
-    SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume, WorkerJob,
-    WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs, read_extents,
-    read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
+    ReclaimPrep, ReclaimResult, ReclaimThresholds, ReclaimedEntry, RepackApply, RepackJob,
+    RepackResult, SharedFileCache, SignSnapshotManifestJob, SignSnapshotManifestResult, Volume,
+    WorkerJob, WorkerResult, find_segment_in_dirs, lock_file_cache, open_delta_body_in_dirs,
+    read_extents, read_plan_for_apply, scan_plan_handoffs, scan_reclaim_candidates,
 };
 
 // ---------------------------------------------------------------------------
@@ -721,10 +721,23 @@ impl VolumeActor {
     /// ever references a deleted input, and readers still holding an
     /// older snapshot recover via the `NotFound` retry in
     /// [`VolumeReader::read_with_snapshot`].
+    ///
+    /// Each bucket takes the volume mutex on its own. A close pass
+    /// carries ten or more buckets of ~10k entries, and registering
+    /// those entries is the bulk of the work, so one hold across the
+    /// pass blocks guest writes for as long as all of them together.
+    /// Guest writes take the mutex between buckets instead, and the
+    /// single publish at the end keeps readers seeing the whole pass at
+    /// once.
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
+        let (mut acc, buckets) = RepackApply::new(result);
+        for bucket in &buckets {
+            self.lock_volume(LockSite::RepackApply)
+                .apply_repack_bucket(bucket, &mut acc)?;
+        }
         let (stats, consumed_inputs) = self
             .lock_volume(LockSite::RepackApply)
-            .apply_repack_result(result)?;
+            .finish_repack_apply(acc)?;
         if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
             self.publish_snapshot();
         }
