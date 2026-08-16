@@ -193,6 +193,9 @@ pub struct RepackApply {
     derive_total: Duration,
     header_total: Duration,
     merge_total: Duration,
+    remove_total: Duration,
+    index_total: Duration,
+    lbamap_total: Duration,
     gate_total: Duration,
     /// Summed time spent inside the buckets.
     in_bucket: Duration,
@@ -217,6 +220,9 @@ impl RepackApply {
             derive_total: Duration::ZERO,
             header_total: Duration::ZERO,
             merge_total: Duration::ZERO,
+            remove_total: Duration::ZERO,
+            index_total: Duration::ZERO,
+            lbamap_total: Duration::ZERO,
             gate_total: Duration::ZERO,
             in_bucket: Duration::ZERO,
         };
@@ -592,6 +598,9 @@ impl Volume {
 
         let mut extents_removed = 0usize;
         let mut merge = Duration::ZERO;
+        let mut remove = Duration::ZERO;
+        let mut index_reg = Duration::ZERO;
+        let mut lbamap_reg = Duration::ZERO;
         let gate_start = Instant::now();
         let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
             let merge_start = Instant::now();
@@ -613,11 +622,13 @@ impl Volume {
                 index.purge_journal_segment(input.input_ulid);
                 index.purge_segment_delta_sources(input.input_ulid);
             }
+            remove = merge_start.elapsed();
 
             // Register carried entries against the new bucket
             // output as the disk rebuild would, gated on the
             // current owner being any of the bucket's inputs.
             if let Some(out) = &bucket.output {
+                let index_start = Instant::now();
                 let ctx = extentindex::SegmentRegistrationCtx {
                     segment_id: out.new_ulid,
                     body_section_start: out.new_body_section_start,
@@ -635,11 +646,14 @@ impl Volume {
                         &bucket_input_ulids,
                     )?;
                 }
+                index_reg = index_start.elapsed();
 
+                let lbamap_start = Instant::now();
                 let lbamap = Arc::make_mut(&mut vol.lbamap);
                 for e in &out.out_entries {
                     lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
                 }
+                lbamap_reg = lbamap_start.elapsed();
             }
             merge = merge_start.elapsed();
             Ok(())
@@ -648,6 +662,9 @@ impl Volume {
         acc.derive_total += derive;
         acc.header_total += header;
         acc.merge_total += merge;
+        acc.remove_total += remove;
+        acc.index_total += index_reg;
+        acc.lbamap_total += lbamap_reg;
         acc.gate_total += gate_check;
 
         if let ResolvabilityGate::Refused(orphaned) = gate {
@@ -700,10 +717,14 @@ impl Volume {
             ""
         };
         let phases = format!(
-            "derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms",
+            "derive={:.1}ms header={:.1}ms merge={:.1}ms \
+             (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms",
             derive.as_secs_f64() * 1e3,
             header.as_secs_f64() * 1e3,
             merge.as_secs_f64() * 1e3,
+            remove.as_secs_f64() * 1e3,
+            index_reg.as_secs_f64() * 1e3,
+            lbamap_reg.as_secs_f64() * 1e3,
             gate_check.as_secs_f64() * 1e3,
         );
         match &bucket.output {
@@ -737,6 +758,9 @@ impl Volume {
             derive_total,
             header_total,
             merge_total,
+            remove_total,
+            index_total,
+            lbamap_total,
             gate_total,
             in_bucket,
         } = acc;
@@ -757,12 +781,16 @@ impl Volume {
                 .saturating_sub(gate_total);
             log::info!(
                 "repack {generation}: apply pass {buckets} bucket(s) in {:.1}ms \
-                 (derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms other={:.1}ms), \
+                 (derive={:.1}ms header={:.1}ms merge={:.1}ms \
+                 (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms other={:.1}ms), \
                  fsync={:.1}ms",
                 ms(in_bucket),
                 ms(derive_total),
                 ms(header_total),
                 ms(merge_total),
+                ms(remove_total),
+                ms(index_total),
+                ms(lbamap_total),
                 ms(gate_total),
                 ms(other),
                 ms(fsync_start.elapsed()),
