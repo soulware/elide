@@ -950,23 +950,27 @@ impl ExtentIndex {
                     self.insert_journal_if_absent(ctx.segment_id, entry.hash, location);
                     return Ok(());
                 }
-                let admitted = match admission {
+                match admission {
                     // First-write-wins, matching `insert_if_absent`.
-                    Admission::IfAbsent => !self.inner.contains_key(&entry.hash),
-                    Admission::ConsumingInputs(inputs) => match self.inner.get(&entry.hash) {
-                        None => true,
-                        Some(loc) => inputs.contains(&loc.segment_id),
-                    },
-                };
-                if admitted {
-                    match admission {
-                        Admission::IfAbsent => {
+                    Admission::IfAbsent => {
+                        if !self.inner.contains_key(&entry.hash) {
                             self.inner.insert(entry.hash, location);
                         }
-                        // DATA precedence on the live path: clear any
-                        // stale delta slot, matching `insert`.
-                        Admission::ConsumingInputs(_) => self.insert(entry.hash, location),
                     }
+                    Admission::ConsumingInputs(inputs) => match self.inner.get_mut(&entry.hash) {
+                        // The slot names a consumed input, so the entry takes
+                        // it over. `get_mut` path-copies during the descent,
+                        // so the in-place overwrite fuses the admission probe
+                        // with the insert; clearing the delta slot keeps DATA
+                        // precedence, matching `insert`.
+                        Some(owner) if inputs.contains(&owner.segment_id) => {
+                            *owner = location;
+                            self.deltas.remove(&entry.hash);
+                        }
+                        // A concurrent writer re-pointed the hash; it wins.
+                        Some(_) => {}
+                        None => self.insert(entry.hash, location),
+                    },
                 }
             }
         }
