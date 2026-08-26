@@ -30,6 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -146,6 +151,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -189,6 +197,9 @@ jobs:
           diff -u testdata/mint-discharge-vectors.json \
                   .mint-ci/testdata/mint-discharge-vectors.json \
             || { echo "::error::elide's discharge vectors have drifted from mint@main"; exit 1; }
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
