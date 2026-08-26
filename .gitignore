@@ -1,7 +1,15 @@
 # Editor local settings
 .vscode/
-.claude/
-!.claude/agents/
+
+# Claude Code machine-local state
+.claude/settings.local.json
+.claude/worktrees/
+.claude/.cc-writes/
+.claude/agent-memory/
+.claude/scheduled_tasks.lock
+
+# macOS
+.DS_Store
 
 # Disk images
 *.img
