@@ -3025,7 +3025,7 @@ mod tests {
 
             async fn snapshot(&mut self) {
                 self.seal();
-                let batch: Vec<Seg> = self.pending.drain(..).collect();
+                let batch: Vec<Seg> = std::mem::take(&mut self.pending);
                 for seg in batch {
                     self.upload(seg).await;
                     self.check().await;
