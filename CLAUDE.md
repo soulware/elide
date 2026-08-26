@@ -70,11 +70,11 @@ When in doubt, re-read the Fly.io blog before proposing changes to anything maca
 
 ## Comments
 
-@docs/comments.md
+@docs/rules/comments.md
 
 ## Writing style
 
-@docs/ste.md
+@docs/rules/ste.md
 
 ## Documentation
 
