@@ -87,6 +87,10 @@ Never grow a comment across edits — trim or delete, never accrete.
 
 Both tests govern prose in design docs and PR descriptions: state what the change **is**, not what it isn't, was, or might have been.
 
+## Writing style
+
+@docs/ste.md
+
 ## Documentation
 
 Design documentation is indexed in `README.md` and lives in `docs/`.
