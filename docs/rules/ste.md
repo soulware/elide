@@ -1,7 +1,7 @@
 # Writing style: Simplified Technical English
 
-Write all output, all commit messages, all documentation, and all intermediate
-reasoning in ASD-STE100 Simplified Technical English, Issue 9.
+Write all output, all commit messages, and all documentation in ASD-STE100
+Simplified Technical English, Issue 9.
 
 The specification has two parts. Part 1 gives the writing rules. Part 2 gives an
 approved dictionary of approximately 900 words. The dictionary is a copyrighted
@@ -33,17 +33,20 @@ Apply the dictionary principles only.
 - Do not use a wordy phrase. Write "because", not "due to the fact that".
 - Do not use an idiom or a metaphor.
 
-## Reasoning
+## Economy
 
-- Apply these rules to intermediate reasoning.
 - Do not restate the task.
 - Do not narrate a plan before you do the work.
+- Reflect the user's own words when you answer, so the user sees that you read
+  them. This is not a restatement of the task.
 
 ## Limits
 
 These rules apply to prose, and to code comments. These rules do not apply to
 code, to an identifier, to a file path, to a command, to an error message, or to
 quoted text.
+
+Intermediate reasoning is exempt. Think in the form that solves the problem.
 
 ## Sources
 
