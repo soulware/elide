@@ -32,7 +32,7 @@ const DEADLINE: Duration = Duration::from_secs(120);
 fn incompressible_block(seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; 4096];
     let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
-    for chunk in out.chunks_exact_mut(8) {
+    for chunk in out.as_chunks_mut::<8>().0 {
         x = x.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = x;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
