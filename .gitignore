@@ -5,7 +5,7 @@
 .claude/settings.local.json
 .claude/worktrees/
 .claude/.cc-writes/
-.claude/agent-memory/
+.claude/agent-memory-local/
 .claude/scheduled_tasks.lock
 
 # macOS
