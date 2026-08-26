@@ -44,3 +44,8 @@ Apply the dictionary principles only.
 These rules apply to prose, and to code comments. These rules do not apply to
 code, to an identifier, to a file path, to a command, to an error message, or to
 quoted text.
+
+## Sources
+
+- [ASD-STE100](https://www.asd-ste100.org/) — the official specification. Request a free copy of Issue 9 there.
+- [Simplified Technical English](https://en.wikipedia.org/wiki/Simplified_Technical_English) — a summary of the rules, with a table of approved and unapproved words.
