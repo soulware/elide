@@ -285,9 +285,11 @@ impl LockStats {
         self.armed.site.store(site.index(), Ordering::Relaxed);
         self.armed.queued.store(queued, Ordering::Relaxed);
         self.armed.joined.store(0, Ordering::Relaxed);
+        // Zero is the unarmed sentinel, and the first clock tick after
+        // `base` reads as zero.
         self.armed
             .release_nanos
-            .store(self.now_nanos(), Ordering::Release);
+            .store(self.now_nanos().max(1), Ordering::Release);
     }
 
     /// Count a guest write that took the mutex without blocking.
@@ -356,7 +358,9 @@ impl LockStats {
         if release == 0 {
             return;
         }
-        let tail = self.now_nanos().saturating_sub(release);
+        // A drain inside one clock tick still counts, so its window max
+        // and peak stay nonzero alongside its `drains` increment.
+        let tail = self.now_nanos().saturating_sub(release).max(1);
         let queued = self.armed.queued.load(Ordering::Relaxed);
         let joined = self.armed.joined.load(Ordering::Relaxed);
         let site = self.armed.site.load(Ordering::Relaxed);
