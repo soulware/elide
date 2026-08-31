@@ -1175,6 +1175,11 @@ fn collect_stats(
     floor: Option<Ulid>,
 ) -> io::Result<Vec<SegmentStats>> {
     let index_dir = fork_dir.join("index");
+    // `collect_idx_files` lists `index/` raw, where `discover_fork_segments`
+    // drops the `index/<input>.idx` files a bare `gc/<new>` supersedes.
+    // `gc_fork` returns at its `has_pending_results` gate whenever a bare
+    // `gc/<ulid>` exists, so every path listed here names a live committed
+    // segment and the two listings hold the same set.
     let mut idx_files = segment::collect_idx_files(&index_dir)?;
     segment::sort_for_rebuild(fork_dir, &mut idx_files);
 
@@ -1198,7 +1203,22 @@ fn collect_stats(
         // Read index from .idx — the only local file we need for stats.
         // Presence of .idx means the segment is confirmed in S3 (invariant:
         // .idx is written inside promote_segment IPC, after confirmed S3 PUT).
-        let (_, entries, _) = segment::read_and_verify_segment_index(&idx_path, vk)?;
+        //
+        // A volume apply unlinks an input's `.idx` as it consumes it, so a
+        // segment listed above can be gone by the time it is read. It is
+        // consumed, so it belongs in no plan this pass emits, and the walk
+        // that built the liveness view skips it on the same terms.
+        let (_, entries, _) = match segment::read_and_verify_segment_index(&idx_path, vk) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                warn!(
+                    "segment vanished during rebuild (GC race): {}",
+                    idx_path.display()
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         // Read inline section from .idx for any inline entries.
         let has_inline = entries
@@ -2697,6 +2717,60 @@ mod tests {
     ///
     /// Two segments with the same hash for different LBAs: S1 has DATA(LBA 0→H),
     /// S2 has DedupRef(LBA 1→H).  The extent_index maps H→S2 (S2 processed
+    /// A volume apply unlinks an input's `.idx` as it consumes it, so a
+    /// segment can vanish between the listing and the read. The pass skips
+    /// it and classifies the rest.
+    #[test]
+    fn collect_stats_skips_a_segment_that_vanished_after_the_listing() {
+        let dir = TempDir::new().unwrap();
+        let fork_dir = dir.path();
+
+        elide_core::signing::generate_keypair(
+            fork_dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        let vk =
+            elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
+                .unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(fork_dir, fork_dir).unwrap();
+        vol.write(0, &[7u8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        let pending_dir = elide_core::segment::pending_open_dir(fork_dir);
+        for entry in fs::read_dir(&pending_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if let Ok(ulid) = ulid::Ulid::from_string(name_str) {
+                vol.promote_segment(ulid).unwrap();
+            }
+        }
+
+        let rebuild_chain = vec![(fork_dir.to_path_buf(), None)];
+        let index = extentindex::rebuild(&rebuild_chain).unwrap();
+        let lbamap = lbamap::rebuild_segments(&rebuild_chain).unwrap();
+        let live_hashes = lbamap.claim_referenced_hashes();
+
+        let present = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None).unwrap();
+        assert_eq!(present.len(), 1, "the volume has one committed segment");
+
+        // A path the listing returns and the read cannot open is what an
+        // unlink between the two produces.
+        let gone = Ulid::new();
+        std::os::unix::fs::symlink(
+            fork_dir.join("index").join("no-such-segment"),
+            fork_dir.join("index").join(format!("{gone}.idx")),
+        )
+        .unwrap();
+
+        let after = collect_stats(fork_dir, &vk, &index, &live_hashes, &lbamap, None)
+            .expect("a vanished segment leaves the pass running");
+        assert_eq!(after.len(), 1, "the surviving segment is still classified");
+    }
+
     /// last).  collect_stats for S1 should still keep the DATA entry via lba_live.
     #[test]
     fn collect_stats_keeps_data_entry_when_lba_live_but_not_extent_canonical() {
