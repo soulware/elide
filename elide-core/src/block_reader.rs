@@ -114,11 +114,10 @@ impl BlockReader {
             .collect();
         search_dirs.dedup();
 
-        let mut lbamap = lbamap::rebuild_segments(&rebuild_chain)?;
+        let (mut extent_index, mut lbamap, _) = crate::rebuild::rebuild_views(&rebuild_chain)?;
         // Rebuild with the volume's persisted journal ranges so the live
         // view routes journal entries exactly as the volume does.
         let journal = crate::config::VolumeConfig::read(&dir)?.journal_ranges();
-        let mut extent_index = extentindex::rebuild(&rebuild_chain)?;
 
         // Replay WAL records on top. Use scan_readonly so we don't truncate
         // partial tails that may exist on a currently-running volume.

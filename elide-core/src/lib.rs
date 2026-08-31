@@ -21,6 +21,7 @@ pub mod malloc_policy;
 pub mod name_record;
 pub mod operator_session;
 pub mod process;
+pub mod rebuild;
 pub mod rewrite_apply;
 pub mod rewrite_plan;
 pub mod segment;

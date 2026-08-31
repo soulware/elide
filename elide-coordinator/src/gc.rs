@@ -88,7 +88,7 @@ use ulid::Ulid;
 use crate::gc_census::DensityCensus;
 
 use elide_core::blake3_id_hasher::Blake3HashSet;
-use elide_core::extentindex::{self, ExtentIndex, SegmentPresence};
+use elide_core::extentindex::{ExtentIndex, SegmentPresence};
 use elide_core::lbamap::{self, LbaMap};
 use elide_core::rewrite_plan::{PlanOutput, RewritePlan};
 use elide_core::segment::{self, EntryKind, SegmentEntry};
@@ -480,9 +480,8 @@ fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
         .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
         .chain(std::iter::once((fork_dir.to_path_buf(), None)))
         .collect();
-    let index = extentindex::rebuild(&rebuild_chain).context("rebuilding extent index")?;
-    let (mut lbamap, view_ceiling) =
-        lbamap::rebuild_segments_with_ceiling(&rebuild_chain).context("rebuilding lba map")?;
+    let (index, mut lbamap, view_ceiling) = elide_core::rebuild::rebuild_views(&rebuild_chain)
+        .context("rebuilding extent index and lba map")?;
     // Every plan this pass emits is classified against this view, and a
     // refusal at apply names the claimant that blocked the fold. Comparing
     // the two ULIDs says which side the fault sits on, so the ceiling is
@@ -1755,6 +1754,7 @@ fn replay_wal_into_lbamap(wal_dir: &Path, lbamap: &mut LbaMap) -> Result<()> {
 mod tests {
     use super::*;
     use crate::upload::segment_key;
+    use elide_core::extentindex;
     use object_store::memory::InMemory;
     use std::time::Duration;
     use tempfile::TempDir;
