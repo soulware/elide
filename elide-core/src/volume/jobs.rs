@@ -160,19 +160,20 @@ pub struct PromoteDeltaSpec {
     pub sketch_index: Arc<crate::sketch_index::SketchIndex>,
     /// Body-lookup roots: the fork directory first, then ancestor dirs.
     pub search_dirs: Vec<PathBuf>,
-    /// Which hashes were referenced at prep time. An unreferenced source is
-    /// declined: deltaing against one pins bytes GC was about to free and gets
-    /// the GC plan that omitted them refused on apply.
-    pub referenced: crate::lbamap::ReferencedHashes,
-    /// The sealed snapshot the same-LBA tier sources from, present for the
-    /// volumes that have one. The resemblance tier needs only the candidate
-    /// map.
+    /// Live lbamap snapshot at prep time. The worker composes the
+    /// referenced-hashes view from this and `extent_index`, off the
+    /// volume mutex. An unreferenced source is declined: deltaing
+    /// against one pins bytes GC was about to free and gets the GC plan
+    /// that omitted them refused on apply.
+    pub lbamap: Arc<crate::lbamap::LbaMap>,
+    /// Where the same-LBA tier probes for the sealed snapshot it sources
+    /// from. The worker runs the probe. Recovery promotes pass `None`.
+    /// The resemblance tier needs only the candidate map.
     pub prior: Option<PromoteDeltaPrior>,
 }
 
 pub struct PromoteDeltaPrior {
     pub base_dir: PathBuf,
-    pub snap_ulid: Ulid,
     /// The volume's journal window, whose LBAs are excluded from the source
     /// map so dictionaries come from filesystem content alone.
     pub journal_ranges: crate::journal::JournalRanges,
