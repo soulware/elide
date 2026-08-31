@@ -1,31 +1,18 @@
 # Elide
 
-## Rust Code Quality Rules
+## Rust code quality rules
 
-These rules apply to all Rust code in this project. Follow them without needing to be reminded.
+Clippy with `-D warnings` runs in CI, and a pre-commit hook runs `cargo fmt --check`. The rules here are the ones no lint catches.
 
 **No panicking code in library paths.**
 - No `.unwrap()` or `.expect()` outside of tests and `main.rs`. Propagate errors with `?`.
 - `.expect()` is only acceptable in tests, `main.rs` entry points, and for invariants that are genuinely impossible to violate — in that case, add a comment explaining why.
 - No `panic!`, `unreachable!`, `todo!`, or `unimplemented!` in library code unless behind a `#[cfg(test)]` or clearly guarded.
+- For a fixed-size slice conversion, use the module's const-generic `read_fixed::<N>` helper rather than `.try_into().expect(...)`. `elide-core/src/segment.rs` and `elide-core/src/writelog.rs` each define one.
 
 **Avoid unnecessary data copies.**
-- Prefer borrowing (`&[u8]`, `&str`) over cloning when the lifetime allows it.
-- Avoid `.to_vec()`, `.clone()`, or `Vec::new()` allocations on hot paths unless genuinely necessary.
-- If a function only reads data, take a slice not an owned value.
 - Avoid allocating a `Vec` for a small, fixed-size header — use a stack buffer (`[u8; N]`) instead.
-- When you already own an allocation, pass it by value rather than borrowing it only to copy it again. The pattern `some_option.as_deref().unwrap_or(fallback)` followed by `.to_vec()` is a sign you should use `some_option.unwrap_or_else(|| fallback.to_vec())` and pass ownership directly.
-
-**Error handling.**
-- Use `io::Error::other(msg)` not `io::Error::new(io::ErrorKind::Other, msg)`.
-- Match on `error.kind()` when distinguishing error cases — don't swallow errors with a catch-all `Err(_)`.
-- Error messages should be lowercase and not end with punctuation (Rust convention).
-
-**Code quality.**
-- Run `cargo fmt` before committing (enforced by pre-commit hook). Clippy with `-D warnings` is enforced in CI, not locally.
-- Fix all clippy warnings — don't accumulate `#[allow(...)]` suppressions unless there is a deliberate, documented reason.
-- Prefer `div_ceil()` over manual ceiling-division idioms.
-- Use const-generic `read_fixed::<N>` helpers rather than `.try_into().expect(...)` for fixed-size slice conversions.
+- When you already own an allocation, pass it by value rather than borrowing it only to copy it again.
 
 **Prefer crates over hand-rolled implementations.**
 - Before implementing a non-trivial algorithm or format (e.g. ULID, UUID, base64, checksums), check whether a well-known crate exists and discuss with the user before deciding to roll it by hand.
@@ -53,21 +40,6 @@ These rules apply to all Rust code in this project. Follow them without needing 
 - If a property must hold (e.g. every segment is signed), enforce it unconditionally — no fallback mode, no warn-and-continue.
 - An optional path for a correctness invariant means the invariant doesn't actually hold.
 
-## Macaroon design
-
-Macaroons in this project follow the canonical design from Fly.io's ["Macaroons Escalated Quickly"](https://fly.io/blog/macaroons-escalated-quickly/). Two examples in tree: volume macaroons (coord-issued, PID-bound — see `docs/architecture.md`) and the operator-authorisation chain (mint primaries + auth-issued discharges, see `docs/design/auth-service.md`).
-
-**Stay aligned with the canonical model.**
-
-- **Symmetric MAC only.** A macaroon's chain is keyed-BLAKE3 (or keyed-HMAC) MAC. If a proposal reaches for asymmetric crypto inside something it still calls a macaroon, that's drift — rename it and design it as a separate artefact, or rework to symmetric.
-- **Don't distribute the root key.** Verification of MAC tags happens at the service that holds the root key. Other services POST bytes to that service and cache the yes/no answer. The root never leaves its home.
-- **Don't distribute HKDF-derived per-scope keys to verifiers either.** Anyone who can verify with a key can also forge with it. Distributing per-coord/per-window/per-anything MAC keys to verifiers gives them forgery capability for that scope. Use the verification-service pattern instead.
-- **Verify ≠ clear.** Verification = HMAC tag check (pure crypto, cacheable, same bytes → same answer). Clearing = caveat predicate evaluation against live request context (per-request, never cacheable). Caches are for verification results, never for clearing results.
-- **Service tokens at the trust source.** The issuer of a token is whoever is the trust source for the claim being attested. Volume tokens attest "this PID is volume V on this host" — coord is the trust source, so coord issues. Operator authorisation attests "a human authorised this op" — mint and auth are the trust sources, so they issue.
-- **Third-party caveats + discharges, not handrolled asymmetric signatures,** when composing trust across services with independent root keys. The TPC mechanism is what's in the macaroon paper; if you find yourself reaching for Ed25519 to "compose" two signing parties, you're rebuilding TPCs poorly.
-
-When in doubt, re-read the Fly.io blog before proposing changes to anything macaroon-shaped.
-
 ## Comments
 
 @docs/rules/comments.md
@@ -76,21 +48,34 @@ When in doubt, re-read the Fly.io blog before proposing changes to anything maca
 
 @docs/rules/ste.md
 
+## Macaroons
+
+Read [`docs/rules/macaroons.md`](docs/rules/macaroons.md) before you design or change anything macaroon-shaped.
+
 ## Documentation
 
-Design documentation is indexed in `README.md` and lives in `docs/`.
+Design documentation lives in `docs/`.
 
 - `docs/overview.md` — problem statement, key concepts, operation modes, empirical findings
-- `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification
 - `docs/architecture.md` — system architecture, directory layout, write/read paths, LBA map, extent index, dedup, snapshots
 - `docs/formats.md` — WAL format, segment file format, S3 retrieval strategies
 - `docs/operations.md` — GC, repacking, boot hints, filesystem metadata awareness
+- `docs/findings.md` — empirical measurements: dedup rates, demand-fetch patterns, delta compression data, write amplification
 - `docs/testing.md` — property-based tests: ULID monotonicity invariant, crash-recovery oracle, simulation model
 - `docs/reference.md` — lsvd reference comparison, implementation notes, open questions
+- `docs/quickstart.md` — the walkthrough, with `quickstart-{local,tigris,data-volume}.md` per deployment
+- `docs/design/` — per-feature design docs, one file per subsystem or change
+- `docs/plans/` — work plans for changes in flight
+- `docs/status/` — snapshots of a soak, an investigation, or a release
+- `docs/rules/` — the rule files imported above
+- `docs/finding-*.md`, `docs/reference-{lsvd,dis,nydus}.md` — one-off investigations and surveys of other systems
 
 ## References
 
+`refs/` is gitignored, so it exists only in the primary checkout. From a worktree, resolve the path with `git worktree list | head -1`.
+
 - `refs/lsvd-paper.pdf` — local copy of ["Beating the I/O Bottleneck: A Case for Log-Structured Virtual Disks"](https://doi.org/10.1145/3492321.3524271) (EuroSys 2022)
-- [asch/dis](https://github.com/asch/dis) — the paper authors' original implementation (named DIS in code; kernel device-mapper module + Go userspace daemon)
 - `refs/lsvd/` — local clone of lab47/lsvd, Evan Phoenix's independent Go reimplementation of the paper; our primary studied reference
-- [composefs/composefs-rs](https://github.com/composefs/composefs-rs) — Rust composefs implementation
+- `refs/composefs-rs/` — [composefs/composefs-rs](https://github.com/composefs/composefs-rs), the Rust composefs implementation
+- `refs/nydus-snapshotter/` — containerd/nydus-snapshotter
+- [asch/dis](https://github.com/asch/dis) — the paper authors' original implementation (named DIS in code; kernel device-mapper module + Go userspace daemon), surveyed in `docs/reference-dis.md`
