@@ -2911,12 +2911,23 @@ pub(crate) fn execute_promote(
     let mut delta_body: Vec<u8> = Vec::new();
     let mut reserved_sources = crate::blake3_id_hasher::Blake3HashSet::default();
     if job.delta.policy.enabled {
-        if let Some(prior_spec) = &job.delta.prior {
-            match prior_cache.map_for(
-                &prior_spec.base_dir,
-                prior_spec.snap_ulid,
-                &prior_spec.journal_ranges,
-            ) {
+        // The probe is a delta-optimisation input, so a probe failure
+        // skips the tier.
+        let prior_snap = match &job.delta.prior {
+            Some(spec) => match crate::volume::latest_snapshot(&spec.base_dir) {
+                Ok(latest) => latest.map(|snap_ulid| (spec, snap_ulid)),
+                Err(e) => {
+                    warn!(
+                        "formation {}: snapshot probe failed, skipping same-LBA delta tier: {e}",
+                        job.segment_ulid
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some((prior_spec, snap_ulid)) = prior_snap {
+            match prior_cache.map_for(&prior_spec.base_dir, snap_ulid, &prior_spec.journal_ranges) {
                 Ok(prior) => {
                     match crate::delta_compute::delta_pendings_against_prior(
                         &mut pendings,
@@ -2930,7 +2941,7 @@ pub(crate) fn execute_promote(
                                     "formation {}: {} delta entries vs snapshot {}, {} → {} bytes, {} entries held as sources",
                                     job.segment_ulid,
                                     stats.entries_converted,
-                                    prior_spec.snap_ulid,
+                                    snap_ulid,
                                     stats.original_body_bytes,
                                     stats.delta_body_bytes,
                                     stats.entries_reserved_as_sources,
@@ -2944,18 +2955,26 @@ pub(crate) fn execute_promote(
                 }
                 Err(e) => {
                     warn!(
-                        "formation {}: snapshot {} source map unavailable, skipping same-LBA delta tier: {e}",
-                        job.segment_ulid, prior_spec.snap_ulid
+                        "formation {}: snapshot {snap_ulid} source map unavailable, skipping same-LBA delta tier: {e}",
+                        job.segment_ulid
                     );
                 }
             }
         }
 
+        // The resemblance tier's cost filter asks "is this candidate
+        // source worth pinning" against claims plus every named delta
+        // source — the same liveness definition every deletion decision
+        // uses, so the filter never skips a source the GC would keep.
+        let referenced = job
+            .delta
+            .lbamap
+            .referenced_hashes(job.delta.extent_index.named_delta_sources());
         match crate::delta_compute::delta_pendings_by_resemblance(
             &mut pendings,
             &job.delta.sketch_index,
             &job.delta.extent_index,
-            &job.delta.referenced,
+            &referenced,
             &job.delta.search_dirs,
             &mut delta_body,
             &reserved_sources,

@@ -1044,7 +1044,7 @@ impl Volume {
                         extent_index: Arc::new(extentindex::ExtentIndex::new()),
                         sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
                         search_dirs: Vec::new(),
-                        referenced: Default::default(),
+                        lbamap: Arc::new(crate::lbamap::LbaMap::new()),
                         prior: None,
                     },
                     journal: jpart,
@@ -3848,22 +3848,14 @@ impl Volume {
                 search_dirs.push(layer.dir.clone());
             }
         }
-        // The resemblance tier's cost filter asks "is this candidate
-        // source worth pinning" against claims plus every named delta
-        // source — the same liveness definition every deletion decision
-        // uses, so the filter never skips a source the GC would keep.
-        let referenced = self
-            .lbamap
-            .referenced_hashes(self.extent_index.named_delta_sources());
         let delta = jobs::PromoteDeltaSpec {
             policy: self.delta_policy,
             extent_index: Arc::clone(&self.extent_index),
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
-            referenced,
-            prior: latest_snapshot(&self.base_dir)?.map(|snap_ulid| PromoteDeltaPrior {
+            lbamap: Arc::clone(&self.lbamap),
+            prior: Some(PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
-                snap_ulid,
                 journal_ranges: self.journal.clone(),
             }),
         };
