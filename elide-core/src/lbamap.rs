@@ -19,15 +19,13 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use imbl::OrdMap;
-use log::warn;
 use ulid::Ulid;
 
 use crate::blake3_id_hasher::{Blake3HamtMap, Blake3HashSet};
 use crate::segment;
-use crate::signing;
 
 /// A portion of a stored extent that overlaps a read request.
 ///
@@ -1014,81 +1012,80 @@ fn rebuild_segments_inner(
     layers: &[(PathBuf, Option<String>)],
     verify: bool,
 ) -> io::Result<(LbaMap, Option<Ulid>)> {
-    let mut map = LbaMap::new();
-    // The highest ULID whose entries reached the map, so the ceiling names
-    // coverage rather than intent: a segment listed but skipped below is one
-    // the caller's view does not carry.
-    let mut ceiling: Option<Ulid> = None;
+    let mut builder = LbaMapBuilder::new();
+    crate::rebuild::walk_fork_layers(layers, verify, &mut builder)?;
+    Ok(builder.finish())
+}
 
-    for (fork_dir, branch_ulid) in layers {
-        // `discover_fork_segments` handles the race-safe listing order
-        // (pending → gc → index) and returns the committed tier
-        // (gc ∪ index) by ULID ascending, then pending by ULID
-        // ascending. Admission runs in two phases, both order-independent
-        // within themselves. Flush-tier segments (empty inputs list)
-        // admit by highest claimant ULID — the segment mint is monotonic,
-        // so the highest claimant is the newest write. Compaction outputs
-        // (recorded inputs list) admit afterwards, ULID ascending, under
-        // `AboveHorizon(max(inputs))`: the output overrides claims its
-        // pass classified and defers to claims flushed after the
-        // classification, mirroring the `insert_consuming_inputs` rule
-        // the live apply enforced. ULID order alone cannot express that
-        // rule here — a pass's outputs can mint above a flush that landed
-        // mid-pass, and admitting them by ULID would resurrect the stale
-        // claim the live apply refused.
-        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
+/// Builds an [`LbaMap`] from a segment walk.
+///
+/// The walk delivers the committed tier (gc ∪ index) by ULID ascending,
+/// then pending by ULID ascending. Admission runs in two phases, both
+/// order-independent within themselves. Flush-tier segments (empty inputs
+/// list) admit by highest claimant ULID — the segment mint is monotonic, so
+/// the highest claimant is the newest write. Compaction outputs (recorded
+/// inputs list) admit at the end of the layer, ULID ascending, under
+/// `AboveHorizon(max(inputs))`: the output overrides claims its pass
+/// classified and defers to claims flushed after the classification,
+/// mirroring the `insert_consuming_inputs` rule the live apply enforced.
+/// ULID order alone cannot express that rule here — a pass's outputs can
+/// mint above a flush that landed mid-pass, and admitting them by ULID
+/// would resurrect the stale claim the live apply refused.
+pub(crate) struct LbaMapBuilder {
+    map: LbaMap,
+    /// The highest ULID whose entries reached the map, so the ceiling names
+    /// coverage rather than intent: a segment the walk skips is one the
+    /// caller's view does not carry.
+    ceiling: Option<Ulid>,
+    outputs: Vec<(Ulid, Ulid, Vec<segment::SegmentEntry>)>,
+}
 
-        if segments.is_empty() {
-            continue;
-        }
-
-        // Load the verifying key only when this layer has segments to check
-        // *and* the caller wants verification.
-        let vk = if verify {
-            Some(signing::load_verifying_key(
-                fork_dir,
-                signing::VOLUME_PUB_FILE,
-            )?)
-        } else {
-            None
-        };
-
-        let mut outputs: Vec<(Ulid, Ulid, Vec<segment::SegmentEntry>)> = Vec::new();
-        for sref in &segments {
-            let parsed = match &vk {
-                Some(vk) => segment::read_and_verify_segment_index(&sref.path, vk),
-                None => segment::read_segment_index(&sref.path),
-            };
-            let (_bss, entries, inputs) = match parsed {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    warn!(
-                        "segment vanished during rebuild (GC race): {}",
-                        sref.path.display()
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            ceiling = ceiling.max(Some(sref.ulid));
-            match inputs.iter().max().copied() {
-                Some(horizon) => outputs.push((sref.ulid, horizon, entries)),
-                None => {
-                    for entry in entries {
-                        map.register_entry_if_newer(&entry, sref.ulid);
-                    }
-                }
-            }
-        }
-        outputs.sort_by_key(|(ulid, _, _)| *ulid);
-        for (ulid, horizon, entries) in outputs {
-            for entry in &entries {
-                map.register_entry_with_horizon(entry, ulid, horizon);
-            }
+impl LbaMapBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: LbaMap::new(),
+            ceiling: None,
+            outputs: Vec::new(),
         }
     }
 
-    Ok((map, ceiling))
+    pub(crate) fn finish(self) -> (LbaMap, Option<Ulid>) {
+        (self.map, self.ceiling)
+    }
+}
+
+impl crate::rebuild::SegmentVisitor for LbaMapBuilder {
+    fn visit(
+        &mut self,
+        _fork_dir: &Path,
+        sref: &segment::SegmentRef,
+        _body_section_start: u64,
+        entries: &[segment::SegmentEntry],
+        inputs: &[Ulid],
+    ) -> io::Result<()> {
+        self.ceiling = self.ceiling.max(Some(sref.ulid));
+        match inputs.iter().max().copied() {
+            // A compaction output waits for the end of its layer, so it
+            // carries its entries until then.
+            Some(horizon) => self.outputs.push((sref.ulid, horizon, entries.to_vec())),
+            None => {
+                for entry in entries {
+                    self.map.register_entry_if_newer(entry, sref.ulid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn end_layer(&mut self) {
+        let mut outputs = std::mem::take(&mut self.outputs);
+        outputs.sort_by_key(|(ulid, _, _)| *ulid);
+        for (ulid, horizon, entries) in outputs {
+            for entry in &entries {
+                self.map.register_entry_with_horizon(entry, ulid, horizon);
+            }
+        }
+    }
 }
 
 // --- tests ---

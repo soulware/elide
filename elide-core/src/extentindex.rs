@@ -24,16 +24,14 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use log::warn;
 use ulid::Ulid;
 
 use crate::blake3_id_hasher::{Blake3HamtMap, Blake3HashSet};
 use crate::segment::{self, EntryKind};
-use crate::signing;
 use crate::sketch_index::SketchIndex;
 
 /// How the extent's body is stored locally.
@@ -1135,47 +1133,50 @@ pub fn rebuild_with_sketches(
 
 fn rebuild_inner(
     forks: &[(PathBuf, Option<String>)],
-    mut sketches: Option<&mut SketchIndex>,
+    sketches: Option<&mut SketchIndex>,
 ) -> io::Result<ExtentIndex> {
-    let mut index = ExtentIndex::new();
+    let mut builder = ExtentIndexBuilder::new(sketches);
+    crate::rebuild::walk_fork_layers(forks, true, &mut builder)?;
+    Ok(builder.finish().0)
+}
 
-    for (fork_dir, branch_ulid) in forks {
-        // Discover all segments in race-safe listing order (pending → gc →
-        // index) and rebuild-processing order ((gc ∪ index) by ULID, then
-        // pending by ULID). Both `lbamap::rebuild_segments` and this
-        // function share the helper. `discover_fork_segments` filters out
-        // `index/<input>.idx` files superseded by a bare `gc/<new>` — see
-        // its doc comment.
-        //
-        // `insert_if_absent` is used throughout (first-write-wins = lowest
-        // ULID canonical). Iterating the committed tier (gc ∪ index) in
-        // ULID ascending order means the first insert for any hash comes
-        // from the lowest-ULID segment holding it, matching the rule.
-        let segments = segment::discover_fork_segments(fork_dir, branch_ulid.as_deref())?;
+/// Builds an [`ExtentIndex`] from a segment walk.
+///
+/// `insert_if_absent` is used throughout (first-write-wins = lowest ULID
+/// canonical). The walk hands over the committed tier (gc ∪ index) in ULID
+/// ascending order, so the first insert for any hash comes from the
+/// lowest-ULID segment holding it, matching the rule.
+pub(crate) struct ExtentIndexBuilder<'s> {
+    index: ExtentIndex,
+    sketches: Option<&'s mut SketchIndex>,
+}
 
-        if segments.is_empty() {
-            continue;
+impl<'s> ExtentIndexBuilder<'s> {
+    pub(crate) fn new(sketches: Option<&'s mut SketchIndex>) -> Self {
+        Self {
+            index: ExtentIndex::new(),
+            sketches,
         }
+    }
 
-        // Load the verifying key only when this fork has segments to check.
-        let vk = signing::load_verifying_key(fork_dir, signing::VOLUME_PUB_FILE)?;
+    pub(crate) fn finish(self) -> (ExtentIndex, Option<&'s mut SketchIndex>) {
+        (self.index, self.sketches)
+    }
+}
 
-        for sref in &segments {
+impl crate::rebuild::SegmentVisitor for ExtentIndexBuilder<'_> {
+    fn visit(
+        &mut self,
+        fork_dir: &Path,
+        sref: &segment::SegmentRef,
+        body_section_start: u64,
+        entries: &[segment::SegmentEntry],
+        _inputs: &[Ulid],
+    ) -> io::Result<()> {
+        let index = &mut self.index;
+        {
             let segment_id = sref.ulid;
             let path = &sref.path;
-
-            let (body_section_start, entries, _inputs) =
-                match segment::read_and_verify_segment_index(path, &vk) {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!(
-                            "segment vanished during rebuild (GC race): {}",
-                            path.display()
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
 
             // Read inline section lazily: only when at least one inline-kind
             // entry exists (Inline or CanonicalInline).
@@ -1203,7 +1204,7 @@ fn rebuild_inner(
             let (body_tier, delta_body_source) = match sref.tier {
                 segment::SegmentTier::Pending | segment::SegmentTier::GcApplied => {
                     let delta =
-                        DeltaBodySource::full_for_segment(path, &entries, body_section_start)?;
+                        DeltaBodySource::full_for_segment(path, entries, body_section_start)?;
                     (RegistrationBodyTier::Local, delta)
                 }
                 segment::SegmentTier::Index => {
@@ -1235,14 +1236,13 @@ fn rebuild_inner(
             };
             for (raw_idx, entry) in entries.iter().enumerate() {
                 index.register_entry_if_absent(entry, raw_idx as u32, &ctx)?;
-                if let Some(sketches) = sketches.as_mut() {
+                if let Some(sketches) = self.sketches.as_mut() {
                     sketches.insert_entry(entry);
                 }
             }
         }
+        Ok(())
     }
-
-    Ok(index)
 }
 
 /// The `(inner_owners, delta_owners, journal_owners, live_segments)` tuple
