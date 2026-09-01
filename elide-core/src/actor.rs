@@ -106,8 +106,7 @@ pub struct VolumeConfig {
 /// consistent triple: observing a new generation means observing the extent
 /// index that goes with it, in the same atomic load.
 pub struct ReadSnapshot {
-    pub lbamap: Arc<LbaMap>,
-    pub extent_index: Arc<ExtentIndex>,
+    pub maps: crate::map_layers::MapLayers,
     pub flush_gen: u64,
     pub layout_gen: u64,
 }
@@ -722,10 +721,8 @@ fn publish_snapshot(
         Publication::ReplacesFiles => layout_gen.fetch_add(1, Ordering::SeqCst) + 1,
         Publication::AppendsToWal => layout_gen.load(Ordering::SeqCst),
     };
-    let (lbamap, extent_index) = volume.snapshot_maps();
     snapshot.swap(Arc::new(ReadSnapshot {
-        lbamap,
-        extent_index,
+        maps: volume.map_layers().clone(),
         flush_gen: new_flush,
         layout_gen: new_layout,
     }))
@@ -1135,9 +1132,9 @@ impl VolumeActor {
             return Ok(crate::volume::ReapStats::default());
         }
         let floor = crate::volume::latest_snapshot(&self.base_dir)?;
-        let snap = self.snapshot.load();
+        let maps = self.snapshot.load().maps.materialised();
         let sweep =
-            crate::volume::sweep_unreachable(&snap.lbamap, &snap.extent_index, &open, floor);
+            crate::volume::sweep_unreachable(&maps.lbamap, &maps.extent_index, &open, floor);
         let totals = sweep.totals();
         if totals.stored > 0 {
             log::info!(
@@ -2398,8 +2395,8 @@ impl VolumeClient {
     ///
     /// See [`scan_reclaim_candidates`] for the detection logic.
     pub fn reclaim_candidates(&self, thresholds: ReclaimThresholds) -> Vec<ReclaimCandidate> {
-        let snap = self.snapshot.load();
-        scan_reclaim_candidates(&snap.lbamap, &snap.extent_index, thresholds)
+        let maps = self.snapshot.load().maps.materialised();
+        scan_reclaim_candidates(&maps.lbamap, &maps.extent_index, thresholds)
     }
 
     /// Alias-merge extent reclamation over `[lba, lba + lba_length)`.
@@ -2492,12 +2489,11 @@ impl VolumeReader {
             self.last_layout_gen.set(snap.layout_gen);
         }
         let config = &self.client.config;
-        let extent_index = &snap.extent_index;
+        let extent_index = &snap.maps.base().extent_index;
         read_extents(
             lba,
             buf,
-            &snap.lbamap,
-            extent_index,
+            &snap.maps,
             snap.layout_gen,
             &self.client.file_cache,
             &self.dmat_cache,
@@ -4185,10 +4181,8 @@ fn is_index_entry_live(
 /// Also spawns a worker thread for off-actor I/O (WAL promotion, etc.).
 /// The worker exits when the actor shuts down and drops its job sender.
 pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
-    let (lbamap, extent_index) = volume.snapshot_maps();
     let initial = Arc::new(ReadSnapshot {
-        lbamap,
-        extent_index,
+        maps: volume.map_layers().clone(),
         flush_gen: 0,
         layout_gen: 0,
     });

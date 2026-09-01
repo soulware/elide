@@ -1059,7 +1059,8 @@ fn same_epoch_duplicate_minted_as_dedup_ref_at_formation() {
 
     // The extent index owner is the segment's Data entry, not a stale WAL
     // location (the pre-promote CAS pairing must survive the duplicate).
-    let loc = vol.extent_index.lookup(&hash).expect("hash resolvable");
+    let maps = vol.maps.materialised();
+    let loc = maps.extent_index.lookup(&hash).expect("hash resolvable");
     assert_eq!(loc.segment_id, ulids[0]);
 
     assert_eq!(vol.read(0, 2).unwrap(), data);
@@ -1090,7 +1091,8 @@ fn duplicate_of_promoted_canonical_minted_at_formation() {
     assert_eq!(vol.dedup_mint_stats().minted_entries, 1);
 
     // The canonical stays owned by the first segment.
-    let loc = vol.extent_index.lookup(&blake3::hash(&data)).unwrap();
+    let maps = vol.maps.materialised();
+    let loc = maps.extent_index.lookup(&blake3::hash(&data)).unwrap();
     assert_eq!(loc.segment_id, s1);
 
     assert_eq!(vol.read(10, 1).unwrap(), data);
@@ -1162,7 +1164,11 @@ fn format_mid_session_flips_window_at_promote_take() {
     // durable tier as pre-derivation residue, resolvable through `inner`.
     let pre_hash = blake3::hash(&pre_flip);
     assert!(
-        vol.extent_index.lookup(&pre_hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&pre_hash)
+            .is_some(),
         "pre-derivation window write is durable, not journal",
     );
 
@@ -1175,7 +1181,11 @@ fn format_mid_session_flips_window_at_promote_take() {
     vol.promote_for_test().unwrap();
     let post_hash = blake3::hash(&post_flip);
     assert!(
-        vol.extent_index.lookup(&post_hash).is_none(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&post_hash)
+            .is_none(),
         "post-derivation window write is journal-tier, absent from inner",
     );
     assert_eq!(vol.read(56, 1).unwrap(), post_flip);
@@ -1186,11 +1196,19 @@ fn format_mid_session_flips_window_at_promote_take() {
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
     assert!(
-        vol.extent_index.lookup(&pre_hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&pre_hash)
+            .is_some(),
         "durable residue stays durable across rebuild",
     );
     assert!(
-        vol.extent_index.lookup(&post_hash).is_none(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&post_hash)
+            .is_none(),
         "journal-tier content stays out of inner across rebuild",
     );
     assert_eq!(vol.read(56, 1).unwrap(), post_flip);
@@ -1696,9 +1714,19 @@ fn journal_and_home_store_separate_bodies_same_epoch() {
     let hash = blake3::hash(&data);
     // Home owns the durable `inner` slot; the journal copy lives in the
     // disjoint journal map keyed by its own segment.
-    assert_eq!(vol.extent_index.lookup(&hash).unwrap().segment_id, data_seg);
+    assert_eq!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash)
+            .unwrap()
+            .segment_id,
+        data_seg
+    );
     assert!(
-        vol.extent_index
+        vol.maps
+            .materialised()
+            .extent_index
             .lookup_journal(journal_seg, &hash)
             .is_some()
     );
@@ -1709,9 +1737,19 @@ fn journal_and_home_store_separate_bodies_same_epoch() {
     // Rebuild reproduces the disjoint tiers.
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
-    assert_eq!(vol.extent_index.lookup(&hash).unwrap().segment_id, data_seg);
+    assert_eq!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash)
+            .unwrap()
+            .segment_id,
+        data_seg
+    );
     assert!(
-        vol.extent_index
+        vol.maps
+            .materialised()
+            .extent_index
             .lookup_journal(journal_seg, &hash)
             .is_some()
     );
@@ -1737,11 +1775,15 @@ fn journal_and_home_own_separate_tiers_across_epochs() {
     let s1 = pending_ulids(&base)[0];
     let hash = blake3::hash(&data);
     assert!(
-        vol.extent_index.lookup(&hash).is_none(),
+        vol.maps.materialised().extent_index.lookup(&hash).is_none(),
         "journal content is not in inner"
     );
     assert!(
-        vol.extent_index.lookup_journal(s1, &hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(s1, &hash)
+            .is_some(),
         "journal copy owns its journal-map slot"
     );
     assert_eq!(vol.read(100, 1).unwrap(), data);
@@ -1758,12 +1800,21 @@ fn journal_and_home_own_separate_tiers_across_epochs() {
     assert_eq!(entries[0].kind, segment::EntryKind::Data);
 
     assert_eq!(
-        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash)
+            .unwrap()
+            .segment_id,
         s2,
         "home owns inner"
     );
     assert!(
-        vol.extent_index.lookup_journal(s1, &hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(s1, &hash)
+            .is_some(),
         "journal copy still owns its tier"
     );
 
@@ -1774,11 +1825,22 @@ fn journal_and_home_own_separate_tiers_across_epochs() {
     drop(vol);
     let vol = Volume::open(&base, &base).unwrap();
     assert_eq!(
-        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash)
+            .unwrap()
+            .segment_id,
         s2,
         "rebuild agrees with the live path"
     );
-    assert!(vol.extent_index.lookup_journal(s1, &hash).is_some());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(s1, &hash)
+            .is_some()
+    );
     assert_eq!(vol.read(0, 1).unwrap(), data);
     assert_eq!(vol.read(100, 1).unwrap(), data);
 
@@ -1817,12 +1879,21 @@ fn journal_write_stores_own_body_not_dedup_against_stable() {
 
     let hash = blake3::hash(&data);
     assert_eq!(
-        vol.extent_index.lookup(&hash).unwrap().segment_id,
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash)
+            .unwrap()
+            .segment_id,
         s1,
         "stable canonical unchanged in inner"
     );
     assert!(
-        vol.extent_index.lookup_journal(s2, &hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(s2, &hash)
+            .is_some(),
         "journal copy has its own body"
     );
 
@@ -4450,11 +4521,11 @@ fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
 
     // Sanity: both hashes are in the extent_index, h0 → seg_a, h1 → seg_b.
     assert!(
-        vol.extent_index.lookup(&h0).is_some(),
+        vol.maps.materialised().extent_index.lookup(&h0).is_some(),
         "h0 should be in extent_index pre-GC"
     );
     assert!(
-        vol.extent_index.lookup(&h1).is_some(),
+        vol.maps.materialised().extent_index.lookup(&h1).is_some(),
         "h1 should be in extent_index pre-GC"
     );
 
@@ -4465,11 +4536,11 @@ fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
     let count = vol.apply_gc_handoffs().unwrap();
     assert_eq!(count, 1);
     assert!(
-        vol.extent_index.lookup(&h0).is_none(),
+        vol.maps.materialised().extent_index.lookup(&h0).is_none(),
         "h0 should be removed from extent_index after apply"
     );
     assert!(
-        vol.extent_index.lookup(&h1).is_some(),
+        vol.maps.materialised().extent_index.lookup(&h1).is_some(),
         "h1 should still be in extent_index after apply"
     );
 
@@ -4479,7 +4550,7 @@ fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
 
     // h1 must still be in the extent_index (carried by the bare GC body).
     assert!(
-        vol.extent_index.lookup(&h1).is_some(),
+        vol.maps.materialised().extent_index.lookup(&h1).is_some(),
         "h1 should be in extent_index after restart"
     );
 
@@ -4487,7 +4558,7 @@ fn gc_staged_crash_in_bare_phase_drops_removed_extents() {
     // would re-introduce it via index/<seg_a>.idx because insert_if_absent
     // doesn't know that seg_a was consumed by the bare GC body.
     assert!(
-        vol.extent_index.lookup(&h0).is_none(),
+        vol.maps.materialised().extent_index.lookup(&h0).is_none(),
         "h0 must be gone after restart — was a Removed entry in the GC handoff. \
              A stale entry here means index/<seg_a>.idx was processed without consulting \
              the bare gc body's `inputs` field. See HandoffProtocol.tla counterexample."
@@ -4934,7 +5005,8 @@ fn promote_segment_recovers_mid_apply_crash() {
     // Invariant 2: the extent-index entry for the written hash now points
     // at Cached, not Local.
     let hash = blake3::hash(&data);
-    let loc = vol
+    let maps = vol.maps.materialised();
+    let loc = maps
         .extent_index
         .lookup(&hash)
         .expect("hash still present in extent index");
@@ -5201,8 +5273,7 @@ fn read_extents_errors_on_hash_missing_from_both_indexes() {
     let err = read::read_extents(
         0,
         &mut out,
-        &map,
-        &index,
+        &crate::map_layers::MapLayers::new(crate::map_layers::Maps::new(map, index)),
         0,
         &file_cache,
         &dmat_cache,
@@ -5234,11 +5305,12 @@ fn invariant_catches_stale_location_at_deleted_segment() {
     vol.flush_wal().unwrap();
 
     let (hash, mut stale) = {
-        let (h, l) = vol.extent_index.iter().next().expect("flushed entry");
+        let maps = vol.maps.materialised();
+        let (h, l) = maps.extent_index.iter().next().expect("flushed entry");
         (*h, l.clone())
     };
     stale.segment_id = ulid::Ulid::from_parts(u64::MAX, u128::MAX);
-    Arc::make_mut(&mut vol.extent_index).insert(hash, stale);
+    vol.maps.extent_index_mut().insert(hash, stale);
 
     vol.assert_volume_invariants("stale_location_test");
 }
@@ -5329,7 +5401,8 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
             delta_hash: crate::segment::stored_hash(b"blob"),
         }],
     );
-    Arc::make_mut(&mut vol.extent_index)
+    vol.maps
+        .extent_index_mut()
         .register_entry_if_absent(
             &delta_entry,
             0,
@@ -5342,7 +5415,7 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
             },
         )
         .unwrap();
-    Arc::make_mut(&mut vol.lbamap).insert(50, 1, target_hash, claimant);
+    vol.maps.lbamap_mut().insert(50, 1, target_hash, claimant);
 
     let (stats, consumed_inputs) = vol.apply_repack_result(result).unwrap();
 
@@ -5351,7 +5424,11 @@ fn repack_refuses_bucket_whose_dropped_hash_became_a_delta_source() {
         "the bucket dropping the delta source must be refused, stats: {stats:?}"
     );
     assert!(
-        vol.extent_index.lookup(&source_hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&source_hash)
+            .is_some(),
         "the delta's source must still resolve through the data index"
     );
     for path in &consumed_inputs {
@@ -5483,12 +5560,12 @@ fn same_content_rewrite_racing_flush_apply_matches_rebuild() {
     // parity with the disk rebuild is the observable property.
     let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
     assert_eq!(
-        vol.lbamap.hash_at(200),
+        vol.maps.materialised().lbamap.hash_at(200),
         rebuilt.hash_at(200),
         "live claim at the raced LBA diverged from the disk rebuild"
     );
     assert_eq!(
-        vol.lbamap.claimant_at(200),
+        vol.maps.materialised().lbamap.claimant_at(200),
         rebuilt.claimant_at(200),
         "live claimant at the raced LBA diverged from the disk rebuild"
     );
@@ -5550,7 +5627,7 @@ fn same_epoch_rewrite_cycle_matches_rebuild() {
 
     let rebuilt = lbamap::rebuild_segments(&[(base.clone(), None)]).expect("disk rebuild");
     assert_eq!(
-        vol.lbamap.hash_at(200),
+        vol.maps.materialised().lbamap.hash_at(200),
         rebuilt.hash_at(200),
         "live claim at the cycled LBA diverged from the disk rebuild"
     );
@@ -5576,12 +5653,18 @@ fn gate_refuses_a_mutation_stranding_a_declared_hash() {
     let hash = blake3::hash(&data);
     vol.write(0, &data).unwrap();
     vol.flush_wal().unwrap();
-    let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
+    let owner = vol
+        .maps
+        .materialised()
+        .extent_index
+        .lookup(&hash)
+        .unwrap()
+        .segment_id;
 
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
-            Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
+            v.maps.extent_index_mut().remove_owner_at(&hash, owner);
             Ok(())
         })
         .unwrap();
@@ -5594,7 +5677,7 @@ fn gate_refuses_a_mutation_stranding_a_declared_hash() {
         ResolvabilityGate::Applied => panic!("stranding a declared hash must refuse"),
     }
     assert!(
-        vol.extent_index.lookup(&hash).is_some(),
+        vol.maps.materialised().extent_index.lookup(&hash).is_some(),
         "refusal restores the index"
     );
     assert_eq!(vol.read(0, 1).unwrap(), data);
@@ -5615,11 +5698,17 @@ fn the_gate_trusts_the_declared_footprint() {
     let hash = blake3::hash(&data);
     vol.write(0, &data).unwrap();
     vol.flush_wal().unwrap();
-    let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
+    let owner = vol
+        .maps
+        .materialised()
+        .extent_index
+        .lookup(&hash)
+        .unwrap()
+        .segment_id;
 
     let gate = vol
         .mutate_gated_on_resolvability(&Default::default(), &LbaRanges::new([(0, 1)]), |v| {
-            Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
+            v.maps.extent_index_mut().remove_owner_at(&hash, owner);
             Ok(())
         })
         .unwrap();
@@ -5644,7 +5733,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
 
     let hash = blake3::hash(b"journal block");
     let seg = vol.mint.next();
-    Arc::make_mut(&mut vol.extent_index).insert_journal_if_absent(
+    vol.maps.extent_index_mut().insert_journal_if_absent(
         seg,
         hash,
         extentindex::ExtentLocation {
@@ -5657,7 +5746,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
             inline_data: None,
         },
     );
-    Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
+    vol.maps.lbamap_mut().insert(0, 1, hash, seg);
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
     let ranges = LbaRanges::new([(0, 2)]);
 
@@ -5670,7 +5759,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
     );
 
     let other = vol.mint.next();
-    Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, other);
+    vol.maps.lbamap_mut().insert(1, 1, hash, other);
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, &ranges, |_| Ok(()))
         .unwrap();
@@ -5684,10 +5773,10 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
         }
     }
 
-    Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, seg);
+    vol.maps.lbamap_mut().insert(1, 1, hash, seg);
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, &ranges, |v| {
-            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            v.maps.extent_index_mut().purge_journal_segment(seg);
             Ok(())
         })
         .unwrap();
@@ -5696,7 +5785,11 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
         "purging the claimant's journal map strands its claims"
     );
     assert!(
-        vol.extent_index.lookup_journal(seg, &hash).is_some(),
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(seg, &hash)
+            .is_some(),
         "refusal restores the journal map"
     );
 
@@ -5724,14 +5817,16 @@ fn the_gate_trusts_the_declared_claim_ranges() {
         body_section_start: 0,
         inline_data: None,
     };
-    Arc::make_mut(&mut vol.extent_index).insert_journal_if_absent(seg, hash, location.clone());
-    Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
-    Arc::make_mut(&mut vol.lbamap).insert(8, 1, hash, seg);
+    vol.maps
+        .extent_index_mut()
+        .insert_journal_if_absent(seg, hash, location.clone());
+    vol.maps.lbamap_mut().insert(0, 1, hash, seg);
+    vol.maps.lbamap_mut().insert(8, 1, hash, seg);
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
 
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
-            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            v.maps.extent_index_mut().purge_journal_segment(seg);
             Ok(())
         })
         .unwrap();
@@ -5742,11 +5837,17 @@ fn the_gate_trusts_the_declared_claim_ranges() {
         }
         ResolvabilityGate::Applied => panic!("a stranded claim in range must refuse"),
     }
-    assert!(vol.extent_index.lookup_journal(seg, &hash).is_some());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(seg, &hash)
+            .is_some()
+    );
 
     let gate = vol
         .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(16, 17)]), |v| {
-            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            v.maps.extent_index_mut().purge_journal_segment(seg);
             Ok(())
         })
         .unwrap();
@@ -5754,7 +5855,13 @@ fn the_gate_trusts_the_declared_claim_ranges() {
         matches!(gate, ResolvabilityGate::Applied),
         "claims outside the declared ranges are outside the walk"
     );
-    assert!(vol.extent_index.lookup_journal(seg, &hash).is_none());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup_journal(seg, &hash)
+            .is_none()
+    );
 
     fs::remove_dir_all(base).unwrap();
 }

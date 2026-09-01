@@ -22,6 +22,7 @@ use crate::{
     chunk_tree, delta_compute, dmat,
     extentindex::{self, BodySource, SegmentPresence},
     lbamap,
+    map_layers::MapLayers,
     segment::{self},
 };
 
@@ -536,8 +537,7 @@ impl FileCache {
 pub(crate) fn read_extents(
     lba: u64,
     out: &mut [u8],
-    lbamap: &lbamap::LbaMap,
-    extent_index: &extentindex::ExtentIndex,
+    maps: &MapLayers,
     layout_gen: u64,
     file_cache: &SharedFileCache,
     dmat_cache: &DmatCache,
@@ -560,7 +560,7 @@ pub(crate) fn read_extents(
     // bitset. Multi-extent reads on the same segment (the steady state)
     // skip the segment_presence HashMap probe after the first lookup.
     let mut last_segment_presence: Option<(Ulid, Option<&Arc<SegmentPresence>>)> = None;
-    for er in lbamap.extents_in_range(lba, end_lba) {
+    for er in maps.extents_in_range(lba, end_lba) {
         // Fill any gap between the previous extent and this one with zeros —
         // unwritten LBAs read back as zero by block-device convention.
         if er.range_start > cursor {
@@ -585,12 +585,11 @@ pub(crate) fn read_extents(
         // journal map, so the probe misses and falls through to `inner` —
         // making the tiers disjoint without the read path knowing the window.
         // Gated on a non-empty journal map so non-ext4 volumes pay nothing.
-        let resolved = if extent_index.journal_is_empty() {
-            extent_index.lookup(&er.hash)
+        let resolved = if maps.journal_is_empty() {
+            maps.lookup_extent(&er.hash)
         } else {
-            extent_index
-                .lookup_journal(er.claimant_ulid, &er.hash)
-                .or_else(|| extent_index.lookup(&er.hash))
+            maps.lookup_journal(er.claimant_ulid, &er.hash)
+                .or_else(|| maps.lookup_extent(&er.hash))
         };
         let loc = match resolved {
             Some(loc) => loc,
@@ -599,7 +598,7 @@ pub(crate) fn read_extents(
                 if try_read_delta_extent(
                     &er,
                     lba,
-                    extent_index,
+                    maps,
                     layout_gen,
                     file_cache,
                     dmat_cache,
@@ -675,7 +674,7 @@ pub(crate) fn read_extents(
                 let presence = match last_segment_presence {
                     Some((id, p)) if id == loc.segment_id => p,
                     _ => {
-                        let p = extent_index.segment_presence(loc.segment_id);
+                        let p = maps.segment_presence(loc.segment_id);
                         last_segment_presence = Some((loc.segment_id, p));
                         p
                     }
@@ -846,7 +845,7 @@ pub(crate) fn read_extents(
 fn try_read_delta_extent(
     er: &lbamap::ExtentRead,
     lba: u64,
-    extent_index: &extentindex::ExtentIndex,
+    maps: &MapLayers,
     layout_gen: u64,
     file_cache: &SharedFileCache,
     dmat_cache: &DmatCache,
@@ -859,7 +858,7 @@ fn try_read_delta_extent(
 ) -> io::Result<bool> {
     use std::os::unix::fs::FileExt;
 
-    let Some(delta_loc) = extent_index.lookup_delta(&er.hash) else {
+    let Some(delta_loc) = maps.lookup_delta(&er.hash) else {
         return Ok(false);
     };
     let delta_segment_id = delta_loc.segment_id;
@@ -901,7 +900,7 @@ fn try_read_delta_extent(
     // demand-fetch path integrates.
     let mut picked: Option<(segment::DeltaOption, extentindex::ExtentLocation)> = None;
     for opt in &options {
-        if let Some(source_loc) = extent_index.lookup(&opt.source_hash) {
+        if let Some(source_loc) = maps.lookup_extent(&opt.source_hash) {
             picked = Some((opt.clone(), source_loc.clone()));
             break;
         }
@@ -924,7 +923,7 @@ fn try_read_delta_extent(
         // descriptors).
         let presence_known_set = match source_loc.body_source {
             BodySource::Local => true,
-            BodySource::Cached(idx) => extent_index
+            BodySource::Cached(idx) => maps
                 .segment_presence(source_loc.segment_id)
                 .is_some_and(|p| p.test(idx)),
         };

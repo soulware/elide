@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use ulid::Ulid;
 
@@ -286,20 +285,22 @@ impl Volume {
         let mut unlink = Vec::new();
         let mut reaped_fmt: Vec<String> = Vec::new();
         let no_carried = crate::blake3_id_hasher::Blake3HashSet::default();
+        self.maps.absorb();
         for seg in segments {
             if !seg.journal {
+                let maps = self.maps.materialised();
                 let fresh = seg.owned_hashes.iter().find(|hash| {
-                    let owner_here = self
+                    let owner_here = maps
                         .extent_index
                         .lookup(hash)
                         .is_some_and(|loc| loc.segment_id == seg.ulid)
-                        || self
+                        || maps
                             .extent_index
                             .lookup_delta(hash)
                             .is_some_and(|loc| loc.segment_id == seg.ulid);
                     owner_here
-                        && (self.lbamap.is_referenced(hash)
-                            || self.extent_index.is_named_delta_source(hash))
+                        && (maps.lbamap.is_referenced(hash)
+                            || maps.extent_index.is_named_delta_source(hash))
                 });
                 if let Some(hash) = fresh {
                     log::info!(
@@ -311,7 +312,7 @@ impl Volume {
                     continue;
                 }
             }
-            let index = Arc::make_mut(&mut self.extent_index);
+            let index = self.maps.extent_index_mut();
             stats.entries_removed +=
                 index.remove_input_owned(seg.ulid, &seg.owned_hashes, &no_carried) as u64;
             index.purge_journal_segment(seg.ulid);
@@ -344,8 +345,9 @@ impl Volume {
             return Ok(ReapStats::default());
         }
         let floor = super::latest_snapshot(&self.base_dir)?;
+        let maps = self.maps.materialised();
         let candidates =
-            sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor).candidates;
+            sweep_unreachable(&maps.lbamap, &maps.extent_index, &open, floor).candidates;
         if candidates.is_empty() {
             return Ok(ReapStats::default());
         }
@@ -378,8 +380,9 @@ impl Volume {
             return Ok(false);
         }
         let floor = super::latest_snapshot(&self.base_dir)?;
+        let maps = self.maps.materialised();
         let candidates =
-            sweep_unreachable(&self.lbamap, &self.extent_index, &open, floor).candidates;
+            sweep_unreachable(&maps.lbamap, &maps.extent_index, &open, floor).candidates;
         if candidates.is_empty() {
             return Ok(false);
         }
@@ -436,7 +439,11 @@ mod tests {
         assert!(stats.bytes_reclaimed > 0);
         assert!(open_files(&base).is_empty());
         assert!(
-            vol.extent_index.lookup(&blake3::hash(&a)).is_none(),
+            vol.maps
+                .materialised()
+                .extent_index
+                .lookup(&blake3::hash(&a))
+                .is_none(),
             "the reaped body's location left the index"
         );
         assert_eq!(vol.read(0, 1).unwrap(), b);
@@ -483,7 +490,12 @@ mod tests {
         vol.write(0, &block(3)).unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let sweep = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None);
+        let sweep = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        );
 
         // XOF-filled blocks never shrink, so each rides its 4096 bytes raw.
         assert_eq!(
@@ -516,7 +528,13 @@ mod tests {
         vol.write(0, &block(2)).unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
+        let candidates = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        )
+        .candidates;
         assert_eq!(candidates.len(), 1);
         let parsed = parse_reap_candidates(candidates);
 
@@ -560,10 +578,21 @@ mod tests {
         }
 
         let mut vol = Volume::open(&base, &base).unwrap();
-        assert!(vol.extent_index.is_journal_segment(old_ring));
+        assert!(
+            vol.maps
+                .materialised()
+                .extent_index
+                .is_journal_segment(old_ring)
+        );
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
+        let candidates = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        )
+        .candidates;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ulid, old_ring);
         assert!(
@@ -577,8 +606,18 @@ mod tests {
             stats.entries_removed, 0,
             "journal purge is an outer removal"
         );
-        assert!(!vol.extent_index.is_journal_segment(old_ring));
-        assert!(vol.extent_index.is_journal_segment(new_ring));
+        assert!(
+            !vol.maps
+                .materialised()
+                .extent_index
+                .is_journal_segment(old_ring)
+        );
+        assert!(
+            vol.maps
+                .materialised()
+                .extent_index
+                .is_journal_segment(new_ring)
+        );
         assert_eq!(vol.read(9, 1).unwrap(), block(4));
 
         drop(vol);
@@ -621,7 +660,13 @@ mod tests {
         vol.write(20, &block(8)).unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
+        let candidates = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        )
+        .candidates;
         let cand = candidates
             .iter()
             .find(|c| c.ulid == mixed)
@@ -635,10 +680,19 @@ mod tests {
         assert_eq!(stats.segments_reaped, 1);
         assert!(stats.entries_removed >= 1);
         assert!(
-            vol.extent_index.lookup(&data_hash).is_none(),
+            vol.maps
+                .materialised()
+                .extent_index
+                .lookup(&data_hash)
+                .is_none(),
             "the durable location left the index with the file"
         );
-        assert!(!vol.extent_index.is_journal_segment(mixed));
+        assert!(
+            !vol.maps
+                .materialised()
+                .extent_index
+                .is_journal_segment(mixed)
+        );
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -681,7 +735,13 @@ mod tests {
         }
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
+        let candidates = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        )
+        .candidates;
         assert_eq!(candidates.len(), 3);
 
         // Cap of two entries: the first two single-entry segments parse,
@@ -716,7 +776,13 @@ mod tests {
         vol.flush_wal().unwrap();
 
         let open = list_open_segments(&base).unwrap();
-        let candidates = sweep_unreachable(&vol.lbamap, &vol.extent_index, &open, None).candidates;
+        let candidates = sweep_unreachable(
+            &vol.maps.materialised().lbamap,
+            &vol.maps.materialised().extent_index,
+            &open,
+            None,
+        )
+        .candidates;
         assert_eq!(candidates.len(), 1);
         let parsed = parse_reap_candidates(candidates);
         let (stats, unlink) = vol.apply_reap(parsed);

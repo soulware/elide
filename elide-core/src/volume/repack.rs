@@ -336,6 +336,7 @@ impl Volume {
             .collect();
         let u_flush = self.mint.next();
         let flush = self.rotate_wal_into_promote(u_flush)?;
+        let maps = self.maps.materialised();
 
         let job = RepackJob {
             base_dir: self.base_dir.clone(),
@@ -345,8 +346,8 @@ impl Volume {
             work_budget: u64::MAX,
             output_ulids,
             journal_output_ulids,
-            lbamap_snapshot: Arc::clone(&self.lbamap),
-            extent_index_snapshot: Arc::clone(&self.extent_index),
+            lbamap_snapshot: maps.lbamap,
+            extent_index_snapshot: maps.extent_index,
             ancestor_layers: self.ancestor_layers.clone(),
             fetcher: self.fetcher.clone(),
             signer: Arc::clone(&self.signer),
@@ -413,6 +414,7 @@ impl Volume {
             .map(|_| self.mint.next())
             .collect();
 
+        let maps = self.maps.materialised();
         Ok(CloseGenerationPrep {
             rotated: Some(rotated),
             job: Some(RepackJob {
@@ -423,8 +425,8 @@ impl Volume {
                 work_budget: REPACK_CLOSE_WORK_BYTES,
                 output_ulids,
                 journal_output_ulids,
-                lbamap_snapshot: Arc::clone(&self.lbamap),
-                extent_index_snapshot: Arc::clone(&self.extent_index),
+                lbamap_snapshot: maps.lbamap,
+                extent_index_snapshot: maps.extent_index,
                 ancestor_layers: self.ancestor_layers.clone(),
                 fetcher: self.fetcher.clone(),
                 signer: Arc::clone(&self.signer),
@@ -531,6 +533,8 @@ impl Volume {
         // check here is what refuses the bucket. Liveness is probed
         // against the maintained counts as each bucket reaches it, so
         // an earlier bucket's landing counts.
+        self.maps.absorb();
+        let maps = self.maps.materialised();
         let stale: Vec<blake3::Hash> = bucket
             .inputs
             .iter()
@@ -539,17 +543,17 @@ impl Volume {
                     if carried_hashes.contains(*hash) {
                         return false;
                     }
-                    let still_at_input = self
+                    let still_at_input = maps
                         .extent_index
                         .lookup(hash)
                         .is_some_and(|loc| loc.segment_id == input.input_ulid)
-                        || self
+                        || maps
                             .extent_index
                             .lookup_delta(hash)
                             .is_some_and(|loc| loc.segment_id == input.input_ulid);
                     still_at_input
-                        && (self.lbamap.is_referenced(hash)
-                            || self.extent_index.is_named_delta_source(hash))
+                        && (maps.lbamap.is_referenced(hash)
+                            || maps.extent_index.is_named_delta_source(hash))
                 })
             })
             .copied()
@@ -582,7 +586,7 @@ impl Volume {
             .flat_map(|input| input.owned_hashes.iter().copied())
             .collect();
         for input in &bucket.inputs {
-            footprint.extend(self.extent_index.journal_hashes(input.input_ulid));
+            footprint.extend(maps.extent_index.journal_hashes(input.input_ulid));
         }
         if let Some(out) = &bucket.output {
             footprint.extend(out.out_entries.iter().map(|e| e.hash));
@@ -615,7 +619,7 @@ impl Volume {
         let gate_start = Instant::now();
         let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
             let merge_start = Instant::now();
-            let index = Arc::make_mut(&mut vol.extent_index);
+            let (lbamap, index) = vol.maps.base_mut();
 
             // Per-input CAS-remove for hashes the bucket's output
             // didn't carry — gated on the specific input's ULID so
@@ -660,7 +664,6 @@ impl Volume {
                 index_reg = index_start.elapsed();
 
                 let lbamap_start = Instant::now();
-                let lbamap = Arc::make_mut(&mut vol.lbamap);
                 for e in &out.out_entries {
                     lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
                 }

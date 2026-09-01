@@ -396,7 +396,8 @@ impl Volume {
         // discriminator here: a durable write and a journal-window write
         // both stake their claim at the WAL's ULID.
         let rotated_wal = flush.as_ref().map(|f| f.old_wal_ulid);
-        let entries: Vec<lbamap::ExtentRead> = self
+        let maps = self.maps.materialised();
+        let entries: Vec<lbamap::ExtentRead> = maps
             .lbamap
             .extents_in_range(start_lba, end_lba)
             .filter(|e| Some(e.claimant_ulid) != rotated_wal)
@@ -422,8 +423,8 @@ impl Volume {
                 target_start_lba: start_lba,
                 target_lba_length: lba_length,
                 entries,
-                lbamap_snapshot: Arc::clone(&self.lbamap),
-                extent_index_snapshot: Arc::clone(&self.extent_index),
+                lbamap_snapshot: maps.lbamap,
+                extent_index_snapshot: maps.extent_index,
                 search_dirs,
                 pending_dir: segment::pending_open_dir(&self.base_dir),
                 segment_ulid,
@@ -481,8 +482,7 @@ impl Volume {
         };
 
         let mut outcome = ReclaimOutcome::default();
-        let lbamap = Arc::make_mut(&mut self.lbamap);
-        let extent_index = Arc::make_mut(&mut self.extent_index);
+        let (lbamap, extent_index) = self.maps.base_mut();
         for (raw_idx, re) in result.entries.iter().enumerate() {
             let blocks = lbamap.register_entry_if_newer(&re.entry, result.segment_ulid);
             if blocks == 0 {
