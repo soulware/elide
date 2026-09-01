@@ -3218,6 +3218,9 @@ struct RepackCandidate {
     /// Body-bearing entry hashes — used by apply to derive the
     /// to-remove set under per-input CAS.
     owned_hashes: Vec<blake3::Hash>,
+    /// `(start_lba, lba_length)` of every claim-making entry, the
+    /// apply's resolvability-gate coverage for this input.
+    claim_ranges: Vec<(u64, u32)>,
     /// `true` when every classification is `FullyLive` — a single-input
     /// bucket of one of these is a no-op rewrite and is skipped.
     all_live: bool,
@@ -3579,6 +3582,11 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             .filter(|e| e.kind.owns_extent_hash())
             .map(|e| e.hash)
             .collect();
+        let claim_ranges: Vec<(u64, u32)> = entries
+            .iter()
+            .filter(|e| !e.kind.is_canonical_only())
+            .map(|e| (e.start_lba, e.lba_length))
+            .collect();
         cost.classify += classify_start.elapsed();
 
         let candidate = RepackCandidate {
@@ -3589,6 +3597,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
             dead_bytes,
             live_entry_count,
             owned_hashes,
+            claim_ranges,
             all_live: scan.all_live,
         };
         if scan.journal {
@@ -3685,6 +3694,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 input_ulid: c.seg_ulid,
                 input_path: std::mem::take(&mut c.seg_path),
                 owned_hashes: std::mem::take(&mut c.owned_hashes),
+                claim_ranges: std::mem::take(&mut c.claim_ranges),
             });
             journal_bytes_freed += c.dead_bytes;
             stats.segments_compacted += 1;
@@ -3823,6 +3833,7 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
                 input_ulid: c.seg_ulid,
                 input_path: std::mem::take(&mut c.seg_path),
                 owned_hashes: std::mem::take(&mut c.owned_hashes),
+                claim_ranges: std::mem::take(&mut c.claim_ranges),
             });
             bucket_bytes_freed += c.dead_bytes;
             stats.segments_compacted += 1;
