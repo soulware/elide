@@ -6325,3 +6325,38 @@ mod wal_replay_order {
         assert_eq!(fresh.claimant_at(7), Some(high));
     }
 }
+
+/// A write lands in the delta layer and reads back through the overlay; a
+/// promote absorbs the delta into the base.
+#[test]
+fn writes_land_in_the_delta_layer() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    assert!(vol.maps.delta_is_empty());
+
+    let a = vec![0x11u8; 4096 * 4];
+    let b = vec![0x22u8; 4096];
+    vol.write(0, &a).unwrap();
+    vol.write(1, &b).unwrap();
+    assert!(!vol.maps.delta_is_empty(), "writes go to the delta");
+    assert!(
+        vol.maps.base().lbamap.is_empty(),
+        "the base is untouched by writes"
+    );
+
+    let mut expected = a.clone();
+    expected[4096..8192].copy_from_slice(&b);
+    assert_eq!(vol.read(0, 4).unwrap(), expected);
+    assert_eq!(vol.read(1, 1).unwrap(), b);
+    assert_eq!(vol.read(2, 2).unwrap(), a[8192..]);
+
+    let hash_a = blake3::hash(&a);
+    assert!(vol.maps.lookup_extent(&hash_a).is_some());
+    assert!(vol.maps.base().extent_index.lookup(&hash_a).is_none());
+
+    vol.promote_for_test().unwrap();
+    assert!(vol.maps.delta_is_empty(), "the promote absorbed the delta");
+    assert_eq!(vol.read(0, 4).unwrap(), expected);
+
+    fs::remove_dir_all(base).unwrap();
+}
