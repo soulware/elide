@@ -6360,3 +6360,71 @@ fn writes_land_in_the_delta_layer() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// The promote as freeze, fold, swap: the prep freezes the epoch under its
+/// WAL ULID, writes that land while the worker runs go to a new delta above
+/// it, the fold leaves the live base alone, and the swap retires the layer.
+#[test]
+fn a_promote_freezes_its_epoch_and_the_swap_retires_it() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a = vec![0x31u8; 4096 * 2];
+    let b = vec![0x32u8; 4096];
+    let c = vec![0x33u8; 4096];
+    vol.write(0, &a).unwrap();
+    vol.write(8, &b).unwrap();
+
+    let segment_ulid = vol.mint.next();
+    let job = vol.take_wal_into_promote_job(segment_ulid).unwrap();
+    assert_eq!(vol.maps.frozen_depth(), 1, "the prep froze the epoch");
+    assert!(vol.maps.delta_is_empty());
+    assert!(vol.pending.is_empty());
+
+    // A write that lands while the worker runs goes to the new delta above
+    // the frozen layer and masks part of the epoch's first extent.
+    vol.write(1, &c).unwrap();
+    assert!(!vol.maps.delta_is_empty());
+    assert_eq!(vol.maps.frozen_depth(), 1);
+    let mut expected = a.clone();
+    expected[4096..].copy_from_slice(&c);
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+    assert_eq!(vol.read(8, 1).unwrap(), b);
+
+    let result = crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default())
+        .map_err(|f| f.error)
+        .unwrap();
+    assert_eq!(result.entries.len(), 2);
+
+    let layers = vol.maps.clone();
+    let new_base = fold_promote_result(&layers, &result).unwrap();
+    assert_eq!(
+        vol.maps.base().lbamap.len(),
+        0,
+        "the fold leaves the live base alone"
+    );
+    assert_eq!(new_base.lbamap.claimant_at(8), Some(segment_ulid));
+
+    vol.swap_promote(&result, new_base, layers.base());
+    assert_eq!(vol.maps.frozen_depth(), 0, "the swap retired the layer");
+    assert!(
+        !vol.maps.delta_is_empty(),
+        "the concurrent write stays in the delta"
+    );
+    assert_eq!(vol.maps.base().lbamap.claimant_at(8), Some(segment_ulid));
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+    assert_eq!(vol.read(8, 1).unwrap(), b);
+    remove_promoted_wal(&result);
+
+    // The next promote folds the concurrent write over the first epoch's
+    // claim, and a rebuild from disk agrees with the maps.
+    vol.promote_for_test().unwrap();
+    assert_eq!(vol.maps.frozen_depth(), 0);
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+    assert_eq!(vol.read(8, 1).unwrap(), b);
+
+    fs::remove_dir_all(base).unwrap();
+}
