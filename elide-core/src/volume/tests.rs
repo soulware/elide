@@ -5305,13 +5305,8 @@ fn invariant_catches_stale_location_at_deleted_segment() {
     vol.flush_wal().unwrap();
 
     let (hash, mut stale) = {
-        let (h, l) = vol
-            .maps
-            .materialised()
-            .extent_index
-            .iter()
-            .next()
-            .expect("flushed entry");
+        let maps = vol.maps.materialised();
+        let (h, l) = maps.extent_index.iter().next().expect("flushed entry");
         (*h, l.clone())
     };
     stale.segment_id = ulid::Ulid::from_parts(u64::MAX, u128::MAX);
