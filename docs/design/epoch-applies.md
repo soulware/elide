@@ -1,8 +1,9 @@
 # Design: epoch applies
 
-**Status:** design only. The measurements come from the `write_contention`
-simulator (2026-08-31, parked on the `wip-measurement-probes` branch) and the
-rig's per-site lock statistics (2026-09-01). Builds on claimant tracking
+**Status:** steps 1 to 3 shipped (#984, #985, #987, #988, 2026-09-01), steps 4
+and 5 open. The measurements come from the `write_contention` simulator
+(2026-08-31, parked on the `wip-measurement-probes` branch) and the rig's
+per-site lock statistics (2026-09-01). Builds on claimant tracking
 (`lbamap-claimant-tracking.md`), the plan-apply gate (`gc-plan-handoff.md`) and
 the reap (`open-generation-reap.md`).
 
@@ -41,13 +42,13 @@ mutation itself stays, and it sets the floor.
 
 ## The scheme
 
-The volume keeps its mutex. Under it the maps become three layers and an
-epoch counter:
+The volume keeps its mutex. Under it the maps become three layers
+(`MapLayers`, `elide-core/src/map_layers.rs`):
 
 - **base**, the two large maps, which only an apply replaces,
-- **frozen**, a list of immutable layers, one per promote in flight,
-- **delta**, the two small maps that hold the open WAL's writes,
-- **epoch**, which the WAL rotation increments.
+- **frozen**, a list of immutable layers, one per promote in flight, each
+  tagged with the WAL ULID of the epoch it holds,
+- **delta**, the two small maps that hold the open WAL's writes.
 
 A write inserts into `delta`. An apply runs in three steps:
 
@@ -63,8 +64,12 @@ Reads resolve `delta`, then each frozen layer from newest to oldest, then
 
 The WAL rotation is the epoch boundary. `delta` holds exactly the open WAL's
 writes, so the frozen layer a promote takes is that promote's own entry set.
-The `pending` vector stays as the worker's input, because segment formation
-needs WAL order and body offsets that the maps do not carry.
+The `pending` vector is the worker's input, because segment formation needs
+WAL order and body offsets that the maps do not carry. The prep hands the
+worker the raw `pending` writes, the journal ranges, a journal segment ULID
+minted under the lock, and an O(1) clone of the layers. The worker
+materialises the clone once and stages against it, so a retry after a failure
+stages again from the same immutable layer.
 
 ## Writes
 
@@ -83,10 +88,13 @@ one thread, with readers present or absent.
 `ReadSnapshot` carries `base`, the frozen list, `delta` and the two generation
 counters. A publish clones the layer handles, O(1) each.
 
-A point lookup (`lookup`, `lookup_with_claimant`, `claim_refcount`,
-`extent_index.lookup`) queries the layers in order and returns the first hit.
-Each miss costs one more tree descent, measured at about 250ns per layer on a
-populated delta (`second_lookup_cost` probe).
+A point lookup (`lookup_extent`, `lookup_journal`, `lookup_delta`) queries the
+layers in order and returns the first hit. `has_full_match` answers from the
+topmost layer that covers any part of the range. Each miss costs one more tree
+descent, measured at about 250ns per layer on a populated delta
+(`second_lookup_cost` probe). A walk of a whole map (liveness, the gate's
+residual walk, the invariants) reads `materialised()`, the layers folded into
+a clone of `base`, which costs two handle clones when the layers are empty.
 
 A range query (`extents_in_range`) is an overlay. It queries `delta` for the
 range, fills each gap from the newest frozen layer, then the next, then `base`.
@@ -109,14 +117,31 @@ run against and the moment they run.
 | gc-plan-apply | `register_entry_consuming_inputs`, `remove_owner_at`, `purge_journal_segment`, gate | clone `base`, transform, gate on the clone, swap with the removal check |
 | repack-apply (per bucket) | same shape as gc-plan-apply | same shape as gc-plan-apply |
 | reap-apply | `remove_input_owned`, purges | clone `base`, transform, swap with the removal check |
-| reclaim-apply | `register_entry_if_newer`, register output | clone `base`, transform, swap |
+| reclaim-apply | `register_entry_if_newer`, register output | fold the frozen layers below the output's ULID into a clone of `base`, transform, swap, retire those layers |
 | gc-handoff-finalize, own-segments, publish | no map mutation | unchanged |
 
 A refused gate discards the clone. Today it restores two `Arc`s; the outcome
 is the same.
 
 Only frozen layers ever hold WAL locations, and `delta` holds only the open
-WAL's. The drain flip and the reclaim therefore touch `base` alone.
+WAL's. The drain flip re-points locations the drained segment owns, and those
+entered `base` at the promote's fold, so the flip touches `base` alone
+(`fold_base`, `swap_base`).
+
+The reclaim admits by ULID order. `prepare_reclaim` closes the WAL before it
+mints the output's ULID, so every frozen layer at the prep sorts below the
+output and every write after the prep sorts above it. A frozen layer below the
+output can exist at the fold, when the actor stashed a failed promote for a
+retry, and a fold over `base` alone would leave that layer to mask the output
+in memory while the rebuild picks the output. The reclaim's fold replays the
+frozen layers below its ULID into the clone and its swap retires them
+(`fold_below`, `swap_below`). The layers above mask the output, which is the
+rebuild's order. The fold reads each run's landed blocks through the layers
+above the output (`above`), so a write that arrived after the prep refuses the
+blocks it covers, and a pass with no landed run deletes its output.
+
+A promote whose layer an earlier fold retired folds and swaps as before: its
+replay finds the layer gone and its CAS flips find the WAL locations in `base`.
 
 ## The fold rules mirror the rebuild
 
@@ -136,10 +161,12 @@ extent index already applies. The rebuild produces the same result through
 consuming-inputs admission, since a repack or GC output never names the WAL
 among its inputs.
 
-**Other folds.** The transform functions are unchanged, so their admission is
-the rebuild's admission by construction. `register_entry_consuming_inputs`
-takes a range only from a consumed input, and `register_entry_if_newer` takes
-it only from a lower claimant.
+**Other folds.** The transform functions are the rebuild's, so their admission
+is the rebuild's admission by construction. `register_entry_consuming_inputs`
+takes a range only from a consumed input, and a WAL is never an input, so it
+respects every frozen layer over `base` alone. `register_entry_if_newer` takes
+a range from a lower claimant, so it respects a frozen layer only over a fold
+that took every layer below its ULID (`fold_below`).
 
 ## Removals race the layers
 
@@ -167,17 +194,24 @@ preconditions (`pre_promote_offsets`) hold by construction.
 ## Frozen depth
 
 Each promote in flight owns one frozen layer. The WAL-threshold promote and the
-GC checkpoint promote can overlap, so the list can hold two. A read pays one
-descent per layer, so the depth is a cost the lock line reports.
+GC checkpoint promote can overlap, so the list can hold two, and a promote the
+actor stashed after a failure keeps its layer across retries. A layer retires
+at its promote's swap, or at the swap of a `fold_below` that replayed it. A
+read pays one descent per layer, so the depth is a cost the lock line reports.
 `promotes_in_flight` bounds it today; the design keeps that bound.
 
 ## Off-lock consumers of the maps
 
 `sweep_unreachable`, `scan_reclaim_candidates`, the gate's residual walk and
 the invariants asserts iterate a whole map. They take a snapshot and call
-`materialise()`, which folds the layers into a clone of `base` off the lock, in
-O(layer × log n). The coordinator's GC reads the maps from disk and is not
+`materialised()`, which folds the layers into a clone of `base` off the lock,
+in O(layer × log n). The coordinator's GC reads the maps from disk and is not
 affected.
+
+A release no-op assertion is free only when its receiver is. The invariants
+umbrella reads `base()` for the delta-source counts, which live there; a
+`materialised()` receiver pays the fold in every build (rc27 saw it as
+`repack-unlink` at 5.1ms).
 
 ## What the mutex still covers
 
@@ -196,12 +230,14 @@ of scope here.
 
 ## Implementation order
 
-1. The layered `ReadSnapshot`, the overlay range query, `materialise()`, and
-   writes into `delta`. Applies keep their in-place mutation on a materialised
-   base under the lock. This step changes no hold and validates the read path.
-2. The promote as freeze, fold, swap. This removes `promote-apply` and
-   `promote-prep` from the hold ranking.
-3. The base-only applies: the drain flip and the reclaim.
+1. The layered `ReadSnapshot`, the overlay range query, `materialised()`, and
+   writes into `delta` (#984, #985). The applies absorb the layers into `base`
+   and mutate it in place under the lock. Rig (rc27): write hold 0.0926 to
+   0.0428 ms per write.
+2. The promote as freeze, fold, swap (#987). Rig (rc28): `promote-prep` max
+   72.2 to 0.7ms, `promote-apply` max 55.8 to 0.3ms, blocked writes in the
+   10-100ms band 2554 to 1805 per million, the series low.
+3. The drain flip and the reclaim as fold and swap (#988, rc29).
 4. GC plan apply, repack buckets and the reap, with the swap removal check.
 5. The fold-equals-rebuild assertion after every swap in the
    `volume-invariants` build, and a proptest that interleaves writes with
@@ -211,14 +247,6 @@ Each step is measured on the rig's `[lock …]` lines before the next starts.
 
 ## Open questions
 
-- The promote fold's "layer wins on its ranges" rule rests on the claim that
-  `base` never receives content newer than a frozen write on the same range.
-  A proptest that interleaves writes, promotes and repack outputs with ULIDs
-  minted after the WAL's is the check to write before step 2.
-- The journal tier is keyed by `(claimant, hash)`. A journal write inserts
-  under the WAL ULID in `delta`, and the promote fold rekeys it to the segment.
-  Whether `lookup_journal` needs the layer walk, or the claimant alone selects
-  the layer, decides the read cost for journal LBAs.
 - The depth policy when a third promote would freeze while two layers are in
   flight: wait, or stack.
 - `pending` and `delta` describe the same writes. Whether the worker can form
