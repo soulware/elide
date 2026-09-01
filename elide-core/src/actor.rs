@@ -785,7 +785,9 @@ impl VolumeActor {
     /// the unlinks: publishing first guarantees no published snapshot
     /// ever references a deleted input, and readers still holding an
     /// older snapshot recover via the `NotFound` retry in
-    /// [`VolumeReader::read_with_snapshot`].
+    /// [`VolumeReader::read_with_snapshot`]. The unlinks and their
+    /// directory fsyncs run with the mutex released; the lock at the
+    /// end covers the invariants assertion alone.
     ///
     /// Each bucket takes the volume mutex on its own, and releases it to
     /// a waiting guest write. A close pass carries ten or more buckets of
@@ -808,8 +810,9 @@ impl VolumeActor {
         if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
             self.publish_snapshot();
         }
+        crate::volume::unlink_consumed_inputs(&consumed_inputs)?;
         self.lock_volume(LockSite::RepackUnlink)
-            .remove_consumed_inputs(&consumed_inputs)?;
+            .assert_consumed_inputs_removed();
         Ok(stats)
     }
 
@@ -1154,8 +1157,9 @@ impl VolumeActor {
         if stop == ReapStop::BeforeUnlink {
             return Ok(stats);
         }
+        crate::volume::unlink_consumed_inputs(&unlink)?;
         self.lock_volume(LockSite::ReapUnlink)
-            .remove_consumed_inputs(&unlink)?;
+            .assert_consumed_inputs_removed();
         Ok(stats)
     }
 

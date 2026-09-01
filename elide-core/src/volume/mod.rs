@@ -92,7 +92,7 @@ pub use reclaim::{
 };
 pub use repack::{
     CloseGenerationPrep, CompactionStats, RepackApply, RepackJob, RepackResult, RepackedBucket,
-    RepackedInput, RepackedOutput,
+    RepackedInput, RepackedOutput, unlink_consumed_inputs,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 

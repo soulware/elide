@@ -742,9 +742,8 @@ impl Volume {
         Ok(())
     }
 
-    /// Close out a repack apply pass: fsync the generation directory the
-    /// buckets wrote into, record what the journal tier now holds, and
-    /// hand back the pass totals.
+    /// Close out a repack apply pass: record what the journal tier now
+    /// holds, and hand back the pass totals.
     pub fn finish_repack_apply(
         &mut self,
         acc: RepackApply,
@@ -765,8 +764,6 @@ impl Volume {
             in_bucket,
         } = acc;
 
-        let fsync_start = Instant::now();
-        segment::fsync_dir(&pending_dir)?;
         if buckets > 0 {
             let generation = pending_dir
                 .file_name()
@@ -782,8 +779,7 @@ impl Volume {
             log::info!(
                 "repack {generation}: apply pass {buckets} bucket(s) in {:.1}ms \
                  (derive={:.1}ms header={:.1}ms merge={:.1}ms \
-                 (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms other={:.1}ms), \
-                 fsync={:.1}ms",
+                 (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms other={:.1}ms)",
                 ms(in_bucket),
                 ms(derive_total),
                 ms(header_total),
@@ -793,7 +789,6 @@ impl Volume {
                 ms(lbamap_total),
                 ms(gate_total),
                 ms(other),
-                ms(fsync_start.elapsed()),
             );
         }
 
@@ -806,40 +801,51 @@ impl Volume {
         Ok((stats, consumed_inputs))
     }
 
-    /// Unlink input segment files consumed by a repack, delta-repack or
-    /// reap apply, then fsync the directory each one lived in. Called
-    /// after the read snapshot reflecting the apply has been published,
-    /// so no published snapshot ever references an unlinked file.
-    ///
-    /// Already-missing files are fine — a previous partial unlink may
-    /// have removed some of the batch.
-    ///
-    /// This is the end of the repack transaction, so the volume
-    /// invariants are asserted here rather than in the apply phase:
-    /// between apply and this unlink the consumed inputs are still on
-    /// disk, and a disk rebuild ranks a still-present `u_flush` input
-    /// above the pre-minted output ULIDs — content-equal but not
-    /// claimant-equal to the in-memory maps.
-    pub fn remove_consumed_inputs(&mut self, paths: &[PathBuf]) -> io::Result<()> {
-        let mut dirs: Vec<&Path> = Vec::new();
-        for path in paths {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            if let Some(parent) = path.parent()
-                && !dirs.contains(&parent)
-            {
-                dirs.push(parent);
-            }
-        }
-        for dir in dirs {
-            segment::fsync_dir(&dir.join("."))?;
-        }
-        self.assert_volume_invariants("remove_consumed_inputs");
+    /// [`unlink_consumed_inputs`] then
+    /// [`Self::assert_consumed_inputs_removed`], for a caller that holds
+    /// the volume across both.
+    pub fn remove_consumed_inputs(&self, paths: &[PathBuf]) -> io::Result<()> {
+        unlink_consumed_inputs(paths)?;
+        self.assert_consumed_inputs_removed();
         Ok(())
     }
+
+    /// The end of the repack transaction, where the volume invariants
+    /// are asserted rather than in the apply phase: between apply and
+    /// the unlink the consumed inputs are still on disk, and a disk
+    /// rebuild ranks a still-present `u_flush` input above the
+    /// pre-minted output ULIDs — content-equal but not claimant-equal to
+    /// the in-memory maps.
+    pub fn assert_consumed_inputs_removed(&self) {
+        self.assert_volume_invariants("remove_consumed_inputs");
+    }
+}
+
+/// Unlink input segment files consumed by a repack or reap apply, then
+/// fsync the directory each one lived in. Runs after the read snapshot
+/// that reflects the apply is published, so no published snapshot
+/// references an unlinked file.
+///
+/// Already-missing files are fine — a previous partial unlink may have
+/// removed some of the batch.
+pub fn unlink_consumed_inputs(paths: &[PathBuf]) -> io::Result<()> {
+    let mut dirs: Vec<&Path> = Vec::new();
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(parent) = path.parent()
+            && !dirs.contains(&parent)
+        {
+            dirs.push(parent);
+        }
+    }
+    for dir in dirs {
+        segment::fsync_dir(&dir.join("."))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
