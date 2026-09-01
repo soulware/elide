@@ -453,7 +453,13 @@ fn snapshot_after_gc_apply_covers_fold_output() {
 
         simulate_upload(&mut vol, fork_dir);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+        let _ = gc_fork(
+            fork_dir,
+            fork_dir.parent().unwrap(),
+            &gc_config,
+            vec![u_gc],
+            None,
+        );
         let _ = vol.apply_gc_handoffs();
         promote_gc_outputs(&mut vol, fork_dir);
         let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -617,7 +623,7 @@ proptest! {
                         .map(|d| d.flatten().count())
                         .unwrap_or(0);
 
-                    let gc_stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+                    let gc_stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc], None);
 
                     // Volume applies the handoff: re-signs gc body, updates extent
                     // index, writes index/<new>.idx, deletes index/<old>.idx.
@@ -897,7 +903,7 @@ proptest! {
                     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
                     // Step 1: real GC compaction (no-ops if nothing to compact).
-                    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+                    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc], None);
 
                     // Step 2: volume re-signs GC output, updates extent index.
                     let _ = vol.apply_gc_handoffs();
@@ -1013,7 +1019,13 @@ fn gc_oracle_repro_bug_h() {
     // (S1, is_body=false, fd→pending/S1).
     simulate_upload(&mut vol, fork_dir);
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+    let _ = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    );
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -1031,7 +1043,13 @@ fn gc_oracle_repro_bug_h() {
     // holds the stale fd to pending/S1.
     simulate_upload(&mut vol, fork_dir);
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+    let _ = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    );
     let _ = vol.apply_gc_handoffs();
     promote_gc_outputs(&mut vol, fork_dir);
     let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -1225,7 +1243,13 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     // Op 2: GcSweep.
     simulate_upload(&mut vol, fork_dir);
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+    let _ = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    );
     let applied_1 = vol.apply_gc_handoffs().unwrap();
     eprintln!("apply_1 applied={applied_1}");
     eprintln!("gc/ after apply_1: [{}]", list_dir(&gc_dir).join(", "));
@@ -1250,7 +1274,14 @@ fn gc_segment_cleanup_minimal_dedup_then_zero_partial() {
     );
     let idx_before_2 = list_dir(&index_dir).len();
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let stats_2 = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let stats_2 = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     eprintln!(
         "stats_2: strategy={:?} candidates={} deferred={}",
         stats_2.strategy, stats_2.candidates, stats_2.deferred
@@ -1341,7 +1372,14 @@ fn gc_tombstone_finalize_keeps_own_segments_consistent() {
     // GcSweep: A and B pool into a single all-drop (zero-entry) tombstone
     // bucket; C is left for retention.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let stats = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     assert_eq!(
         stats.candidates, 2,
         "only the two dead segments pool as candidates; the large live C is retained"

@@ -79,7 +79,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
 
 use anyhow::{Context, Result};
 use object_store::ObjectStore;
@@ -181,6 +182,50 @@ pub struct GcStats {
     /// classified. Present once the pass loads its state; the tick loop
     /// owns how often it is logged.
     pub census: Option<DensityCensus>,
+    /// Present when this pass emitted no plan and read no input outside
+    /// its fingerprint. Hand it back to the next `gc_fork` call to skip
+    /// the liveness rebuild while the fork's inputs hash the same.
+    pub idle: Option<IdlePass>,
+}
+
+/// What one pass read, and what it decided, for a pass that decided to
+/// do nothing.
+///
+/// A later pass whose inputs hash to the same fingerprint reaches the
+/// same decision, so it replays this and skips the rebuild of the extent
+/// index and the LBA map. See `docs/design/gc-idle-pass-gate.md`.
+#[derive(Clone)]
+pub struct IdlePass {
+    fingerprint: [u8; 32],
+    taken: Instant,
+    total_segments: usize,
+    deferred: usize,
+    reclaim_targets: Vec<ReclaimTarget>,
+}
+
+impl IdlePass {
+    /// How long ago the pass this replays ran. Measured from that pass,
+    /// so the tick loop's hold expires on a fixed clock however many
+    /// replays it covers.
+    pub fn held_for(&self) -> std::time::Duration {
+        self.taken.elapsed()
+    }
+
+    fn replay(&self) -> GcStats {
+        GcStats {
+            strategy: GcStrategy::None(NoneReason::NoCandidates),
+            candidates: 0,
+            bytes_freed: 0,
+            dead_cleaned: 0,
+            deferred: self.deferred,
+            total_segments: self.total_segments,
+            buckets_emitted: 0,
+            deferred_cold: 0,
+            reclaim_targets: self.reclaim_targets.clone(),
+            census: None,
+            idle: Some(self.clone()),
+        }
+    }
 }
 
 impl GcStats {
@@ -196,6 +241,7 @@ impl GcStats {
             deferred_cold: 0,
             reclaim_targets: Vec::new(),
             census: None,
+            idle: None,
         }
     }
 }
@@ -226,6 +272,7 @@ pub fn gc_fork(
     by_id_dir: &Path,
     config: &GcConfig,
     bucket_ulids: Vec<Ulid>,
+    idle: Option<IdlePass>,
 ) -> Result<GcStats> {
     if bucket_ulids.is_empty() {
         return Ok(GcStats::none(NoneReason::NoCandidates, 0));
@@ -252,7 +299,18 @@ pub fn gc_fork(
     // any existing stale scratch.
     cleanup_staging_files(&gc_dir);
 
-    let mut pass = load_pass_state(fork_dir, by_id_dir)?;
+    let chain = rebuild_chain(fork_dir, by_id_dir)?;
+    // Sampled ahead of the rebuild: an input that lands between this hash
+    // and the walk below is absent here and present in the next pass's
+    // fingerprint, which is what makes the replay safe.
+    let fingerprint = pass_fingerprint(&chain, fork_dir)?;
+    let taken = Instant::now();
+    if let Some(prev) = idle.filter(|p| p.fingerprint == fingerprint) {
+        debug!("[gc] fork inputs match the last idle pass, replaying it");
+        return Ok(prev.replay());
+    }
+
+    let mut pass = load_pass_state(fork_dir, &chain)?;
     let total_segments = pass.total_segments;
     let deferred_count = pass.deferred_count;
     let bloat = std::mem::take(&mut pass.bloat);
@@ -277,6 +335,17 @@ pub fn gc_fork(
 
     let buckets = select_buckets(resident_stats, config, bucket_ulids.len());
     if buckets.is_empty() {
+        let reclaim_targets = reclaim_targets_for_declined(bloat, &HashSet::new());
+        // A cold deferral is the one decision a pass takes on an input
+        // outside the fingerprint, so a zero cold count is what makes
+        // this pass replayable.
+        let idle = (deferred_cold == 0).then(|| IdlePass {
+            fingerprint,
+            taken,
+            total_segments,
+            deferred: deferred_count,
+            reclaim_targets: reclaim_targets.clone(),
+        });
         return Ok(GcStats {
             strategy: GcStrategy::None(NoneReason::NoCandidates),
             candidates: 0,
@@ -286,8 +355,9 @@ pub fn gc_fork(
             total_segments,
             buckets_emitted: 0,
             deferred_cold,
-            reclaim_targets: reclaim_targets_for_declined(bloat, &HashSet::new()),
+            reclaim_targets,
             census,
+            idle,
         });
     }
 
@@ -321,6 +391,7 @@ pub fn gc_fork(
         deferred_cold,
         reclaim_targets,
         census,
+        idle: None,
     })
 }
 
@@ -463,24 +534,107 @@ fn reclaim_targets_for_declined(
     extents.into_iter().map(|e| e.target).collect()
 }
 
-fn load_pass_state(fork_dir: &Path, by_id_dir: &Path) -> Result<PassState> {
+/// The layers a liveness rebuild reads, oldest ancestor first and this
+/// fork last.
+///
+/// The ancestor chain is in the chain so the liveness view matches what
+/// the volume uses at apply time. Without it, a hash that lives only via
+/// an ancestor-mapped LBA would look dead from the coordinator, get
+/// omitted from the plan, and trip the volume's stale-liveness check on
+/// apply. Mirrors `volume::open_read_state`.
+fn rebuild_chain(fork_dir: &Path, by_id_dir: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
+    let ancestor_layers = elide_core::volume::walk_ancestors(fork_dir, by_id_dir)
+        .context("walking fork ancestor chain")?;
+    Ok(ancestor_layers
+        .iter()
+        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
+        .chain(std::iter::once((fork_dir.to_path_buf(), None)))
+        .collect())
+}
+
+/// Hash of every input a pass reads to decide what to collect: the
+/// ordered segment list of each chain layer, the WAL files, and the
+/// snapshot floor.
+///
+/// A segment's content is fixed once written, so its ULID stands for the
+/// content. The tier joins it because a promote moves a segment from
+/// `pending/` to `index/`, which moves it in the processing order at
+/// identical content.
+///
+/// `cache/` is absent by design. It reaches a decision through the
+/// cold-deferral filter alone, and the gate replays a pass only when that
+/// filter deferred nothing. See `docs/design/gc-idle-pass-gate.md`.
+fn pass_fingerprint(chain: &[(PathBuf, Option<String>)], fork_dir: &Path) -> Result<[u8; 32]> {
+    let mut h = blake3::Hasher::new();
+    for (dir, branch) in chain {
+        let path = dir.as_os_str().as_encoded_bytes();
+        h.update(&(path.len() as u64).to_le_bytes());
+        h.update(path);
+        let cutoff = branch.as_deref();
+        let branch = cutoff.unwrap_or("").as_bytes();
+        h.update(&(branch.len() as u64).to_le_bytes());
+        h.update(branch);
+        let segments = segment::discover_fork_segments(dir, cutoff)
+            .with_context(|| format!("listing segments in {}", dir.display()))?;
+        h.update(&(segments.len() as u64).to_le_bytes());
+        for sref in segments {
+            h.update(&[sref.tier as u8]);
+            h.update(&sref.ulid.to_bytes());
+        }
+    }
+
+    let mut wal: Vec<(std::ffi::OsString, u64, u128)> = Vec::new();
+    match fs::read_dir(fork_dir.join("wal")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("reading wal dir"),
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let Ok(md) = entry.metadata() else { continue };
+                if !md.is_file() {
+                    continue;
+                }
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                wal.push((entry.file_name(), md.len(), mtime));
+            }
+        }
+    }
+    wal.sort_unstable();
+    h.update(&(wal.len() as u64).to_le_bytes());
+    for (name, len, mtime) in wal {
+        let name = name.as_encoded_bytes();
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name);
+        h.update(&len.to_le_bytes());
+        h.update(&mtime.to_le_bytes());
+    }
+
+    match latest_snapshot(fork_dir).context("reading snapshot floor")? {
+        Some(u) => {
+            h.update(&[1]);
+            h.update(&u.to_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+
+    Ok(*h.finalize().as_bytes())
+}
+
+fn load_pass_state(
+    fork_dir: &Path,
+    rebuild_chain: &[(PathBuf, Option<String>)],
+) -> Result<PassState> {
     let vk =
         elide_core::signing::load_verifying_key(fork_dir, elide_core::signing::VOLUME_PUB_FILE)
             .context("loading volume verifying key")?;
 
-    // Walk the ancestor chain so the liveness view matches what the volume
-    // uses at apply time. Without this, a hash that lives only via an
-    // ancestor-mapped LBA would look dead from the coordinator, get omitted
-    // from the plan, and trip the volume's stale-liveness check on apply.
-    // Mirrors `volume::open_read_state`.
-    let ancestor_layers = elide_core::volume::walk_ancestors(fork_dir, by_id_dir)
-        .context("walking fork ancestor chain")?;
-    let rebuild_chain: Vec<(std::path::PathBuf, Option<String>)> = ancestor_layers
-        .iter()
-        .map(|l| (l.dir.clone(), l.branch_ulid.clone()))
-        .chain(std::iter::once((fork_dir.to_path_buf(), None)))
-        .collect();
-    let (index, mut lbamap, view_ceiling) = elide_core::rebuild::rebuild_views(&rebuild_chain)
+    let (index, mut lbamap, view_ceiling) = elide_core::rebuild::rebuild_views(rebuild_chain)
         .context("rebuilding extent index and lba map")?;
     // Every plan this pass emits is classified against this view, and a
     // refusal at apply names the claimant that blocked the fold. Comparing
@@ -2521,7 +2675,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should have compacted at least 2 segments (S1 + S2), got {}",
@@ -2626,7 +2780,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
 
         // Find the emitted GC plan in gc/. Under the plan handoff protocol
         // the coordinator writes `gc/<ulid>.plan` instead of a signed
@@ -2689,7 +2843,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert_eq!(stats.strategy, GcStrategy::Compact);
         assert_eq!(stats.candidates, 1);
 
@@ -3786,7 +3940,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert_eq!(
             stats.deferred, 0,
             "Delta partial-death must be expanded in-band, not deferred"
@@ -3998,7 +4152,7 @@ mod tests {
             interval: Duration::ZERO,
             ..crate::config::GcConfig::default()
         };
-        gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()]).unwrap();
+        gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()], None).unwrap();
         let index = extentindex::rebuild(&rebuild_chain).unwrap();
         assert!(
             index.lookup(&parent_b_hash).is_some(),
@@ -4139,7 +4293,7 @@ mod tests {
         let mut out_mint = elide_core::ulid_mint::UlidMint::new(Ulid::new());
         let mut pass = |n: usize| {
             let ulids: Vec<Ulid> = (0..n).map(|_| out_mint.next()).collect();
-            gc_fork(dir, dir.parent().unwrap(), &config, ulids).unwrap();
+            gc_fork(dir, dir.parent().unwrap(), &config, ulids, None).unwrap();
             let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
             vol.apply_gc_handoffs().unwrap();
             let bare: Vec<Ulid> = std::fs::read_dir(dir.join("gc"))
@@ -4303,7 +4457,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert_eq!(stats.deferred, 0, "dead delta owner must not defer");
         assert!(stats.candidates >= 1, "owner segment must be a candidate");
 
@@ -4449,7 +4603,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert!(
             stats.candidates >= 1,
             "GC must compact at least one bucket, got candidates={}",
@@ -4528,7 +4682,7 @@ mod tests {
             ..crate::config::GcConfig::default()
         };
         let u_gc = Ulid::new();
-        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc]).unwrap();
+        let stats = gc_fork(dir, dir.parent().unwrap(), &config, vec![u_gc], None).unwrap();
         assert!(
             stats.candidates >= 2,
             "GC should compact ≥2 segments, got {}",
@@ -4559,6 +4713,172 @@ mod tests {
             vol.read(1, 1).unwrap().as_slice(),
             &block2,
             "lba 1 must survive GC + crash + reopen (inline entry)"
+        );
+    }
+    // --- idle pass gate (docs/design/gc-idle-pass-gate.md) ---
+
+    /// A fork with one dense pending segment: the pass classifies it,
+    /// finds nothing eligible, and is replayable.
+    fn quiet_fork(dir: &Path) {
+        elide_core::signing::generate_keypair(
+            dir,
+            elide_core::signing::VOLUME_KEY_FILE,
+            elide_core::signing::VOLUME_PUB_FILE,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("index")).unwrap();
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(0, &[0xAAu8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+    }
+
+    fn idle_config() -> crate::config::GcConfig {
+        crate::config::GcConfig {
+            interval: Duration::ZERO,
+            ..crate::config::GcConfig::default()
+        }
+    }
+
+    /// Remove the volume's public key. `load_pass_state` reads it first,
+    /// so from here a pass that rebuilds fails and a pass that replays
+    /// succeeds — which is what tells the two apart.
+    fn block_the_rebuild(dir: &Path) {
+        fs::remove_file(dir.join(elide_core::signing::VOLUME_PUB_FILE)).unwrap();
+    }
+
+    #[test]
+    fn idle_pass_replays_while_the_fork_holds_still() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        quiet_fork(dir);
+        let config = idle_config();
+
+        let first = gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()], None).unwrap();
+        assert_eq!(first.strategy, GcStrategy::None(NoneReason::NoCandidates));
+        let idle = first
+            .idle
+            .expect("a pass with nothing eligible is replayable");
+
+        block_the_rebuild(dir);
+        assert!(
+            gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()], None).is_err(),
+            "without the cached pass this call must rebuild"
+        );
+
+        let second = gc_fork(
+            dir,
+            dir.parent().unwrap(),
+            &config,
+            vec![Ulid::new()],
+            Some(idle),
+        )
+        .unwrap();
+        assert_eq!(second.strategy, GcStrategy::None(NoneReason::NoCandidates));
+        assert_eq!(second.total_segments, first.total_segments);
+        assert_eq!(second.deferred, first.deferred);
+        assert_eq!(second.reclaim_targets, first.reclaim_targets);
+        assert!(second.idle.is_some(), "a replay stays replayable");
+    }
+
+    #[test]
+    fn a_replay_carries_the_age_of_the_pass_that_ran() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        quiet_fork(dir);
+        let config = idle_config();
+
+        let first = gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()], None).unwrap();
+        let idle = first.idle.unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let second = gc_fork(
+            dir,
+            dir.parent().unwrap(),
+            &config,
+            vec![Ulid::new()],
+            Some(idle),
+        )
+        .unwrap();
+        let held = second.idle.unwrap().held_for();
+        assert!(
+            held >= Duration::from_millis(20),
+            "the hold must measure from the pass that ran, got {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_segment_busts_the_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        quiet_fork(dir);
+        let config = idle_config();
+
+        let first = gc_fork(dir, dir.parent().unwrap(), &config, vec![Ulid::new()], None).unwrap();
+        let idle = first.idle.unwrap();
+
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        vol.write(8, &[0xBBu8; 4096]).unwrap();
+        vol.flush_wal().unwrap();
+        drop(vol);
+
+        block_the_rebuild(dir);
+        assert!(
+            gc_fork(
+                dir,
+                dir.parent().unwrap(),
+                &config,
+                vec![Ulid::new()],
+                Some(idle)
+            )
+            .is_err(),
+            "a fork that gained a segment must rebuild"
+        );
+    }
+
+    #[test]
+    fn a_wal_append_busts_the_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        quiet_fork(dir);
+
+        let chain = rebuild_chain(dir, dir.parent().unwrap()).unwrap();
+        let mut vol = elide_core::volume::Volume::open(dir, dir).unwrap();
+        // Sampled with the volume already open, so the difference below
+        // comes from the record.
+        let before = pass_fingerprint(&chain, dir).unwrap();
+        vol.write(8, &[0xBBu8; 4096]).unwrap();
+
+        assert_ne!(
+            pass_fingerprint(&chain, dir).unwrap(),
+            before,
+            "a WAL record must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn a_promote_busts_the_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        quiet_fork(dir);
+
+        let chain = rebuild_chain(dir, dir.parent().unwrap()).unwrap();
+        let before = pass_fingerprint(&chain, dir).unwrap();
+
+        // A promote moves the segment between tiers, which moves it in
+        // the rebuild's processing order at identical content.
+        let pending = segment::pending_generation_dirs(dir)
+            .into_iter()
+            .flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .next()
+            .expect("the flush left a pending segment");
+        let ulid = pending.file_name().unwrap().to_str().unwrap().to_owned();
+        fs::rename(&pending, dir.join("index").join(format!("{ulid}.idx"))).unwrap();
+
+        assert_ne!(
+            pass_fingerprint(&chain, dir).unwrap(),
+            before,
+            "a promote must change the fingerprint"
         );
     }
 }
