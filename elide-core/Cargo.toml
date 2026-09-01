@@ -109,3 +109,7 @@ harness = false
 [[bench]]
 name = "lbamap_fold_merge"
 harness = false
+
+[[bench]]
+name = "journal_flip_apply"
+harness = false

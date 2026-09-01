@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use ulid::Ulid;
 
 use crate::blake3_id_hasher::{Blake3HamtMap, Blake3HashSet};
-use crate::segment::{self, EntryKind};
+use crate::segment::{self, EntryKind, SegmentEntry};
 use crate::sketch_index::SketchIndex;
 
 /// How the extent's body is stored locally.
@@ -529,14 +529,24 @@ impl ExtentIndex {
         &mut self,
         segment: Ulid,
         body_section_start: u64,
-        idx_of: impl Fn(&blake3::Hash) -> Option<u32>,
+        entries: &[SegmentEntry],
     ) {
         let Some(seg) = self.journal.get_mut(&segment) else {
             return;
         };
+        // Built past the guard, so a segment the journal map does not hold
+        // pays nothing for an index it asks no question of. `blake3::Hash`
+        // equality is constant-time, so resolving each hash by a linear
+        // scan instead costs seconds at full segment size.
+        let mut entry_idx = crate::blake3_id_hasher::Blake3HashMap::<u32>::default();
+        for (i, e) in entries.iter().enumerate() {
+            entry_idx.entry(e.hash).or_insert(i as u32);
+        }
         let hashes: Vec<blake3::Hash> = seg.keys().copied().collect();
         for hash in hashes {
-            let Some(idx) = idx_of(&hash) else { continue };
+            let Some(idx) = entry_idx.get(&hash).copied() else {
+                continue;
+            };
             if let Some(loc) = seg.get_mut(&hash) {
                 loc.body_source = BodySource::Cached(idx);
                 loc.body_section_start = body_section_start;
@@ -1774,6 +1784,68 @@ mod tests {
         assert!(index.insert_journal_if_absent(seg, h(1), first));
         assert!(!index.insert_journal_if_absent(seg, h(1), second));
         assert_eq!(index.lookup_journal(seg, &h(1)).unwrap().body_offset, 100);
+    }
+
+    #[test]
+    fn promote_journal_segment_to_cache_resolves_the_first_entry_position() {
+        // The presence bitmap is indexed by entry position, so the flip has
+        // to name where in the segment each journal hash sits. A hash
+        // repeated in one segment keeps the first, matching
+        // `insert_journal_if_absent`.
+        let mut index = ExtentIndex::new();
+        let seg = useg(3);
+        index.insert_journal_if_absent(seg, h(1), data_loc(seg));
+        index.insert_journal_if_absent(seg, h(2), data_loc(seg));
+
+        let entries: Vec<SegmentEntry> = [h(9), h(2), h(1), h(1)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, hash)| {
+                SegmentEntry::new_data(hash, i as u64, 1, segment::Codec::None, vec![0u8; 4096])
+                    .entry
+            })
+            .collect();
+        index.promote_journal_segment_to_cache(seg, 512, &entries);
+
+        let one = index.lookup_journal(seg, &h(1)).unwrap();
+        assert!(
+            matches!(one.body_source, BodySource::Cached(2)),
+            "first position wins, got {:?}",
+            one.body_source
+        );
+        assert_eq!(one.body_section_start, 512);
+        let two = index.lookup_journal(seg, &h(2)).unwrap();
+        assert!(matches!(two.body_source, BodySource::Cached(1)));
+        assert_eq!(two.body_section_start, 512);
+    }
+
+    #[test]
+    fn promote_journal_segment_to_cache_leaves_a_data_segment_alone() {
+        // A drain applies this for every segment. One the journal map does
+        // not hold has no body to flip, and the entry index the flip needs
+        // is built past that guard, so the call answers nothing and costs
+        // nothing.
+        let mut index = ExtentIndex::new();
+        let journal = useg(3);
+        let data = useg(5);
+        index.insert_journal_if_absent(journal, h(1), data_loc(journal));
+
+        let entries: Vec<SegmentEntry> = [h(1)]
+            .into_iter()
+            .map(|hash| {
+                SegmentEntry::new_data(hash, 0, 1, segment::Codec::None, vec![0u8; 4096]).entry
+            })
+            .collect();
+        index.promote_journal_segment_to_cache(data, 512, &entries);
+
+        assert!(!index.is_journal_segment(data));
+        assert!(
+            matches!(
+                index.lookup_journal(journal, &h(1)).unwrap().body_source,
+                BodySource::Local
+            ),
+            "another segment's journal body is untouched"
+        );
     }
 
     #[test]
