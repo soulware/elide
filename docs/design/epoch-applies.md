@@ -237,7 +237,10 @@ of scope here.
 2. The promote as freeze, fold, swap (#987). Rig (rc28): `promote-prep` max
    72.2 to 0.7ms, `promote-apply` max 55.8 to 0.3ms, blocked writes in the
    10-100ms band 2554 to 1805 per million, the series low.
-3. The drain flip and the reclaim as fold and swap (#988, rc29).
+3. The drain flip and the reclaim as fold and swap (#988). Rig (rc29):
+   `promote-segment-apply` max 78.2 to 0.3ms; the 10-100ms band 1805 to
+   1394 per million; `gc-plan-apply` and `repack-apply` are 99.6% of the
+   lock hold that remains.
 4. GC plan apply, repack buckets and the reap, with the swap removal check.
 5. The fold-equals-rebuild assertion after every swap in the
    `volume-invariants` build, and a proptest that interleaves writes with
