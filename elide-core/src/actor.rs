@@ -703,13 +703,18 @@ pub(crate) enum Publication {
 /// Must be called while holding the volume mutex (the `&Volume` argument
 /// is the live guard) so the (lbamap, extent_index, generations) tuple
 /// observed by the next `snapshot.load()` is internally consistent.
+///
+/// Returns the snapshot this one replaced. Its drop frees every map node
+/// the mutations since the last publish path-copied, a cost proportional
+/// to their count, so the caller drops it after it releases the mutex.
+#[must_use]
 fn publish_snapshot(
     volume: &Volume,
     snapshot: &ArcSwap<ReadSnapshot>,
     flush_gen: &AtomicU64,
     layout_gen: &AtomicU64,
     publication: Publication,
-) {
+) -> Arc<ReadSnapshot> {
     let new_flush = flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
     // Read `layout_gen` back when this publication leaves the files alone, so
     // the snapshot carries the generation of the last one that did move them.
@@ -718,12 +723,12 @@ fn publish_snapshot(
         Publication::AppendsToWal => layout_gen.load(Ordering::SeqCst),
     };
     let (lbamap, extent_index) = volume.snapshot_maps();
-    snapshot.store(Arc::new(ReadSnapshot {
+    snapshot.swap(Arc::new(ReadSnapshot {
         lbamap,
         extent_index,
         flush_gen: new_flush,
         layout_gen: new_layout,
-    }));
+    }))
 }
 
 impl VolumeActor {
@@ -771,13 +776,15 @@ impl VolumeActor {
     /// readers' descriptors.
     fn publish_snapshot(&mut self) {
         let guard = self.lock_volume(LockSite::PublishSnapshot);
-        publish_snapshot(
+        let previous = publish_snapshot(
             &guard,
             &self.snapshot,
             &self.flush_gen,
             &self.layout_gen,
             Publication::ReplacesFiles,
         );
+        drop(guard);
+        drop(previous);
     }
 
     /// Apply a worker's repack result, publish the read snapshot, then
@@ -2100,10 +2107,10 @@ impl VolumeClient {
         let hash = blake3::hash(data);
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
-        let (needs_promote, sync) = {
+        let (needs_promote, sync, previous) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
-            publish_snapshot(
+            let previous = publish_snapshot(
                 &guard,
                 &self.snapshot,
                 &self.flush_gen,
@@ -2111,8 +2118,9 @@ impl VolumeClient {
                 Publication::AppendsToWal,
             );
             let sync = if fua { guard.wal_sync_handle() } else { None };
-            (guard.needs_promote(), sync)
+            (guard.needs_promote(), sync, previous)
         };
+        drop(previous);
         sync_wal_handle(sync)?;
         if needs_promote {
             self.signal_check_promote();
@@ -2126,10 +2134,10 @@ impl VolumeClient {
     /// See [`Volume::write_zeroes`] for details.
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         let volume = self.volume()?;
-        let (needs_promote, sync) = {
+        let (needs_promote, sync, previous) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_zeroes(start_lba, lba_count)?;
-            publish_snapshot(
+            let previous = publish_snapshot(
                 &guard,
                 &self.snapshot,
                 &self.flush_gen,
@@ -2137,8 +2145,9 @@ impl VolumeClient {
                 Publication::AppendsToWal,
             );
             let sync = if fua { guard.wal_sync_handle() } else { None };
-            (guard.needs_promote(), sync)
+            (guard.needs_promote(), sync, previous)
         };
+        drop(previous);
         sync_wal_handle(sync)?;
         if needs_promote {
             self.signal_check_promote();
