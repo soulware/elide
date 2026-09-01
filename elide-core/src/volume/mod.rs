@@ -3152,19 +3152,10 @@ impl Volume {
             }
             // Flip journal-tier bodies for this segment from Local to
             // Cached, mirroring the durable loop above. The presence-bitmap
-            // index for each hash is its first entry position, resolved
-            // through a prebuilt index: blake3::Hash equality is
-            // constant-time, so a linear scan per hash costs seconds at
-            // full segment size.
-            let mut entry_idx = crate::blake3_id_hasher::Blake3HashMap::<u32>::default();
-            for (i, e) in entries.iter().enumerate() {
-                entry_idx.entry(e.hash).or_insert(i as u32);
-            }
+            // index for each hash is its first entry position.
             self.maps
                 .extent_index_mut()
-                .promote_journal_segment_to_cache(ulid, body_section_start, |h| {
-                    entry_idx.get(h).copied()
-                });
+                .promote_journal_segment_to_cache(ulid, body_section_start, entries);
 
             // Delta entries: the delta blob has moved from inline in
             // the now-deleted pending file to the standalone
