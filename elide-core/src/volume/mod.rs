@@ -1425,7 +1425,7 @@ impl Volume {
             (offset, open.ulid)
         };
         self.maps
-            .lbamap_mut()
+            .delta_lbamap_mut()
             .insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw
         // payload offset, updated to segment file offsets after promotion.
@@ -1447,11 +1447,18 @@ impl Volume {
             body_section_start: 0,
             inline_data: None,
         };
-        let ei = self.maps.extent_index_mut();
-        if is_journal {
-            ei.insert_journal_if_absent(wal_ulid, hash, location);
+        let resolves = if is_journal {
+            self.maps.lookup_journal(wal_ulid, &hash).is_some()
         } else {
-            ei.insert_if_absent(hash, location);
+            self.maps.lookup_extent(&hash).is_some()
+        };
+        if !resolves {
+            let ei = self.maps.delta_extent_index_mut();
+            if is_journal {
+                ei.insert_journal_if_absent(wal_ulid, hash, location);
+            } else {
+                ei.insert_if_absent(hash, location);
+            }
         }
         let mut entry =
             segment::SegmentEntry::new_data_no_body(hash, lba, lba_length, codec, stored_length);
@@ -1510,7 +1517,7 @@ impl Volume {
             open.ulid
         };
         self.maps
-            .lbamap_mut()
+            .delta_lbamap_mut()
             .insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
         self.pending.push(PendingWrite {
             entry: segment::SegmentEntry::new_zero(start_lba, lba_count),
