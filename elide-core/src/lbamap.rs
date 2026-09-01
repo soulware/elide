@@ -836,6 +836,11 @@ impl LbaMap {
         self.claim_counts.contains_key(hash)
     }
 
+    /// Every hash some LBA claims, one per hash.
+    pub fn claim_hashes(&self) -> impl Iterator<Item = &blake3::Hash> {
+        self.claim_counts.keys()
+    }
+
     /// A detached view of claim membership plus the caller-supplied
     /// delta-source pin set, for a worker that needs the liveness
     /// question off-lock. The volume composes the set from its extent

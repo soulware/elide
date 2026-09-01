@@ -240,6 +240,8 @@ pub struct VolumeActor {
     volume: Arc<Mutex<Volume>>,
     /// The volume's directory, for control-plane work that reads it directly.
     base_dir: PathBuf,
+    /// The fork ancestry, for the GC plan fold's stale-cancel diagnostic.
+    ancestor_layers: Vec<AncestorLayer>,
     snapshot: Arc<ArcSwap<ReadSnapshot>>,
     rx: Receiver<VolumeRequest>,
     /// Publication counter.  Bumped under the volume mutex on every snapshot
@@ -793,20 +795,26 @@ impl VolumeActor {
     /// directory fsyncs run with the mutex released; the lock at the
     /// end covers the invariants assertion alone.
     ///
-    /// Each bucket takes the volume mutex on its own, and releases it to
-    /// a waiting guest write. A close pass carries ten or more buckets of
-    /// ~10k entries, and registering those entries is the bulk of the
-    /// work, so one hold across the pass blocks guest writes for as long
-    /// as all of them together — and releasing without the fair handoff
-    /// costs them the same, since this loop would win the lock straight
-    /// back. The single publish at the end keeps readers seeing the whole
-    /// pass at once.
+    /// Each bucket folds on this thread with the mutex released, between
+    /// two holds that clone and swap handles. Both holds release to a
+    /// waiting guest write with the fair handoff, since this loop would
+    /// win the lock straight back. The single publish at the end keeps
+    /// readers seeing the whole pass at once.
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let (mut acc, buckets) = RepackApply::new(result);
         for bucket in &buckets {
-            self.lock_volume(LockSite::RepackApply)
+            let layers = self
+                .lock_volume(LockSite::RepackApply)
                 .fair()
-                .apply_repack_bucket(bucket, &mut acc)?;
+                .map_layers()
+                .clone();
+            if let crate::volume::RepackFold::Landed(landed) =
+                crate::volume::fold_repack_bucket(&layers, bucket, &mut acc)?
+            {
+                self.lock_volume(LockSite::RepackApply)
+                    .fair()
+                    .swap_repack_bucket(bucket, landed, layers.base(), &mut acc);
+            }
         }
         let (stats, consumed_inputs) = self
             .lock_volume(LockSite::RepackApply)
@@ -1153,7 +1161,11 @@ impl VolumeActor {
         if parsed.is_empty() {
             return Ok(crate::volume::ReapStats::default());
         }
-        let (stats, unlink) = self.lock_volume(LockSite::ReapApply).apply_reap(parsed);
+        let layers = self.lock_volume(LockSite::ReapApply).map_layers().clone();
+        let fold = crate::volume::fold_reap(&layers, parsed);
+        let (stats, unlink) = self
+            .lock_volume(LockSite::ReapApply)
+            .swap_reap(fold, layers.base());
         if unlink.is_empty() || stop == ReapStop::BeforePublish {
             return Ok(stats);
         }
@@ -1318,6 +1330,43 @@ impl VolumeActor {
                 }
             }
         }
+    }
+
+    /// One GC plan apply: the prep and the swap under the volume mutex,
+    /// the fold between them on this thread with the mutex released.
+    /// Plans arrive in batches the actor folds back to back, so both
+    /// holds release to a waiting guest write with the fair handoff, for
+    /// the same reason the repack bucket loop does.
+    fn apply_gc_plan(
+        &mut self,
+        result: crate::volume::GcPlanApplyResult,
+    ) -> io::Result<crate::volume::StagedApply> {
+        use crate::volume::{PlanFold, PlanSwapPrep, StagedApply};
+        let layers = match self
+            .lock_volume(LockSite::GcPlanApply)
+            .fair()
+            .prepare_plan_swap(&result)
+        {
+            PlanSwapPrep::Skip(outcome) => return Ok(outcome),
+            PlanSwapPrep::Layers(layers) => layers,
+        };
+        let landed = match crate::volume::fold_plan_apply_result(
+            &layers,
+            result,
+            &self.base_dir,
+            &self.ancestor_layers,
+        )? {
+            PlanFold::Cancelled => return Ok(StagedApply::Cancelled),
+            PlanFold::Landed(landed) => landed,
+        };
+        let outcome = self
+            .lock_volume(LockSite::GcPlanApply)
+            .fair()
+            .swap_plan_apply(&landed, layers.base())?;
+        if outcome == StagedApply::Cancelled {
+            landed.remove_output();
+        }
+        Ok(outcome)
     }
 
     /// Whether any worker job is dispatched but not yet resolved.
@@ -1581,13 +1630,7 @@ impl VolumeActor {
             return;
         }
         self.parked.handoff_in_flight = false;
-        // Plans arrive in batches the actor folds back to back, so this
-        // releases to a waiting guest write for the same reason the
-        // repack bucket loop does.
-        let applied = self
-            .lock_volume(LockSite::GcPlanApply)
-            .fair()
-            .apply_plan_apply_result(*result);
+        let applied = self.apply_gc_plan(*result);
         match applied {
             Ok(crate::volume::StagedApply::Applied) => {
                 self.publish_snapshot();
@@ -4265,6 +4308,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     let actor = VolumeActor {
         volume: Arc::clone(&volume),
         base_dir: config.base_dir.clone(),
+        ancestor_layers: config.ancestor_layers.clone(),
         snapshot: Arc::clone(&snapshot),
         rx,
         flush_gen: Arc::clone(&flush_gen),
