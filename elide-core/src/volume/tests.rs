@@ -6365,6 +6365,86 @@ fn writes_land_in_the_delta_layer() {
 /// WAL ULID, writes that land while the worker runs go to a new delta above
 /// it, the fold leaves the live base alone, and the swap retires the layer.
 #[test]
+fn a_drain_flips_a_clone_of_base_under_the_delta() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let a = vec![0x41u8; 4096 * 2];
+    let c = vec![0x43u8; 4096];
+    vol.write(0, &a).unwrap();
+    vol.promote_for_test().unwrap();
+    let seg = vol.last_segment_ulid.unwrap();
+    let hash_a = blake3::hash(&a);
+    assert!(matches!(
+        vol.maps
+            .base()
+            .extent_index
+            .lookup(&hash_a)
+            .map(|l| l.body_source),
+        Some(BodySource::Local)
+    ));
+
+    let job = match vol.prepare_promote_segment(seg).unwrap() {
+        PromoteSegmentPrep::Job(job) => *job,
+        PromoteSegmentPrep::AlreadyPromoted => panic!("pending/{seg} exists"),
+    };
+    let result = crate::actor::execute_promote_segment(job).unwrap();
+
+    // A write that lands while the worker runs sits in the delta above base.
+    vol.write(1, &c).unwrap();
+    assert!(!vol.maps.delta_is_empty());
+
+    let layers = vol.maps.clone();
+    let new_base = fold_promote_segment_result(&layers, &result).unwrap();
+    assert!(
+        matches!(
+            vol.maps
+                .base()
+                .extent_index
+                .lookup(&hash_a)
+                .map(|l| l.body_source),
+            Some(BodySource::Local)
+        ),
+        "the fold leaves the live base alone"
+    );
+    assert!(matches!(
+        new_base.extent_index.lookup(&hash_a).map(|l| l.body_source),
+        Some(BodySource::Cached(0))
+    ));
+
+    vol.swap_promote_segment(&result, new_base, layers.base());
+    assert!(
+        !vol.maps.delta_is_empty(),
+        "the concurrent write stays in the delta"
+    );
+    assert!(matches!(
+        vol.maps
+            .base()
+            .extent_index
+            .lookup(&hash_a)
+            .map(|l| l.body_source),
+        Some(BodySource::Cached(0))
+    ));
+    remove_promoted_segment_sources(&vol.base_dir, &result).unwrap();
+    assert!(
+        segment::find_pending_file(&vol.base_dir, &seg.to_string()).is_none(),
+        "the drain deleted pending/{seg}"
+    );
+
+    let mut expected = a.clone();
+    expected[4096..].copy_from_slice(&c);
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+
+    vol.promote_for_test().unwrap();
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(0, 2).unwrap(), expected);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn a_promote_freezes_its_epoch_and_the_swap_retires_it() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();

@@ -1445,12 +1445,24 @@ impl VolumeActor {
                 self.pipeline.promote_segments_in_flight -= 1;
                 match result {
                     Ok(r) => {
-                        let apply_result = self
+                        // The fold runs on this thread with the mutex
+                        // released; the two holds around it clone and swap
+                        // handles.
+                        let layers = self
                             .lock_volume(LockSite::PromoteSegmentApply)
-                            .apply_promote_segment_result(r);
+                            .map_layers()
+                            .clone();
+                        let apply_result = crate::volume::fold_promote_segment_result(&layers, &r)
+                            .map(|new_base| {
+                                self.lock_volume(LockSite::PromoteSegmentApply)
+                                    .swap_promote_segment(&r, new_base, layers.base());
+                            });
                         if apply_result.is_ok() {
                             self.publish_snapshot();
                         }
+                        let apply_result = apply_result.and_then(|()| {
+                            crate::volume::remove_promoted_segment_sources(&self.base_dir, &r)
+                        });
                         self.reply_parked_promote_segment(ulid, apply_result);
                     }
                     Err(e) => {
@@ -1493,13 +1505,23 @@ impl VolumeActor {
                 let reply = self.parked.reclaim.take();
                 let outcome = match result {
                     Ok(r) => {
-                        let apply_result = self
+                        let layers = self
                             .lock_volume(LockSite::ReclaimApply)
-                            .apply_reclaim_result(r);
-                        if matches!(&apply_result, Ok(o) if !o.discarded && o.runs_rewritten > 0) {
-                            self.publish_snapshot();
+                            .map_layers()
+                            .clone();
+                        match crate::volume::fold_reclaim_result(&layers, &r) {
+                            Ok(crate::volume::ReclaimFold::Landed { new_base, outcome }) => {
+                                self.lock_volume(LockSite::ReclaimApply).swap_reclaim(
+                                    &r,
+                                    new_base,
+                                    layers.base(),
+                                );
+                                self.publish_snapshot();
+                                Ok(outcome)
+                            }
+                            Ok(crate::volume::ReclaimFold::NoSwap(outcome)) => Ok(outcome),
+                            Err(e) => Err(e),
                         }
-                        apply_result
                     }
                     Err(e) => {
                         warn!("worker reclaim failed: {e}");
@@ -4456,6 +4478,9 @@ fn read_reclaim_extent_body(
 pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     let target_start = job.target_start_lba;
     let target_end = target_start + job.target_lba_length as u64;
+    let maps = job.layers.materialised();
+    let lbamap_snapshot = maps.lbamap;
+    let extent_index_snapshot = maps.extent_index;
 
     // Cache containment/bloat decisions per hash so repeated runs of
     // the same hash inside the target share one full-map walk.
@@ -4477,14 +4502,14 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
     // Sources already pinned by a registered delta encoding: the "H
     // will stick around" signal the delta-emission decision below
     // consults.
-    let delta_source_pins = job.extent_index_snapshot.named_delta_sources();
+    let delta_source_pins = extent_index_snapshot.named_delta_sources();
 
     for er in &job.entries {
         if er.hash == crate::volume::ZERO_HASH {
             continue;
         }
         let should_rewrite = *decision.entry(er.hash).or_insert_with(|| {
-            let runs = job.lbamap_snapshot.runs_for_hash(&er.hash);
+            let runs = lbamap_snapshot.runs_for_hash(&er.hash);
             let contained = runs.iter().all(|(lba, length, _)| {
                 *lba >= target_start && *lba + *length as u64 <= target_end
             });
@@ -4504,7 +4529,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 .map(|(_, len, off)| *off as u64 + *len as u64)
                 .max()
                 .unwrap_or(0);
-            let logical_blocks = match job.extent_index_snapshot.lookup(&er.hash) {
+            let logical_blocks = match extent_index_snapshot.lookup(&er.hash) {
                 Some(loc) if loc.inline_data.is_none() && loc.codec == segment::Codec::None => {
                     // Plaintext Data: body_length is the exact logical
                     // size in bytes. Divide to get blocks. Catches tail
@@ -4529,11 +4554,8 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
         let resolved = match body_cache.entry(er.hash) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => {
-                let fetched = read_reclaim_extent_body(
-                    &job.extent_index_snapshot,
-                    &job.search_dirs,
-                    &er.hash,
-                )?;
+                let fetched =
+                    read_reclaim_extent_body(&extent_index_snapshot, &job.search_dirs, &er.hash)?;
                 v.insert(fetched)
             }
         };
@@ -4557,7 +4579,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
 
                 // If the new hash is already canonical somewhere, emit a thin
                 // DedupRef — cheapest possible output, strictly beats any Delta.
-                if job.extent_index_snapshot.lookup(&new_hash).is_some() {
+                if extent_index_snapshot.lookup(&new_hash).is_some() {
                     entries.push(segment::PendingEntry::from_entry(
                         segment::SegmentEntry::new_dedup_ref(
                             new_hash,
@@ -4600,7 +4622,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 // should have been attempted).
                 let pre_snapshot_h = match (
                     job.snapshot_floor_ulid,
-                    job.extent_index_snapshot.lookup(&er.hash),
+                    extent_index_snapshot.lookup(&er.hash),
                 ) {
                     (Some(floor), Some(loc)) => loc.segment_id <= floor,
                     _ => false,
@@ -4670,7 +4692,7 @@ pub(crate) fn execute_reclaim(job: ReclaimJob) -> io::Result<ReclaimResult> {
                 // If the new hash is already canonical somewhere, prefer a
                 // thin DedupRef — a DATA entry is cheaper to read than a
                 // Delta when the body exists.
-                if job.extent_index_snapshot.lookup(&new_hash).is_some() {
+                if extent_index_snapshot.lookup(&new_hash).is_some() {
                     entries.push(segment::PendingEntry::from_entry(
                         segment::SegmentEntry::new_dedup_ref(
                             new_hash,

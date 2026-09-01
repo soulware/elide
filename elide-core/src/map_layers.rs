@@ -237,19 +237,86 @@ impl MapLayers {
     }
 
     /// Install a promote's fold as `base` and retire its frozen layer.
+    pub fn swap_promote(&mut self, folded_from: &Maps, new_base: Maps, wal_ulid: Ulid) {
+        self.swap_base(folded_from, new_base);
+        self.frozen.retain(|l| l.wal_ulid != wal_ulid);
+    }
+
+    /// A base-only apply's fold: `apply` run over a clone of `base`. `self`
+    /// is unchanged, so the caller runs this with the volume mutex released.
+    /// The layers above `base` hold WAL locations and the claims of the
+    /// writes that made them, so an apply that re-points or registers
+    /// segment locations finds every entry it acts on in `base`.
+    pub fn fold_base(
+        &self,
+        apply: impl FnOnce(&mut LbaMap, &mut ExtentIndex) -> io::Result<()>,
+    ) -> io::Result<Maps> {
+        let mut maps = self.base.clone();
+        apply(
+            Arc::make_mut(&mut maps.lbamap),
+            Arc::make_mut(&mut maps.extent_index),
+        )?;
+        Ok(maps)
+    }
+
+    /// Install a fold as `base`. The layers above it stay.
     ///
     /// `folded_from` is the `base` the fold started from. The actor is the
     /// only mutator of `base`, and it runs the fold and this swap on its own
     /// thread with no other apply between them, so the two are the same
     /// handles; the assertion states that invariant.
-    pub fn swap_promote(&mut self, folded_from: &Maps, new_base: Maps, wal_ulid: Ulid) {
+    pub fn swap_base(&mut self, folded_from: &Maps, new_base: Maps) {
         debug_assert!(
             Arc::ptr_eq(&self.base.lbamap, &folded_from.lbamap)
                 && Arc::ptr_eq(&self.base.extent_index, &folded_from.extent_index),
-            "base moved between a promote's fold and its swap"
+            "base moved between a fold and its swap"
         );
         self.base = new_base;
-        self.frozen.retain(|l| l.wal_ulid != wal_ulid);
+    }
+
+    /// The fold for an apply whose admission is ULID order: a clone of
+    /// `base` with every frozen layer below `ulid` replayed in, oldest
+    /// first, then `apply` run over the clone. A claim in a layer above
+    /// `ulid` is newer than the apply's output and masks it, which is the
+    /// order the rebuild from disk gives the two. `self` is unchanged, so
+    /// the caller runs this with the volume mutex released.
+    pub fn fold_below(
+        &self,
+        ulid: Ulid,
+        apply: impl FnOnce(&mut LbaMap, &mut ExtentIndex) -> io::Result<()>,
+    ) -> io::Result<Maps> {
+        let mut maps = self.base.clone();
+        for layer in self.frozen.iter().filter(|l| l.wal_ulid < ulid) {
+            fold(&mut maps, &layer.maps);
+        }
+        apply(
+            Arc::make_mut(&mut maps.lbamap),
+            Arc::make_mut(&mut maps.extent_index),
+        )?;
+        Ok(maps)
+    }
+
+    /// Install a [`Self::fold_below`] as `base` and retire the layers it
+    /// replayed. A promote whose layer retires here still folds and swaps:
+    /// its replay finds the layer gone and its locations in `base`.
+    pub fn swap_below(&mut self, folded_from: &Maps, new_base: Maps, ulid: Ulid) {
+        self.swap_base(folded_from, new_base);
+        self.frozen.retain(|l| l.wal_ulid >= ulid);
+    }
+
+    /// The layers above `ulid` over `base`: how a [`Self::fold_below`]
+    /// resolves under the writes that landed after the apply's prep.
+    pub fn above(&self, ulid: Ulid, base: Maps) -> Self {
+        Self {
+            base,
+            frozen: self
+                .frozen
+                .iter()
+                .filter(|l| l.wal_ulid >= ulid)
+                .cloned()
+                .collect(),
+            delta: self.delta.clone(),
+        }
     }
 
     /// Put `base` back to `pre`, a value [`Self::materialised`] returned
@@ -308,6 +375,7 @@ fn overlay(layers: &[&Arc<LbaMap>], start: u64, end: u64, out: &mut Vec<ExtentRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::{Codec, EntryKind, SegmentEntry};
 
     fn h(n: u8) -> blake3::Hash {
         blake3::hash(&[n])
@@ -581,5 +649,96 @@ mod tests {
         assert!(layers.has_full_match(0, 4, &h(1)));
         assert!(layers.has_full_match(8, 4, &h(2)));
         assert!(layers.delta_is_empty());
+    }
+
+    #[test]
+    fn a_base_fold_swaps_under_the_layers() {
+        let mut base = LbaMap::new();
+        base.insert(0, 8, h(1), seg(1));
+        let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
+        layers.delta_lbamap_mut().insert(0, 2, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(6, 2, h(3), seg(11));
+
+        let before = layers.clone();
+        let new_base = layers
+            .fold_base(|lbamap, _| {
+                lbamap.insert(0, 8, h(4), seg(5));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            reads(&layers.extents_in_range(0, 8)),
+            reads(&before.extents_in_range(0, 8)),
+            "the fold leaves the live layers alone"
+        );
+
+        layers.swap_base(before.base(), new_base);
+        assert_eq!(layers.frozen_depth(), 1);
+        assert!(!layers.delta_is_empty());
+        assert_eq!(
+            reads(&layers.extents_in_range(0, 8)),
+            vec![(0, 2, h(2), 0), (2, 6, h(4), 2), (6, 8, h(3), 0)]
+        );
+    }
+
+    #[test]
+    fn a_fold_below_takes_the_older_layers_and_leaves_the_newer() {
+        let mut base = LbaMap::new();
+        base.insert(0, 8, h(1), seg(1));
+        let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
+        layers.delta_lbamap_mut().insert(0, 2, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(6, 2, h(3), seg(12));
+        layers.freeze(seg(12));
+        layers.delta_lbamap_mut().insert(4, 1, h(5), seg(13));
+
+        let run = SegmentEntry {
+            hash: h(4),
+            start_lba: 0,
+            lba_length: 8,
+            codec: Codec::None,
+            kind: EntryKind::Data,
+            stored_offset: 0,
+            stored_length: 8 * 4096,
+            inline: None,
+            delta_options: Vec::new(),
+            journal: false,
+            sketch: None,
+            stored_hash: None,
+        };
+        let before = layers.clone();
+        let new_base = layers
+            .fold_below(seg(11), |lbamap, _| {
+                assert_eq!(lbamap.claimant_at(0), Some(seg(10)), "layer 10 folded in");
+                assert_eq!(lbamap.claimant_at(6), Some(seg(1)), "layer 12 left above");
+                assert_eq!(
+                    lbamap.register_entry_if_newer(&run, seg(11)),
+                    8,
+                    "the fold admits over base and layer 10"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let view = before.above(seg(11), new_base.clone());
+        assert_eq!(
+            reads(&view.extents_in_range(0, 8)),
+            vec![
+                (0, 4, h(4), 0),
+                (4, 5, h(5), 0),
+                (5, 6, h(4), 5),
+                (6, 8, h(3), 0)
+            ],
+            "layers 12 and 13 mask the fold, layer 10 is under it"
+        );
+
+        layers.swap_below(before.base(), new_base, seg(11));
+        assert_eq!(layers.frozen_depth(), 1, "layer 10 retired, layer 12 stays");
+        assert!(!layers.delta_is_empty());
+        assert_eq!(
+            reads(&layers.extents_in_range(0, 8)),
+            reads(&view.extents_in_range(0, 8))
+        );
     }
 }

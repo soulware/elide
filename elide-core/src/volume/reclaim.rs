@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
+use crate::map_layers::{MapLayers, Maps};
 use crate::{extentindex, lbamap, segment};
 
 use super::{Volume, ZERO_HASH, latest_snapshot};
@@ -23,8 +24,8 @@ pub struct ReclaimJob {
     pub target_start_lba: u64,
     pub target_lba_length: u32,
     pub entries: Vec<lbamap::ExtentRead>,
-    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
-    pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
+    /// The maps at prep, an O(1) clone. The worker materialises them once.
+    pub layers: MapLayers,
     pub search_dirs: Vec<PathBuf>,
     pub pending_dir: PathBuf,
     /// Pre-minted on the actor so the worker can write
@@ -93,6 +94,18 @@ pub struct ReclaimOutcome {
     pub runs_refused: u32,
     /// Total uncompressed bytes committed to fresh compact entries.
     pub bytes_rewritten: u64,
+}
+
+/// What a reclaim's fold produced.
+pub enum ReclaimFold {
+    /// Base keeps its handles: the worker wrote no segment, or no run
+    /// landed and the output is deleted.
+    NoSwap(ReclaimOutcome),
+    /// At least one run landed. [`Volume::swap_reclaim`] installs `new_base`.
+    Landed {
+        new_base: Maps,
+        outcome: ReclaimOutcome,
+    },
 }
 
 /// Per-hash thresholds controlling which hashes the reclamation scanner
@@ -396,10 +409,10 @@ impl Volume {
         // discriminator here: a durable write and a journal-window write
         // both stake their claim at the WAL's ULID.
         let rotated_wal = flush.as_ref().map(|f| f.old_wal_ulid);
-        let maps = self.maps.materialised();
-        let entries: Vec<lbamap::ExtentRead> = maps
-            .lbamap
+        let entries: Vec<lbamap::ExtentRead> = self
+            .maps
             .extents_in_range(start_lba, end_lba)
+            .into_iter()
             .filter(|e| Some(e.claimant_ulid) != rotated_wal)
             .collect();
 
@@ -423,8 +436,7 @@ impl Volume {
                 target_start_lba: start_lba,
                 target_lba_length: lba_length,
                 entries,
-                lbamap_snapshot: maps.lbamap,
-                extent_index_snapshot: maps.extent_index,
+                layers: self.maps.clone(),
                 search_dirs,
                 pending_dir: segment::pending_open_dir(&self.base_dir),
                 segment_ulid,
@@ -434,59 +446,73 @@ impl Volume {
         })
     }
 
-    /// Apply phase of reclaim — runs on the actor thread after the
-    /// worker returns.
-    ///
-    /// Each rewritten run is admitted on its own. A run is a claim over
-    /// one LBA range, so what invalidates it is a write to that range,
-    /// and `register_entry_if_newer` is what expresses exactly that: it
-    /// installs on the sub-ranges whose current claimant sorts below
-    /// `u_reclaim` and leaves every higher claimant its sub-range.
-    ///
-    /// The ULID polarity is what makes if-newer the right rule.
-    /// [`Self::prepare_reclaim`] closes the WAL before minting
-    /// `u_reclaim`, both under the actor lock, so a write arriving
-    /// afterwards opens a fresh WAL at a higher ULID and every
-    /// concurrent-write claimant sorts above the reclaim's outputs.
-    /// Repack's outputs are pre-minted *below* the flushed WAL, which
-    /// is why that path needs a consumed-inputs whitelist to tell a
-    /// claim it tears down from a write it did not carry; reclaim
-    /// consumes no segment and has no such ambiguity.
-    ///
-    /// The extent index takes the same runs under
-    /// `register_entry_consuming_inputs` with an empty consumed set:
-    /// reclaim's live sub-ranges hash fresh, so the normal case is a
-    /// free slot, and a hash a concurrent writer already owns keeps its
-    /// owner. A run whose claim was refused outright registers nothing,
-    /// which keeps "the index names the reclaim segment" and "the
-    /// reclaim landed that run" the same statement.
-    ///
-    /// A pass where no run landed deletes `pending/<segment_ulid>` as an
-    /// orphan. GC would eventually classify it as all-dead; cleaning up
-    /// here avoids the round-trip.
+    /// Apply phase of reclaim for a caller that holds the volume across it:
+    /// fold, then swap. The actor runs the two steps itself with the mutex
+    /// released around the fold ([`fold_reclaim_result`],
+    /// [`Self::swap_reclaim`]).
     pub fn apply_reclaim_result(&mut self, result: ReclaimResult) -> io::Result<ReclaimOutcome> {
-        if !result.segment_written {
-            return Ok(ReclaimOutcome::default());
+        let layers = self.maps.clone();
+        match fold_reclaim_result(&layers, &result)? {
+            ReclaimFold::NoSwap(outcome) => Ok(outcome),
+            ReclaimFold::Landed { new_base, outcome } => {
+                self.swap_reclaim(&result, new_base, layers.base());
+                Ok(outcome)
+            }
         }
+    }
 
-        let no_consumed_inputs = HashSet::new();
-        let ctx = extentindex::SegmentRegistrationCtx {
-            segment_id: result.segment_ulid,
+    /// Install a reclaim's fold. O(1) in the maps.
+    pub fn swap_reclaim(&mut self, result: &ReclaimResult, new_base: Maps, folded_from: &Maps) {
+        self.maps
+            .swap_below(folded_from, new_base, result.segment_ulid);
+        self.has_new_segments = true;
+        self.last_segment_ulid = Some(result.segment_ulid);
+    }
+}
+
+/// A reclaim's fold: each rewritten run admitted over a clone of base with
+/// the frozen layers below the output's ULID replayed in. Runs with the
+/// volume mutex released; [`Volume::swap_reclaim`] installs the result.
+///
+/// A run is a claim over `[start_lba, start_lba + lba_length)` at the output
+/// segment's ULID, admitted where the claimant it replaces is older. The
+/// extent index takes the same runs under `register_entry_consuming_inputs`
+/// with an empty consumed set: reclaim's live sub-ranges hash fresh, so the
+/// normal case is a free slot, and a hash a concurrent writer already owns
+/// keeps its owner.
+///
+/// [`Volume::prepare_reclaim`] closes the WAL before it mints the output's
+/// ULID, so every frozen layer at the prep carries a lower claimant and every
+/// write after the prep a higher one. The fold replays the lower layers, and
+/// the higher layers mask the output, which is the order the rebuild from
+/// disk gives the two.
+///
+/// A run lands on the blocks that resolve to the output segment through the
+/// layers above the fold, so a write that arrived after the prep refuses the
+/// blocks it covers. A write that lands between this fold and the swap sits
+/// in the delta above the fold; it masks the run, and its own fold replays
+/// it over the run.
+///
+/// A pass where no run landed deletes `pending/<segment_ulid>` as an orphan.
+pub fn fold_reclaim_result(layers: &MapLayers, result: &ReclaimResult) -> io::Result<ReclaimFold> {
+    if !result.segment_written {
+        return Ok(ReclaimFold::NoSwap(ReclaimOutcome::default()));
+    }
+
+    let no_consumed_inputs = HashSet::new();
+    let ctx = extentindex::SegmentRegistrationCtx {
+        segment_id: result.segment_ulid,
+        body_section_start: result.body_section_start,
+        body_tier: extentindex::RegistrationBodyTier::Local,
+        delta_body_source: Some(extentindex::DeltaBodySource::Full {
             body_section_start: result.body_section_start,
-            body_tier: extentindex::RegistrationBodyTier::Local,
-            delta_body_source: Some(extentindex::DeltaBodySource::Full {
-                body_section_start: result.body_section_start,
-                body_length: result.body_length,
-            }),
-            inline: extentindex::InlineSource::EntryInline,
-        };
-
-        let mut outcome = ReclaimOutcome::default();
-        let (lbamap, extent_index) = self.maps.base_mut();
+            body_length: result.body_length,
+        }),
+        inline: extentindex::InlineSource::EntryInline,
+    };
+    let new_base = layers.fold_below(result.segment_ulid, |lbamap, extent_index| {
         for (raw_idx, re) in result.entries.iter().enumerate() {
-            let blocks = lbamap.register_entry_if_newer(&re.entry, result.segment_ulid);
-            if blocks == 0 {
-                outcome.runs_refused += 1;
+            if lbamap.register_entry_if_newer(&re.entry, result.segment_ulid) == 0 {
                 continue;
             }
             extent_index.register_entry_consuming_inputs(
@@ -495,26 +521,38 @@ impl Volume {
                 &ctx,
                 &no_consumed_inputs,
             )?;
-            outcome.runs_rewritten += 1;
-            // Reaching here means `blocks > 0`, so the entry spans at
-            // least one block and the divisor is non-zero. Live bytes
-            // are `lba_length * 4096`, which makes the pro-rate exact
-            // when a concurrent write kept part of the range.
-            outcome.bytes_rewritten +=
-                re.uncompressed_bytes * u64::from(blocks) / u64::from(re.entry.lba_length);
         }
+        Ok(())
+    })?;
 
-        if outcome.runs_rewritten == 0 {
-            let path = result.pending_dir.join(result.segment_ulid.to_string());
-            let _ = std::fs::remove_file(&path);
-            outcome.discarded = true;
-            return Ok(outcome);
+    let view = layers.above(result.segment_ulid, new_base.clone());
+    let mut outcome = ReclaimOutcome::default();
+    for re in &result.entries {
+        let start = re.entry.start_lba;
+        let end = start + u64::from(re.entry.lba_length);
+        let blocks: u64 = view
+            .extents_in_range(start, end)
+            .iter()
+            .filter(|e| e.claimant_ulid == result.segment_ulid)
+            .map(|e| e.range_end - e.range_start)
+            .sum();
+        if blocks == 0 {
+            outcome.runs_refused += 1;
+            continue;
         }
-
-        self.has_new_segments = true;
-        self.last_segment_ulid = Some(result.segment_ulid);
-        Ok(outcome)
+        outcome.runs_rewritten += 1;
+        // Live bytes are `lba_length * 4096`, which makes the pro-rate exact
+        // when a concurrent write kept part of the range.
+        outcome.bytes_rewritten += re.uncompressed_bytes * blocks / u64::from(re.entry.lba_length);
     }
+
+    if outcome.runs_rewritten == 0 {
+        let path = result.pending_dir.join(result.segment_ulid.to_string());
+        let _ = std::fs::remove_file(&path);
+        outcome.discarded = true;
+        return Ok(ReclaimFold::NoSwap(outcome));
+    }
+    Ok(ReclaimFold::Landed { new_base, outcome })
 }
 
 #[cfg(test)]

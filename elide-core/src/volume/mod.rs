@@ -88,8 +88,8 @@ pub use reap::{
     parse_reap_candidates, sweep_unreachable,
 };
 pub use reclaim::{
-    ReclaimCandidate, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult, ReclaimThresholds,
-    ReclaimedEntry, scan_reclaim_candidates,
+    ReclaimCandidate, ReclaimFold, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult,
+    ReclaimThresholds, ReclaimedEntry, fold_reclaim_result, scan_reclaim_candidates,
 };
 pub use repack::{
     CloseGenerationPrep, CompactionStats, RepackApply, RepackJob, RepackResult, RepackedBucket,
@@ -421,6 +421,119 @@ pub fn remove_promoted_wal(result: &PromoteResult) {
             result.old_wal_path.display()
         );
     }
+}
+
+/// A promoted segment's fold: the drain flip or the GC-carried flip run over
+/// a clone of base. Runs with the volume mutex released;
+/// [`Volume::swap_promote_segment`] installs the result.
+pub fn fold_promote_segment_result(
+    layers: &MapLayers,
+    result: &PromoteSegmentResult,
+) -> io::Result<Maps> {
+    if result.tombstone {
+        return Ok(layers.base().clone());
+    }
+    layers.fold_base(|_, extent_index| {
+        flip_promoted_segment(extent_index, result);
+        Ok(())
+    })
+}
+
+/// Point a promoted segment's entries at `cache/<ulid>`.
+fn flip_promoted_segment(
+    extent_index: &mut extentindex::ExtentIndex,
+    result: &PromoteSegmentResult,
+) {
+    let ulid = result.ulid;
+    let entries = &result.parsed.entries;
+    let body_section_start = result.parsed.body_section_start;
+
+    // The in-memory mirror of the all-bits-set `cache/<ulid>.present` that
+    // `promote_to_cache` wrote. The hot read path uses it for the per-entry
+    // presence check on `BodyOnly` cache hits.
+    extent_index.set_segment_presence(
+        ulid,
+        Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
+    );
+
+    if result.is_drain {
+        for (i, entry) in entries.iter().enumerate() {
+            if !entry.kind.has_body_bytes() || entry.journal {
+                continue;
+            }
+            // Durable entries only: the CAS is gated on this segment owning
+            // the hash. Journal-tier entries flip below through the journal
+            // map.
+            let owns = extent_index
+                .lookup(&entry.hash)
+                .is_some_and(|loc| loc.segment_id == ulid);
+            if !owns {
+                continue;
+            }
+            let idata = if entry.kind.is_inline() {
+                let start = entry.stored_offset as usize;
+                let end = start + entry.stored_length as usize;
+                if end <= result.inline.len() {
+                    Some(result.inline[start..end].into())
+                } else {
+                    continue;
+                }
+            } else {
+                None
+            };
+            extent_index.insert(
+                entry.hash,
+                extentindex::ExtentLocation {
+                    segment_id: ulid,
+                    body_offset: entry.stored_offset,
+                    body_length: entry.stored_length,
+                    codec: entry.codec,
+                    body_source: BodySource::Cached(i as u32),
+                    body_section_start,
+                    inline_data: idata,
+                },
+            );
+        }
+        // Journal-tier bodies flip from Local to Cached through the journal
+        // map. The presence-bitmap index for each hash is its first entry
+        // position.
+        extent_index.promote_journal_segment_to_cache(ulid, body_section_start, entries);
+    }
+
+    // Delta entries: the delta blob lives in the `cache/<ulid>.delta`
+    // sidecar, so `DeltaBodySource::Full` becomes `Cached`. The CAS against
+    // `segment_id == ulid` lets a concurrent delta-repack or reclaim that
+    // re-pointed the hash at a newer segment win.
+    for entry in entries.iter() {
+        if !entry.kind.is_delta() {
+            continue;
+        }
+        extent_index.flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
+    }
+}
+
+/// Delete a promoted segment's sources: a drain's `pending/<ulid>` and its
+/// `.delta` sidecar, or the idx files of a GC output's consumed inputs. Runs
+/// after the swap is published, so a reader on an older snapshot recovers
+/// through its `NotFound` retry.
+pub fn remove_promoted_segment_sources(
+    base_dir: &Path,
+    result: &PromoteSegmentResult,
+) -> io::Result<()> {
+    if result.tombstone || !result.is_drain {
+        let index_dir = base_dir.join("index");
+        for old_ulid in &result.parsed.inputs {
+            let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+        }
+        return Ok(());
+    }
+    let ulid_str = result.ulid.to_string();
+    if let Some(delta_path) = segment::find_pending_file(base_dir, &format!("{ulid_str}.delta")) {
+        let _ = fs::remove_file(&delta_path);
+    }
+    let pending_path = segment::find_pending_file(base_dir, &ulid_str)
+        .ok_or_else(|| io::Error::other(format!("pending segment {ulid_str} missing")))?;
+    fs::remove_file(&pending_path)
 }
 
 /// One destination segment's share of a promote apply.
@@ -3066,173 +3179,46 @@ impl Volume {
         })))
     }
 
-    /// Apply phase of `promote_segment`. Consumes the worker's result.
-    ///
-    /// Drain path: transitions extent-index entries from
-    /// `BodySource::Local` (pointing at `pending/<ulid>`) to
-    /// `BodySource::Cached(n)` (pointing at the new `cache/<ulid>.body`).
-    /// The CAS check (`segment_id == ulid`) makes the rewrite a no-op for
-    /// any entry a concurrent write has already superseded. Then evicts
-    /// the segment's cached fd, deletes the delta sidecar if present,
-    /// and deletes `pending/<ulid>`.
-    ///
-    /// GC tombstone path: deletes `index/<old>.idx` for every consumed
-    /// input. No extent-index updates (tombstones carry no entries).
-    ///
-    /// GC carried path: same as tombstone plus the extent-index state
-    /// stays untouched — the `apply_gc_handoffs` step already rewrote
-    /// the extent index to `BodySource::Cached` against the fresh ULID.
+    /// Apply phase of `promote_segment` for a caller that holds the volume
+    /// across it: fold, swap, then delete the source files. The actor runs
+    /// the three steps itself with the mutex released around the fold
+    /// ([`fold_promote_segment_result`], [`Self::swap_promote_segment`],
+    /// [`remove_promoted_segment_sources`]).
     pub fn apply_promote_segment_result(&mut self, result: PromoteSegmentResult) -> io::Result<()> {
-        let PromoteSegmentResult {
-            ulid,
-            is_drain,
-            parsed,
-            inline,
-            tombstone,
-        } = result;
-        let entries = &parsed.entries;
-        let inputs = &parsed.inputs;
-        let body_section_start = parsed.body_section_start;
-        let index_dir = self.base_dir.join("index");
-        self.own_segments.insert(ulid);
+        let layers = self.maps.clone();
+        let new_base = fold_promote_segment_result(&layers, &result)?;
+        self.swap_promote_segment(&result, new_base, layers.base());
+        remove_promoted_segment_sources(&self.base_dir, &result)
+    }
 
-        if tombstone {
-            for old_ulid in inputs {
-                let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
+    /// Install a promoted segment's fold and the bookkeeping the apply owns.
+    /// O(1) in the maps.
+    pub fn swap_promote_segment(
+        &mut self,
+        result: &PromoteSegmentResult,
+        new_base: Maps,
+        folded_from: &Maps,
+    ) {
+        self.own_segments.insert(result.ulid);
+        if result.tombstone || !result.is_drain {
+            for old_ulid in &result.parsed.inputs {
                 self.own_segments.remove(old_ulid);
             }
-            self.assert_volume_invariants("apply_promote_segment_result_tombstone");
-            return Ok(());
         }
-
-        if is_drain {
-            // Evict before the CAS so readers arriving post-publish
-            // open the new cache body, not a stale handle to the
-            // soon-to-be-deleted pending file.
-            self.evict_cached_segment(ulid);
-
-            // Install the in-memory mirror of the all-bits-set
-            // `cache/<ulid>.present` that `promote_to_cache` just
-            // wrote. The hot read path uses this for the per-entry
-            // presence check on `BodyOnly` cache hits — without it
-            // the rebuild-on-startup path would be the only source,
-            // which is too late for live drains.
-            self.maps.extent_index_mut().set_segment_presence(
-                ulid,
-                Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
-            );
-
-            for (i, entry) in entries.iter().enumerate() {
-                if !entry.kind.has_body_bytes() || entry.journal {
-                    continue;
-                }
-                // Durable entries only: the CAS is gated on this segment
-                // already owning the hash in `inner`. Journal-tier entries
-                // are flipped to Cached below via the journal map.
-                let owns = self
-                    .maps
-                    .materialised()
-                    .extent_index
-                    .lookup(&entry.hash)
-                    .is_some_and(|loc| loc.segment_id == ulid);
-                if !owns {
-                    continue;
-                }
-                let idata = if entry.kind.is_inline() {
-                    let start = entry.stored_offset as usize;
-                    let end = start + entry.stored_length as usize;
-                    if end <= inline.len() {
-                        Some(inline[start..end].into())
-                    } else {
-                        continue;
-                    }
-                } else {
-                    None
-                };
-                self.maps.extent_index_mut().insert(
-                    entry.hash,
-                    extentindex::ExtentLocation {
-                        segment_id: ulid,
-                        body_offset: entry.stored_offset,
-                        body_length: entry.stored_length,
-                        codec: entry.codec,
-                        body_source: BodySource::Cached(i as u32),
-                        body_section_start,
-                        inline_data: idata,
-                    },
-                );
-            }
-            // Flip journal-tier bodies for this segment from Local to
-            // Cached, mirroring the durable loop above. The presence-bitmap
-            // index for each hash is its first entry position.
-            self.maps
-                .extent_index_mut()
-                .promote_journal_segment_to_cache(ulid, body_section_start, entries);
-
-            // Delta entries: the delta blob has moved from inline in
-            // the now-deleted pending file to the standalone
-            // `cache/<ulid>.delta` sidecar, so flip
-            // `DeltaBodySource::Full → Cached`. CAS against
-            // `segment_id == ulid` so a concurrent delta-repack or
-            // reclaim that re-pointed the hash at a newer segment
-            // wins.
-            for entry in entries.iter() {
-                if !entry.kind.is_delta() {
-                    continue;
-                }
-                self.maps
-                    .extent_index_mut()
-                    .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
-            }
-
-            let ulid_str = ulid.to_string();
-            if let Some(delta_path) =
-                segment::find_pending_file(&self.base_dir, &format!("{ulid_str}.delta"))
-            {
-                let _ = fs::remove_file(&delta_path);
-            }
-            let pending_path = segment::find_pending_file(&self.base_dir, &ulid_str)
-                .ok_or_else(|| io::Error::other(format!("pending segment {ulid_str} missing")))?;
-            fs::remove_file(&pending_path)?;
-        } else {
-            // GC carried path: delete each consumed input's idx.
-            for old_ulid in inputs {
-                let _ = fs::remove_file(index_dir.join(format!("{old_ulid}.idx")));
-                self.own_segments.remove(old_ulid);
-            }
-
-            // GC carried entries already reference `BodySource::Cached(idx)`
-            // against `ulid` (planted by `apply_gc_handoffs`); now that
-            // `promote_to_cache` has produced `cache/<ulid>.body` +
-            // `cache/<ulid>.present`, install the in-memory presence
-            // mirror so reads against the new cache shape succeed
-            // without consulting `.present` on disk.
-            self.maps.extent_index_mut().set_segment_presence(
-                ulid,
-                Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
-            );
-
-            // Carried Delta entries: the delta blob now lives in the
-            // `cache/<ulid>.delta` sidecar rather than the bare
-            // `gc/<ulid>` file, so flip `DeltaBodySource::Full →
-            // Cached`. CAS against `segment_id == ulid` so a
-            // concurrent repoint at a newer segment wins.
-            for entry in entries.iter() {
-                if !entry.kind.is_delta() {
-                    continue;
-                }
-                self.maps
-                    .extent_index_mut()
-                    .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
-            }
+        if result.is_drain {
+            // Evict before the swap so readers arriving post-publish open
+            // the new cache body.
+            self.evict_cached_segment(result.ulid);
         }
-        let caller = if is_drain {
+        self.maps.swap_base(folded_from, new_base);
+        let caller = if result.tombstone {
+            "apply_promote_segment_result_tombstone"
+        } else if result.is_drain {
             "apply_promote_segment_result_drain"
         } else {
             "apply_promote_segment_result_gc_carried"
         };
         self.assert_volume_invariants(caller);
-        Ok(())
     }
 
     /// Finalize a completed GC handoff by deleting the bare `gc/<ulid>` file.
