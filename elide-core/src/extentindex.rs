@@ -340,7 +340,7 @@ pub struct ExtentIndex {
     /// consumed inputs wholesale — none of them scan the whole tier. An
     /// empty submap is always removed, so [`journal_is_empty`](Self::journal_is_empty)
     /// stays a single outer check. See `docs/design/gc-journal-segregation.md`.
-    journal: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, ExtentLocation>>,
+    journal: imbl::HashMap<Ulid, Blake3HamtMap<ExtentLocation>>,
     /// Source hashes named by every Delta encoding on disk, keyed by the
     /// segment holding the encoding and then by the composite hash.
     ///
@@ -357,7 +357,7 @@ pub struct ExtentIndex {
     ///
     /// Segment-outer for the same reason as `journal`: retiring an input is
     /// one `remove`.
-    delta_sources: imbl::HashMap<Ulid, imbl::HashMap<blake3::Hash, Arc<[blake3::Hash]>>>,
+    delta_sources: imbl::HashMap<Ulid, Blake3HamtMap<Arc<[blake3::Hash]>>>,
     /// `delta_source_counts[s]` equals the number of recorded encodings
     /// across `delta_sources` naming `s` as a source, maintained on the
     /// recording and purge paths. Answers
