@@ -1,8 +1,11 @@
-//! The volume's maps as layers: a large `base`, and a small `delta` that
-//! holds the open WAL's writes. Reads resolve `delta`, then `base`. A
-//! mutation of `base` absorbs `delta` first, so iteration always runs over
-//! one map (`docs/design/epoch-applies.md`).
+//! The volume's maps as layers: a large `base`, frozen layers that each hold
+//! one WAL epoch a promote is in the middle of committing, and a small
+//! `delta` that holds the open WAL's writes. Reads resolve `delta`, then the
+//! frozen layers newest first, then `base`. A mutation of `base` absorbs every
+//! layer first, so iteration always runs over one map
+//! (`docs/design/epoch-applies.md`).
 
+use std::io;
 use std::sync::Arc;
 
 use ulid::Ulid;
@@ -42,11 +45,21 @@ impl Default for Maps {
     }
 }
 
-/// `base` under `delta`. `delta` holds body locations in the open WAL and
-/// the claims those writes made; every other kind of entry lives in `base`.
+/// One WAL epoch between its promote's freeze and swap.
+#[derive(Clone)]
+struct FrozenLayer {
+    wal_ulid: Ulid,
+    maps: Maps,
+}
+
+/// `base` under the frozen layers under `delta`. `delta` and the frozen
+/// layers hold body locations in a WAL and the claims those writes made;
+/// every other kind of entry lives in `base`.
 #[derive(Clone)]
 pub struct MapLayers {
     base: Maps,
+    /// Oldest first.
+    frozen: Vec<FrozenLayer>,
     delta: Maps,
 }
 
@@ -54,6 +67,7 @@ impl MapLayers {
     pub fn new(base: Maps) -> Self {
         Self {
             base,
+            frozen: Vec::new(),
             delta: Maps::empty(),
         }
     }
@@ -62,75 +76,72 @@ impl MapLayers {
         self.delta.is_empty()
     }
 
+    pub fn frozen_depth(&self) -> usize {
+        self.frozen.len()
+    }
+
     /// The base layer alone. Segment presence lives only here, so a
     /// presence probe reads it without a fold.
     pub fn base(&self) -> &Maps {
         &self.base
     }
 
+    /// The layers above `base`, newest first.
+    fn upper(&self) -> impl Iterator<Item = &Maps> {
+        std::iter::once(&self.delta).chain(self.frozen.iter().rev().map(|l| &l.maps))
+    }
+
+    /// Every layer, newest first.
+    fn all(&self) -> impl Iterator<Item = &Maps> {
+        self.upper().chain(std::iter::once(&self.base))
+    }
+
     /// The extents that cover `[start_lba, end_lba)`, in LBA order, each
     /// taken from the topmost layer that covers its sub-range.
     pub fn extents_in_range(&self, start_lba: u64, end_lba: u64) -> Vec<ExtentRead> {
+        let layers: Vec<&Arc<LbaMap>> = self.all().map(|m| &m.lbamap).collect();
         let mut out = Vec::new();
-        overlay(
-            &[&self.delta.lbamap, &self.base.lbamap],
-            start_lba,
-            end_lba,
-            &mut out,
-        );
+        overlay(&layers, start_lba, end_lba, &mut out);
         out
     }
 
     /// [`LbaMap::has_full_match`] on the topmost layer that covers any part
-    /// of the range. A partial cover in `delta` answers for the range, so a
-    /// match in `base` under it reads as no match.
+    /// of the range. A partial cover in an upper layer answers for the
+    /// range, so a match in a layer under it reads as no match.
     pub fn has_full_match(&self, start_lba: u64, lba_length: u32, hash: &blake3::Hash) -> bool {
         let end_lba = start_lba + lba_length as u64;
-        if self
-            .delta
-            .lbamap
-            .extents_in_range(start_lba, end_lba)
-            .next()
-            .is_some()
-        {
-            return self
-                .delta
+        for layer in self.upper() {
+            if layer
                 .lbamap
-                .has_full_match(start_lba, lba_length, hash);
+                .extents_in_range(start_lba, end_lba)
+                .next()
+                .is_some()
+            {
+                return layer.lbamap.has_full_match(start_lba, lba_length, hash);
+            }
         }
         self.base.lbamap.has_full_match(start_lba, lba_length, hash)
     }
 
     pub fn lookup_extent(&self, hash: &blake3::Hash) -> Option<&ExtentLocation> {
-        self.delta
-            .extent_index
-            .lookup(hash)
-            .or_else(|| self.base.extent_index.lookup(hash))
+        self.all().find_map(|m| m.extent_index.lookup(hash))
     }
 
     pub fn lookup_journal(&self, segment: Ulid, hash: &blake3::Hash) -> Option<&ExtentLocation> {
-        self.delta
-            .extent_index
-            .lookup_journal(segment, hash)
-            .or_else(|| self.base.extent_index.lookup_journal(segment, hash))
+        self.all()
+            .find_map(|m| m.extent_index.lookup_journal(segment, hash))
     }
 
     pub fn lookup_delta(&self, hash: &blake3::Hash) -> Option<&DeltaLocation> {
-        self.delta
-            .extent_index
-            .lookup_delta(hash)
-            .or_else(|| self.base.extent_index.lookup_delta(hash))
+        self.all().find_map(|m| m.extent_index.lookup_delta(hash))
     }
 
     pub fn journal_is_empty(&self) -> bool {
-        self.delta.extent_index.journal_is_empty() && self.base.extent_index.journal_is_empty()
+        self.all().all(|m| m.extent_index.journal_is_empty())
     }
 
     pub fn segment_presence(&self, segment: Ulid) -> Option<&Arc<SegmentPresence>> {
-        self.delta
-            .extent_index
-            .segment_presence(segment)
-            .or_else(|| self.base.extent_index.segment_presence(segment))
+        self.base.extent_index.segment_presence(segment)
     }
 
     /// The write path's target.
@@ -143,8 +154,22 @@ impl MapLayers {
         Arc::make_mut(&mut self.delta.extent_index)
     }
 
-    /// Fold `delta` into `base` and leave `delta` empty.
+    /// Close the open WAL's epoch: `delta` becomes a frozen layer tagged
+    /// `wal_ulid`, and a fresh `delta` receives the next epoch's writes.
+    pub fn freeze(&mut self, wal_ulid: Ulid) {
+        if self.delta.is_empty() {
+            return;
+        }
+        let maps = std::mem::take(&mut self.delta);
+        self.frozen.push(FrozenLayer { wal_ulid, maps });
+    }
+
+    /// Fold every frozen layer, oldest first, then `delta`, into `base`,
+    /// and leave both empty.
     pub fn absorb(&mut self) {
+        for layer in self.frozen.drain(..) {
+            fold(&mut self.base, &layer.maps);
+        }
         if self.delta.is_empty() {
             return;
         }
@@ -152,19 +177,19 @@ impl MapLayers {
         fold(&mut self.base, &delta);
     }
 
-    /// `base`'s LBA map for mutation, with `delta` absorbed first.
+    /// `base`'s LBA map for mutation, with every layer absorbed first.
     pub fn lbamap_mut(&mut self) -> &mut LbaMap {
         self.absorb();
         Arc::make_mut(&mut self.base.lbamap)
     }
 
-    /// `base`'s extent index for mutation, with `delta` absorbed first.
+    /// `base`'s extent index for mutation, with every layer absorbed first.
     pub fn extent_index_mut(&mut self) -> &mut ExtentIndex {
         self.absorb();
         Arc::make_mut(&mut self.base.extent_index)
     }
 
-    /// Both of `base`'s maps for mutation, with `delta` absorbed first.
+    /// Both of `base`'s maps for mutation, with every layer absorbed first.
     pub fn base_mut(&mut self) -> (&mut LbaMap, &mut ExtentIndex) {
         self.absorb();
         (
@@ -173,45 +198,91 @@ impl MapLayers {
         )
     }
 
-    /// One map with `delta` folded in. Two handle clones when `delta` is
-    /// empty, otherwise a fold into a clone of `base`. `self` is unchanged.
+    /// One map with every layer folded in. Two handle clones when the
+    /// layers are empty, otherwise a fold into a clone of `base`. `self` is
+    /// unchanged.
     pub fn materialised(&self) -> Maps {
-        if self.delta.is_empty() {
+        if self.frozen.is_empty() && self.delta.is_empty() {
             return self.base.clone();
         }
         let mut maps = self.base.clone();
-        fold(&mut maps, &self.delta);
+        for layer in &self.frozen {
+            fold(&mut maps, &layer.maps);
+        }
+        if !self.delta.is_empty() {
+            fold(&mut maps, &self.delta);
+        }
         maps
     }
 
+    /// A promote's fold: a clone of `base` with the layer tagged `wal_ulid`
+    /// replayed into it, then `apply` run over the clone. `self` is
+    /// unchanged, so the caller runs this with the volume mutex released.
+    /// A layer an earlier absorb already folded is in `base`, so the
+    /// replay is a no-op and `apply` finds its locations there.
+    pub fn fold_promote(
+        &self,
+        wal_ulid: Ulid,
+        apply: impl FnOnce(&mut LbaMap, &mut ExtentIndex) -> io::Result<()>,
+    ) -> io::Result<Maps> {
+        let mut maps = self.base.clone();
+        if let Some(layer) = self.frozen.iter().find(|l| l.wal_ulid == wal_ulid) {
+            fold(&mut maps, &layer.maps);
+        }
+        apply(
+            Arc::make_mut(&mut maps.lbamap),
+            Arc::make_mut(&mut maps.extent_index),
+        )?;
+        Ok(maps)
+    }
+
+    /// Install a promote's fold as `base` and retire its frozen layer.
+    ///
+    /// `folded_from` is the `base` the fold started from. The actor is the
+    /// only mutator of `base`, and it runs the fold and this swap on its own
+    /// thread with no other apply between them, so the two are the same
+    /// handles; the assertion states that invariant.
+    pub fn swap_promote(&mut self, folded_from: &Maps, new_base: Maps, wal_ulid: Ulid) {
+        debug_assert!(
+            Arc::ptr_eq(&self.base.lbamap, &folded_from.lbamap)
+                && Arc::ptr_eq(&self.base.extent_index, &folded_from.extent_index),
+            "base moved between a promote's fold and its swap"
+        );
+        self.base = new_base;
+        self.frozen.retain(|l| l.wal_ulid != wal_ulid);
+    }
+
     /// Put `base` back to `pre`, a value [`Self::materialised`] returned
-    /// after an absorb. `delta` is empty across a mutation and its rollback,
-    /// which both run under one hold of the volume mutex.
+    /// after an absorb. The layers are empty across a mutation and its
+    /// rollback, which both run under one hold of the volume mutex.
     pub fn restore(&mut self, pre: Maps) {
-        debug_assert!(self.delta.is_empty(), "restore with a populated delta");
+        debug_assert!(
+            self.frozen.is_empty() && self.delta.is_empty(),
+            "restore with populated layers"
+        );
         self.base = pre;
     }
 }
 
-/// Replay `delta`'s entries over `base`. The entries are disjoint and are
+/// Replay `layer`'s entries over `base`. The entries are disjoint and are
 /// the net of the writes that produced them, so the replay equals the writes.
-fn fold(base: &mut Maps, delta: &Maps) {
+fn fold(base: &mut Maps, layer: &Maps) {
     let lbamap = Arc::make_mut(&mut base.lbamap);
     for (lba, len, hash, payload_block_offset, claimant) in
-        delta.lbamap.iter_entries_with_claimant()
+        layer.lbamap.iter_entries_with_claimant()
     {
         lbamap.insert_with_offset(lba, len, payload_block_offset, hash, claimant);
     }
     let index = Arc::make_mut(&mut base.extent_index);
-    for (hash, location) in delta.extent_index.iter() {
+    for (hash, location) in layer.extent_index.iter() {
         index.insert_if_absent(*hash, location.clone());
     }
-    for ((segment, hash), location) in delta.extent_index.journal_iter() {
+    for ((segment, hash), location) in layer.extent_index.journal_iter() {
         index.insert_journal_if_absent(segment, hash, location.clone());
     }
     debug_assert!(
-        delta.extent_index.deltas_iter().next().is_none(),
-        "the delta layer holds Delta locations"
+        layer.extent_index.deltas_iter().next().is_none(),
+        "an upper layer holds Delta locations"
     );
 }
 
@@ -250,6 +321,10 @@ mod tests {
         v.iter()
             .map(|x| (x.range_start, x.range_end, x.hash, x.payload_block_offset))
             .collect()
+    }
+
+    fn entries(m: &LbaMap) -> Vec<(u64, u32, blake3::Hash, u32, Ulid)> {
+        m.iter_entries_with_claimant().collect()
     }
 
     #[test]
@@ -310,6 +385,120 @@ mod tests {
         assert!(!layers.has_full_match(16, 2, &h(4)));
     }
 
+    #[test]
+    fn frozen_layers_sit_between_delta_and_base_newest_first() {
+        let mut base = LbaMap::new();
+        base.insert(0, 8, h(1), seg(1));
+        let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
+
+        layers.delta_lbamap_mut().insert(2, 2, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(3, 2, h(3), seg(11));
+        layers.freeze(seg(11));
+        layers.delta_lbamap_mut().insert(6, 1, h(4), seg(12));
+        assert_eq!(layers.frozen_depth(), 2);
+
+        assert_eq!(
+            reads(&layers.extents_in_range(0, 8)),
+            vec![
+                (0, 2, h(1), 0),
+                (2, 3, h(2), 0),
+                (3, 5, h(3), 0),
+                (5, 6, h(1), 5),
+                (6, 7, h(4), 0),
+                (7, 8, h(1), 7),
+            ]
+        );
+        assert!(layers.has_full_match(6, 1, &h(4)));
+        assert!(
+            !layers.has_full_match(2, 2, &h(2)),
+            "the newer layer covers part"
+        );
+
+        let single = layers.materialised();
+        assert_eq!(
+            reads(&single.lbamap.extents_in_range(0, 8).collect::<Vec<_>>()),
+            reads(&layers.extents_in_range(0, 8))
+        );
+    }
+
+    #[test]
+    fn an_empty_delta_freezes_nothing() {
+        let mut layers = MapLayers::new(Maps::empty());
+        layers.freeze(seg(10));
+        assert_eq!(layers.frozen_depth(), 0);
+    }
+
+    #[test]
+    fn fold_promote_replays_one_layer_and_swap_retires_it() {
+        let mut base = LbaMap::new();
+        base.insert(0, 8, h(1), seg(1));
+        let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
+        layers.delta_lbamap_mut().insert(2, 2, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(4, 2, h(3), seg(11));
+        layers.freeze(seg(11));
+        layers.delta_lbamap_mut().insert(6, 1, h(4), seg(12));
+
+        let folded_from = layers.base().clone();
+        let new_base = layers
+            .fold_promote(seg(10), |lbamap, _index| {
+                assert_eq!(lbamap.set_claimant_if_matches(2, 2, h(2), seg(20)), 1);
+                assert_eq!(
+                    lbamap.set_claimant_if_matches(4, 2, h(3), seg(20)),
+                    0,
+                    "the other frozen layer is outside this fold"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            layers.base().lbamap.claimant_at(2),
+            Some(seg(1)),
+            "the fold leaves the live base alone"
+        );
+
+        layers.swap_promote(&folded_from, new_base, seg(10));
+        assert_eq!(layers.frozen_depth(), 1);
+        assert_eq!(layers.base().lbamap.claimant_at(2), Some(seg(20)));
+        assert_eq!(
+            reads(&layers.extents_in_range(0, 8)),
+            vec![
+                (0, 2, h(1), 0),
+                (2, 4, h(2), 0),
+                (4, 6, h(3), 0),
+                (6, 7, h(4), 0),
+                (7, 8, h(1), 7),
+            ]
+        );
+
+        layers.absorb();
+        assert_eq!(layers.frozen_depth(), 0);
+        assert!(layers.delta_is_empty());
+        assert_eq!(layers.base().lbamap.claimant_at(4), Some(seg(11)));
+        assert_eq!(layers.base().lbamap.claimant_at(6), Some(seg(12)));
+    }
+
+    #[test]
+    fn a_layer_an_absorb_took_still_folds_and_swaps() {
+        let mut layers = MapLayers::new(Maps::empty());
+        layers.delta_lbamap_mut().insert(0, 4, h(1), seg(10));
+        layers.freeze(seg(10));
+        layers.lbamap_mut().insert(8, 1, h(2), seg(30));
+        assert_eq!(layers.frozen_depth(), 0);
+
+        let folded_from = layers.base().clone();
+        let new_base = layers
+            .fold_promote(seg(10), |lbamap, _| {
+                assert_eq!(lbamap.set_claimant_if_matches(0, 4, h(1), seg(20)), 1);
+                Ok(())
+            })
+            .unwrap();
+        layers.swap_promote(&folded_from, new_base, seg(10));
+        assert_eq!(layers.base().lbamap.claimant_at(0), Some(seg(20)));
+        assert_eq!(layers.base().lbamap.claimant_at(8), Some(seg(30)));
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -320,10 +509,6 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             self.0 >> 33
         }
-    }
-
-    fn entries(m: &LbaMap) -> Vec<(u64, u32, blake3::Hash, u32, Ulid)> {
-        m.iter_entries_with_claimant().collect()
     }
 
     #[test]
@@ -339,24 +524,36 @@ mod tests {
             base.insert(lba, len, hash, seg(1));
         }
         let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
-        for _ in 0..200 {
-            let lba = lcg.next() % 64;
-            let len = 1 + (lcg.next() % 4) as u32;
-            let hash = h((lcg.next() % 16) as u8);
-            single.insert(lba, len, hash, seg(2));
-            layers.delta_lbamap_mut().insert(lba, len, hash, seg(2));
+        for epoch in 2..5u64 {
+            for _ in 0..100 {
+                let lba = lcg.next() % 64;
+                let len = 1 + (lcg.next() % 4) as u32;
+                let hash = h((lcg.next() % 16) as u8);
+                single.insert(lba, len, hash, seg(epoch));
+                layers.delta_lbamap_mut().insert(lba, len, hash, seg(epoch));
+            }
+            if epoch < 4 {
+                layers.freeze(seg(epoch));
+            }
         }
+        assert_eq!(layers.frozen_depth(), 2);
         assert!(!layers.delta_is_empty());
 
         let materialised = layers.materialised();
-        assert!(
-            !layers.delta_is_empty(),
+        assert_eq!(
+            layers.frozen_depth(),
+            2,
             "materialised leaves the layers alone"
         );
         assert_eq!(entries(&materialised.lbamap), entries(&single));
+        assert_eq!(reads(&layers.extents_in_range(0, 64)), {
+            let v: Vec<ExtentRead> = single.extents_in_range(0, 64).collect();
+            reads(&v)
+        });
 
         layers.absorb();
         assert!(layers.delta_is_empty());
+        assert_eq!(layers.frozen_depth(), 0);
         let absorbed = layers.materialised();
         assert_eq!(entries(&absorbed.lbamap), entries(&single));
         for n in 0..16u8 {
@@ -366,10 +563,6 @@ mod tests {
                 "claim count for hash {n}"
             );
         }
-        assert_eq!(reads(&layers.extents_in_range(0, 64)), {
-            let v: Vec<ExtentRead> = single.extents_in_range(0, 64).collect();
-            reads(&v)
-        });
     }
 
     #[test]

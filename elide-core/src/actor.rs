@@ -1338,9 +1338,19 @@ impl VolumeActor {
             WorkerResult::Promote(Ok(result)) => {
                 self.pipeline.promotes_in_flight -= 1;
                 let ulid = result.segment_ulid;
-                let apply = self
+                // The fold runs on this thread with the mutex released; the
+                // two holds around it clone and swap handles.
+                let layers = self
                     .lock_volume(LockSite::PromoteApply)
-                    .apply_promote(&result);
+                    .map_layers()
+                    .clone();
+                let apply = crate::volume::fold_promote_result(&layers, &result).map(|new_base| {
+                    self.lock_volume(LockSite::PromoteApply).swap_promote(
+                        &result,
+                        new_base,
+                        layers.base(),
+                    );
+                });
                 if let Err(e) = &apply {
                     // The segment is committed and the old WAL was kept, so
                     // reads stay resolvable; the in-memory maps are missing
@@ -1349,6 +1359,9 @@ impl VolumeActor {
                     error!("apply of promoted segment {ulid} failed: {e}");
                 }
                 self.publish_snapshot();
+                if apply.is_ok() {
+                    crate::volume::remove_promoted_wal(&result);
+                }
                 self.on_promote_result();
 
                 let clone_apply = |apply: &io::Result<()>| match apply {
@@ -2889,28 +2902,51 @@ impl PriorSourceCache {
 /// path and the startup recovery promote in `Volume::open_impl`, so all
 /// three execution sites share one write pass.
 pub(crate) fn execute_promote(
-    job: PromoteJob,
+    mut job: PromoteJob,
     prior_cache: &mut PriorSourceCache,
 ) -> Result<PromoteResult, PromoteFailure> {
-    fn fail(error: io::Error, job: PromoteJob) -> PromoteFailure {
-        PromoteFailure {
-            error,
-            job: Box::new(job),
+    let maps = job.layers.materialised();
+    let (primary, journal, dedup) = crate::volume::stage_pending_for_promote(
+        std::mem::take(&mut job.pending),
+        &maps.extent_index,
+        job.old_wal_ulid,
+        &job.journal_ranges,
+        job.journal_segment_ulid,
+    );
+    match write_promote(&job, &maps, &primary, journal.as_ref(), prior_cache) {
+        Ok(mut result) => {
+            result.dedup = dedup;
+            Ok(result)
+        }
+        Err(error) => {
+            job.pending = primary.into_writes();
+            if let Some(j) = journal {
+                job.pending.extend(j.partition.into_writes());
+            }
+            Err(PromoteFailure {
+                error,
+                job: Box::new(job),
+            })
         }
     }
+}
 
-    if let Err(e) = std::fs::File::open(&job.old_wal_path).and_then(|f| f.sync_data()) {
-        return Err(fail(e, job));
-    }
+/// Write the staged partitions as segments. `maps` is the job's layers
+/// folded into one map; the delta tiers resolve sources through it.
+fn write_promote(
+    job: &PromoteJob,
+    maps: &crate::map_layers::Maps,
+    primary: &crate::volume::PendingPartition,
+    journal: Option<&crate::volume::JournalPartition>,
+    prior_cache: &mut PriorSourceCache,
+) -> io::Result<PromoteResult> {
+    std::fs::File::open(&job.old_wal_path).and_then(|f| f.sync_data())?;
 
     // Body bytes for entries written via `write_commit` live only in the WAL
     // between commit and promote. Pair each pending write back with its bytes
     // for write_and_commit to consume.
     let mut pendings =
-        match crate::volume::materialise_pending_bodies(&job.old_wal_path, job.primary.writes()) {
-            Ok(p) => p,
-            Err(e) => return Err(fail(e, job)),
-        };
+        crate::volume::materialise_pending_bodies(&job.old_wal_path, primary.writes())?;
 
     // Delta tiers, in cascade order. Same-LBA first where the volume has a
     // sealed snapshot, then resemblance over what it left alone. Both are
@@ -2941,7 +2977,7 @@ pub(crate) fn execute_promote(
                     match crate::delta_compute::delta_pendings_against_prior(
                         &mut pendings,
                         prior,
-                        &job.delta.extent_index,
+                        &maps.extent_index,
                         &job.delta.search_dirs,
                     ) {
                         Ok((body, stats, reserved)) => {
@@ -2959,7 +2995,7 @@ pub(crate) fn execute_promote(
                             delta_body = body;
                             reserved_sources = reserved;
                         }
-                        Err(e) => return Err(fail(e, job)),
+                        Err(e) => return Err(e),
                     }
                 }
                 Err(e) => {
@@ -2975,36 +3011,31 @@ pub(crate) fn execute_promote(
         // source worth pinning" against claims plus every named delta
         // source — the same liveness definition every deletion decision
         // uses, so the filter never skips a source the GC would keep.
-        let referenced = job
-            .delta
+        let referenced = maps
             .lbamap
-            .referenced_hashes(job.delta.extent_index.named_delta_sources());
-        match crate::delta_compute::delta_pendings_by_resemblance(
+            .referenced_hashes(maps.extent_index.named_delta_sources());
+        let stats = crate::delta_compute::delta_pendings_by_resemblance(
             &mut pendings,
             &job.delta.sketch_index,
-            &job.delta.extent_index,
+            &maps.extent_index,
             &referenced,
             &job.delta.search_dirs,
             &mut delta_body,
             &reserved_sources,
-        ) {
-            Ok(stats) => {
-                if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
-                    log::info!(
-                        "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes ({} cached), skipped {} unreferenced, converted {} entries, {} → {} bytes",
-                        job.segment_ulid,
-                        stats.targets_probed,
-                        stats.candidates_tried,
-                        stats.dictionary_bytes_read,
-                        stats.dictionary_cache_hits,
-                        stats.candidates_unreferenced,
-                        stats.delta.entries_converted,
-                        stats.delta.original_body_bytes,
-                        stats.delta.delta_body_bytes,
-                    );
-                }
-            }
-            Err(e) => return Err(fail(e, job)),
+        )?;
+        if stats.delta.entries_converted > 0 || stats.targets_probed > 0 {
+            log::info!(
+                "formation {}: resemblance probed {} target(s), tried {} dictionary(s) over {} bytes ({} cached), skipped {} unreferenced, converted {} entries, {} → {} bytes",
+                job.segment_ulid,
+                stats.targets_probed,
+                stats.candidates_tried,
+                stats.dictionary_bytes_read,
+                stats.dictionary_cache_hits,
+                stats.candidates_unreferenced,
+                stats.delta.entries_converted,
+                stats.delta.original_body_bytes,
+                stats.delta.delta_body_bytes,
+            );
         }
     }
 
@@ -3014,17 +3045,14 @@ pub(crate) fn execute_promote(
     let (body_section_start, entries) = if pendings.is_empty() {
         (0, Vec::new())
     } else {
-        match segment::write_and_commit(
+        segment::write_and_commit(
             &job.pending_dir,
             job.segment_ulid,
             pendings,
             &delta_body,
             job.delta.policy.persist_sketches,
             job.signer.as_ref(),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(fail(e, job)),
-        }
+        )?
     };
     let delta_region_body_length: u64 = if delta_body.is_empty() {
         0
@@ -3038,16 +3066,13 @@ pub(crate) fn execute_promote(
 
     // The epoch's journal-window share commits as its own segment, so
     // it dies whole as the journal wraps. Never delta'd.
-    let journal = match &job.journal {
+    let journal = match journal {
         None => None,
         Some(jpart) => {
-            let j_pendings = match crate::volume::materialise_pending_bodies(
+            let j_pendings = crate::volume::materialise_pending_bodies(
                 &job.old_wal_path,
                 jpart.partition.writes(),
-            ) {
-                Ok(p) => p,
-                Err(e) => return Err(fail(e, job)),
-            };
+            )?;
             match segment::write_and_commit(
                 &job.pending_dir,
                 jpart.segment_ulid,
@@ -3069,7 +3094,7 @@ pub(crate) fn execute_promote(
                         pre_promote_offsets: jpart.partition.pre_promote_offsets().to_vec(),
                     })
                 }
-                Err(e) => return Err(fail(e, job)),
+                Err(e) => return Err(e),
             }
         }
     };
@@ -3077,12 +3102,13 @@ pub(crate) fn execute_promote(
     Ok(PromoteResult {
         segment_ulid: job.segment_ulid,
         old_wal_ulid: job.old_wal_ulid,
-        old_wal_path: job.old_wal_path,
+        old_wal_path: job.old_wal_path.clone(),
         body_section_start,
         entries,
-        pre_promote_offsets: job.primary.into_pre_promote_offsets(),
+        pre_promote_offsets: primary.pre_promote_offsets().to_vec(),
         delta_region_body_length,
         journal,
+        dedup: crate::volume::DedupMintStats::default(),
     })
 }
 

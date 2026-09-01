@@ -8,11 +8,12 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::blake3_id_hasher::Blake3HashSet;
+use crate::map_layers::MapLayers;
 use crate::{extentindex, rewrite_plan, segment, segment_cache};
 
 use super::{
-    AncestorLayer, BoxFetcher, PendingWrite, ReclaimJob, ReclaimResult, RepackJob, RepackResult,
-    StagedApply,
+    AncestorLayer, BoxFetcher, DedupMintStats, PendingWrite, ReclaimJob, ReclaimResult, RepackJob,
+    RepackResult, StagedApply,
 };
 
 /// One destination segment's share of a promote: the pending writes, and the
@@ -56,7 +57,7 @@ impl PendingPartition {
             .zip(self.pre_promote_offsets.iter().copied())
     }
 
-    pub(super) fn into_writes(self) -> Vec<PendingWrite> {
+    pub(crate) fn into_writes(self) -> Vec<PendingWrite> {
         self.writes
     }
 
@@ -91,18 +92,27 @@ impl PendingPartition {
     }
 }
 
-/// Data needed by the worker thread to write a pending segment.
+/// Data needed by the worker thread to write a pending segment. The worker
+/// stages `pending` against `layers` itself, so the prep hands over the
+/// epoch as the write path left it.
 pub struct PromoteJob {
     pub segment_ulid: Ulid,
     pub old_wal_ulid: Ulid,
     pub old_wal_path: PathBuf,
-    pub primary: PendingPartition,
+    /// The epoch's writes in WAL order.
+    pub pending: Vec<PendingWrite>,
+    /// The volume's journal window at prep, which splits the epoch's
+    /// journal share into its own segment.
+    pub journal_ranges: crate::journal::JournalRanges,
+    /// The journal segment's ULID, minted after `segment_ulid` so the
+    /// journal segment sorts above the data segment. An epoch with no
+    /// journal share leaves it unused.
+    pub journal_segment_ulid: Ulid,
+    /// The volume's maps at prep, with the epoch as a frozen layer.
+    pub layers: MapLayers,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub pending_dir: PathBuf,
     pub delta: PromoteDeltaSpec,
-    /// The epoch's journal-window share, present when the volume has a
-    /// journal window and the epoch touched journal LBAs.
-    pub journal: Option<JournalPartition>,
 }
 
 /// The journal-window share of one promote: entries whose LBAs fall in the
@@ -148,24 +158,19 @@ impl DeltaPolicy {
     }
 }
 
-/// Where a promote's delta tiers find dictionaries.
+/// Where a promote's delta tiers find dictionaries. Source bodies and the
+/// referenced-hashes view come from the job's `layers`, materialised on the
+/// worker; any canonical serving a hash yields identical bytes, so the live
+/// maps suffice. An unreferenced source is declined: deltaing against one
+/// pins bytes GC was about to free and gets the GC plan that omitted them
+/// refused on apply.
 pub struct PromoteDeltaSpec {
     pub policy: DeltaPolicy,
-    /// Live extent-index snapshot for resolving source bodies by hash. Any
-    /// canonical serving a hash yields identical bytes, so the live index
-    /// suffices.
-    pub extent_index: Arc<extentindex::ExtentIndex>,
     /// Candidate map over the lineage's persisted sketches, for selecting
     /// sources by content resemblance.
     pub sketch_index: Arc<crate::sketch_index::SketchIndex>,
     /// Body-lookup roots: the fork directory first, then ancestor dirs.
     pub search_dirs: Vec<PathBuf>,
-    /// Live lbamap snapshot at prep time. The worker composes the
-    /// referenced-hashes view from this and `extent_index`, off the
-    /// volume mutex. An unreferenced source is declined: deltaing
-    /// against one pins bytes GC was about to free and gets the GC plan
-    /// that omitted them refused on apply.
-    pub lbamap: Arc<crate::lbamap::LbaMap>,
     /// Where the same-LBA tier probes for the sealed snapshot it sources
     /// from. The worker runs the probe. Recovery promotes pass `None`.
     /// The resemblance tier needs only the candidate map.
@@ -210,6 +215,8 @@ pub struct PromoteResult {
     /// `body_section_start + delta_region_body_length`.
     pub delta_region_body_length: u64,
     pub journal: Option<JournalSegmentResult>,
+    /// The dedup refs the worker's staging minted for this epoch.
+    pub dedup: DedupMintStats,
 }
 
 /// The journal segment written alongside the primary. Its bodies are all

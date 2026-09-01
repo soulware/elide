@@ -340,21 +340,21 @@ fn classify_pending_dedup_entries(
 /// already paired to its write. Taking the tokens here also puts them ahead of
 /// `segment::write_and_commit` rewriting `stored_offset` to segment-relative.
 ///
-/// `mint` yields the journal segment's ULID, so callers mint the primary
-/// segment's ULID first.
-fn stage_pending_for_promote(
+/// `journal_segment_ulid` names the journal segment; callers mint it after
+/// the primary segment's ULID.
+pub(crate) fn stage_pending_for_promote(
     mut writes: Vec<PendingWrite>,
     extent_index: &extentindex::ExtentIndex,
     wal_ulid: Ulid,
     journal_ranges: &crate::journal::JournalRanges,
-    mint: &mut UlidMint,
+    journal_segment_ulid: Ulid,
 ) -> (PendingPartition, Option<JournalPartition>, DedupMintStats) {
     let dedup = classify_pending_dedup_entries(&mut writes, extent_index, wal_ulid);
     let pre_promote_offsets = snapshot_pre_promote_offsets(&writes, extent_index);
     let (primary, journal) =
         PendingPartition::new(writes, pre_promote_offsets).split_journal(journal_ranges);
     let journal = journal.map(|partition| JournalPartition {
-        segment_ulid: mint.next(),
+        segment_ulid: journal_segment_ulid,
         partition,
     });
     (primary, journal, dedup)
@@ -401,6 +401,26 @@ fn apply_promoted_entries(
         )?;
     }
     Ok(())
+}
+
+/// A promote's fold: `layers` with the epoch's frozen layer replayed into a
+/// clone of base and the promoted entries applied to it. Runs with the
+/// volume mutex released; [`Volume::swap_promote`] installs the result.
+pub fn fold_promote_result(layers: &MapLayers, result: &PromoteResult) -> io::Result<Maps> {
+    layers.fold_promote(result.old_wal_ulid, |lbamap, extent_index| {
+        apply_promoted_entries(extent_index, lbamap, result)
+    })
+}
+
+/// Delete a promoted epoch's WAL file. Runs after the swap is published, so
+/// a reader on an older snapshot recovers through its `NotFound` retry.
+pub fn remove_promoted_wal(result: &PromoteResult) {
+    if let Err(e) = fs::remove_file(&result.old_wal_path) {
+        log::warn!(
+            "failed to delete old WAL {}: {e}",
+            result.old_wal_path.display()
+        );
+    }
 }
 
 /// One destination segment's share of a promote apply.
@@ -1040,41 +1060,33 @@ impl Volume {
             // Primary ULID first: the journal segment must sort above the
             // data segment (see `JournalPartition`).
             let segment_ulid = mint.next();
-            let (primary, jpart, dedup) = stage_pending_for_promote(
-                pending,
-                &extent_index,
-                old_wal_ulid,
-                &journal,
-                &mut mint,
-            );
-            recovery_dedup_stats.minted_entries += dedup.minted_entries;
-            recovery_dedup_stats.wal_body_bytes += dedup.wal_body_bytes;
+            let journal_segment_ulid = mint.next();
             let result = crate::actor::execute_promote(
                 PromoteJob {
                     segment_ulid,
                     old_wal_ulid,
                     old_wal_path: wal_path.clone(),
-                    primary,
+                    pending,
+                    journal_ranges: journal.clone(),
+                    journal_segment_ulid,
+                    layers: MapLayers::new(Maps::new(lbamap.clone(), extent_index.clone())),
                     signer: Arc::clone(&signer),
                     pending_dir: segment::pending_open_dir(base_dir),
                     // Recovery promotes of stale WALs write plain Data
-                    // entries. Both delta tiers resolve sources through
-                    // Arc'd snapshots, and the open path holds the index
-                    // and the candidate map by value at this point, so an
-                    // empty spec leaves every entry alone.
+                    // entries: the policy is off, so both delta tiers leave
+                    // every entry alone.
                     delta: crate::volume::jobs::PromoteDeltaSpec {
                         policy: crate::volume::jobs::DeltaPolicy::OFF,
-                        extent_index: Arc::new(extentindex::ExtentIndex::new()),
                         sketch_index: Arc::new(crate::sketch_index::SketchIndex::new()),
                         search_dirs: Vec::new(),
-                        lbamap: Arc::new(crate::lbamap::LbaMap::new()),
                         prior: None,
                     },
-                    journal: jpart,
                 },
                 &mut crate::actor::PriorSourceCache::default(),
             )
             .map_err(|failure| failure.error)?;
+            recovery_dedup_stats.minted_entries += result.dedup.minted_entries;
+            recovery_dedup_stats.wal_body_bytes += result.dedup.wal_body_bytes;
             apply_promoted_entries(&mut extent_index, &mut lbamap, &result)?;
             // Bump last_segment_ulid so the first-snapshot pinning invariant
             // (see `Volume::snapshot`) covers the recovery-promoted segments.
@@ -2930,7 +2942,7 @@ impl Volume {
         self.assert_extent_index_consistent(caller);
         self.assert_lbamap_hashes_resolvable(caller);
         self.maps
-            .materialised()
+            .base()
             .extent_index
             .debug_assert_delta_source_counts();
     }
@@ -3385,6 +3397,17 @@ impl Volume {
         let size = fs::metadata(&new_path)?.len();
         let wal = writelog::WriteLog::reopen(&new_path, size)?;
 
+        // The layer the take froze is immutable, so staging here yields the
+        // partitions and tokens the worker held.
+        let staged = self.maps.materialised();
+        let (primary, journal, _dedup) = stage_pending_for_promote(
+            job.pending,
+            &staged.extent_index,
+            job.old_wal_ulid,
+            &job.journal_ranges,
+            job.journal_segment_ulid,
+        );
+
         // The live maps reference the WAL's old identity: extent-index
         // locations point body-bearing hashes at `(old_wal_ulid, offset)`
         // and lbamap claims carry `old_wal_ulid` as claimant. Re-key both
@@ -3392,8 +3415,8 @@ impl Volume {
         // CAS/hash-match guards leave anything a concurrent writer has
         // superseded untouched.
         {
-            let journal_part = job.journal.as_ref().map(|j| &j.partition);
-            let partitions = std::iter::once(&job.primary).chain(journal_part);
+            let journal_part = journal.as_ref().map(|j| &j.partition);
+            let partitions = std::iter::once(&primary).chain(journal_part);
             let (lbamap, index) = self.maps.base_mut();
             for part in partitions {
                 for (write, old_wal_offset) in part.iter() {
@@ -3443,8 +3466,8 @@ impl Volume {
             ulid: new_ulid,
             path: new_path,
         });
-        self.pending = job.primary.into_writes();
-        if let Some(j) = job.journal {
+        self.pending = primary.into_writes();
+        if let Some(j) = journal {
             self.pending.extend(j.partition.into_writes());
         }
         Ok(())
@@ -3898,7 +3921,9 @@ impl Volume {
     }
 
     /// Take the open WAL and pending writes into a [`PromoteJob`] targeting
-    /// `segment_ulid`.
+    /// `segment_ulid`. The epoch's delta layer freezes under the WAL's
+    /// ULID, so reads keep resolving it while the worker runs and the apply
+    /// folds it into a clone of base.
     ///
     /// Errors if no WAL is open — callers check `pending` is non-empty first,
     /// and the write path only ever appends entries after opening the WAL.
@@ -3907,16 +3932,8 @@ impl Volume {
             .wal
             .take()
             .ok_or_else(|| io::Error::other("internal: pending writes non-empty but wal absent"))?;
-        self.maps.absorb();
-        let maps = self.maps.materialised();
-        let (primary, jpart, dedup) = stage_pending_for_promote(
-            std::mem::take(&mut self.pending),
-            &maps.extent_index,
-            open.ulid,
-            &self.journal,
-            &mut self.mint,
-        );
-        self.record_dedup_mint_stats(open.ulid, dedup);
+        self.maps.freeze(open.ulid);
+        let journal_segment_ulid = self.mint.next();
         let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
         for layer in &self.ancestor_layers {
             if !search_dirs.contains(&layer.dir) {
@@ -3925,10 +3942,8 @@ impl Volume {
         }
         let delta = jobs::PromoteDeltaSpec {
             policy: self.delta_policy,
-            extent_index: maps.extent_index,
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
-            lbamap: maps.lbamap,
             prior: Some(PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 journal_ranges: self.journal.clone(),
@@ -3944,21 +3959,32 @@ impl Volume {
             segment_ulid,
             old_wal_ulid: open.ulid,
             old_wal_path: open.path,
-            primary,
+            pending: std::mem::take(&mut self.pending),
+            journal_ranges: self.journal.clone(),
+            journal_segment_ulid,
+            layers: self.maps.clone(),
             signer: Arc::clone(&self.signer),
             pending_dir: segment::pending_open_dir(&self.base_dir),
             delta,
-            journal: jpart,
         })
     }
 
-    /// Apply phase of the off-actor promote.  Runs on the actor thread
-    /// after the worker has written the segment.
-    ///
-    /// Updates the extent index (CAS), deletes the old WAL, and evicts
-    /// the cached file descriptor.  The caller must call `publish_snapshot`
-    /// after this to make the changes visible to readers.
+    /// Apply phase of the promote for a caller that holds the volume across
+    /// it: fold, swap, then delete the old WAL. The actor runs the three
+    /// steps itself with the mutex released around the fold
+    /// ([`fold_promote_result`], [`Self::swap_promote`]).
     pub fn apply_promote(&mut self, result: &PromoteResult) -> io::Result<()> {
+        let layers = self.maps.clone();
+        let new_base = fold_promote_result(&layers, result)?;
+        self.swap_promote(result, new_base, layers.base());
+        remove_promoted_wal(result);
+        Ok(())
+    }
+
+    /// Install a promote's fold: the folded maps become base, the epoch's
+    /// frozen layer retires, and the bookkeeping the apply owns lands. O(1)
+    /// in the maps; the sketch inserts are per primary entry.
+    pub fn swap_promote(&mut self, result: &PromoteResult, new_base: Maps, folded_from: &Maps) {
         self.has_new_segments = true;
         // The journal segment ULID is the higher of the pair; the
         // snapshot-pinning invariant needs the max here.
@@ -3970,9 +3996,8 @@ impl Volume {
                 .unwrap_or(result.segment_ulid)
                 .max(result.segment_ulid),
         );
-
-        let (lbamap, extent_index) = self.maps.base_mut();
-        apply_promoted_entries(extent_index, lbamap, result)?;
+        self.maps
+            .swap_promote(folded_from, new_base, result.old_wal_ulid);
 
         // Extend the candidate map with what this promote sketched, so the
         // next formation can source against it. The journal partition
@@ -3981,16 +4006,8 @@ impl Volume {
         for entry in &result.entries {
             sketches.insert_entry(entry);
         }
-
-        // Delete old WAL — only after the extent index is updated.
-        if let Err(e) = fs::remove_file(&result.old_wal_path) {
-            log::warn!(
-                "failed to delete old WAL {}: {e}",
-                result.old_wal_path.display()
-            );
-        }
+        self.record_dedup_mint_stats(result.old_wal_ulid, result.dedup);
         self.evict_cached_segment(result.old_wal_ulid);
-        Ok(())
     }
 
     // ------------------------------------------------------------------
