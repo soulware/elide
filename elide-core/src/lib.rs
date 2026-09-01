@@ -18,6 +18,7 @@ pub mod lbamap;
 pub mod lock_stats;
 pub mod malloc_debug;
 pub mod malloc_policy;
+pub mod map_layers;
 pub mod name_record;
 pub mod operator_session;
 pub mod process;

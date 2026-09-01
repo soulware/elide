@@ -197,6 +197,19 @@ impl LbaMap {
         self.insert_inner(start_lba, lba_length, 0, hash, claimant);
     }
 
+    /// [`Self::insert`] of an entry that is the tail of a split payload, so a
+    /// layer fold carries the entry as it stands.
+    pub fn insert_with_offset(
+        &mut self,
+        start_lba: u64,
+        lba_length: u32,
+        payload_block_offset: u32,
+        hash: blake3::Hash,
+        claimant: Ulid,
+    ) {
+        self.insert_inner(start_lba, lba_length, payload_block_offset, hash, claimant);
+    }
+
     /// Insert only on sub-ranges where no overlapping current entry has a
     /// claimant `>=` ours; leave higher-claimant overlaps untouched. Used by
     /// structural-commit apply paths (GC / redact / repack) to merge their

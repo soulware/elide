@@ -84,11 +84,14 @@ impl ReadonlyVolume {
     /// as zeros.
     pub fn read_into(&self, start_lba: u64, buf: &mut [u8]) -> io::Result<()> {
         let cache_dir = self.base_dir.join("cache");
+        let maps = crate::map_layers::MapLayers::new(crate::map_layers::Maps {
+            lbamap: Arc::clone(&self.lbamap),
+            extent_index: Arc::clone(&self.extent_index),
+        });
         read_extents(
             start_lba,
             buf,
-            &self.lbamap,
-            &self.extent_index,
+            &maps,
             0,
             &self.file_cache,
             &self.dmat_cache,

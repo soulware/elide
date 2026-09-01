@@ -40,6 +40,7 @@ use crate::{
     blake3_id_hasher::Blake3HashSet,
     extentindex::{self, BodySource},
     lbamap::{self, LbaMap},
+    map_layers::{MapLayers, Maps},
     rewrite_plan,
     segment::{self, EntryKind},
     segment_cache,
@@ -763,8 +764,10 @@ pub struct Volume {
     /// The `Flock` releases the lock automatically when dropped.
     #[allow(dead_code)]
     lock_file: nix::fcntl::Flock<fs::File>,
-    pub(in crate::volume) lbamap: Arc<lbamap::LbaMap>,
-    pub(in crate::volume) extent_index: Arc<extentindex::ExtentIndex>,
+    /// The LBA map and the extent index, as a `base` under the open WAL's
+    /// `delta`. A mutation absorbs `delta` first; a read that iterates
+    /// takes `materialised()`.
+    pub(in crate::volume) maps: MapLayers,
     /// Candidate map for the formation resemblance delta tier, harvested
     /// from the same walk that rebuilt `extent_index` and extended with
     /// each promote's own sketched entries.
@@ -1111,8 +1114,7 @@ impl Volume {
             base_dir: base_dir.to_owned(),
             ancestor_layers,
             lock_file,
-            lbamap: Arc::new(lbamap),
-            extent_index: Arc::new(extent_index),
+            maps: MapLayers::new(Maps::new(lbamap, extent_index)),
             sketch_index: Arc::new(sketch_index),
             delta_policy: jobs::DeltaPolicy::from_env(),
             wal,
@@ -1166,7 +1168,7 @@ impl Volume {
         // (blank or discarded device) — absence of evidence, not an
         // affirmative "not ext4". Only written content can clear the
         // stored window below.
-        let superblock_written = self.lbamap.lookup(0).is_some();
+        let superblock_written = self.maps.materialised().lbamap.lookup(0).is_some();
         let mut reader = read::VolumeExt4Reader { volume: self };
         let derived = match crate::ext4_scan::journal_lba_ranges(&mut reader) {
             // The device read fine and does not parse as ext4: the
@@ -1372,7 +1374,7 @@ impl Volume {
         // so this is safe regardless of where the body lives (Local,
         // Cached present, Cached absent, or S3-only). See
         // `docs/design/noop-write-skip.md`.
-        if self.lbamap.has_full_match(lba, lba_length, &hash) {
+        if self.maps.has_full_match(lba, lba_length, &hash) {
             self.noop_stats.skipped_writes += 1;
             self.noop_stats.skipped_bytes += data.len() as u64;
             if crate::wtrace::enabled() {
@@ -1422,7 +1424,9 @@ impl Volume {
                 .append_data(lba, lba_length, &hash, wal_flags, bytes_to_write)?;
             (offset, open.ulid)
         };
-        Arc::make_mut(&mut self.lbamap).insert(lba, lba_length, hash, wal_ulid);
+        self.maps
+            .lbamap_mut()
+            .insert(lba, lba_length, hash, wal_ulid);
         // Temporary extent index entry: points into the WAL at the raw
         // payload offset, updated to segment file offsets after promotion.
         // A journal-window write goes to the disjoint journal tier keyed by
@@ -1443,7 +1447,7 @@ impl Volume {
             body_section_start: 0,
             inline_data: None,
         };
-        let ei = Arc::make_mut(&mut self.extent_index);
+        let ei = self.maps.extent_index_mut();
         if is_journal {
             ei.insert_journal_if_absent(wal_ulid, hash, location);
         } else {
@@ -1505,7 +1509,9 @@ impl Volume {
             open.wal.append_zero(start_lba, lba_count)?;
             open.ulid
         };
-        Arc::make_mut(&mut self.lbamap).insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
+        self.maps
+            .lbamap_mut()
+            .insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
         self.pending.push(PendingWrite {
             entry: segment::SegmentEntry::new_zero(start_lba, lba_count),
             wal_body_offset: None,
@@ -1535,8 +1541,7 @@ impl Volume {
         read_extents(
             lba,
             buf,
-            &self.lbamap,
-            &self.extent_index,
+            &self.maps,
             0,
             &self.file_cache,
             &self.dmat_cache,
@@ -1758,7 +1763,7 @@ impl Volume {
             base_dir: self.base_dir.clone(),
             ancestor_layers: self.ancestor_layers.clone(),
             fetcher: self.fetcher.clone(),
-            extent_index: Arc::clone(&self.extent_index),
+            extent_index: self.maps.materialised().extent_index,
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             plan,
@@ -1840,14 +1845,16 @@ impl Volume {
         // that drops it. Both probe maintained counts.
         let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
         let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
+        self.maps.absorb();
+        let maps = self.maps.materialised();
         for (hash, _kind, input_ulid) in &input_old_entries {
             // Check both `inner` and `deltas` — a Delta entry sits in
             // `extent_index.deltas` and would be missed by `lookup` alone.
-            let still_at_input = self
+            let still_at_input = maps
                 .extent_index
                 .lookup(hash)
                 .is_some_and(|loc| loc.segment_id == *input_ulid)
-                || self
+                || maps
                     .extent_index
                     .lookup_delta(hash)
                     .is_some_and(|loc| loc.segment_id == *input_ulid);
@@ -1857,7 +1864,7 @@ impl Volume {
             if carried_hashes.contains(hash) {
                 continue;
             }
-            if self.lbamap.is_referenced(hash) || self.extent_index.is_named_delta_source(hash) {
+            if maps.lbamap.is_referenced(hash) || maps.extent_index.is_named_delta_source(hash) {
                 stale_cancel.push((*hash, *input_ulid));
             }
             to_remove.push((*hash, *input_ulid));
@@ -1868,7 +1875,7 @@ impl Volume {
                 "plan {new_ulid}: stale-liveness cancellation — {} hash(es) live in \
                  volume but absent from materialised output; removing plan [{}]",
                 stale_cancel.len(),
-                describe_stale_cancel(&stale_cancel, &self.lbamap),
+                describe_stale_cancel(&stale_cancel, &maps.lbamap),
             );
             // Cancelling is one of the two mechanisms `NoDanglingDeltaSource`
             // needs (docs/testing.md), so it fires whenever a delta increfs
@@ -1880,7 +1887,7 @@ impl Volume {
                 diagnose_stale_cancel(
                     &self.base_dir,
                     &self.ancestor_layers,
-                    &self.lbamap,
+                    &maps.lbamap,
                     &stale_cancel,
                     &self.base_dir.join("index"),
                 );
@@ -1906,7 +1913,7 @@ impl Volume {
         let mut footprint = entry_hashes;
         footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
         for input in &consumed {
-            footprint.extend(self.extent_index.journal_hashes(*input));
+            footprint.extend(maps.extent_index.journal_hashes(*input));
         }
         let derive = derive_start.elapsed();
 
@@ -1930,8 +1937,7 @@ impl Volume {
         // `pre_apply_*` back the rename-failure restore below; the
         // resolvability gate keeps its own snapshots for the refusal
         // path.
-        let pre_apply_index = Arc::clone(&self.extent_index);
-        let pre_apply_lbamap = Arc::clone(&self.lbamap);
+        let pre_apply = self.maps.materialised();
         let mut merge = Duration::ZERO;
         let mut blocked: Vec<(u64, u32)> = Vec::new();
         let gate_ranges =
@@ -1940,7 +1946,7 @@ impl Volume {
         let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
             let merge_start = Instant::now();
             {
-                let index = Arc::make_mut(&mut vol.extent_index);
+                let index = vol.maps.extent_index_mut();
                 for (i, e) in entries.iter().enumerate() {
                     index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
                 }
@@ -1977,7 +1983,7 @@ impl Volume {
             // `docs/finding-sweep-flush-claimant-bug.md`,
             // `gc_output_loses_to_live_write_applied_after_gc`, and
             // `gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush`.
-            let lbamap = Arc::make_mut(&mut vol.lbamap);
+            let lbamap = vol.maps.lbamap_mut();
             for e in &entries {
                 let took = lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
                 if !e.kind.is_canonical_only() && took < e.lba_length {
@@ -2032,7 +2038,9 @@ impl Volume {
         let superseded: Vec<(u64, u64, Ulid)> = blocked
             .iter()
             .flat_map(|(start, length)| {
-                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+                pre_apply
+                    .lbamap
+                    .extents_in_range(*start, start + *length as u64)
             })
             .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
             .map(|x| (x.range_start, x.range_end, x.claimant_ulid))
@@ -2052,8 +2060,7 @@ impl Volume {
                 superseded.len(),
                 superseded.len().min(REFUSAL_SAMPLE_LIMIT),
             );
-            self.extent_index = pre_apply_index;
-            self.lbamap = pre_apply_lbamap;
+            self.maps.restore(pre_apply);
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_superseded");
@@ -2077,7 +2084,7 @@ impl Volume {
         // an input's entries can cover one LBA, the earlier dead on the
         // anchor and dropped, with the later one carried.
         self.assert_claims_within_input_ranges(
-            &pre_apply_lbamap,
+            &pre_apply.lbamap,
             &consumed,
             &input_claim_ranges,
             new_ulid,
@@ -2086,7 +2093,9 @@ impl Volume {
         let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
             .iter()
             .flat_map(|(start, length)| {
-                pre_apply_lbamap.extents_in_range(*start, start + *length as u64)
+                pre_apply
+                    .lbamap
+                    .extents_in_range(*start, start + *length as u64)
             })
             .filter(|x| consumed.contains(&x.claimant_ulid))
             .filter_map(|x| {
@@ -2110,8 +2119,7 @@ impl Volume {
                 dropped.len(),
                 dropped.len().min(REFUSAL_SAMPLE_LIMIT),
             );
-            self.extent_index = pre_apply_index;
-            self.lbamap = pre_apply_lbamap;
+            self.maps.restore(pre_apply);
             let _ = fs::remove_file(&tmp_path);
             let _ = fs::remove_file(&plan_path);
             self.assert_volume_invariants("apply_plan_apply_result_dropped_claim");
@@ -2132,8 +2140,7 @@ impl Volume {
         // produces the same claimant ULIDs as the in-memory merge.
         let bare_path = gc_dir.join(new_ulid.to_string());
         if let Err(e) = fs::rename(&tmp_path, &bare_path) {
-            self.extent_index = pre_apply_index;
-            self.lbamap = pre_apply_lbamap;
+            self.maps.restore(pre_apply);
             return Err(e);
         }
         let _ = fs::remove_file(&plan_path);
@@ -2260,7 +2267,7 @@ impl Volume {
         if !crate::volume_invariants_enabled() {
             return;
         }
-        self.lbamap.debug_assert_claim_counts();
+        self.maps.materialised().lbamap.debug_assert_claim_counts();
         let first = match self.disk_lbamap_projection() {
             Ok(m) => m,
             Err(e) => {
@@ -2351,9 +2358,10 @@ impl Volume {
     }
 
     fn divergence_at(&self, disk: &LbaMap, lba: u64) -> Option<Diverge> {
-        let mem_hash = self.lbamap.hash_at(lba);
+        let maps = self.maps.materialised();
+        let mem_hash = maps.lbamap.hash_at(lba);
         let disk_hash = disk.hash_at(lba);
-        let mem_claimant = self.lbamap.claimant_at(lba);
+        let mem_claimant = maps.lbamap.claimant_at(lba);
         let disk_claimant = disk.claimant_at(lba);
         if mem_hash == disk_hash && mem_claimant == disk_claimant {
             return None;
@@ -2370,7 +2378,7 @@ impl Volume {
     /// Up to [`DIVERGENCE_REPORT_CAP`] LBAs where memory and `disk` differ.
     fn diverging_lbas(&self, disk: &LbaMap) -> Vec<Diverge> {
         let mut all_lbas: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for (lba, _, _, _) in self.lbamap.iter_entries() {
+        for (lba, _, _, _) in self.maps.materialised().lbamap.iter_entries() {
             all_lbas.insert(lba);
         }
         for (lba, _, _, _) in disk.iter_entries() {
@@ -2601,7 +2609,7 @@ impl Volume {
         // AND that the in-memory location names a segment the walk can
         // still see — a hash can be validly owned on disk while the
         // in-memory location dangles at a deleted file.
-        for (hash, loc) in self.extent_index.iter() {
+        for (hash, loc) in self.maps.materialised().extent_index.iter() {
             if diverging.len() >= 8 {
                 break;
             }
@@ -2619,7 +2627,7 @@ impl Volume {
                 ));
             }
         }
-        for (hash, loc) in self.extent_index.deltas_iter() {
+        for (hash, loc) in self.maps.materialised().extent_index.deltas_iter() {
             if diverging.len() >= 8 {
                 break;
             }
@@ -2642,7 +2650,7 @@ impl Volume {
         // durable rebuild that mistakenly placed a journal hash in `inner`
         // (or vice versa) shows here as a phantom, so this is the executable
         // form of the tier-disjointness invariant.
-        for ((seg, hash), _loc) in self.extent_index.journal_iter() {
+        for ((seg, hash), _loc) in self.maps.materialised().extent_index.journal_iter() {
             if diverging.len() >= 8 {
                 break;
             }
@@ -2696,17 +2704,18 @@ impl Volume {
     /// it never resolves through extent_index by design. Skipped here.
     fn unresolvable_lbamap_hashes(&self, sample_limit: usize) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
-        for (lba, _len, hash, _anchor, claimant) in self.lbamap.iter_entries_with_claimant() {
+        let maps = self.maps.materialised();
+        for (lba, _len, hash, _anchor, claimant) in maps.lbamap.iter_entries_with_claimant() {
             if hash == ZERO_HASH {
                 continue;
             }
             // A journal-tier LBA resolves through the `(claimant, hash)`
             // journal map, exactly as the read path does; a durable LBA
             // resolves through `inner` or the delta map.
-            if self.extent_index.lookup_journal(claimant, &hash).is_some() {
+            if maps.extent_index.lookup_journal(claimant, &hash).is_some() {
                 continue;
             }
-            if self.extent_index.lookup(&hash).is_some() {
+            if maps.extent_index.lookup(&hash).is_some() {
                 continue;
             }
             // A delta-resolved hash is only readable if at least one of
@@ -2715,10 +2724,10 @@ impl Volume {
             // consults the DATA map only for sources), so a delta whose
             // every source lacks one is as stranded as a hash with no
             // location.
-            if self.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+            if maps.extent_index.lookup_delta(&hash).is_some_and(|loc| {
                 loc.options
                     .iter()
-                    .any(|opt| self.extent_index.lookup(&opt.source_hash).is_some())
+                    .any(|opt| maps.extent_index.lookup(&opt.source_hash).is_some())
             }) {
                 continue;
             }
@@ -2753,18 +2762,19 @@ impl Volume {
         sample_limit: usize,
     ) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
+        let maps = self.maps.materialised();
         let mut residual: Blake3HashSet = Blake3HashSet::default();
         for &hash in footprint {
-            if hash == ZERO_HASH || self.lbamap.claim_refcount(&hash) == 0 {
+            if hash == ZERO_HASH || maps.lbamap.claim_refcount(&hash) == 0 {
                 continue;
             }
-            if self.extent_index.lookup(&hash).is_some() {
+            if maps.extent_index.lookup(&hash).is_some() {
                 continue;
             }
-            if self.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+            if maps.extent_index.lookup_delta(&hash).is_some_and(|loc| {
                 loc.options
                     .iter()
-                    .any(|opt| self.extent_index.lookup(&opt.source_hash).is_some())
+                    .any(|opt| maps.extent_index.lookup(&opt.source_hash).is_some())
             }) {
                 continue;
             }
@@ -2779,11 +2789,11 @@ impl Volume {
             claim_ranges.len(),
         );
         for (start, end) in claim_ranges.iter() {
-            for x in self.lbamap.extents_in_range(start, end) {
+            for x in maps.lbamap.extents_in_range(start, end) {
                 if !residual.contains(&x.hash) {
                     continue;
                 }
-                if self
+                if maps
                     .extent_index
                     .lookup_journal(x.claimant_ulid, &x.hash)
                     .is_none()
@@ -2830,11 +2840,10 @@ impl Volume {
         claim_ranges: &LbaRanges,
         mutate: impl FnOnce(&mut Self) -> io::Result<()>,
     ) -> io::Result<ResolvabilityGate> {
-        let pre_index = Arc::clone(&self.extent_index);
-        let pre_lbamap = Arc::clone(&self.lbamap);
+        self.maps.absorb();
+        let pre = self.maps.materialised();
         if let Err(e) = mutate(self) {
-            self.extent_index = pre_index;
-            self.lbamap = pre_lbamap;
+            self.maps.restore(pre);
             return Err(e);
         }
         let orphaned =
@@ -2842,8 +2851,7 @@ impl Volume {
         if orphaned.total == 0 {
             return Ok(ResolvabilityGate::Applied);
         }
-        self.extent_index = pre_index;
-        self.lbamap = pre_lbamap;
+        self.maps.restore(pre);
         Ok(ResolvabilityGate::Refused(orphaned))
     }
 
@@ -2914,7 +2922,10 @@ impl Volume {
         self.assert_pending_above_committed(caller);
         self.assert_extent_index_consistent(caller);
         self.assert_lbamap_hashes_resolvable(caller);
-        self.extent_index.debug_assert_delta_source_counts();
+        self.maps
+            .materialised()
+            .extent_index
+            .debug_assert_delta_source_counts();
     }
 
     /// Synchronous single-shot variant of the plan apply path — runs prep,
@@ -3087,7 +3098,7 @@ impl Volume {
             // presence check on `BodyOnly` cache hits — without it
             // the rebuild-on-startup path would be the only source,
             // which is too late for live drains.
-            Arc::make_mut(&mut self.extent_index).set_segment_presence(
+            self.maps.extent_index_mut().set_segment_presence(
                 ulid,
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
             );
@@ -3100,6 +3111,8 @@ impl Volume {
                 // already owning the hash in `inner`. Journal-tier entries
                 // are flipped to Cached below via the journal map.
                 let owns = self
+                    .maps
+                    .materialised()
                     .extent_index
                     .lookup(&entry.hash)
                     .is_some_and(|loc| loc.segment_id == ulid);
@@ -3117,7 +3130,7 @@ impl Volume {
                 } else {
                     None
                 };
-                Arc::make_mut(&mut self.extent_index).insert(
+                self.maps.extent_index_mut().insert(
                     entry.hash,
                     extentindex::ExtentLocation {
                         segment_id: ulid,
@@ -3140,11 +3153,11 @@ impl Volume {
             for (i, e) in entries.iter().enumerate() {
                 entry_idx.entry(e.hash).or_insert(i as u32);
             }
-            Arc::make_mut(&mut self.extent_index).promote_journal_segment_to_cache(
-                ulid,
-                body_section_start,
-                |h| entry_idx.get(h).copied(),
-            );
+            self.maps
+                .extent_index_mut()
+                .promote_journal_segment_to_cache(ulid, body_section_start, |h| {
+                    entry_idx.get(h).copied()
+                });
 
             // Delta entries: the delta blob has moved from inline in
             // the now-deleted pending file to the standalone
@@ -3157,7 +3170,8 @@ impl Volume {
                 if !entry.kind.is_delta() {
                     continue;
                 }
-                Arc::make_mut(&mut self.extent_index)
+                self.maps
+                    .extent_index_mut()
                     .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
             }
 
@@ -3183,7 +3197,7 @@ impl Volume {
             // `cache/<ulid>.present`, install the in-memory presence
             // mirror so reads against the new cache shape succeed
             // without consulting `.present` on disk.
-            Arc::make_mut(&mut self.extent_index).set_segment_presence(
+            self.maps.extent_index_mut().set_segment_presence(
                 ulid,
                 Arc::new(extentindex::SegmentPresence::from_data_kinds(entries)),
             );
@@ -3197,7 +3211,8 @@ impl Volume {
                 if !entry.kind.is_delta() {
                     continue;
                 }
-                Arc::make_mut(&mut self.extent_index)
+                self.maps
+                    .extent_index_mut()
                     .flip_delta_body_source_to_cached_if_matches(&entry.hash, ulid);
             }
         }
@@ -3372,8 +3387,7 @@ impl Volume {
         {
             let journal_part = job.journal.as_ref().map(|j| &j.partition);
             let partitions = std::iter::once(&job.primary).chain(journal_part);
-            let index = Arc::make_mut(&mut self.extent_index);
-            let lbamap = Arc::make_mut(&mut self.lbamap);
+            let (lbamap, index) = self.maps.base_mut();
             for part in partitions {
                 for (write, old_wal_offset) in part.iter() {
                     let entry = &write.entry;
@@ -3526,7 +3540,7 @@ impl Volume {
                     }
                 }
             }
-            for (_hash, loc) in self.extent_index.iter() {
+            for (_hash, loc) in self.maps.materialised().extent_index.iter() {
                 if own_segments.contains(&loc.segment_id) {
                     debug_assert!(
                         loc.segment_id <= snap_ulid,
@@ -3573,10 +3587,11 @@ impl Volume {
         // [`crate::actor::live_index_segments`]. Reclamation of those
         // segment files is GC's job; this is a manifest-only filter.
         let index_dir = self.base_dir.join("index");
+        let maps = self.maps.materialised();
         let index_ulids = crate::actor::live_index_segments(
             &index_dir,
-            &self.extent_index,
-            &self.lbamap,
+            &maps.extent_index,
+            &maps.lbamap,
             &self.verifying_key,
             &self.segment_cache,
         )?;
@@ -3654,12 +3669,13 @@ impl Volume {
         snap_ulid: Ulid,
         kind: crate::signing::SnapshotKind,
     ) -> SignSnapshotManifestJob {
+        let maps = self.maps.materialised();
         SignSnapshotManifestJob {
             snap_ulid,
             base_dir: self.base_dir.clone(),
             signer: Arc::clone(&self.signer),
-            extent_index: Arc::clone(&self.extent_index),
-            lbamap: Arc::clone(&self.lbamap),
+            extent_index: maps.extent_index,
+            lbamap: maps.lbamap,
             verifying_key: self.verifying_key,
             segment_cache: Arc::clone(&self.segment_cache),
             kind,
@@ -3698,7 +3714,7 @@ impl Volume {
             &self.base_dir,
             &self.ancestor_layers,
             self.fetcher.as_ref(),
-            &self.extent_index,
+            &self.maps.base().extent_index,
             body_section_start,
             body_source,
         )
@@ -3713,7 +3729,7 @@ impl Volume {
     }
 
     pub fn lbamap_len(&self) -> usize {
-        self.lbamap.len()
+        self.maps.materialised().lbamap.len()
     }
 
     /// Attach a `SegmentFetcher` for demand-fetch on segment cache miss.
@@ -3740,11 +3756,16 @@ impl Volume {
     /// Return the current LBA map and extent index as shared references.
     ///
     /// Called by `VolumeActor` after every mutation to publish a new `ReadSnapshot`.
-    /// The cost is two `Arc::clone` calls — O(1) unless a snapshot reader is still
-    /// holding the previous version, in which case `Arc::make_mut` in the next
-    /// mutation triggers a copy-on-write clone.
+    /// The layered maps, for a publish to clone.
+    pub fn map_layers(&self) -> &MapLayers {
+        &self.maps
+    }
+
+    /// One map each, with the open WAL's delta folded in. Two `Arc::clone`
+    /// calls when the delta is empty.
     pub fn snapshot_maps(&self) -> (Arc<lbamap::LbaMap>, Arc<extentindex::ExtentIndex>) {
-        (Arc::clone(&self.lbamap), Arc::clone(&self.extent_index))
+        let maps = self.maps.materialised();
+        (maps.lbamap, maps.extent_index)
     }
 
     /// Shared handle on the volume's dmat cache — the single per-process
@@ -3879,9 +3900,11 @@ impl Volume {
             .wal
             .take()
             .ok_or_else(|| io::Error::other("internal: pending writes non-empty but wal absent"))?;
+        self.maps.absorb();
+        let maps = self.maps.materialised();
         let (primary, jpart, dedup) = stage_pending_for_promote(
             std::mem::take(&mut self.pending),
-            &self.extent_index,
+            &maps.extent_index,
             open.ulid,
             &self.journal,
             &mut self.mint,
@@ -3895,10 +3918,10 @@ impl Volume {
         }
         let delta = jobs::PromoteDeltaSpec {
             policy: self.delta_policy,
-            extent_index: Arc::clone(&self.extent_index),
+            extent_index: maps.extent_index,
             sketch_index: Arc::clone(&self.sketch_index),
             search_dirs,
-            lbamap: Arc::clone(&self.lbamap),
+            lbamap: maps.lbamap,
             prior: Some(PromoteDeltaPrior {
                 base_dir: self.base_dir.clone(),
                 journal_ranges: self.journal.clone(),
@@ -3941,11 +3964,8 @@ impl Volume {
                 .max(result.segment_ulid),
         );
 
-        apply_promoted_entries(
-            Arc::make_mut(&mut self.extent_index),
-            Arc::make_mut(&mut self.lbamap),
-            result,
-        )?;
+        let (lbamap, extent_index) = self.maps.base_mut();
+        apply_promoted_entries(extent_index, lbamap, result)?;
 
         // Extend the candidate map with what this promote sketched, so the
         // next formation can source against it. The journal partition
