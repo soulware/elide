@@ -394,7 +394,14 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
     // Step 4: gc_fork — GC compaction; H0 appears dead from disk state.
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
 
     // Step 5: BUG B INJECTION — write D0 again to lba=5.
     // H0 is still in the extent index (apply_gc_handoffs hasn't run yet), so
@@ -445,6 +452,7 @@ fn gc_handoff_bug_b_dedup_ref_after_checkpoint() {
         fork_dir.parent().unwrap(),
         &gc_config,
         vec![u_gc2],
+        None,
     )
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -550,7 +558,14 @@ fn gc_checkpoint_ulid_ordering_crash_recovery() {
     // produced by flushing the current WAL will have a ULID below u_sweep.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
         .unwrap();
@@ -665,7 +680,14 @@ fn gc_checkpoint_nonempty_wal_ulid_ordering_crash_recovery() {
     // the WAL segment wins → D2.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store))
         .unwrap();
@@ -823,7 +845,14 @@ fn drain_failure_skips_gc_and_data_survives() {
     // GC runs after successful drain: pending/ is now empty, all prior
     // segments are in segments/.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     vol.apply_gc_handoffs().unwrap();
     rt.block_on(apply_done_handoffs(
         fork_dir,
@@ -917,7 +946,14 @@ fn gc_restart_safety_applied_handoff() {
     // Step 3: GC pass — gc_checkpoint mints ULIDs, gc_fork emits the coord
     // plan at gc/<new>.plan describing how to compact S1 and S2.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
 
     // Step 4: apply_gc_handoffs — materialises the plan: writes
     // gc/<new>.staged, signs it, renames to bare gc/<new>, and updates the
@@ -1043,7 +1079,14 @@ fn a_lost_plan_apply_rename_costs_only_the_fold() {
 
     // Step 2: emit the plan.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
 
     let gc_dir = fork_dir.join("gc");
     let plan_path = gc_dir.join(format!("{u_gc}.plan"));
@@ -1166,7 +1209,14 @@ fn gc_collect_stats_skips_thin_dedup_ref_segment() {
     // Step 5: gc_checkpoint + gc_fork.
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
 
-    let stats = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let stats = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
 
     // All three segments (S1, S2, S3) should be included in stats.
     // With unified format, DedupRef segments are processed normally.
@@ -1237,7 +1287,13 @@ fn gc_oracle_bug_g_read_fails_after_gc_restart_dedup_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+        let _ = gc_fork(
+            fork_dir,
+            fork_dir.parent().unwrap(),
+            &gc_config,
+            vec![u_gc],
+            None,
+        );
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -1359,7 +1415,13 @@ fn gc_oracle_bug_g_variant2_dedup_restart_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+        let _ = gc_fork(
+            fork_dir,
+            fork_dir.parent().unwrap(),
+            &gc_config,
+            vec![u_gc],
+            None,
+        );
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -1493,7 +1555,13 @@ fn gc_oracle_bug_g_variant3_dedup_flush_restart_sweep() {
     let gc_sweep = |vol: &mut Volume| {
         drain(vol);
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        let _ = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]);
+        let _ = gc_fork(
+            fork_dir,
+            fork_dir.parent().unwrap(),
+            &gc_config,
+            vec![u_gc],
+            None,
+        );
         let _ = vol.apply_gc_handoffs();
         simulate_coord_cache_evict(fork_dir);
         let _ = rt.block_on(apply_done_handoffs(fork_dir, ulid::Ulid::nil(), &store));
@@ -1640,7 +1708,14 @@ fn gc_bug_h_canonical_body_shadows_live_lba() {
     // Volume method calls so the test is deterministic.
     let run_gc_round = |vol: &mut Volume| {
         let u_gc = vol.gc_checkpoint_for_test().unwrap();
-        gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+        gc_fork(
+            fork_dir,
+            fork_dir.parent().unwrap(),
+            &gc_config,
+            vec![u_gc],
+            None,
+        )
+        .unwrap();
         vol.apply_gc_handoffs().unwrap();
 
         // Collect bare gc/<ulid> files, promote each, then finalize.
@@ -1861,7 +1936,14 @@ fn gc_keeps_live_delta_source() {
     vol.flush_wal().unwrap();
 
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    let st = gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    let st = gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     assert!(
         st.candidates >= 2,
         "both segments must be GC candidates once the floor is gone, got {}",
@@ -1954,7 +2036,7 @@ fn gc_leaves_a_forks_reachable_range_alone() {
     ));
 
     let u_gc = source.gc_checkpoint_for_test().unwrap();
-    let st = gc_fork(&source_dir, by_id, &gc_config, vec![u_gc]).unwrap();
+    let st = gc_fork(&source_dir, by_id, &gc_config, vec![u_gc], None).unwrap();
     assert_eq!(
         st.total_segments, 1,
         "the branch-time segment sits below the floor and must not enter the pass"
@@ -2087,7 +2169,14 @@ fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
     rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
 
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
 
     // ── Plan→apply window ──
     // A DedupRef write keeps H_A referenced in the live map, so the
@@ -2163,6 +2252,7 @@ fn gc_delta_minted_in_plan_apply_window_cancels_then_heals() {
         fork_dir.parent().unwrap(),
         &gc_config,
         vec![u_gc2],
+        None,
     )
     .unwrap();
     vol.apply_gc_handoffs().unwrap();
@@ -2255,7 +2345,14 @@ fn write_after_plan_survives_post_crash_apply(tier: WriteTier) {
     rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
 
     let u_gc = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     let plan_path = fork_dir.join("gc").join(format!("{u_gc}.plan"));
     assert!(
         plan_path.exists(),
@@ -2410,7 +2507,14 @@ fn write_over_a_gc_output_survives_a_later_plan_applying_after_a_crash() {
     // Pass 1, carried all the way through the coordinator's upload,
     // promote and input cleanup so its output is a promoted segment.
     let u1 = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u1]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u1],
+        None,
+    )
+    .unwrap();
     assert!(
         fork_dir.join("gc").join(format!("{u1}.plan")).exists(),
         "pass 1 must emit a plan over the sparse segment"
@@ -2428,7 +2532,14 @@ fn write_over_a_gc_output_survives_a_later_plan_applying_after_a_crash() {
     rt.block_on(drain_pending_to_store(&mut vol, ulid::Ulid::nil(), &store));
 
     let u2 = vol.gc_checkpoint_for_test().unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u2]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u2],
+        None,
+    )
+    .unwrap();
     let plan_path = fork_dir.join("gc").join(format!("{u2}.plan"));
     assert!(plan_path.exists(), "pass 2 must emit a plan");
     let plan = elide_core::rewrite_plan::RewritePlan::read(&plan_path).unwrap();
@@ -2578,6 +2689,7 @@ fn a_plan_set_split_by_a_crash_keeps_the_acknowledged_write() {
         fork_dir.parent().unwrap(),
         &gc_config,
         buckets.clone(),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -2788,7 +2900,14 @@ fn a_fold_over_an_undrained_write_loses_to_it_on_remount() {
          ordering is the whole point of this test",
         pending[0]
     );
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     let plan_path = fork_dir.join("gc").join(format!("{u_gc}.plan"));
     assert!(
         plan_path.exists(),
@@ -2889,7 +3008,14 @@ fn a_fold_carrying_a_superseded_hash_is_refused() {
     let hidden_src = elide_core::segment::pending_open_dir(fork_dir).join(pending[0].to_string());
     let hidden_dst = dir.path().join("hidden.seg");
     fs::rename(&hidden_src, &hidden_dst).unwrap();
-    gc_fork(fork_dir, fork_dir.parent().unwrap(), &gc_config, vec![u_gc]).unwrap();
+    gc_fork(
+        fork_dir,
+        fork_dir.parent().unwrap(),
+        &gc_config,
+        vec![u_gc],
+        None,
+    )
+    .unwrap();
     fs::rename(&hidden_dst, &hidden_src).unwrap();
     assert!(
         fork_dir.join("gc").join(format!("{u_gc}.plan")).exists(),

@@ -39,6 +39,16 @@ const FENCE_HEARTBEAT: Duration = Duration::from_secs(60);
 /// on the scale of minutes while the pass runs on `gc.interval`.
 const CENSUS_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How long the tick loop replays one idle GC pass before it rebuilds the
+/// liveness view again. A fork whose inputs hold still costs one real
+/// pass per window.
+///
+/// The window bounds the reaction time a fork gets when an input escapes
+/// the pass fingerprint. It stays well under [`CENSUS_INTERVAL`], because
+/// only a real pass carries a census. See
+/// `docs/design/gc-idle-pass-gate.md`.
+const IDLE_PASS_HOLD: Duration = Duration::from_secs(120);
+
 /// Result of re-reading `names/<name>` against this fork's ULID. The
 /// two consumers dispose of the non-`Bound` cases differently — the
 /// tick-top fence stays conservative (only `Displaced` fences), the
@@ -93,6 +103,11 @@ pub struct GcCycleOrchestrator {
     /// often than the distribution moves, so the log runs on
     /// [`CENSUS_INTERVAL`] instead of per pass.
     last_census: Instant,
+    /// Cross-tick: the last GC pass that emitted no plan, replayed while
+    /// the fork's inputs hash the same and the pass is younger than
+    /// [`IDLE_PASS_HOLD`]. Carries the age of the pass that ran, which is
+    /// what the hold measures.
+    idle_pass: Option<gc::IdlePass>,
     /// Publish scratch: ULIDs uploaded (drain) or produced (GC output)
     /// since the last published cut — the signal that S3 segment state
     /// changed and a HEAD PUT is due. Kept across ticks until a publish
@@ -213,6 +228,7 @@ impl GcCycleOrchestrator {
             last_reap,
             last_fence,
             last_census: now.checked_sub(CENSUS_INTERVAL).unwrap_or(now),
+            idle_pass: None,
             last_cut,
             tick_added: Vec::new(),
             tick_superseded: Vec::new(),
@@ -1233,14 +1249,21 @@ impl GcCycleOrchestrator {
             let fork_dir = self.fork_dir.clone();
             let by_id_dir = self.by_id_dir.clone();
             let gc_config = self.gc_config.clone();
+            let idle = self
+                .idle_pass
+                .take()
+                .filter(|p| p.held_for() < IDLE_PASS_HOLD);
             tokio::task::spawn_blocking(move || {
-                gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, bucket_ulids)
+                gc::gc_fork(&fork_dir, &by_id_dir, &gc_config, bucket_ulids, idle)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("gc task panicked: {e}")))
         };
         let reclaim_targets = match &gc_result {
-            Ok(stats) => stats.reclaim_targets.clone(),
+            Ok(stats) => {
+                self.idle_pass = stats.idle.clone();
+                stats.reclaim_targets.clone()
+            }
             Err(_) => Vec::new(),
         };
         if self.last_census.elapsed() >= CENSUS_INTERVAL
