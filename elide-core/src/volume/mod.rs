@@ -613,26 +613,38 @@ fn refusal_identity(kind: &str, runs: &[(u64, u64, Ulid)], inputs: usize) -> Opt
 }
 
 /// Disjoint half-open LBA ranges, ascending, for coverage queries.
-struct LbaRanges(Vec<(u64, u64)>);
+pub(in crate::volume) struct LbaRanges(Vec<(u64, u64)>);
 
 impl LbaRanges {
     /// The union of the LBA ranges `entries` stakes a claim over.
     /// Canonical-only kinds carry a body for dedup resolution and claim
     /// nothing, so they contribute no range.
-    fn from_claims(entries: &[segment::SegmentEntry]) -> Self {
+    pub(in crate::volume) fn from_claims(entries: &[segment::SegmentEntry]) -> Self {
+        Self::new(Self::claim_ranges(entries))
+    }
+
+    /// The union of the claim ranges of `entries` and the `(start_lba,
+    /// lba_length)` pairs in `ranges`.
+    pub(in crate::volume) fn from_claims_and_ranges(
+        entries: &[segment::SegmentEntry],
+        ranges: impl IntoIterator<Item = (u64, u32)>,
+    ) -> Self {
         Self::new(
-            entries
-                .iter()
-                .filter(|e| !e.kind.is_canonical_only())
-                .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
-                .collect(),
+            Self::claim_ranges(entries).chain(ranges.into_iter().map(|(s, l)| (s, s + l as u64))),
         )
+    }
+
+    fn claim_ranges(entries: &[segment::SegmentEntry]) -> impl Iterator<Item = (u64, u64)> + '_ {
+        entries
+            .iter()
+            .filter(|e| !e.kind.is_canonical_only())
+            .map(|e| (e.start_lba, e.start_lba + e.lba_length as u64))
     }
 
     /// Sort and coalesce `ranges`. Empty ranges cover nothing and are
     /// dropped, which keeps [`Self::next_start_after`] on a range that
     /// can hold `cursor` back.
-    fn new(ranges: Vec<(u64, u64)>) -> Self {
+    pub(in crate::volume) fn new(ranges: impl IntoIterator<Item = (u64, u64)>) -> Self {
         let mut ranges: Vec<(u64, u64)> = ranges.into_iter().filter(|(s, e)| s < e).collect();
         ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -669,6 +681,14 @@ impl LbaRanges {
     fn next_start_after(&self, lba: u64) -> Option<u64> {
         let i = self.0.partition_point(|(s, _)| *s <= lba);
         self.0.get(i).map(|(s, _)| *s)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.0.iter().copied()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -1914,8 +1934,10 @@ impl Volume {
         let pre_apply_lbamap = Arc::clone(&self.lbamap);
         let mut merge = Duration::ZERO;
         let mut blocked: Vec<(u64, u32)> = Vec::new();
+        let gate_ranges =
+            LbaRanges::from_claims_and_ranges(&entries, input_claim_ranges.iter().copied());
         let gate_start = Instant::now();
-        let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
+        let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
             let merge_start = Instant::now();
             {
                 let index = Arc::make_mut(&mut vol.extent_index);
@@ -2148,11 +2170,12 @@ impl Volume {
     /// apply consumes lies inside the union of that segment's entry LBA
     /// ranges.
     ///
-    /// It is what makes the dropped-claim refusal's bounded walk
-    /// complete rather than merely cheap. That walk queries the map over
-    /// the inputs' own entry ranges, so a claim keyed to an input from
-    /// outside them is one the refusal cannot see, and a fold that drops
-    /// it reports clean.
+    /// It is what makes the bounded walks of the dropped-claim refusal
+    /// and the resolvability gate complete rather than merely cheap. Both
+    /// query the map over the inputs' own entry ranges, so a claim keyed
+    /// to an input from outside them is one they cannot see. A fold that
+    /// drops it reports clean, and a purge that strands it passes the
+    /// gate.
     ///
     /// A claim reaches the map by registering an entry, and a split only
     /// narrows a range inside the original, so the property holds by
@@ -2176,8 +2199,7 @@ impl Volume {
         let within = LbaRanges::new(
             input_claim_ranges
                 .iter()
-                .map(|(start, length)| (*start, start + *length as u64))
-                .collect(),
+                .map(|(start, length)| (*start, start + *length as u64)),
         );
         let outside: Vec<(u64, u64, Ulid)> = pre_apply
             .iter_entries_with_claimant()
@@ -2192,7 +2214,8 @@ impl Volume {
             let mut msg = format!(
                 "claims-within-input-ranges invariant violation during [plan {new_ulid} apply]: \
                  {} claim(s) held by a consumed input sit outside its entry ranges, so the \
-                 dropped-claim refusal's bounded walk cannot see them",
+                 bounded walks of the dropped-claim refusal and the resolvability gate cannot \
+                 see them",
                 outside.len()
             );
             for (from, to, claimant) in outside.iter().take(REFUSAL_SAMPLE_LIMIT) {
@@ -2713,18 +2736,20 @@ impl Volume {
     /// one resolves for every claimant at once through `inner` or a
     /// delta with a resolving source, and otherwise per claim through
     /// the claimant's journal map — the one tier whose resolution is
-    /// claimant-keyed, which takes a map walk to pair each claim with
-    /// its claimant.
+    /// claimant-keyed, which takes a walk over the claims to pair each
+    /// with its claimant.
     ///
-    /// That walk is shared: every hash the claimant-free tiers leave
-    /// unresolved settles in one pass over the map. A journal
-    /// consolidation bucket lands its whole footprint in that residual
-    /// — journal hashes resolve only through their claimant — so the
-    /// walk's cost has to be per gate call, with the wholly-durable
+    /// That walk covers the claims in `claim_ranges`, and it is shared:
+    /// every hash the claimant-free tiers leave unresolved settles in
+    /// one pass over those claims. A journal consolidation bucket lands
+    /// its whole footprint in that residual — journal hashes resolve
+    /// only through their claimant — so the walk's cost is per gate
+    /// call and proportional to the bucket, with the wholly-durable
     /// footprints of GC folds and close-pass buckets skipping it.
     fn unresolvable_footprint_hashes(
         &self,
         footprint: &Blake3HashSet,
+        claim_ranges: &LbaRanges,
         sample_limit: usize,
     ) -> UnresolvableHashes {
         let mut found = UnresolvableHashes::default();
@@ -2749,17 +2774,24 @@ impl Volume {
             return found;
         }
         log::info!(
-            "resolvability gate: residual walk over {} journal-tier hash(es)",
+            "resolvability gate: residual walk over {} journal-tier hash(es) in {} lba range(s)",
             residual.len(),
+            claim_ranges.len(),
         );
-        for (lba, _len, hash, _off, claimant) in self.lbamap.iter_entries_with_claimant() {
-            if !residual.contains(&hash) {
-                continue;
-            }
-            if self.extent_index.lookup_journal(claimant, &hash).is_none() {
-                found.total += 1;
-                if found.sample.len() < sample_limit {
-                    found.sample.push((lba, hash));
+        for (start, end) in claim_ranges.iter() {
+            for x in self.lbamap.extents_in_range(start, end) {
+                if !residual.contains(&x.hash) {
+                    continue;
+                }
+                if self
+                    .extent_index
+                    .lookup_journal(x.claimant_ulid, &x.hash)
+                    .is_none()
+                {
+                    found.total += 1;
+                    if found.sample.len() < sample_limit {
+                        found.sample.push((x.range_start, x.hash));
+                    }
                 }
             }
         }
@@ -2780,17 +2812,22 @@ impl Volume {
     /// `footprint` is the caller's declaration of every hash whose
     /// resolvability the mutation can change: each hash it removes or
     /// registers in either map, each hash whose lbamap claim it merges,
-    /// and each journal-tier hash of a segment it purges. A claim over
-    /// an undeclared hash can only strand through a mutation reaching
-    /// outside its declaration; with the volume invariants switched on
-    /// the whole map is re-checked after every structural op, which is
-    /// where that class is caught. Checking the declaration rather than the map is
-    /// what takes the gate from O(lbamap) per call to O(footprint) —
+    /// and each journal-tier hash of a segment it purges. `claim_ranges`
+    /// is the matching declaration of every LBA whose claim the mutation
+    /// can re-point or whose claimant it can purge, which are the entry
+    /// ranges of each input it consumes and of the output it registers. A claim
+    /// over an undeclared hash, or outside the declared ranges, can only
+    /// strand through a mutation reaching outside its declaration; with
+    /// the volume invariants switched on the whole map is re-checked
+    /// after every structural op, which is where that class is caught.
+    /// Checking the declaration rather than the map is what takes the
+    /// gate from O(lbamap) per call to O(footprint + claims in range) —
     /// the difference between millions of lookups under the write mutex
     /// and thousands (#902).
     pub(in crate::volume) fn mutate_gated_on_resolvability(
         &mut self,
         footprint: &Blake3HashSet,
+        claim_ranges: &LbaRanges,
         mutate: impl FnOnce(&mut Self) -> io::Result<()>,
     ) -> io::Result<ResolvabilityGate> {
         let pre_index = Arc::clone(&self.extent_index);
@@ -2800,7 +2837,8 @@ impl Volume {
             self.lbamap = pre_lbamap;
             return Err(e);
         }
-        let orphaned = self.unresolvable_footprint_hashes(footprint, REFUSAL_SAMPLE_LIMIT);
+        let orphaned =
+            self.unresolvable_footprint_hashes(footprint, claim_ranges, REFUSAL_SAMPLE_LIMIT);
         if orphaned.total == 0 {
             return Ok(ResolvabilityGate::Applied);
         }

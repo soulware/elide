@@ -5580,7 +5580,7 @@ fn gate_refuses_a_mutation_stranding_a_declared_hash() {
 
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
     let gate = vol
-        .mutate_gated_on_resolvability(&footprint, |v| {
+        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
             Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
             Ok(())
         })
@@ -5618,7 +5618,7 @@ fn the_gate_trusts_the_declared_footprint() {
     let owner = vol.extent_index.lookup(&hash).unwrap().segment_id;
 
     let gate = vol
-        .mutate_gated_on_resolvability(&Default::default(), |v| {
+        .mutate_gated_on_resolvability(&Default::default(), &LbaRanges::new([(0, 1)]), |v| {
             Arc::make_mut(&mut v.extent_index).remove_owner_at(&hash, owner);
             Ok(())
         })
@@ -5659,9 +5659,10 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
     );
     Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
+    let ranges = LbaRanges::new([(0, 2)]);
 
     let gate = vol
-        .mutate_gated_on_resolvability(&footprint, |_| Ok(()))
+        .mutate_gated_on_resolvability(&footprint, &ranges, |_| Ok(()))
         .unwrap();
     assert!(
         matches!(gate, ResolvabilityGate::Applied),
@@ -5671,7 +5672,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
     let other = vol.mint.next();
     Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, other);
     let gate = vol
-        .mutate_gated_on_resolvability(&footprint, |_| Ok(()))
+        .mutate_gated_on_resolvability(&footprint, &ranges, |_| Ok(()))
         .unwrap();
     match gate {
         ResolvabilityGate::Refused(orphaned) => {
@@ -5685,7 +5686,7 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
 
     Arc::make_mut(&mut vol.lbamap).insert(1, 1, hash, seg);
     let gate = vol
-        .mutate_gated_on_resolvability(&footprint, |v| {
+        .mutate_gated_on_resolvability(&footprint, &ranges, |v| {
             Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
             Ok(())
         })
@@ -5698,6 +5699,62 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
         vol.extent_index.lookup_journal(seg, &hash).is_some(),
         "refusal restores the journal map"
     );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The journal-tier walk covers the declared claim ranges and nothing
+/// else — the bound that holds a journal bucket's gate to O(bucket)
+/// under the write mutex. A purge that strands a claim outside the
+/// declaration escapes it; `assert_claims_within_input_ranges` in the
+/// `volume-invariants` build is what audits that contract.
+#[test]
+fn the_gate_trusts_the_declared_claim_ranges() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let hash = blake3::hash(b"journal block");
+    let seg = vol.mint.next();
+    let location = extentindex::ExtentLocation {
+        segment_id: seg,
+        body_offset: 0,
+        body_length: 4096,
+        codec: segment::Codec::None,
+        body_source: extentindex::BodySource::Local,
+        body_section_start: 0,
+        inline_data: None,
+    };
+    Arc::make_mut(&mut vol.extent_index).insert_journal_if_absent(seg, hash, location.clone());
+    Arc::make_mut(&mut vol.lbamap).insert(0, 1, hash, seg);
+    Arc::make_mut(&mut vol.lbamap).insert(8, 1, hash, seg);
+    let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
+
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
+            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            Ok(())
+        })
+        .unwrap();
+    match gate {
+        ResolvabilityGate::Refused(orphaned) => {
+            assert_eq!(orphaned.total, 1, "only the claim in range is counted");
+            assert_eq!(orphaned.sample, vec![(0, hash)]);
+        }
+        ResolvabilityGate::Applied => panic!("a stranded claim in range must refuse"),
+    }
+    assert!(vol.extent_index.lookup_journal(seg, &hash).is_some());
+
+    let gate = vol
+        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(16, 17)]), |v| {
+            Arc::make_mut(&mut v.extent_index).purge_journal_segment(seg);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        matches!(gate, ResolvabilityGate::Applied),
+        "claims outside the declared ranges are outside the walk"
+    );
+    assert!(vol.extent_index.lookup_journal(seg, &hash).is_none());
 
     fs::remove_dir_all(base).unwrap();
 }

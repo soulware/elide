@@ -149,6 +149,10 @@ pub struct RepackedInput {
     pub input_ulid: Ulid,
     pub input_path: PathBuf,
     pub owned_hashes: Vec<blake3::Hash>,
+    /// `(start_lba, lba_length)` of every claim-making entry in the
+    /// input's index at dispatch time. Bounds the apply's resolvability
+    /// gate to the LBAs the input can hold a claim over.
+    pub claim_ranges: Vec<(u64, u32)>,
 }
 
 /// Materialised rewrite output for a repack bucket.
@@ -601,8 +605,15 @@ impl Volume {
         let mut remove = Duration::ZERO;
         let mut index_reg = Duration::ZERO;
         let mut lbamap_reg = Duration::ZERO;
+        let gate_ranges = super::LbaRanges::from_claims_and_ranges(
+            bucket.output.as_ref().map_or(&[][..], |o| &o.out_entries),
+            bucket
+                .inputs
+                .iter()
+                .flat_map(|i| i.claim_ranges.iter().copied()),
+        );
         let gate_start = Instant::now();
-        let gate = self.mutate_gated_on_resolvability(&footprint, |vol| {
+        let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
             let merge_start = Instant::now();
             let index = Arc::make_mut(&mut vol.extent_index);
 
@@ -1089,6 +1100,7 @@ mod tests {
                     input_ulid,
                     input_path: input_path.clone(),
                     owned_hashes: vec![blake3::hash(&recurring)],
+                    claim_ranges: vec![(0, 1)],
                 }],
                 output: None,
                 bytes_freed: 4096,
