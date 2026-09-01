@@ -1,7 +1,7 @@
 # Design: epoch applies
 
-**Status:** steps 1 to 3 shipped (#984, #985, #987, #988, 2026-09-01), steps 4
-and 5 open. The measurements come from the `write_contention` simulator
+**Status:** steps 1 to 4 shipped (#984, #985, #987, #988, #989, 2026-09-01),
+step 5 open. The measurements come from the `write_contention` simulator
 (2026-08-31, parked on the `wip-measurement-probes` branch) and the rig's
 per-site lock statistics (2026-09-01). Builds on claimant tracking
 (`lbamap-claimant-tracking.md`), the plan-apply gate (`gc-plan-handoff.md`) and
@@ -114,14 +114,31 @@ run against and the moment they run.
 | promote-prep | take `pending`, stage, mint | freeze: `delta` → frozen layer, rotate WAL, mint |
 | promote-apply | CAS WAL locations to segment locations, bump claimants | fold the frozen layer into a clone of `base` with the segment's locations and ULID; swap, pop the layer |
 | promote-segment-apply | flip pending locations to cache, rekey journal | clone `base`, flip, swap |
-| gc-plan-apply | `register_entry_consuming_inputs`, `remove_owner_at`, `purge_journal_segment`, gate | clone `base`, transform, gate on the clone, swap with the removal check |
-| repack-apply (per bucket) | same shape as gc-plan-apply | same shape as gc-plan-apply |
+| gc-plan-apply | `register_entry_consuming_inputs`, `remove_owner_at`, `purge_journal_segment`, gate | fold the frozen layers below the plan's ULID into a clone of `base`, transform, gate on the clone under the upper layers, swap with the removal check, retire those layers |
+| repack-apply (per bucket) | same shape as gc-plan-apply | clone `base`, transform, gate on the clone under the upper layers, swap with the removal check |
 | reap-apply | `remove_input_owned`, purges | clone `base`, transform, swap with the removal check |
 | reclaim-apply | `register_entry_if_newer`, register output | fold the frozen layers below the output's ULID into a clone of `base`, transform, swap, retire those layers |
 | gc-handoff-finalize, own-segments, publish | no map mutation | unchanged |
 
-A refused gate discards the clone. Today it restores two `Arc`s; the outcome
-is the same.
+A refused gate discards the clone.
+
+The GC plan folds below its ULID for the reason the reclaim does. The plan's
+ULID is minted at a GC checkpoint, so every WAL opened after it sorts above,
+and a frozen layer below it is a promote the actor stashed after a failure.
+That layer's claims sit below the plan, and the rebuild admits by highest
+ULID, so a plan that carries an LBA the layer claims would win on disk and
+lose in memory. The absorb put those claims in `base`, where
+`register_entry_consuming_inputs` refused the range and the superseded-carry
+check refused the plan. The replay of the layer into the fold's clone keeps
+that refusal (`a_gc_plan_fold_replays_a_stashed_layer_below_its_ulid`). The
+repack and the reap have no ULID-order check, so their fold over `base` alone
+gives the materialised map the absorb gave.
+
+The liveness probes (`still_at_input`, `is_referenced`,
+`is_named_delta_source`, the gate's `claim_refcount`) read the layers
+materialised into one map, which is the map the rebuild gives. A layered sum
+over-counts a `base` claim that an upper layer masks. The fold materialises
+off the lock, so the exact answer costs the guest write nothing.
 
 Only frozen layers ever hold WAL locations, and `delta` holds only the open
 WAL's. The drain flip re-points locations the drained segment owns, and those
@@ -179,14 +196,20 @@ strand that claim.
 
 Two checks close the window:
 
-1. The fold reads liveness across every layer at its start. `claim_refcount`
-   and `is_named_delta_source` sum over `base`, the frozen layers and `delta`.
-2. The swap, under the lock, checks each hash the fold removed against the
-   `delta` entries written since the fold started. `delta` is small and the
-   check is one lookup per removed hash. A hit refuses the swap, the apply
-   discards its clone, and the next pass runs against a base that includes the
-   claim. This is the refusal shape `mutate_gated_on_resolvability` already
-   has.
+1. The fold reads liveness over the materialised layers at its start, so a
+   claim already in `delta` or a frozen layer refuses the removal there.
+2. The swap, under the lock, checks the hashes the fold removed against the
+   claims in `delta` (`MapLayers::delta_claims_any`). Only `delta` changes
+   between a fold and its swap: freezes and every other mutation of `base`
+   run on the actor thread, which is the thread that folds. The walk is over
+   `delta`'s claim keys, which are few against a fold's removals. A hit
+   refuses the unit, one plan, one bucket or one reap pass; the apply
+   discards its clone, and the next pass runs against a base that includes
+   the claim.
+
+The GC plan's commit rename runs after the check and before the swap. A
+rename failure leaves the maps as they were, and a crash between the two
+ends the process with the output committed for the rebuild.
 
 The promote fold has no removal, and its input layer is immutable, so its CAS
 preconditions (`pre_promote_offsets`) hold by construction.
@@ -241,7 +264,8 @@ of scope here.
    `promote-segment-apply` max 78.2 to 0.3ms; the 10-100ms band 1805 to
    1394 per million; `gc-plan-apply` and `repack-apply` are 99.6% of the
    lock hold that remains.
-4. GC plan apply, repack buckets and the reap, with the swap removal check.
+4. GC plan apply, repack buckets and the reap, with the swap removal check
+   (#989).
 5. The fold-equals-rebuild assertion after every swap in the
    `volume-invariants` build, and a proptest that interleaves writes with
    folds.
