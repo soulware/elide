@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::{
     blake3_id_hasher::Blake3HashSet,
-    extentindex, lbamap,
+    extentindex,
     map_layers::{MapLayers, Maps},
     segment::{self},
     segment_cache,
@@ -102,7 +102,7 @@ pub struct RepackJob {
     pub pending_dir: PathBuf,
     pub floor: Option<Ulid>,
     /// The candidate segment files, listed at prep. Carrying the list
-    /// pins eligibility to the same instant as `lbamap_snapshot`, so a
+    /// pins eligibility to the same instant as `layers`, so a
     /// segment landing while the worker runs is outside this pass rather
     /// than classified against a snapshot that predates its entries.
     pub seg_paths: Vec<PathBuf>,
@@ -115,8 +115,10 @@ pub struct RepackJob {
     /// after every entry of `output_ulids` so each sorts above every data
     /// output. Length is [`JOURNAL_CONSOLIDATION_ULIDS`].
     pub journal_output_ulids: Vec<Ulid>,
-    pub lbamap_snapshot: Arc<lbamap::LbaMap>,
-    pub extent_index_snapshot: Arc<extentindex::ExtentIndex>,
+    /// The volume's map layers as of dispatch. The worker materialises
+    /// them into the lbamap and extent index it classifies against, so a
+    /// claim in a frozen layer or in `delta` reads live.
+    pub layers: MapLayers,
     pub ancestor_layers: Vec<super::AncestorLayer>,
     pub fetcher: Option<segment::BoxFetcher>,
     pub signer: Arc<dyn segment::SegmentSigner>,
@@ -618,7 +620,6 @@ impl Volume {
             .collect();
         let u_flush = self.mint.next();
         let flush = self.rotate_wal_into_promote(u_flush)?;
-        let maps = self.maps.materialised();
 
         let job = RepackJob {
             base_dir: self.base_dir.clone(),
@@ -628,8 +629,7 @@ impl Volume {
             work_budget: u64::MAX,
             output_ulids,
             journal_output_ulids,
-            lbamap_snapshot: maps.lbamap,
-            extent_index_snapshot: maps.extent_index,
+            layers: self.maps.clone(),
             ancestor_layers: self.ancestor_layers.clone(),
             fetcher: self.fetcher.clone(),
             signer: Arc::clone(&self.signer),
@@ -696,7 +696,6 @@ impl Volume {
             .map(|_| self.mint.next())
             .collect();
 
-        let maps = self.maps.materialised();
         Ok(CloseGenerationPrep {
             rotated: Some(rotated),
             job: Some(RepackJob {
@@ -707,8 +706,7 @@ impl Volume {
                 work_budget: REPACK_CLOSE_WORK_BYTES,
                 output_ulids,
                 journal_output_ulids,
-                lbamap_snapshot: maps.lbamap,
-                extent_index_snapshot: maps.extent_index,
+                layers: self.maps.clone(),
                 ancestor_layers: self.ancestor_layers.clone(),
                 fetcher: self.fetcher.clone(),
                 signer: Arc::clone(&self.signer),

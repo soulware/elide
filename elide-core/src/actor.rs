@@ -3489,14 +3489,16 @@ pub(crate) fn execute_repack(job: RepackJob) -> io::Result<RepackResult> {
         work_budget,
         output_ulids,
         journal_output_ulids,
-        lbamap_snapshot,
-        extent_index_snapshot,
+        layers,
         ancestor_layers,
         fetcher,
         signer,
         verifying_key,
         segment_cache,
     } = job;
+    let maps = layers.materialised();
+    let lbamap_snapshot = maps.lbamap;
+    let extent_index_snapshot = maps.extent_index;
 
     // Claims plus every named delta source — a base body must stay
     // resolvable while any registered encoding names it, so the

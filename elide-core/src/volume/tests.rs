@@ -6895,3 +6895,61 @@ fn a_gc_plan_prep_hands_the_worker_the_base_index() {
     drop(stalled);
     fs::remove_dir_all(base).unwrap();
 }
+
+/// The close-generation prep hands the worker the map layers, and the
+/// worker materialises them with the lock released. A hash dead in `base`
+/// and claimed in a frozen layer classifies live, so the pass carries it
+/// and the bucket lands.
+#[test]
+fn a_close_generation_prep_hands_the_worker_the_layers() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let x = xof_block(1);
+    let y = xof_block(2);
+    let z = xof_block(3);
+    let w = xof_block(4);
+    let hash_x = blake3::hash(&x);
+    vol.write(0, &x).unwrap();
+    vol.write(1, &y).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(0, &z).unwrap();
+    vol.promote_for_test().unwrap();
+    assert!(
+        !vol.maps.base().lbamap.is_referenced(&hash_x),
+        "x is dead in base"
+    );
+
+    // The claim on x lives in a frozen layer alone.
+    vol.write(5, &x).unwrap();
+    let segment_ulid = vol.mint.next();
+    let stalled = vol.take_wal_into_promote_job(segment_ulid).unwrap();
+    assert_eq!(vol.maps.frozen_depth(), 1, "the prep froze the epoch");
+    vol.write(6, &w).unwrap();
+
+    let prep = vol.prepare_close_generation().unwrap();
+    let job = prep.job.expect("close-generation job");
+    assert_eq!(job.layers.frozen_depth(), 1);
+    assert!(!job.layers.delta_is_empty());
+    let result = crate::actor::execute_repack(job).unwrap();
+    let (stats, consumed) = vol.apply_repack_result(result).unwrap();
+    assert_eq!(stats.buckets_refused, 0, "the worker classified x live");
+    assert_eq!(stats.segments_compacted, 2);
+    assert_eq!(consumed.len(), 2);
+    vol.remove_consumed_inputs(&consumed).unwrap();
+
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash_x)
+            .is_some()
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+    assert_eq!(vol.read(5, 1).unwrap(), x);
+    assert_eq!(vol.read(6, 1).unwrap(), w);
+
+    drop(stalled);
+    fs::remove_dir_all(base).unwrap();
+}
