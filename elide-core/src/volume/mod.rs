@@ -1887,7 +1887,7 @@ impl Volume {
             base_dir: self.base_dir.clone(),
             ancestor_layers: self.ancestor_layers.clone(),
             fetcher: self.fetcher.clone(),
-            extent_index: self.maps.materialised().extent_index,
+            extent_index: Arc::clone(&self.maps.base().extent_index),
             signer: Arc::clone(&self.signer),
             verifying_key: self.verifying_key,
             plan,
