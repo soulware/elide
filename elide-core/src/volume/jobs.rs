@@ -263,9 +263,11 @@ pub struct GcPlanApplyJob {
     pub base_dir: PathBuf,
     pub ancestor_layers: Vec<AncestorLayer>,
     pub fetcher: Option<BoxFetcher>,
-    /// Merged extent index as of dispatch, for resolving DedupRef /
-    /// Delta-base bodies. Apply recomputes updates from a fresh snapshot, so
-    /// writes that land while the worker runs survive.
+    /// The `base` extent index as of dispatch, for resolving DedupRef /
+    /// Delta-base bodies. Every input is a published segment, and a segment
+    /// enters `base` at the swap that publishes it. Apply recomputes updates
+    /// from a fresh snapshot, so writes that land while the worker runs
+    /// survive.
     pub extent_index: Arc<extentindex::ExtentIndex>,
     pub signer: Arc<dyn segment::SegmentSigner>,
     pub verifying_key: ed25519_dalek::VerifyingKey,

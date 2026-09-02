@@ -6809,3 +6809,89 @@ fn a_reap_swap_refuses_a_claim_written_after_its_fold() {
 
     fs::remove_dir_all(base).unwrap();
 }
+
+/// The plan prep hands the worker the `base` extent index. Every input is a
+/// published segment, so the worker resolves an input's DedupRef body
+/// through `base` while a frozen layer and a delta write sit above it, and
+/// the plan lands.
+#[test]
+fn a_gc_plan_prep_hands_the_worker_the_base_index() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    let gc_dir = base.join("gc");
+
+    let x = xof_block(1);
+    let y = xof_block(2);
+    let q = xof_block(5);
+    let w = xof_block(4);
+    let hash_x = blake3::hash(&x);
+    let hash_y = blake3::hash(&y);
+    vol.write(0, &x).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    let canonical = vol.last_segment_ulid.unwrap();
+    vol.write(3, &x).unwrap();
+    vol.write(4, &y).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    let input = vol.last_segment_ulid.unwrap();
+    assert_ne!(canonical, input);
+    assert_eq!(
+        vol.maps
+            .base()
+            .extent_index
+            .lookup(&hash_x)
+            .unwrap()
+            .segment_id,
+        canonical,
+        "the input's x entry is a DedupRef into the canonical segment"
+    );
+
+    vol.write(4, &q).unwrap();
+    let segment_ulid = vol.mint.next();
+    let stalled = vol.take_wal_into_promote_job(segment_ulid).unwrap();
+    assert_eq!(vol.maps.frozen_depth(), 1, "the prep froze the epoch");
+
+    let (new_ulid, plan_path) = write_plan_keeping(&mut vol, input, &|e| e.hash == hash_x);
+    vol.write(6, &w).unwrap();
+    assert!(!vol.maps.delta_is_empty(), "the write sits in delta");
+
+    let plan = read_plan_for_apply(&plan_path, new_ulid).unwrap();
+    let job = vol.prepare_plan_apply(plan_path.clone(), new_ulid, plan);
+    assert!(
+        Arc::ptr_eq(&job.extent_index, &vol.maps.base().extent_index),
+        "the prep hands over base's index by handle"
+    );
+    let result = crate::actor::execute_gc_plan_apply(job).unwrap();
+    let layers = match vol.prepare_plan_swap(&result) {
+        PlanSwapPrep::Layers(layers) => layers,
+        PlanSwapPrep::Skip(outcome) => panic!("prep skipped the plan: {outcome:?}"),
+    };
+    let landed = match fold_plan_apply_result(&layers, result, &vol.base_dir, &vol.ancestor_layers)
+        .unwrap()
+    {
+        PlanFold::Landed(landed) => landed,
+        PlanFold::Cancelled => panic!("the fold refused the plan"),
+    };
+    assert_eq!(
+        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        StagedApply::Applied
+    );
+    assert!(gc_dir.join(new_ulid.to_string()).exists());
+    assert!(!plan_path.exists());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash_y)
+            .is_none(),
+        "the dropped hash left the index"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), x);
+    assert_eq!(vol.read(3, 1).unwrap(), x);
+    assert_eq!(vol.read(4, 1).unwrap(), q);
+    assert_eq!(vol.read(6, 1).unwrap(), w);
+
+    drop(stalled);
+    fs::remove_dir_all(base).unwrap();
+}
