@@ -19,12 +19,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
 use super::Volume;
+use crate::blake3_id_hasher::Blake3HashSet;
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
+use crate::map_layers::{MapLayers, Maps};
 use crate::segment::{self, EntryKind};
 
 /// Entries one pass may remove under the volume mutex — four
@@ -265,74 +268,127 @@ fn parse_with_cap(candidates: Vec<ReapCandidate>, cap: usize) -> Vec<ReapSegment
     out
 }
 
+/// A reap pass's fold between [`fold_reap`] and [`Volume::swap_reap`].
+pub struct ReapFold {
+    stats: ReapStats,
+    /// `base` with the reaped segments removed.
+    post: Maps,
+    /// The hashes the fold dropped from the extent index.
+    removed: Blake3HashSet,
+    reaped: Vec<ReapSegment>,
+}
+
+/// The fold of a reap pass over a clone of `base`, with the volume mutex
+/// released.
+///
+/// Each data segment revalidates through the maintained-count probes: a
+/// hash the segment still owns that a claim or an encoding names refuses
+/// the segment whole, which absorbs a dedup claim minted between the
+/// sweep and the fold. The claims read from the materialised layers, the
+/// map the rebuild gives. The owner and the source counts read from the
+/// working index, so a purge of one segment's sources frees a later
+/// segment in the same pass. A journal segment is taken on the sweep's
+/// word: its claims are keyed by its own ULID and only decrease once it
+/// is sealed.
+pub fn fold_reap(layers: &MapLayers, segments: Vec<ReapSegment>) -> ReapFold {
+    let mut stats = ReapStats::default();
+    let mut reaped = Vec::new();
+    let mut removed = Blake3HashSet::default();
+    let no_carried = Blake3HashSet::default();
+    let view = layers.materialised();
+    let mut post = layers.base().clone();
+    let index = Arc::make_mut(&mut post.extent_index);
+    for seg in segments {
+        if !seg.journal {
+            let fresh = seg.owned_hashes.iter().find(|hash| {
+                let owner_here = index
+                    .lookup(hash)
+                    .is_some_and(|loc| loc.segment_id == seg.ulid)
+                    || index
+                        .lookup_delta(hash)
+                        .is_some_and(|loc| loc.segment_id == seg.ulid);
+                owner_here && (view.lbamap.is_referenced(hash) || index.is_named_delta_source(hash))
+            });
+            if let Some(hash) = fresh {
+                log::info!(
+                    "reap open [{}]: refused — hash {} became referenced after the sweep",
+                    seg.ulid,
+                    hash.to_hex(),
+                );
+                stats.segments_refused += 1;
+                continue;
+            }
+        }
+        let dropped = index.remove_input_owned(seg.ulid, &seg.owned_hashes, &no_carried);
+        stats.entries_removed += dropped.len() as u64;
+        removed.extend(dropped);
+        index.purge_journal_segment(seg.ulid);
+        index.purge_segment_delta_sources(seg.ulid);
+        stats.segments_reaped += 1;
+        stats.bytes_reclaimed += seg.bytes;
+        reaped.push(seg);
+    }
+    ReapFold {
+        stats,
+        post,
+        removed,
+        reaped,
+    }
+}
+
 impl Volume {
-    /// Apply phase of the reap — runs under the volume mutex.
-    ///
-    /// Each data segment revalidates through the maintained-count
-    /// probes: a hash the segment still owns that is claimed or named
-    /// as a delta source refuses the segment whole, which is what
-    /// absorbs a dedup claim minted between the sweep and this apply.
-    /// A journal segment is taken on the sweep's word — its claims are
-    /// keyed by its own ULID and only decrease once it is sealed — and
-    /// costs two outer removals.
+    /// The swap of a reap pass, under the volume mutex: refuse the pass
+    /// if a write claimed a hash the fold dropped, else install the fold.
     ///
     /// Returns the files to unlink. The caller publishes its read
     /// snapshot first and then passes them to
     /// [`Self::remove_consumed_inputs`], the publish-before-unlink
     /// discipline every rewrite apply carries.
-    pub fn apply_reap(&mut self, segments: Vec<ReapSegment>) -> (ReapStats, Vec<PathBuf>) {
-        let mut stats = ReapStats::default();
-        let mut unlink = Vec::new();
-        let mut reaped_fmt: Vec<String> = Vec::new();
-        let no_carried = crate::blake3_id_hasher::Blake3HashSet::default();
-        self.maps.absorb();
-        for seg in segments {
-            if !seg.journal {
-                let maps = self.maps.materialised();
-                let fresh = seg.owned_hashes.iter().find(|hash| {
-                    let owner_here = maps
-                        .extent_index
-                        .lookup(hash)
-                        .is_some_and(|loc| loc.segment_id == seg.ulid)
-                        || maps
-                            .extent_index
-                            .lookup_delta(hash)
-                            .is_some_and(|loc| loc.segment_id == seg.ulid);
-                    owner_here
-                        && (maps.lbamap.is_referenced(hash)
-                            || maps.extent_index.is_named_delta_source(hash))
-                });
-                if let Some(hash) = fresh {
-                    log::info!(
-                        "reap open [{}]: refused — hash {} became referenced after the sweep",
-                        seg.ulid,
-                        hash.to_hex(),
-                    );
-                    stats.segments_refused += 1;
-                    continue;
-                }
-            }
-            let index = self.maps.extent_index_mut();
-            stats.entries_removed +=
-                index.remove_input_owned(seg.ulid, &seg.owned_hashes, &no_carried) as u64;
-            index.purge_journal_segment(seg.ulid);
-            index.purge_segment_delta_sources(seg.ulid);
+    pub fn swap_reap(&mut self, fold: ReapFold, folded_from: &Maps) -> (ReapStats, Vec<PathBuf>) {
+        let ReapFold {
+            stats,
+            post,
+            removed,
+            reaped,
+        } = fold;
+        if reaped.is_empty() {
+            return (stats, Vec::new());
+        }
+        if let Some(hash) = self.maps.delta_claims_any(&removed) {
+            log::info!(
+                "reap open: refused — a write claimed hash {} after the fold dropped its location",
+                hash.to_hex(),
+            );
+            let refused = ReapStats {
+                segments_refused: stats.segments_refused + reaped.len() as u64,
+                ..ReapStats::default()
+            };
+            return (refused, Vec::new());
+        }
+        self.maps.swap_base(folded_from, post);
+        let mut unlink = Vec::with_capacity(reaped.len());
+        let mut reaped_fmt: Vec<String> = Vec::with_capacity(reaped.len());
+        for seg in reaped {
             self.pending_journal.remove(&seg.ulid);
             self.evict_cached_segment(seg.ulid);
-            stats.segments_reaped += 1;
-            stats.bytes_reclaimed += seg.bytes;
             reaped_fmt.push(seg.ulid.to_string());
             unlink.push(seg.path);
         }
-        if stats.segments_reaped > 0 {
-            log::info!(
-                "reap open: [{}] {} entries removed, {} bytes reclaimed",
-                reaped_fmt.join(","),
-                stats.entries_removed,
-                stats.bytes_reclaimed,
-            );
-        }
+        log::info!(
+            "reap open: [{}] {} entries removed, {} bytes reclaimed",
+            reaped_fmt.join(","),
+            stats.entries_removed,
+            stats.bytes_reclaimed,
+        );
         (stats, unlink)
+    }
+
+    /// Apply phase of the reap on one thread: [`fold_reap`] then
+    /// [`Self::swap_reap`].
+    pub fn apply_reap(&mut self, segments: Vec<ReapSegment>) -> (ReapStats, Vec<PathBuf>) {
+        let fold = fold_reap(&self.maps, segments);
+        let folded_from = self.maps.base().clone();
+        self.swap_reap(fold, &folded_from)
     }
 
     /// One whole reap pass, inline on the current thread: sweep the live

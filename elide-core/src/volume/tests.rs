@@ -5642,10 +5642,10 @@ fn same_epoch_rewrite_cycle_matches_rebuild() {
     fs::remove_dir_all(base).unwrap();
 }
 
-/// The gate refuses a mutation that strands a claim over a declared
-/// hash, and restores both maps whole.
+/// The footprint check finds a claim over a declared hash that a
+/// mutation of a clone stranded, and reads the clone alone.
 #[test]
-fn gate_refuses_a_mutation_stranding_a_declared_hash() {
+fn the_footprint_check_finds_a_stranded_declared_hash() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -5653,44 +5653,34 @@ fn gate_refuses_a_mutation_stranding_a_declared_hash() {
     let hash = blake3::hash(&data);
     vol.write(0, &data).unwrap();
     vol.flush_wal().unwrap();
-    let owner = vol
-        .maps
-        .materialised()
-        .extent_index
-        .lookup(&hash)
-        .unwrap()
-        .segment_id;
+    let mut maps = vol.maps.materialised();
+    let owner = maps.extent_index.lookup(&hash).unwrap().segment_id;
+    Arc::make_mut(&mut maps.extent_index).remove_owner_at(&hash, owner);
 
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
-            v.maps.extent_index_mut().remove_owner_at(&hash, owner);
-            Ok(())
-        })
-        .unwrap();
-
-    match gate {
-        ResolvabilityGate::Refused(orphaned) => {
-            assert_eq!(orphaned.total, 1);
-            assert_eq!(orphaned.sample, vec![(0, hash)]);
-        }
-        ResolvabilityGate::Applied => panic!("stranding a declared hash must refuse"),
-    }
+    let orphaned = unresolvable_footprint_hashes(
+        &maps,
+        &footprint,
+        &LbaRanges::new([(0, 1)]),
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    assert_eq!(orphaned.total, 1);
+    assert_eq!(orphaned.sample, vec![(0, hash)]);
     assert!(
         vol.maps.materialised().extent_index.lookup(&hash).is_some(),
-        "refusal restores the index"
+        "the clone took the mutation"
     );
     assert_eq!(vol.read(0, 1).unwrap(), data);
 
     fs::remove_dir_all(base).unwrap();
 }
 
-/// The gate checks the declared footprint and nothing else — the bound
-/// that holds it to O(footprint) under the write mutex. A mutation
-/// reaching outside its declaration escapes it; the whole-map oracle in
-/// the `volume-invariants` build is what audits that contract.
+/// The footprint check covers the declared footprint and nothing else,
+/// the bound that holds it to O(footprint). A mutation that reaches
+/// outside its declaration escapes it; the whole-map oracle in the
+/// `volume-invariants` build is what audits that contract.
 #[test]
-fn the_gate_trusts_the_declared_footprint() {
+fn the_footprint_check_trusts_the_declaration() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -5698,22 +5688,19 @@ fn the_gate_trusts_the_declared_footprint() {
     let hash = blake3::hash(&data);
     vol.write(0, &data).unwrap();
     vol.flush_wal().unwrap();
-    let owner = vol
-        .maps
-        .materialised()
-        .extent_index
-        .lookup(&hash)
-        .unwrap()
-        .segment_id;
+    let mut maps = vol.maps.materialised();
+    let owner = maps.extent_index.lookup(&hash).unwrap().segment_id;
+    Arc::make_mut(&mut maps.extent_index).remove_owner_at(&hash, owner);
 
-    let gate = vol
-        .mutate_gated_on_resolvability(&Default::default(), &LbaRanges::new([(0, 1)]), |v| {
-            v.maps.extent_index_mut().remove_owner_at(&hash, owner);
-            Ok(())
-        })
-        .unwrap();
+    let orphaned = unresolvable_footprint_hashes(
+        &maps,
+        &Default::default(),
+        &LbaRanges::new([(0, 1)]),
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    assert_eq!(orphaned.total, 0);
 
-    assert!(matches!(gate, ResolvabilityGate::Applied));
+    vol.maps.extent_index_mut().remove_owner_at(&hash, owner);
     assert!(
         vol.read(0, 1).is_err(),
         "the undeclared stranded claim fails at the extent lookup"
@@ -5750,59 +5737,47 @@ fn the_footprint_check_resolves_journal_claims_per_claimant() {
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
     let ranges = LbaRanges::new([(0, 2)]);
 
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &ranges, |_| Ok(()))
-        .unwrap();
-    assert!(
-        matches!(gate, ResolvabilityGate::Applied),
+    let orphaned = unresolvable_footprint_hashes(
+        &vol.maps.materialised(),
+        &footprint,
+        &ranges,
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    assert_eq!(
+        orphaned.total, 0,
         "the claimant's journal map resolves its claim"
     );
 
     let other = vol.mint.next();
     vol.maps.lbamap_mut().insert(1, 1, hash, other);
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &ranges, |_| Ok(()))
-        .unwrap();
-    match gate {
-        ResolvabilityGate::Refused(orphaned) => {
-            assert_eq!(orphaned.total, 1, "only the foreign claimant is stranded");
-            assert_eq!(orphaned.sample, vec![(1, hash)]);
-        }
-        ResolvabilityGate::Applied => {
-            panic!("a claimant whose journal map lacks the hash must strand")
-        }
-    }
+    let orphaned = unresolvable_footprint_hashes(
+        &vol.maps.materialised(),
+        &footprint,
+        &ranges,
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    assert_eq!(orphaned.total, 1, "only the foreign claimant is stranded");
+    assert_eq!(orphaned.sample, vec![(1, hash)]);
 
     vol.maps.lbamap_mut().insert(1, 1, hash, seg);
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &ranges, |v| {
-            v.maps.extent_index_mut().purge_journal_segment(seg);
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        matches!(gate, ResolvabilityGate::Refused(_)),
-        "purging the claimant's journal map strands its claims"
-    );
-    assert!(
-        vol.maps
-            .materialised()
-            .extent_index
-            .lookup_journal(seg, &hash)
-            .is_some(),
-        "refusal restores the journal map"
+    let mut maps = vol.maps.materialised();
+    Arc::make_mut(&mut maps.extent_index).purge_journal_segment(seg);
+    let orphaned = unresolvable_footprint_hashes(&maps, &footprint, &ranges, REFUSAL_SAMPLE_LIMIT);
+    assert_eq!(
+        orphaned.total, 2,
+        "a purge of the claimant's journal map strands its claims"
     );
 
     fs::remove_dir_all(base).unwrap();
 }
 
 /// The journal-tier walk covers the declared claim ranges and nothing
-/// else — the bound that holds a journal bucket's gate to O(bucket)
-/// under the write mutex. A purge that strands a claim outside the
-/// declaration escapes it; `assert_claims_within_input_ranges` in the
-/// `volume-invariants` build is what audits that contract.
+/// else, the bound that holds a journal bucket's check to O(bucket). A
+/// purge that strands a claim outside the declaration escapes it;
+/// `assert_claims_within_input_ranges` in the `volume-invariants` build
+/// is what audits that contract.
 #[test]
-fn the_gate_trusts_the_declared_claim_ranges() {
+fn the_footprint_check_trusts_the_declared_claim_ranges() {
     let base = keyed_temp_dir();
     let mut vol = Volume::open(&base, &base).unwrap();
 
@@ -5823,44 +5798,27 @@ fn the_gate_trusts_the_declared_claim_ranges() {
     vol.maps.lbamap_mut().insert(0, 1, hash, seg);
     vol.maps.lbamap_mut().insert(8, 1, hash, seg);
     let footprint: crate::blake3_id_hasher::Blake3HashSet = [hash].into_iter().collect();
+    let mut maps = vol.maps.materialised();
+    Arc::make_mut(&mut maps.extent_index).purge_journal_segment(seg);
 
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(0, 1)]), |v| {
-            v.maps.extent_index_mut().purge_journal_segment(seg);
-            Ok(())
-        })
-        .unwrap();
-    match gate {
-        ResolvabilityGate::Refused(orphaned) => {
-            assert_eq!(orphaned.total, 1, "only the claim in range is counted");
-            assert_eq!(orphaned.sample, vec![(0, hash)]);
-        }
-        ResolvabilityGate::Applied => panic!("a stranded claim in range must refuse"),
-    }
-    assert!(
-        vol.maps
-            .materialised()
-            .extent_index
-            .lookup_journal(seg, &hash)
-            .is_some()
+    let orphaned = unresolvable_footprint_hashes(
+        &maps,
+        &footprint,
+        &LbaRanges::new([(0, 1)]),
+        REFUSAL_SAMPLE_LIMIT,
     );
+    assert_eq!(orphaned.total, 1, "only the claim in range is counted");
+    assert_eq!(orphaned.sample, vec![(0, hash)]);
 
-    let gate = vol
-        .mutate_gated_on_resolvability(&footprint, &LbaRanges::new([(16, 17)]), |v| {
-            v.maps.extent_index_mut().purge_journal_segment(seg);
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        matches!(gate, ResolvabilityGate::Applied),
+    let orphaned = unresolvable_footprint_hashes(
+        &maps,
+        &footprint,
+        &LbaRanges::new([(16, 17)]),
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    assert_eq!(
+        orphaned.total, 0,
         "claims outside the declared ranges are outside the walk"
-    );
-    assert!(
-        vol.maps
-            .materialised()
-            .extent_index
-            .lookup_journal(seg, &hash)
-            .is_none()
     );
 
     fs::remove_dir_all(base).unwrap();
@@ -6505,6 +6463,349 @@ fn a_promote_freezes_its_epoch_and_the_swap_retires_it() {
     let vol = Volume::open(&base, &base).unwrap();
     assert_eq!(vol.read(0, 2).unwrap(), expected);
     assert_eq!(vol.read(8, 1).unwrap(), b);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A 4 KiB block of keyed XOF output: distinct fills share no bytes, so
+/// no promote encodes one as a delta of another.
+fn xof_block(fill: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let mut xof = blake3::Hasher::new_keyed(&[fill; 32]).finalize_xof();
+    xof.fill(&mut buf);
+    buf
+}
+
+/// Write a `gc/<new>.plan` over `input` that keeps the entries `keep`
+/// accepts, the shape the coordinator emits when a bucket drops dead
+/// entries.
+fn write_plan_keeping(
+    vol: &mut Volume,
+    input: Ulid,
+    keep: &dyn Fn(&segment::SegmentEntry) -> bool,
+) -> (Ulid, PathBuf) {
+    use crate::rewrite_plan::{PlanOutput, RewritePlan};
+
+    let idx_path = vol.base_dir.join("index").join(format!("{input}.idx"));
+    let (_bss, entries, _) =
+        segment::read_and_verify_segment_index(&idx_path, &vol.verifying_key).unwrap();
+    let outputs = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| keep(e))
+        .map(|(i, _)| PlanOutput::Keep {
+            input,
+            entry_idx: i as u32,
+        })
+        .collect();
+    let new_ulid = vol.gc_checkpoint_for_test().unwrap();
+    let gc_dir = vol.base_dir.join("gc");
+    fs::create_dir_all(&gc_dir).unwrap();
+    let plan_path = gc_dir.join(format!("{new_ulid}.plan"));
+    RewritePlan { new_ulid, outputs }
+        .write_atomic(&plan_path)
+        .unwrap();
+    (new_ulid, plan_path)
+}
+
+/// The GC plan as prep, fold, swap: a write between the fold and the swap
+/// that claims a hash the fold dropped refuses the swap, and the same
+/// plan shape lands once nothing claims the hash.
+#[test]
+fn a_gc_plan_swap_refuses_a_claim_written_after_its_fold() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    let gc_dir = base.join("gc");
+
+    let x = xof_block(1);
+    let y = xof_block(2);
+    let z = xof_block(3);
+    let w = xof_block(4);
+    let hash_x = blake3::hash(&x);
+    vol.write(0, &x).unwrap();
+    vol.write(1, &y).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    let input = vol.last_segment_ulid.unwrap();
+    vol.write(0, &z).unwrap();
+
+    let (new_ulid, plan_path) = write_plan_keeping(&mut vol, input, &|e| e.hash != hash_x);
+    let plan = read_plan_for_apply(&plan_path, new_ulid).unwrap();
+    let job = vol.prepare_plan_apply(plan_path.clone(), new_ulid, plan);
+    let result = crate::actor::execute_gc_plan_apply(job).unwrap();
+    let layers = match vol.prepare_plan_swap(&result) {
+        PlanSwapPrep::Layers(layers) => layers,
+        PlanSwapPrep::Skip(outcome) => panic!("prep skipped the plan: {outcome:?}"),
+    };
+    let landed = match fold_plan_apply_result(&layers, result, &vol.base_dir, &vol.ancestor_layers)
+        .unwrap()
+    {
+        PlanFold::Landed(landed) => landed,
+        PlanFold::Cancelled => panic!("the fold refused the plan"),
+    };
+    assert!(
+        vol.maps.base().extent_index.lookup(&hash_x).is_some(),
+        "the fold leaves the live base alone"
+    );
+
+    // The hazard: the dropped content returns as a dedup claim in delta.
+    vol.write(5, &x).unwrap();
+    assert_eq!(
+        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        StagedApply::Cancelled
+    );
+    landed.remove_output();
+    assert!(!gc_dir.join(new_ulid.to_string()).exists());
+    assert!(!plan_path.exists());
+    assert!(vol.maps.base().extent_index.lookup(&hash_x).is_some());
+    assert_eq!(vol.read(5, 1).unwrap(), x);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    vol.write(5, &w).unwrap();
+    let (new_ulid, plan_path) = write_plan_keeping(&mut vol, input, &|e| e.hash != hash_x);
+    let plan = read_plan_for_apply(&plan_path, new_ulid).unwrap();
+    let job = vol.prepare_plan_apply(plan_path.clone(), new_ulid, plan);
+    let result = crate::actor::execute_gc_plan_apply(job).unwrap();
+    let layers = match vol.prepare_plan_swap(&result) {
+        PlanSwapPrep::Layers(layers) => layers,
+        PlanSwapPrep::Skip(outcome) => panic!("prep skipped the plan: {outcome:?}"),
+    };
+    let landed = match fold_plan_apply_result(&layers, result, &vol.base_dir, &vol.ancestor_layers)
+        .unwrap()
+    {
+        PlanFold::Landed(landed) => landed,
+        PlanFold::Cancelled => panic!("the fold refused the plan"),
+    };
+    assert_eq!(
+        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        StagedApply::Applied
+    );
+    assert!(gc_dir.join(new_ulid.to_string()).exists());
+    assert!(!plan_path.exists());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash_x)
+            .is_none(),
+        "the dropped hash left the index"
+    );
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    vol.promote_for_test().unwrap();
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A frozen layer below a plan's ULID, a promote the actor stashed after
+/// a failure, holds a claim over an LBA the plan carries. The fold
+/// replays that layer before it registers the plan, so the claim blocks
+/// the entry and the superseded-carry check refuses the plan, as the
+/// rebuild's admission by highest ULID requires. The layer stays.
+#[test]
+fn a_gc_plan_fold_replays_a_stashed_layer_below_its_ulid() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+    let gc_dir = base.join("gc");
+
+    let x = xof_block(1);
+    let y = xof_block(2);
+    let q = xof_block(5);
+    vol.write(0, &x).unwrap();
+    vol.write(1, &y).unwrap();
+    vol.promote_for_test().unwrap();
+    simulate_upload(&mut vol);
+    let input = vol.last_segment_ulid.unwrap();
+
+    vol.write(1, &q).unwrap();
+    let segment_ulid = vol.mint.next();
+    let stalled = vol.take_wal_into_promote_job(segment_ulid).unwrap();
+    assert_eq!(vol.maps.frozen_depth(), 1, "the prep froze the epoch");
+
+    let (new_ulid, plan_path) = write_plan_keeping(&mut vol, input, &|_| true);
+    assert!(stalled.old_wal_ulid < new_ulid);
+    let plan = read_plan_for_apply(&plan_path, new_ulid).unwrap();
+    let job = vol.prepare_plan_apply(plan_path.clone(), new_ulid, plan);
+    let result = crate::actor::execute_gc_plan_apply(job).unwrap();
+    let layers = match vol.prepare_plan_swap(&result) {
+        PlanSwapPrep::Layers(layers) => layers,
+        PlanSwapPrep::Skip(outcome) => panic!("prep skipped the plan: {outcome:?}"),
+    };
+    let fold =
+        fold_plan_apply_result(&layers, result, &vol.base_dir, &vol.ancestor_layers).unwrap();
+    assert!(
+        matches!(fold, PlanFold::Cancelled),
+        "the plan carries lba 1, which the stashed layer claims below the plan's ULID"
+    );
+    assert!(!gc_dir.join(new_ulid.to_string()).exists());
+    assert!(!plan_path.exists());
+    assert_eq!(
+        vol.maps.frozen_depth(),
+        1,
+        "the layer stays for its promote"
+    );
+    assert_eq!(vol.read(0, 1).unwrap(), x);
+    assert_eq!(vol.read(1, 1).unwrap(), q);
+
+    drop(stalled);
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The repack bucket as fold and swap: a write between the fold and the
+/// swap that claims a hash the fold dropped refuses the bucket, and the
+/// next pass lands once nothing claims the hash.
+#[test]
+fn a_repack_swap_refuses_a_claim_written_after_its_fold() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let x = xof_block(1);
+    let y = xof_block(2);
+    let z = xof_block(3);
+    let w = xof_block(4);
+    let hash_x = blake3::hash(&x);
+    vol.write(0, &x).unwrap();
+    vol.write(1, &y).unwrap();
+    vol.promote_for_test().unwrap();
+    vol.write(0, &z).unwrap();
+    vol.promote_for_test().unwrap();
+
+    let job = vol
+        .prepare_pack_open_for_test()
+        .unwrap()
+        .expect("repack job");
+    let result = crate::actor::execute_repack(job).unwrap();
+    let (mut acc, buckets) = RepackApply::new(result);
+    assert_eq!(buckets.len(), 1);
+    let bucket = &buckets[0];
+    let output =
+        segment::pending_open_dir(&base).join(bucket.output.as_ref().unwrap().new_ulid.to_string());
+    assert!(output.exists());
+
+    let layers = vol.maps.clone();
+    let landed = match fold_repack_bucket(&layers, bucket, &mut acc).unwrap() {
+        RepackFold::Landed(landed) => landed,
+        RepackFold::Refused => panic!("the fold refused the bucket"),
+    };
+    assert!(
+        vol.maps.base().extent_index.lookup(&hash_x).is_some(),
+        "the fold leaves the live base alone"
+    );
+
+    // The hazard: the dropped content returns as a dedup claim in delta.
+    vol.write(5, &x).unwrap();
+    vol.swap_repack_bucket(bucket, landed, layers.base(), &mut acc);
+    let (stats, consumed) = vol.finish_repack_apply(acc).unwrap();
+    assert_eq!(stats.buckets_refused, 1);
+    assert!(consumed.is_empty(), "a refused bucket keeps its inputs");
+    assert!(!output.exists(), "a refused bucket drops its output");
+    for input in &bucket.inputs {
+        assert!(input.input_path.exists());
+    }
+    assert_eq!(vol.read(5, 1).unwrap(), x);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    vol.write(5, &w).unwrap();
+    let stats = vol.repack_open_for_test().unwrap();
+    assert_eq!(stats.buckets_refused, 0);
+    assert_eq!(stats.segments_compacted, 2);
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash_x)
+            .is_none(),
+        "the dropped hash left the index"
+    );
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    vol.promote_for_test().unwrap();
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+    assert_eq!(vol.read(1, 1).unwrap(), y);
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The reap pass as fold and swap: a write between the fold and the swap
+/// that claims a hash the fold dropped refuses the pass, and the next
+/// pass lands once nothing claims the hash.
+#[test]
+fn a_reap_swap_refuses_a_claim_written_after_its_fold() {
+    let base = keyed_temp_dir();
+    let mut vol = Volume::open(&base, &base).unwrap();
+
+    let x = xof_block(1);
+    let z = xof_block(3);
+    let w = xof_block(4);
+    let hash_x = blake3::hash(&x);
+    vol.write(0, &x).unwrap();
+    vol.flush_wal().unwrap();
+    vol.write(0, &z).unwrap();
+
+    let sweep = |vol: &Volume| {
+        let open = list_open_segments(&base).unwrap();
+        let maps = vol.maps.materialised();
+        parse_reap_candidates(
+            sweep_unreachable(&maps.lbamap, &maps.extent_index, &open, None).candidates,
+        )
+    };
+    let parsed = sweep(&vol);
+    assert_eq!(parsed.len(), 1);
+    let path = parsed[0].path.clone();
+
+    let layers = vol.maps.clone();
+    let fold = fold_reap(&layers, parsed);
+    assert!(
+        vol.maps.base().extent_index.lookup(&hash_x).is_some(),
+        "the fold leaves the live base alone"
+    );
+
+    // The hazard: the dropped content returns as a dedup claim in delta.
+    vol.write(5, &x).unwrap();
+    let (stats, unlink) = vol.swap_reap(fold, layers.base());
+    assert_eq!(stats.segments_refused, 1);
+    assert_eq!(stats.segments_reaped, 0);
+    assert!(unlink.is_empty());
+    assert!(path.exists());
+    assert_eq!(vol.read(5, 1).unwrap(), x);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+
+    vol.write(5, &w).unwrap();
+    let parsed = sweep(&vol);
+    assert_eq!(parsed.len(), 1);
+    let (stats, unlink) = vol.apply_reap(parsed);
+    assert_eq!(stats.segments_reaped, 1);
+    assert_eq!(unlink, vec![path.clone()]);
+    vol.remove_consumed_inputs(&unlink).unwrap();
+    assert!(!path.exists());
+    assert!(
+        vol.maps
+            .materialised()
+            .extent_index
+            .lookup(&hash_x)
+            .is_none()
+    );
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
+
+    drop(vol);
+    let vol = Volume::open(&base, &base).unwrap();
+    assert_eq!(vol.read(5, 1).unwrap(), w);
+    assert_eq!(vol.read(0, 1).unwrap(), z);
 
     fs::remove_dir_all(base).unwrap();
 }

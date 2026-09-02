@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
+use crate::blake3_id_hasher::Blake3HashSet;
 use crate::extentindex::{DeltaLocation, ExtentIndex, ExtentLocation, SegmentPresence};
 use crate::lbamap::{ExtentRead, LbaMap};
 
@@ -274,21 +275,27 @@ impl MapLayers {
         self.base = new_base;
     }
 
-    /// The fold for an apply whose admission is ULID order: a clone of
-    /// `base` with every frozen layer below `ulid` replayed in, oldest
-    /// first, then `apply` run over the clone. A claim in a layer above
-    /// `ulid` is newer than the apply's output and masks it, which is the
-    /// order the rebuild from disk gives the two. `self` is unchanged, so
-    /// the caller runs this with the volume mutex released.
+    /// A clone of `base` with every frozen layer below `ulid` replayed in,
+    /// oldest first: the map an apply whose admission is ULID order starts
+    /// from. A claim in a layer above `ulid` is newer than the apply's
+    /// output and masks it, which is the order the rebuild from disk gives
+    /// the two.
+    pub fn below(&self, ulid: Ulid) -> Maps {
+        let mut maps = self.base.clone();
+        for layer in self.frozen.iter().filter(|l| l.wal_ulid < ulid) {
+            fold(&mut maps, &layer.maps);
+        }
+        maps
+    }
+
+    /// [`Self::below`] with `apply` run over the clone. The caller runs
+    /// this with the volume mutex released.
     pub fn fold_below(
         &self,
         ulid: Ulid,
         apply: impl FnOnce(&mut LbaMap, &mut ExtentIndex) -> io::Result<()>,
     ) -> io::Result<Maps> {
-        let mut maps = self.base.clone();
-        for layer in self.frozen.iter().filter(|l| l.wal_ulid < ulid) {
-            fold(&mut maps, &layer.maps);
-        }
+        let mut maps = self.below(ulid);
         apply(
             Arc::make_mut(&mut maps.lbamap),
             Arc::make_mut(&mut maps.extent_index),
@@ -307,27 +314,32 @@ impl MapLayers {
     /// The layers above `ulid` over `base`: how a [`Self::fold_below`]
     /// resolves under the writes that landed after the apply's prep.
     pub fn above(&self, ulid: Ulid, base: Maps) -> Self {
+        let mut layers = self.with_base(base);
+        layers.frozen.retain(|l| l.wal_ulid >= ulid);
+        layers
+    }
+
+    /// Every layer over another `base`: how a [`Self::fold_base`] resolves
+    /// under the writes that landed after the apply's prep.
+    pub fn with_base(&self, base: Maps) -> Self {
         Self {
             base,
-            frozen: self
-                .frozen
-                .iter()
-                .filter(|l| l.wal_ulid >= ulid)
-                .cloned()
-                .collect(),
+            frozen: self.frozen.clone(),
             delta: self.delta.clone(),
         }
     }
 
-    /// Put `base` back to `pre`, a value [`Self::materialised`] returned
-    /// after an absorb. The layers are empty across a mutation and its
-    /// rollback, which both run under one hold of the volume mutex.
-    pub fn restore(&mut self, pre: Maps) {
-        debug_assert!(
-            self.frozen.is_empty() && self.delta.is_empty(),
-            "restore with populated layers"
-        );
-        self.base = pre;
+    /// The first hash in `hashes` that a claim in `delta` names. A fold
+    /// that removed the index entry of such a hash would strand the claim
+    /// at its swap, so the swap refuses on `Some`. `delta` is the one
+    /// layer a guest write changes between a fold and its swap, and its
+    /// claims are few against a fold's removals, so the walk is over them.
+    pub fn delta_claims_any(&self, hashes: &Blake3HashSet) -> Option<blake3::Hash> {
+        self.delta
+            .lbamap
+            .claim_hashes()
+            .find(|h| hashes.contains(h))
+            .copied()
     }
 }
 
@@ -634,21 +646,51 @@ mod tests {
     }
 
     #[test]
-    fn restore_puts_base_back() {
+    fn with_base_keeps_every_layer_over_the_new_base() {
+        let mut base = LbaMap::new();
+        base.insert(0, 8, h(1), seg(1));
+        let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
+        layers.delta_lbamap_mut().insert(0, 2, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(6, 2, h(3), seg(11));
+
+        let mut other = LbaMap::new();
+        other.insert(0, 8, h(4), seg(5));
+        let view = layers.with_base(Maps::new(other, ExtentIndex::new()));
+        assert_eq!(view.frozen_depth(), 1);
+        assert_eq!(
+            reads(&view.extents_in_range(0, 8)),
+            vec![(0, 2, h(2), 0), (2, 6, h(4), 2), (6, 8, h(3), 0)]
+        );
+        assert_eq!(
+            reads(
+                &layers
+                    .below(seg(20))
+                    .lbamap
+                    .extents_in_range(0, 8)
+                    .collect::<Vec<_>>()
+            ),
+            vec![(0, 2, h(2), 0), (2, 8, h(1), 2)],
+            "below takes the frozen layer and leaves delta"
+        );
+    }
+
+    #[test]
+    fn delta_claims_any_sees_delta_alone() {
         let mut base = LbaMap::new();
         base.insert(0, 4, h(1), seg(1));
         let mut layers = MapLayers::new(Maps::new(base, ExtentIndex::new()));
-        layers.delta_lbamap_mut().insert(8, 4, h(2), seg(2));
+        layers.delta_lbamap_mut().insert(8, 4, h(2), seg(10));
+        layers.freeze(seg(10));
+        layers.delta_lbamap_mut().insert(16, 4, h(3), seg(11));
 
-        layers.absorb();
-        let pre = layers.materialised();
-        layers.lbamap_mut().insert(0, 4, h(3), seg(3));
-        assert!(layers.has_full_match(0, 4, &h(3)));
-
-        layers.restore(pre);
-        assert!(layers.has_full_match(0, 4, &h(1)));
-        assert!(layers.has_full_match(8, 4, &h(2)));
-        assert!(layers.delta_is_empty());
+        let set = |hs: &[blake3::Hash]| hs.iter().copied().collect::<Blake3HashSet>();
+        assert_eq!(layers.delta_claims_any(&set(&[h(3), h(4)])), Some(h(3)));
+        assert_eq!(
+            layers.delta_claims_any(&set(&[h(1), h(2)])),
+            None,
+            "a base or frozen claim is one the fold's probes saw"
+        );
     }
 
     #[test]

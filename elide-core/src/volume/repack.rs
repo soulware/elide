@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 use crate::{
+    blake3_id_hasher::Blake3HashSet,
     extentindex, lbamap,
+    map_layers::{MapLayers, Maps},
     segment::{self},
     segment_cache,
 };
 
-use super::{ResolvabilityGate, Volume, latest_snapshot};
+use super::{Volume, latest_snapshot};
 
 /// Number of output ULIDs reserved for journal consolidation per repack
 /// pass. One suffices: consolidation carries only live journal entries,
@@ -232,6 +234,286 @@ impl RepackApply {
         };
         (acc, buckets)
     }
+
+    /// The generation this pass ran over, for the log lines: `open` for
+    /// the tick's pass, `upload` for the close pass.
+    fn generation(&self) -> &str {
+        self.pending_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pending")
+    }
+}
+
+/// Outcome of [`fold_repack_bucket`].
+pub enum RepackFold {
+    /// The bucket was refused and `acc` records it.
+    Refused,
+    /// The fold landed, ready for [`Volume::swap_repack_bucket`].
+    Landed(RepackLanded),
+}
+
+/// One bucket's fold between [`fold_repack_bucket`] and
+/// [`Volume::swap_repack_bucket`].
+pub struct RepackLanded {
+    /// `base` with the bucket applied.
+    post: Maps,
+    /// The hashes the fold dropped from the extent index.
+    removed: Blake3HashSet,
+    inputs_fmt: String,
+    /// The phase timings, rendered for the bucket's log line.
+    phases: String,
+}
+
+/// The fold of one bucket over a clone of `base`, with the volume mutex
+/// released.
+///
+/// A bucket is a self-contained unit: it derives its own footprint, runs
+/// its own resolvability gate, and probes stale liveness against the
+/// counts it finds when it runs. A reference minted between two buckets
+/// is what that probe refuses on, so a caller that swaps per bucket
+/// reaches the same outcomes as one that held the mutex across the pass.
+///
+/// The probes read the materialised layers, the map the rebuild gives.
+/// The removals and the registrations run over `base` alone: every claim
+/// in the layers above is a write's, and every input is a segment, so
+/// the layers mask the fold as they masked the absorb.
+///   - CAS-remove dropped owned hashes (`current loc.segment_id ==
+///     input_ulid`); a concurrent writer that re-pointed the hash wins.
+///   - If a fresh output was written: insert carried entries into the
+///     extent index under the same per-input CAS gate, then merge them
+///     into the lbamap keyed on `out.new_ulid`. Concurrent live writes
+///     have higher claimant ULIDs and keep their overlapping LBAs.
+///
+/// A refused bucket drops the clone whole: the worker classified against
+/// a prep-time lbamap snapshot, so a dedup ref or a delta-source
+/// reference minted while it ran can reference an input-owned hash the
+/// output does not carry. The output file is deleted, the inputs stay,
+/// and the next repack pass, whose prep snapshot includes the new
+/// reference, carries the hash.
+pub fn fold_repack_bucket(
+    layers: &MapLayers,
+    bucket: &RepackedBucket,
+    acc: &mut RepackApply,
+) -> io::Result<RepackFold> {
+    let started = Instant::now();
+    acc.buckets += 1;
+    let outcome = fold_repack_bucket_inner(layers, bucket, acc);
+    acc.in_bucket += started.elapsed();
+    outcome
+}
+
+fn fold_repack_bucket_inner(
+    layers: &MapLayers,
+    bucket: &RepackedBucket,
+    acc: &mut RepackApply,
+) -> io::Result<RepackFold> {
+    let generation = acc.generation().to_owned();
+
+    let derive_start = Instant::now();
+    let carried_hashes = bucket
+        .output
+        .as_ref()
+        .map(|o| extentindex::ExtentIndex::carried_hashes(&o.out_entries))
+        .unwrap_or_default();
+
+    let bucket_input_ulids: std::collections::HashSet<Ulid> =
+        bucket.inputs.iter().map(|i| i.input_ulid).collect();
+
+    let inputs_fmt = format_inputs(&bucket.inputs);
+
+    // Stale-liveness refusal, the mirror of the GC plan apply's: the
+    // worker classified against a prep-time lbamap snapshot, so a
+    // reference minted since (a dedup claim, or a promoted delta that
+    // names an input-owned hash as its source) can make a hash this
+    // bucket drops live again. A delta source makes no LBA claim, so the
+    // resolvability gate cannot see it; the liveness check here is what
+    // refuses the bucket.
+    let view = layers.materialised();
+    let stale: Vec<blake3::Hash> = bucket
+        .inputs
+        .iter()
+        .flat_map(|input| {
+            input.owned_hashes.iter().filter(|hash| {
+                if carried_hashes.contains(*hash) {
+                    return false;
+                }
+                let still_at_input = view
+                    .extent_index
+                    .lookup(hash)
+                    .is_some_and(|loc| loc.segment_id == input.input_ulid)
+                    || view
+                        .extent_index
+                        .lookup_delta(hash)
+                        .is_some_and(|loc| loc.segment_id == input.input_ulid);
+                still_at_input
+                    && (view.lbamap.is_referenced(hash)
+                        || view.extent_index.is_named_delta_source(hash))
+            })
+        })
+        .copied()
+        .collect();
+    if !stale.is_empty() {
+        log::warn!(
+            "repack {generation} [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
+                 hash(es) became referenced after classification, first {}; \
+                 dropping output and keeping inputs",
+            stale.len(),
+            stale[0].to_hex(),
+        );
+        refuse_bucket(bucket, acc);
+        return Ok(RepackFold::Refused);
+    }
+
+    // Every hash whose resolvability this bucket can change: the inputs'
+    // owned hashes it removes, the journal-tier hashes of the segments it
+    // purges, and the output's entries.
+    let mut footprint: Blake3HashSet = bucket
+        .inputs
+        .iter()
+        .flat_map(|input| input.owned_hashes.iter().copied())
+        .collect();
+    for input in &bucket.inputs {
+        footprint.extend(view.extent_index.journal_hashes(input.input_ulid));
+    }
+    if let Some(out) = &bucket.output {
+        footprint.extend(out.out_entries.iter().map(|e| e.hash));
+    }
+    let derive = derive_start.elapsed();
+
+    let header_start = Instant::now();
+    let delta_body_source = match &bucket.output {
+        Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
+            &acc.pending_dir.join(out.new_ulid.to_string()),
+            &out.out_entries,
+            out.new_body_section_start,
+        )?),
+        None => None,
+    };
+    let header = header_start.elapsed();
+
+    let mut index_reg = Duration::ZERO;
+    let mut lbamap_reg = Duration::ZERO;
+    let gate_ranges = super::LbaRanges::from_claims_and_ranges(
+        bucket.output.as_ref().map_or(&[][..], |o| &o.out_entries),
+        bucket
+            .inputs
+            .iter()
+            .flat_map(|i| i.claim_ranges.iter().copied()),
+    );
+    let mut post = layers.base().clone();
+    let mut removed = Blake3HashSet::default();
+    let merge_start = Instant::now();
+    {
+        let index = Arc::make_mut(&mut post.extent_index);
+        for input in &bucket.inputs {
+            removed.extend(index.remove_input_owned(
+                input.input_ulid,
+                &input.owned_hashes,
+                &carried_hashes,
+            ));
+            // Journal-tier bodies are keyed by segment, so a consumed
+            // input's journal entries drop whole; a journal segment is a
+            // bucket input only as a whole-dead tombstone.
+            index.purge_journal_segment(input.input_ulid);
+            index.purge_segment_delta_sources(input.input_ulid);
+        }
+    }
+    let remove = merge_start.elapsed();
+
+    // Register carried entries against the new bucket output as the disk
+    // rebuild would, gated on the current owner being one of the bucket's
+    // inputs.
+    if let Some(out) = &bucket.output {
+        let index_start = Instant::now();
+        let ctx = extentindex::SegmentRegistrationCtx {
+            segment_id: out.new_ulid,
+            body_section_start: out.new_body_section_start,
+            body_tier: extentindex::RegistrationBodyTier::Local,
+            // `delta_body_source` is Some whenever `bucket.output` is.
+            delta_body_source: delta_body_source
+                .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
+            inline: extentindex::InlineSource::EntryInline,
+        };
+        let index = Arc::make_mut(&mut post.extent_index);
+        for (raw_idx, e) in out.out_entries.iter().enumerate() {
+            index.register_entry_consuming_inputs(e, raw_idx as u32, &ctx, &bucket_input_ulids)?;
+        }
+        index_reg = index_start.elapsed();
+
+        let lbamap_start = Instant::now();
+        let lbamap = Arc::make_mut(&mut post.lbamap);
+        for e in &out.out_entries {
+            lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
+        }
+        lbamap_reg = lbamap_start.elapsed();
+    }
+    let merge = merge_start.elapsed();
+
+    let gate_start = Instant::now();
+    let orphaned = super::unresolvable_footprint_hashes(
+        &layers.with_base(post.clone()).materialised(),
+        &footprint,
+        &gate_ranges,
+        super::REFUSAL_SAMPLE_LIMIT,
+    );
+    let gate_check = gate_start.elapsed();
+    acc.derive_total += derive;
+    acc.header_total += header;
+    acc.merge_total += merge;
+    acc.remove_total += remove;
+    acc.index_total += index_reg;
+    acc.lbamap_total += lbamap_reg;
+    acc.gate_total += gate_check;
+
+    if orphaned.total > 0 {
+        let detail = orphaned
+            .sample
+            .iter()
+            .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "repack {generation} [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
+                 would be unresolvable through the extent index after apply, first {}: \
+                 [{detail}]; dropping output and keeping inputs",
+            orphaned.total,
+            orphaned.sample.len(),
+        );
+        refuse_bucket(bucket, acc);
+        return Ok(RepackFold::Refused);
+    }
+
+    let phases = format!(
+        "derive={:.1}ms header={:.1}ms merge={:.1}ms \
+         (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms",
+        derive.as_secs_f64() * 1e3,
+        header.as_secs_f64() * 1e3,
+        merge.as_secs_f64() * 1e3,
+        remove.as_secs_f64() * 1e3,
+        index_reg.as_secs_f64() * 1e3,
+        lbamap_reg.as_secs_f64() * 1e3,
+        gate_check.as_secs_f64() * 1e3,
+    );
+    Ok(RepackFold::Landed(RepackLanded {
+        post,
+        removed,
+        inputs_fmt,
+        phases,
+    }))
+}
+
+/// Record a refused bucket: the output file goes, the inputs stay, and a
+/// journal bucket's inputs return to the pending journal set.
+fn refuse_bucket(bucket: &RepackedBucket, acc: &mut RepackApply) {
+    acc.stats.buckets_refused += 1;
+    if let Some(out) = &bucket.output {
+        let _ = fs::remove_file(acc.pending_dir.join(out.new_ulid.to_string()));
+    }
+    if bucket.journal {
+        acc.pending_journal
+            .extend(bucket.inputs.iter().map(|i| i.input_ulid));
+    }
 }
 
 impl Volume {
@@ -436,14 +718,15 @@ impl Volume {
         })
     }
 
-    /// Apply phase of `repack` — runs on the actor thread after the
-    /// worker returns, one bucket at a time.
+    /// Apply phase of `repack` on one thread, for the synchronous
+    /// callers: [`fold_repack_bucket`] then [`Self::swap_repack_bucket`]
+    /// per bucket. The actor runs the same two with the mutex released across
+    /// the fold.
     ///
     /// The consumed input files are returned, not deleted: the caller
-    /// must publish its read snapshot first and then pass them to
-    /// [`Self::remove_consumed_inputs`] — deleting before publishing
-    /// would leave the currently-published snapshot pointing at
-    /// unlinked files, failing concurrent reads with `NotFound`.
+    /// publishes its read snapshot first and then passes them to
+    /// [`Self::remove_consumed_inputs`], so every published snapshot names
+    /// files on disk.
     pub fn apply_repack_result(
         &mut self,
         result: RepackResult,
@@ -455,258 +738,53 @@ impl Volume {
         self.finish_repack_apply(acc)
     }
 
-    /// Apply one bucket, folding its outcome into `acc`.
-    ///
-    /// A bucket is a self-contained unit of the apply: it derives its own
-    /// footprint, runs its own resolvability gate, and probes stale
-    /// liveness against the counts it finds when it runs. A reference
-    /// minted between two buckets is what that probe refuses on, so a
-    /// caller holding the volume mutex per bucket reaches the same
-    /// outcomes as one holding it across the pass.
-    ///
-    /// The in-memory merge runs behind
-    /// [`Self::mutate_gated_on_resolvability`]:
-    ///   - CAS-remove dropped owned hashes (`current loc.segment_id ==
-    ///     input_ulid`); concurrent writers that re-pointed the hash
-    ///     win.
-    ///   - If a fresh output was written: insert carried entries into
-    ///     the extent index under the same per-input CAS gate, then
-    ///     merge them into `self.lbamap` via `insert_if_newer` keyed
-    ///     on `out.new_ulid`. Concurrent live writes have higher
-    ///     claimant ULIDs and are preserved on overlapping LBAs.
-    ///
-    /// A refused bucket is rolled back whole: the worker classified
-    /// against a prep-time lbamap snapshot, so a dedup ref or a
-    /// delta-source reference minted while it ran can reference an
-    /// input-owned hash the output doesn't carry. The output file is
-    /// deleted, the inputs stay, and the next repack pass — whose
-    /// prep snapshot includes the new reference — carries the hash.
-    ///
-    /// An applied bucket queues `pending/<input_ulid>` into `acc`'s
-    /// unlink list (for an all-dead bucket too — `output: None`). The
-    /// worker has already written `pending/<new_ulid>` separately.
-    /// Each input's file-cache fd is evicted.
+    /// One bucket's fold and swap on one thread.
     pub fn apply_repack_bucket(
         &mut self,
         bucket: &RepackedBucket,
         acc: &mut RepackApply,
     ) -> io::Result<()> {
-        let started = Instant::now();
-        acc.buckets += 1;
-        let outcome = self.apply_repack_bucket_inner(bucket, acc);
-        acc.in_bucket += started.elapsed();
-        outcome
+        if let RepackFold::Landed(landed) = fold_repack_bucket(&self.maps, bucket, acc)? {
+            let folded_from = self.maps.base().clone();
+            self.swap_repack_bucket(bucket, landed, &folded_from, acc);
+        }
+        Ok(())
     }
 
-    fn apply_repack_bucket_inner(
+    /// The swap of one bucket's fold, under the volume mutex: refuse the
+    /// bucket if a write claimed a hash the fold dropped, else install the
+    /// fold and record the bucket in `acc`.
+    ///
+    /// An applied bucket queues `pending/<input_ulid>` into `acc`'s unlink
+    /// list, for an all-dead bucket too. The worker has already written
+    /// `pending/<new_ulid>`. Each input's file-cache fd is evicted.
+    pub fn swap_repack_bucket(
         &mut self,
         bucket: &RepackedBucket,
+        landed: RepackLanded,
+        folded_from: &Maps,
         acc: &mut RepackApply,
-    ) -> io::Result<()> {
-        // Which generation this pass ran over — `open` for the tick's
-        // pass, `upload` for the close pass. Both reach here through
-        // `execute_repack`, so the logs below name it to tell them apart.
-        let generation = acc
-            .pending_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("pending");
-
-        let derive_start = Instant::now();
-        let carried_hashes = bucket
-            .output
-            .as_ref()
-            .map(|o| extentindex::ExtentIndex::carried_hashes(&o.out_entries))
-            .unwrap_or_default();
-
-        let bucket_input_ulids: std::collections::HashSet<Ulid> =
-            bucket.inputs.iter().map(|i| i.input_ulid).collect();
-
-        let inputs_fmt = format_inputs(&bucket.inputs);
-
-        // Stale-liveness refusal, mirroring the GC plan apply: the
-        // worker classified against a prep-time lbamap snapshot, so a
-        // reference minted since — a dedup claim, or a promoted delta
-        // naming an input-owned hash as its source — can make a hash
-        // this bucket drops live again. A delta source makes no LBA
-        // claim, so the resolvability gate cannot see it; the liveness
-        // check here is what refuses the bucket. Liveness is probed
-        // against the maintained counts as each bucket reaches it, so
-        // an earlier bucket's landing counts.
-        self.maps.absorb();
-        let maps = self.maps.materialised();
-        let stale: Vec<blake3::Hash> = bucket
-            .inputs
-            .iter()
-            .flat_map(|input| {
-                input.owned_hashes.iter().filter(|hash| {
-                    if carried_hashes.contains(*hash) {
-                        return false;
-                    }
-                    let still_at_input = maps
-                        .extent_index
-                        .lookup(hash)
-                        .is_some_and(|loc| loc.segment_id == input.input_ulid)
-                        || maps
-                            .extent_index
-                            .lookup_delta(hash)
-                            .is_some_and(|loc| loc.segment_id == input.input_ulid);
-                    still_at_input
-                        && (maps.lbamap.is_referenced(hash)
-                            || maps.extent_index.is_named_delta_source(hash))
-                })
-            })
-            .copied()
-            .collect();
-        if !stale.is_empty() {
+    ) {
+        let started = Instant::now();
+        let RepackLanded {
+            post,
+            removed,
+            inputs_fmt,
+            phases,
+        } = landed;
+        if let Some(hash) = self.maps.delta_claims_any(&removed) {
             log::warn!(
-                "repack {generation} [{inputs_fmt}]: stale-liveness refusal — {} input-owned \
-                     hash(es) became referenced after classification, first {}; \
-                     dropping output and keeping inputs",
-                stale.len(),
-                stale[0].to_hex(),
+                "repack {} [{inputs_fmt}]: refusing rewrite — a write claimed hash {} after \
+                 the fold dropped its location; dropping output and keeping inputs",
+                acc.generation(),
+                hash.to_hex(),
             );
-            acc.stats.buckets_refused += 1;
-            if let Some(out) = &bucket.output {
-                let _ = fs::remove_file(acc.pending_dir.join(out.new_ulid.to_string()));
-            }
-            if bucket.journal {
-                acc.pending_journal
-                    .extend(bucket.inputs.iter().map(|i| i.input_ulid));
-            }
-            return Ok(());
+            refuse_bucket(bucket, acc);
+            acc.in_bucket += started.elapsed();
+            return;
         }
-
-        // Every hash whose resolvability this bucket can change: the
-        // inputs' owned hashes it removes, the journal-tier hashes
-        // of the segments it purges, and the output's entries.
-        let mut footprint: crate::blake3_id_hasher::Blake3HashSet = bucket
-            .inputs
-            .iter()
-            .flat_map(|input| input.owned_hashes.iter().copied())
-            .collect();
-        for input in &bucket.inputs {
-            footprint.extend(maps.extent_index.journal_hashes(input.input_ulid));
-        }
-        if let Some(out) = &bucket.output {
-            footprint.extend(out.out_entries.iter().map(|e| e.hash));
-        }
-        let derive = derive_start.elapsed();
-
-        let header_start = Instant::now();
-        let delta_body_source = match &bucket.output {
-            Some(out) => Some(extentindex::DeltaBodySource::full_for_segment(
-                &acc.pending_dir.join(out.new_ulid.to_string()),
-                &out.out_entries,
-                out.new_body_section_start,
-            )?),
-            None => None,
-        };
-        let header = header_start.elapsed();
-
-        let mut extents_removed = 0usize;
-        let mut merge = Duration::ZERO;
-        let mut remove = Duration::ZERO;
-        let mut index_reg = Duration::ZERO;
-        let mut lbamap_reg = Duration::ZERO;
-        let gate_ranges = super::LbaRanges::from_claims_and_ranges(
-            bucket.output.as_ref().map_or(&[][..], |o| &o.out_entries),
-            bucket
-                .inputs
-                .iter()
-                .flat_map(|i| i.claim_ranges.iter().copied()),
-        );
-        let gate_start = Instant::now();
-        let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
-            let merge_start = Instant::now();
-            let (lbamap, index) = vol.maps.base_mut();
-
-            // Per-input CAS-remove for hashes the bucket's output
-            // didn't carry — gated on the specific input's ULID so
-            // a concurrent writer that re-pointed the hash wins.
-            for input in &bucket.inputs {
-                extents_removed += index.remove_input_owned(
-                    input.input_ulid,
-                    &input.owned_hashes,
-                    &carried_hashes,
-                );
-                // Journal-tier bodies are keyed by segment, so a
-                // consumed input's journal entries are dropped whole (a
-                // journal segment is only ever folded as a whole-dead
-                // tombstone; no-op for a durable input).
-                index.purge_journal_segment(input.input_ulid);
-                index.purge_segment_delta_sources(input.input_ulid);
-            }
-            remove = merge_start.elapsed();
-
-            // Register carried entries against the new bucket
-            // output as the disk rebuild would, gated on the
-            // current owner being any of the bucket's inputs.
-            if let Some(out) = &bucket.output {
-                let index_start = Instant::now();
-                let ctx = extentindex::SegmentRegistrationCtx {
-                    segment_id: out.new_ulid,
-                    body_section_start: out.new_body_section_start,
-                    body_tier: extentindex::RegistrationBodyTier::Local,
-                    // `delta_body_source` is Some whenever `bucket.output` is.
-                    delta_body_source: delta_body_source
-                        .ok_or_else(|| io::Error::other("repack: missing delta body source"))?,
-                    inline: extentindex::InlineSource::EntryInline,
-                };
-                for (raw_idx, e) in out.out_entries.iter().enumerate() {
-                    index.register_entry_consuming_inputs(
-                        e,
-                        raw_idx as u32,
-                        &ctx,
-                        &bucket_input_ulids,
-                    )?;
-                }
-                index_reg = index_start.elapsed();
-
-                let lbamap_start = Instant::now();
-                for e in &out.out_entries {
-                    lbamap.register_entry_consuming_inputs(e, out.new_ulid, &bucket_input_ulids);
-                }
-                lbamap_reg = lbamap_start.elapsed();
-            }
-            merge = merge_start.elapsed();
-            Ok(())
-        })?;
-        let gate_check = gate_start.elapsed().saturating_sub(merge);
-        acc.derive_total += derive;
-        acc.header_total += header;
-        acc.merge_total += merge;
-        acc.remove_total += remove;
-        acc.index_total += index_reg;
-        acc.lbamap_total += lbamap_reg;
-        acc.gate_total += gate_check;
-
-        if let ResolvabilityGate::Refused(orphaned) = gate {
-            let detail = orphaned
-                .sample
-                .iter()
-                .map(|(lba, hash)| format!("lba={lba} hash={}", hash.to_hex()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            log::warn!(
-                "repack {generation} [{inputs_fmt}]: refusing rewrite — {} lbamap-referenced hash(es) \
-                     would be unresolvable through the extent index after apply, first {}: \
-                     [{detail}]; dropping output and keeping inputs",
-                orphaned.total,
-                orphaned.sample.len(),
-            );
-            acc.stats.buckets_refused += 1;
-            if let Some(out) = &bucket.output {
-                let _ = fs::remove_file(acc.pending_dir.join(out.new_ulid.to_string()));
-            }
-            if bucket.journal {
-                acc.pending_journal
-                    .extend(bucket.inputs.iter().map(|i| i.input_ulid));
-            }
-            return Ok(());
-        }
-
-        acc.stats.extents_removed += extents_removed;
+        self.maps.swap_base(folded_from, post);
+        acc.stats.extents_removed += removed.len();
 
         if let Some(out) = &bucket.output {
             if self.last_segment_ulid < Some(out.new_ulid) {
@@ -730,17 +808,7 @@ impl Volume {
         } else {
             ""
         };
-        let phases = format!(
-            "derive={:.1}ms header={:.1}ms merge={:.1}ms \
-             (remove={:.1}ms index={:.1}ms lbamap={:.1}ms) gate={:.1}ms",
-            derive.as_secs_f64() * 1e3,
-            header.as_secs_f64() * 1e3,
-            merge.as_secs_f64() * 1e3,
-            remove.as_secs_f64() * 1e3,
-            index_reg.as_secs_f64() * 1e3,
-            lbamap_reg.as_secs_f64() * 1e3,
-            gate_check.as_secs_f64() * 1e3,
-        );
+        let generation = acc.generation();
         match &bucket.output {
             Some(out) => log::info!(
                 "repack {generation}: [{inputs_fmt}] -> {} ({tier}{} entries, {} bytes freed; {phases})",
@@ -753,7 +821,7 @@ impl Volume {
                 bucket.bytes_freed,
             ),
         }
-        Ok(())
+        acc.in_bucket += started.elapsed();
     }
 
     /// Close out a repack apply pass: record what the journal tier now

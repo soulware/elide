@@ -1028,20 +1028,20 @@ impl ExtentIndex {
     /// [`register_entry_consuming_inputs`](Self::register_entry_consuming_inputs):
     /// once the input file is unlinked, a rebuild registers only carried
     /// locations, so uncarried hashes still owned by the input must
-    /// leave the in-memory index too. Returns the number of removals.
+    /// leave the in-memory index too. Returns the hashes removed.
     pub fn remove_input_owned(
         &mut self,
         input: Ulid,
         owned: &[blake3::Hash],
         carried: &Blake3HashSet,
-    ) -> usize {
-        let mut removed = 0;
+    ) -> Vec<blake3::Hash> {
+        let mut removed = Vec::new();
         for hash in owned {
             if carried.contains(hash) {
                 continue;
             }
             if self.remove_owner_at(hash, input) {
-                removed += 1;
+                removed.push(*hash);
             }
         }
         removed

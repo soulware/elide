@@ -84,16 +84,17 @@ pub(crate) use read::{
 };
 pub use readonly::ReadonlyVolume;
 pub use reap::{
-    BodyBytes, ReapCandidate, ReapSegment, ReapStats, Sweep, list_open_segments,
-    parse_reap_candidates, sweep_unreachable,
+    BodyBytes, ReapCandidate, ReapFold, ReapSegment, ReapStats, Sweep, fold_reap,
+    list_open_segments, parse_reap_candidates, sweep_unreachable,
 };
 pub use reclaim::{
     ReclaimCandidate, ReclaimFold, ReclaimJob, ReclaimOutcome, ReclaimPrep, ReclaimResult,
     ReclaimThresholds, ReclaimedEntry, fold_reclaim_result, scan_reclaim_candidates,
 };
 pub use repack::{
-    CloseGenerationPrep, CompactionStats, RepackApply, RepackJob, RepackResult, RepackedBucket,
-    RepackedInput, RepackedOutput, unlink_consumed_inputs,
+    CloseGenerationPrep, CompactionStats, RepackApply, RepackFold, RepackJob, RepackLanded,
+    RepackResult, RepackedBucket, RepackedInput, RepackedOutput, fold_repack_bucket,
+    unlink_consumed_inputs,
 };
 use wal::{create_fresh_wal, recover_wal, replay_wal_records};
 
@@ -835,15 +836,6 @@ impl LbaRanges {
 pub(in crate::volume) struct UnresolvableHashes {
     pub total: usize,
     pub sample: Vec<(u64, blake3::Hash)>,
-}
-
-/// Outcome of [`Volume::mutate_gated_on_resolvability`].
-pub(in crate::volume) enum ResolvabilityGate {
-    /// The mutation is in place.
-    Applied,
-    /// The mutation was rolled back: committing it would have left this
-    /// many `(lba, hash)` claims unresolvable.
-    Refused(UnresolvableHashes),
 }
 
 /// Outcome of applying one `.staged` GC handoff via the derive-at-apply path.
@@ -1902,62 +1894,58 @@ impl Volume {
         }
     }
 
-    /// Apply phase for a [`GcPlanApplyResult`] returned by the worker.
-    ///
-    /// Re-derives the to-remove and stale-cancel sets against the **current**
-    /// extent index and lbamap (which may have diverged while the worker was
-    /// running), applies the fold to the in-memory extent index and lbamap,
-    /// refuses it if that would leave any lbamap-referenced hash without a
-    /// body location, then commits via `rename(<tmp>, <bare>)` as the atomic
-    /// commit point. Cancelled materialisations skip the commit — the plan
-    /// was already removed by the worker and any stale `.tmp` will be swept
-    /// on the next apply tick.
+    /// Apply phase for a [`GcPlanApplyResult`]: [`Self::prepare_plan_swap`],
+    /// [`fold_plan_apply_result`] and [`Self::swap_plan_apply`] on one
+    /// thread, for the synchronous callers.
     pub fn apply_plan_apply_result(
         &mut self,
         result: GcPlanApplyResult,
     ) -> io::Result<StagedApply> {
-        // Cancelled in the worker: plan file already removed; any stale
-        // `.tmp` is cleaned up on the next apply pass by the sweep at the
-        // top of `apply_all_staged_handoffs`. Nothing more to do here.
-        if matches!(result.outcome, StagedApply::Cancelled) {
-            return Ok(StagedApply::Cancelled);
+        let layers = match self.prepare_plan_swap(&result) {
+            PlanSwapPrep::Skip(outcome) => return Ok(outcome),
+            PlanSwapPrep::Layers(layers) => layers,
+        };
+        let landed =
+            match fold_plan_apply_result(&layers, result, &self.base_dir, &self.ancestor_layers)? {
+                PlanFold::Cancelled => return Ok(StagedApply::Cancelled),
+                PlanFold::Landed(landed) => landed,
+            };
+        let outcome = self.swap_plan_apply(&landed, layers.base())?;
+        if outcome == StagedApply::Cancelled {
+            landed.remove_output();
         }
+        Ok(outcome)
+    }
 
-        let GcPlanApplyResult {
-            new_ulid,
-            plan_path,
-            gc_dir,
-            tmp_path,
-            new_bss,
-            entries,
-            inputs,
-            input_old_entries,
-            input_claim_ranges,
-            carried_hashes,
-            entry_hashes,
-            handoff_inline,
-            outcome: _,
-        } = result;
-        let tmp_path = match tmp_path {
-            Some(p) => p,
-            None => return Ok(StagedApply::Cancelled),
+    /// The first hold of a GC plan apply: the worker's own cancel, the
+    /// read-state divergence check, then the layers the fold starts from.
+    pub fn prepare_plan_swap(&self, result: &GcPlanApplyResult) -> PlanSwapPrep {
+        // A cancel in the worker removed the plan file; the sweep at the
+        // top of `apply_all_staged_handoffs` removes a stale `.tmp`.
+        if matches!(result.outcome, StagedApply::Cancelled) {
+            return PlanSwapPrep::Skip(StagedApply::Cancelled);
+        }
+        let Some(tmp_path) = &result.tmp_path else {
+            return PlanSwapPrep::Skip(StagedApply::Cancelled);
         };
 
-        // Divergence check: the stale-liveness loop below only examines
-        // hashes the extent index locates *at* an input, so an input
-        // this daemon never loaded would sail through it unchecked.
-        // The plan file stays on disk — unlike a cancel, the plan is
-        // valid against the on-disk layer; it is this daemon that is
-        // wrong (`docs/design/read-state-divergence-check.md`).
-        let unknown: Vec<Ulid> = inputs
+        // The fold's stale-liveness loop examines only hashes the extent
+        // index locates *at* an input, so an input this daemon never
+        // loaded would pass it unchecked. The plan file stays on disk:
+        // the plan is valid against the on-disk layer, and this daemon
+        // is the one that is wrong
+        // (`docs/design/read-state-divergence-check.md`).
+        let unknown: Vec<Ulid> = result
+            .inputs
             .iter()
             .filter(|u| !self.own_segments.contains(u))
             .copied()
             .collect();
         if !unknown.is_empty() {
             log::error!(
-                "plan {new_ulid}: read-state divergence — {} input segment(s) \
+                "plan {}: read-state divergence — {} input segment(s) \
                  unknown to this daemon's read state: [{}]; refusing to fold",
+                result.new_ulid,
                 unknown.len(),
                 unknown
                     .iter()
@@ -1965,403 +1953,71 @@ impl Volume {
                     .collect::<Vec<_>>()
                     .join(", "),
             );
-            let _ = fs::remove_file(&tmp_path);
-            return Ok(StagedApply::Diverged);
+            let _ = fs::remove_file(tmp_path);
+            return PlanSwapPrep::Skip(StagedApply::Diverged);
         }
+        PlanSwapPrep::Layers(self.maps.clone())
+    }
 
-        let derive_start = Instant::now();
-
-        // Liveness for the veto is a claim or any recorded encoding
-        // naming the hash as a source: a base body must stay resolvable
-        // while an encoding names it, so its extent must cancel a plan
-        // that drops it. Both probe maintained counts.
-        let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
-        let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
-        self.maps.absorb();
-        let maps = self.maps.materialised();
-        for (hash, _kind, input_ulid) in &input_old_entries {
-            // Check both `inner` and `deltas` — a Delta entry sits in
-            // `extent_index.deltas` and would be missed by `lookup` alone.
-            let still_at_input = maps
-                .extent_index
-                .lookup(hash)
-                .is_some_and(|loc| loc.segment_id == *input_ulid)
-                || maps
-                    .extent_index
-                    .lookup_delta(hash)
-                    .is_some_and(|loc| loc.segment_id == *input_ulid);
-            if !still_at_input {
-                continue;
-            }
-            if carried_hashes.contains(hash) {
-                continue;
-            }
-            if maps.lbamap.is_referenced(hash) || maps.extent_index.is_named_delta_source(hash) {
-                stale_cancel.push((*hash, *input_ulid));
-            }
-            to_remove.push((*hash, *input_ulid));
-        }
-
-        if !stale_cancel.is_empty() {
+    /// The second hold of a GC plan apply: refuse if a write claimed a
+    /// hash the fold dropped, else commit the output and install the fold.
+    /// The rename runs before the swap, so a rename failure leaves the
+    /// maps as they were. A crash between the two ends the process, and
+    /// the rebuild reads the committed output.
+    pub fn swap_plan_apply(
+        &mut self,
+        landed: &PlanLanded,
+        folded_from: &Maps,
+    ) -> io::Result<StagedApply> {
+        let new_ulid = landed.new_ulid;
+        if let Some(hash) = self.maps.delta_claims_any(&landed.removed) {
             log::warn!(
-                "plan {new_ulid}: stale-liveness cancellation — {} hash(es) live in \
-                 volume but absent from materialised output; removing plan [{}]",
-                stale_cancel.len(),
-                describe_stale_cancel(&stale_cancel, &maps.lbamap),
+                "plan {new_ulid}: refusing fold — a write claimed hash {} after the fold \
+                 dropped its location; dropping output and plan",
+                hash.to_hex(),
             );
-            // Cancelling is one of the two mechanisms `NoDanglingDeltaSource`
-            // needs (docs/testing.md), so it fires whenever a delta increfs
-            // its source between plan prep and apply. The warning above
-            // reports that from state already in hand; the diagnostic below
-            // rebuilds the lbamap from every segment on disk, which belongs
-            // with the other drift detectors on the invariants switch.
-            if crate::volume_invariants_enabled() {
-                diagnose_stale_cancel(
-                    &self.base_dir,
-                    &self.ancestor_layers,
-                    &maps.lbamap,
-                    &stale_cancel,
-                    &self.base_dir.join("index"),
-                );
-            }
-            let _ = fs::remove_file(&tmp_path);
-            let _ = fs::remove_file(&plan_path);
-            // No rebuild: cancel means no segment was committed and no
-            // lbamap mutation happened. Pre-claimant-tracking we kept a
-            // defence-in-depth rebuild here against incremental drift,
-            // but every lbamap mutation now records its claimant ULID
-            // and the stress invariant `assert_lbamap_consistent`
-            // catches divergence at the introducing site.
-            self.assert_volume_invariants("apply_plan_apply_result_cancelled");
-            return Ok(StagedApply::Cancelled);
-        }
-
-        let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
-        // Every hash whose resolvability this apply can change: the
-        // output's entries (registered in the index, merged as claims,
-        // seeded into `entry_hashes` by the worker), the input-owned
-        // hashes it removes, and the journal-tier hashes of the
-        // segments it purges.
-        let mut footprint = entry_hashes;
-        footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
-        for input in &consumed {
-            footprint.extend(maps.extent_index.journal_hashes(*input));
-        }
-        let derive = derive_start.elapsed();
-
-        // Register the output's entries as the disk rebuild would,
-        // gated on the current owner being a consumed input. Carried
-        // Delta locations are `Full` against the bare `gc/<new_ulid>`
-        // file (still at `tmp_path` until the rename below, hence the
-        // layout read); the gc-carried promote flips them to `Cached`.
-        let header_start = Instant::now();
-        let delta_body_source =
-            extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
-        let header = header_start.elapsed();
-        let ctx = extentindex::SegmentRegistrationCtx {
-            segment_id: new_ulid,
-            body_section_start: new_bss,
-            body_tier: extentindex::RegistrationBodyTier::Cached,
-            delta_body_source,
-            inline: extentindex::InlineSource::Section(&handoff_inline),
-        };
-
-        // `pre_apply_*` back the rename-failure restore below; the
-        // resolvability gate keeps its own snapshots for the refusal
-        // path.
-        let pre_apply = self.maps.materialised();
-        let mut merge = Duration::ZERO;
-        let mut blocked: Vec<(u64, u32)> = Vec::new();
-        let gate_ranges =
-            LbaRanges::from_claims_and_ranges(&entries, input_claim_ranges.iter().copied());
-        let gate_start = Instant::now();
-        let gate = self.mutate_gated_on_resolvability(&footprint, &gate_ranges, |vol| {
-            let merge_start = Instant::now();
-            {
-                let index = vol.maps.extent_index_mut();
-                for (i, e) in entries.iter().enumerate() {
-                    index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
-                }
-                for (hash, old_ulid) in &to_remove {
-                    // `remove_owner_at` covers both `inner` and `deltas`. Plain
-                    // `lookup` only checks `inner`, so a Delta-canonical hash
-                    // would be left dangling — phantom entry pointing at a
-                    // deleted input segment. Caught by
-                    // `assert_extent_index_consistent` on
-                    // `gc_delta_partial_death_compaction`.
-                    index.remove_owner_at(hash, *old_ulid);
-                }
-                // Journal-tier bodies are keyed by segment, so a consumed
-                // input's journal entries are dropped by segment rather than
-                // by hash. A journal segment is only ever a bucket input as a
-                // whole-dead tombstone, so this drops nothing still live; for
-                // a durable input it is a no-op.
-                for old_ulid in &consumed {
-                    index.purge_journal_segment(*old_ulid);
-                    index.purge_segment_delta_sources(*old_ulid);
-                }
-            }
-
-            // Merge the GC output into the lbamap by per-entry conditional
-            // insert. `insert_consuming_inputs` installs on a sub-range
-            // whose existing claimant is one of the inputs this apply
-            // consumes and tears down, or which holds this entry's hash at
-            // a lower ULID (identical bytes — adopting the higher ULID
-            // matches the rebuild). A claimant with different content, or a
-            // higher ULID, keeps its sub-range: it marks a write the plan
-            // did not carry (a WAL whose flush promote failed keeps
-            // stamping claims below `new_ulid`). See
-            // `docs/design/lbamap-claimant-tracking.md`,
-            // `docs/finding-sweep-flush-claimant-bug.md`,
-            // `gc_output_loses_to_live_write_applied_after_gc`, and
-            // `gc_fold_must_not_resurrect_stale_claim_after_failed_checkpoint_flush`.
-            let lbamap = vol.maps.lbamap_mut();
-            for e in &entries {
-                let took = lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
-                if !e.kind.is_canonical_only() && took < e.lba_length {
-                    blocked.push((e.start_lba, e.lba_length));
-                }
-            }
-            merge = merge_start.elapsed();
-            Ok(())
-        })?;
-        let gate_check = gate_start.elapsed().saturating_sub(merge);
-
-        if let ResolvabilityGate::Refused(orphaned) = gate {
-            let detail = orphaned
-                .sample
-                .iter()
-                .map(
-                    |(lba, hash)| match to_remove.iter().find(|(h, _)| h == hash) {
-                        Some((_, input)) => {
-                            format!("lba={lba} hash={} was-at={input}", hash.to_hex())
-                        }
-                        None => format!("lba={lba} hash={}", hash.to_hex()),
-                    },
-                )
-                .collect::<Vec<_>>()
-                .join(", ");
-            log::warn!(
-                "plan {new_ulid}: refusing fold — {} lbamap-referenced hash(es) would \
-                 be unresolvable through the extent index after apply, first {}: \
-                 [{detail}]; dropping output and plan",
-                orphaned.total,
-                orphaned.sample.len(),
-            );
-            let _ = fs::remove_file(&tmp_path);
-            let _ = fs::remove_file(&plan_path);
-            self.assert_volume_invariants("apply_plan_apply_result_refused");
-            return Ok(StagedApply::Cancelled);
-        }
-
-        // A carried entry that took fewer LBA blocks than it covers ran
-        // into a claimant this apply does not consume. Above `new_ulid`
-        // that is the ordinary plan-then-write race: the rebuild admits
-        // by highest claimant ULID, so it prefers the same claimant the
-        // merge just did and the two agree.
-        //
-        // Below `new_ulid` they part. The rebuild hands the range to the
-        // fold, so committing buys a volume that reads correctly until
-        // its next mount serves content the merge had refused. Reaching
-        // that means the plan carried a hash another tier had already
-        // superseded, which is what `gc_fork` building liveness from a
-        // full rebuild plus a WAL replay exists to prevent. Refusing
-        // keeps the two in step and leaves the next pass to re-derive.
-        let superseded: Vec<(u64, u64, Ulid)> = blocked
-            .iter()
-            .flat_map(|(start, length)| {
-                pre_apply
-                    .lbamap
-                    .extents_in_range(*start, start + *length as u64)
-            })
-            .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
-            .map(|x| (x.range_start, x.range_end, x.claimant_ulid))
-            .collect();
-        if let Some(identity) = refusal_identity(SUPERSEDED_CARRY, &superseded, inputs.len()) {
-            let detail = superseded
-                .iter()
-                .take(REFUSAL_SAMPLE_LIMIT)
-                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            log::error!(
-                "plan {new_ulid}: refusing fold — {} lba run(s) carried by the plan are held by \
-                 a lower-ULID claimant this apply does not consume, so the plan carries a hash \
-                 another tier has superseded and a rebuild would prefer the fold, first {}: \
-                 [{detail}]; dropping output and plan; {identity}",
-                superseded.len(),
-                superseded.len().min(REFUSAL_SAMPLE_LIMIT),
-            );
-            self.maps.restore(pre_apply);
-            let _ = fs::remove_file(&tmp_path);
-            let _ = fs::remove_file(&plan_path);
-            self.assert_volume_invariants("apply_plan_apply_result_superseded");
-            return Ok(StagedApply::Cancelled);
-        }
-
-        // The mirror of the check above. That one catches a fold claiming
-        // an LBA it should not; this one catches a fold dropping an LBA
-        // it should have carried. A claim the plan was right to drop
-        // cannot still name a consumed input, because dropping it as dead
-        // means something else overwrote it and that something is the
-        // claimant. So a live claim held by an input over a range the
-        // output does not cover says the plan read that LBA as dead while
-        // the volume still serves it.
-        //
-        // The fold consumes its inputs, so on the next open that claim
-        // has no segment to come from and the LBA reverts to whatever
-        // older layer still holds it, or reads as a hole.
-        //
-        // Coverage is taken over LBA ranges rather than per entry: two of
-        // an input's entries can cover one LBA, the earlier dead on the
-        // anchor and dropped, with the later one carried.
-        self.assert_claims_within_input_ranges(
-            &pre_apply.lbamap,
-            &consumed,
-            &input_claim_ranges,
-            new_ulid,
-        );
-        let covered = LbaRanges::from_claims(&entries);
-        let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
-            .iter()
-            .flat_map(|(start, length)| {
-                pre_apply
-                    .lbamap
-                    .extents_in_range(*start, start + *length as u64)
-            })
-            .filter(|x| consumed.contains(&x.claimant_ulid))
-            .filter_map(|x| {
-                covered
-                    .first_gap_in(x.range_start, x.range_end)
-                    .map(|(from, to)| (from, to, x.claimant_ulid))
-            })
-            .collect();
-        if let Some(identity) = refusal_identity(DROPPED_CLAIM, &dropped, inputs.len()) {
-            let detail = dropped
-                .iter()
-                .take(REFUSAL_SAMPLE_LIMIT)
-                .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            log::error!(
-                "plan {new_ulid}: refusing fold — {} lba run(s) are claimed by an input this \
-                 apply consumes and are absent from the output, so the plan read them dead while \
-                 the volume still serves them, first {}: [{detail}]; dropping output and plan; \
-                 {identity}",
-                dropped.len(),
-                dropped.len().min(REFUSAL_SAMPLE_LIMIT),
-            );
-            self.maps.restore(pre_apply);
-            let _ = fs::remove_file(&tmp_path);
-            let _ = fs::remove_file(&plan_path);
-            self.assert_volume_invariants("apply_plan_apply_result_dropped_claim");
             return Ok(StagedApply::Cancelled);
         }
 
         let fs_start = Instant::now();
-        for input in &inputs {
+        for input in &landed.inputs {
             if let Some(p) = segment::find_pending_file(&self.base_dir, &input.to_string()) {
                 let _ = fs::remove_file(p);
             }
         }
-
         // Commit point. On a crash above this rename no fold exists on
-        // disk and restart's rebuild never sees the output; the
-        // in-memory registrations die with the process. On a crash
-        // after it, the rebuild walks the same on-disk segments and
-        // produces the same claimant ULIDs as the in-memory merge.
-        let bare_path = gc_dir.join(new_ulid.to_string());
-        if let Err(e) = fs::rename(&tmp_path, &bare_path) {
-            self.maps.restore(pre_apply);
-            return Err(e);
-        }
-        let _ = fs::remove_file(&plan_path);
+        // disk and the restart's rebuild never sees the output. On a
+        // crash after it, the rebuild walks the same on-disk segments and
+        // produces the same claimant ULIDs as the fold.
+        let bare_path = landed.gc_dir.join(new_ulid.to_string());
+        fs::rename(&landed.tmp_path, &bare_path)?;
+        let _ = fs::remove_file(&landed.plan_path);
+        self.maps
+            .swap_below(folded_from, landed.post.clone(), new_ulid);
         log::info!(
             "plan {new_ulid}: apply phases entries={} removed={} inputs={} \
              derive={:.1}ms header={:.1}ms merge={:.1}ms gate={:.1}ms fs={:.1}ms",
-            entries.len(),
-            to_remove.len(),
-            inputs.len(),
-            derive.as_secs_f64() * 1e3,
-            header.as_secs_f64() * 1e3,
-            merge.as_secs_f64() * 1e3,
-            gate_check.as_secs_f64() * 1e3,
+            landed.entries,
+            landed.removed.len(),
+            landed.inputs.len(),
+            landed.phases.derive.as_secs_f64() * 1e3,
+            landed.phases.header.as_secs_f64() * 1e3,
+            landed.phases.merge.as_secs_f64() * 1e3,
+            landed.phases.gate.as_secs_f64() * 1e3,
             fs_start.elapsed().as_secs_f64() * 1e3,
         );
         self.own_segments.insert(new_ulid);
-        // Bump last_segment_ulid so a snapshot taken after this apply
-        // (with no intervening write) mints its marker at or above the
-        // fold output — the first-snapshot pinning invariant in
-        // `Volume::snapshot` requires every own-segment extent-index
-        // target to sit at or below the marker. The open-time rebuild
-        // computes this from its gc/ + index/ scan; the live apply must
-        // match it.
+        // A snapshot taken after this apply mints its marker at or above
+        // the fold output: the first-snapshot pinning invariant in
+        // `Volume::snapshot` needs every own-segment extent-index target
+        // at or below the marker, and the open-time rebuild computes the
+        // same bound from its gc/ + index/ scan.
         if self.last_segment_ulid < Some(new_ulid) {
             self.last_segment_ulid = Some(new_ulid);
         }
 
         self.assert_volume_invariants("apply_plan_apply_result_applied");
-
         Ok(StagedApply::Applied)
-    }
-
-    /// Stress-only invariant: every live claim held by a segment this
-    /// apply consumes lies inside the union of that segment's entry LBA
-    /// ranges.
-    ///
-    /// It is what makes the bounded walks of the dropped-claim refusal
-    /// and the resolvability gate complete rather than merely cheap. Both
-    /// query the map over the inputs' own entry ranges, so a claim keyed
-    /// to an input from outside them is one they cannot see. A fold that
-    /// drops it reports clean, and a purge that strands it passes the
-    /// gate.
-    ///
-    /// A claim reaches the map by registering an entry, and a split only
-    /// narrows a range inside the original, so the property holds by
-    /// construction. `LbaMap::set_claimant_if_matches` is the one path
-    /// that re-keys claims rather than registering them, and it promotes
-    /// a predecessor entry whole — including the part below the range it
-    /// was handed. Its callers promote WAL writes, whose `insert` has
-    /// already split any overlapping predecessor at that boundary, so
-    /// the promoted claim is keyed at or above it. This asserts that
-    /// rather than resting on it.
-    fn assert_claims_within_input_ranges(
-        &self,
-        pre_apply: &lbamap::LbaMap,
-        consumed: &std::collections::HashSet<Ulid>,
-        input_claim_ranges: &[(u64, u32)],
-        new_ulid: Ulid,
-    ) {
-        if !crate::volume_invariants_enabled() {
-            return;
-        }
-        let within = LbaRanges::new(
-            input_claim_ranges
-                .iter()
-                .map(|(start, length)| (*start, start + *length as u64)),
-        );
-        let outside: Vec<(u64, u64, Ulid)> = pre_apply
-            .iter_entries_with_claimant()
-            .filter(|(_, _, _, _, claimant)| consumed.contains(claimant))
-            .filter_map(|(lba, length, _, _, claimant)| {
-                within
-                    .first_gap_in(lba, lba + length as u64)
-                    .map(|(from, to)| (from, to, claimant))
-            })
-            .collect();
-        if !outside.is_empty() {
-            let mut msg = format!(
-                "claims-within-input-ranges invariant violation during [plan {new_ulid} apply]: \
-                 {} claim(s) held by a consumed input sit outside its entry ranges, so the \
-                 bounded walks of the dropped-claim refusal and the resolvability gate cannot \
-                 see them",
-                outside.len()
-            );
-            for (from, to, claimant) in outside.iter().take(REFUSAL_SAMPLE_LIMIT) {
-                msg.push_str(&format!("\n  lba={from}..{to} held-by={claimant}"));
-            }
-            panic!("{msg}");
-        }
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
@@ -2824,7 +2480,7 @@ impl Volume {
     /// location" — typically an apply path that removed from
     /// extent_index without also pruning the lbamap claim. Backs the
     /// stress invariant below; the production gate checks its declared
-    /// footprint through [`Self::unresolvable_footprint_hashes`], and
+    /// footprint through [`unresolvable_footprint_hashes`], and
     /// this whole-map walk is the oracle that catches a mutation
     /// reaching outside its declaration.
     ///
@@ -2869,122 +2525,6 @@ impl Volume {
             }
         }
         found
-    }
-
-    /// Resolvability of the hashes in `footprint`, by the same rules as
-    /// [`Self::unresolvable_lbamap_hashes`] and counted per stranded
-    /// claim like it. An unclaimed hash resolves vacuously; a claimed
-    /// one resolves for every claimant at once through `inner` or a
-    /// delta with a resolving source, and otherwise per claim through
-    /// the claimant's journal map — the one tier whose resolution is
-    /// claimant-keyed, which takes a walk over the claims to pair each
-    /// with its claimant.
-    ///
-    /// That walk covers the claims in `claim_ranges`, and it is shared:
-    /// every hash the claimant-free tiers leave unresolved settles in
-    /// one pass over those claims. A journal consolidation bucket lands
-    /// its whole footprint in that residual — journal hashes resolve
-    /// only through their claimant — so the walk's cost is per gate
-    /// call and proportional to the bucket, with the wholly-durable
-    /// footprints of GC folds and close-pass buckets skipping it.
-    fn unresolvable_footprint_hashes(
-        &self,
-        footprint: &Blake3HashSet,
-        claim_ranges: &LbaRanges,
-        sample_limit: usize,
-    ) -> UnresolvableHashes {
-        let mut found = UnresolvableHashes::default();
-        let maps = self.maps.materialised();
-        let mut residual: Blake3HashSet = Blake3HashSet::default();
-        for &hash in footprint {
-            if hash == ZERO_HASH || maps.lbamap.claim_refcount(&hash) == 0 {
-                continue;
-            }
-            if maps.extent_index.lookup(&hash).is_some() {
-                continue;
-            }
-            if maps.extent_index.lookup_delta(&hash).is_some_and(|loc| {
-                loc.options
-                    .iter()
-                    .any(|opt| maps.extent_index.lookup(&opt.source_hash).is_some())
-            }) {
-                continue;
-            }
-            residual.insert(hash);
-        }
-        if residual.is_empty() {
-            return found;
-        }
-        log::info!(
-            "resolvability gate: residual walk over {} journal-tier hash(es) in {} lba range(s)",
-            residual.len(),
-            claim_ranges.len(),
-        );
-        for (start, end) in claim_ranges.iter() {
-            for x in maps.lbamap.extents_in_range(start, end) {
-                if !residual.contains(&x.hash) {
-                    continue;
-                }
-                if maps
-                    .extent_index
-                    .lookup_journal(x.claimant_ulid, &x.hash)
-                    .is_none()
-                {
-                    found.total += 1;
-                    if found.sample.len() < sample_limit {
-                        found.sample.push((x.range_start, x.hash));
-                    }
-                }
-            }
-        }
-        found
-    }
-
-    /// Run an in-memory extent-index/lbamap mutation behind the
-    /// resolvability gate shared by the structural rewriters (GC fold
-    /// apply, repack apply): snapshot both maps, run `mutate`, then
-    /// require every claimed hash in `footprint` to resolve through the
-    /// extent index — the read path's lookup. A miss means committing
-    /// the mutation would strand an LBA claim with no body location
-    /// (permanent read EIO that a rebuild reproduces once the inputs
-    /// are unlinked), so both maps are restored and the orphans
-    /// returned for the caller to log and refuse. Both maps are also
-    /// restored when `mutate` itself errors.
-    ///
-    /// `footprint` is the caller's declaration of every hash whose
-    /// resolvability the mutation can change: each hash it removes or
-    /// registers in either map, each hash whose lbamap claim it merges,
-    /// and each journal-tier hash of a segment it purges. `claim_ranges`
-    /// is the matching declaration of every LBA whose claim the mutation
-    /// can re-point or whose claimant it can purge, which are the entry
-    /// ranges of each input it consumes and of the output it registers. A claim
-    /// over an undeclared hash, or outside the declared ranges, can only
-    /// strand through a mutation reaching outside its declaration; with
-    /// the volume invariants switched on the whole map is re-checked
-    /// after every structural op, which is where that class is caught.
-    /// Checking the declaration rather than the map is what takes the
-    /// gate from O(lbamap) per call to O(footprint + claims in range) —
-    /// the difference between millions of lookups under the write mutex
-    /// and thousands (#902).
-    pub(in crate::volume) fn mutate_gated_on_resolvability(
-        &mut self,
-        footprint: &Blake3HashSet,
-        claim_ranges: &LbaRanges,
-        mutate: impl FnOnce(&mut Self) -> io::Result<()>,
-    ) -> io::Result<ResolvabilityGate> {
-        self.maps.absorb();
-        let pre = self.maps.materialised();
-        if let Err(e) = mutate(self) {
-            self.maps.restore(pre);
-            return Err(e);
-        }
-        let orphaned =
-            self.unresolvable_footprint_hashes(footprint, claim_ranges, REFUSAL_SAMPLE_LIMIT);
-        if orphaned.total == 0 {
-            return Ok(ResolvabilityGate::Applied);
-        }
-        self.maps.restore(pre);
-        Ok(ResolvabilityGate::Refused(orphaned))
     }
 
     /// Stress-only invariant: panic if [`Self::unresolvable_lbamap_hashes`]
@@ -4219,6 +3759,474 @@ fn describe_stale_cancel(stale: &[(blake3::Hash, Ulid)], lbamap: &lbamap::LbaMap
         let _ = write!(out, "; ...+{} more", stale.len() - 3);
     }
     out
+}
+
+/// What [`Volume::prepare_plan_swap`] hands the fold.
+pub enum PlanSwapPrep {
+    /// The apply ends here with this outcome.
+    Skip(StagedApply),
+    /// The layers the fold starts from.
+    Layers(MapLayers),
+}
+
+/// Outcome of [`fold_plan_apply_result`].
+pub enum PlanFold {
+    /// The fold refused the plan and removed its output and plan file.
+    Cancelled,
+    /// The fold landed, ready for [`Volume::swap_plan_apply`].
+    Landed(Box<PlanLanded>),
+}
+
+/// A GC plan's fold between [`fold_plan_apply_result`] and
+/// [`Volume::swap_plan_apply`].
+pub struct PlanLanded {
+    new_ulid: Ulid,
+    tmp_path: PathBuf,
+    plan_path: PathBuf,
+    gc_dir: PathBuf,
+    inputs: Vec<Ulid>,
+    /// `base` and the frozen layers below `new_ulid`, with the plan applied.
+    post: Maps,
+    /// The hashes the fold dropped from the extent index.
+    removed: Blake3HashSet,
+    entries: usize,
+    phases: PlanPhases,
+}
+
+impl PlanLanded {
+    /// Remove the output and the plan file of a fold the swap refused.
+    pub fn remove_output(&self) {
+        remove_plan_output(&self.tmp_path, &self.plan_path);
+    }
+}
+
+struct PlanPhases {
+    derive: Duration,
+    header: Duration,
+    merge: Duration,
+    gate: Duration,
+}
+
+fn remove_plan_output(tmp_path: &Path, plan_path: &Path) {
+    let _ = fs::remove_file(tmp_path);
+    let _ = fs::remove_file(plan_path);
+}
+
+/// The fold of a GC plan, run with the volume mutex released. The
+/// removals and the stale cancels derive from the materialised layers,
+/// which is the map the rebuild gives. The plan's registrations and
+/// removals run over `base` and the frozen layers below `new_ulid`, so a
+/// claim a stashed promote holds below the plan refuses it as superseded,
+/// which is the rebuild's admission by highest ULID. The layers above
+/// mask the output. A refusal removes the output and the plan file.
+pub fn fold_plan_apply_result(
+    layers: &MapLayers,
+    result: GcPlanApplyResult,
+    base_dir: &Path,
+    ancestor_layers: &[AncestorLayer],
+) -> io::Result<PlanFold> {
+    let GcPlanApplyResult {
+        new_ulid,
+        plan_path,
+        gc_dir,
+        tmp_path,
+        new_bss,
+        entries,
+        inputs,
+        input_old_entries,
+        input_claim_ranges,
+        carried_hashes,
+        entry_hashes,
+        handoff_inline,
+        outcome: _,
+    } = result;
+    let Some(tmp_path) = tmp_path else {
+        return Ok(PlanFold::Cancelled);
+    };
+
+    let derive_start = Instant::now();
+    let view = layers.materialised();
+    // Liveness for the veto is a claim or any recorded encoding that
+    // names the hash as a source: a base body must stay resolvable while
+    // an encoding names it. Both probe maintained counts. A Delta entry
+    // sits in `deltas`, so the owner probe reads both maps.
+    let mut to_remove: Vec<(blake3::Hash, Ulid)> = Vec::new();
+    let mut stale_cancel: Vec<(blake3::Hash, Ulid)> = Vec::new();
+    for (hash, _kind, input_ulid) in &input_old_entries {
+        let still_at_input = view
+            .extent_index
+            .lookup(hash)
+            .is_some_and(|loc| loc.segment_id == *input_ulid)
+            || view
+                .extent_index
+                .lookup_delta(hash)
+                .is_some_and(|loc| loc.segment_id == *input_ulid);
+        if !still_at_input || carried_hashes.contains(hash) {
+            continue;
+        }
+        if view.lbamap.is_referenced(hash) || view.extent_index.is_named_delta_source(hash) {
+            stale_cancel.push((*hash, *input_ulid));
+        }
+        to_remove.push((*hash, *input_ulid));
+    }
+
+    if !stale_cancel.is_empty() {
+        log::warn!(
+            "plan {new_ulid}: stale-liveness cancellation — {} hash(es) live in \
+             volume but absent from materialised output; removing plan [{}]",
+            stale_cancel.len(),
+            describe_stale_cancel(&stale_cancel, &view.lbamap),
+        );
+        // The cancel is one of the two mechanisms `NoDanglingDeltaSource`
+        // needs (docs/testing.md), so it fires whenever a delta increfs
+        // its source between plan prep and apply. The diagnostic rebuilds
+        // the lbamap from every segment on disk, which belongs with the
+        // other drift detectors on the invariants switch.
+        if crate::volume_invariants_enabled() {
+            diagnose_stale_cancel(
+                base_dir,
+                ancestor_layers,
+                &view.lbamap,
+                &stale_cancel,
+                &base_dir.join("index"),
+            );
+        }
+        remove_plan_output(&tmp_path, &plan_path);
+        return Ok(PlanFold::Cancelled);
+    }
+
+    let consumed: std::collections::HashSet<Ulid> = inputs.iter().copied().collect();
+    // Every hash whose resolvability this apply can change: the output's
+    // entries, the input-owned hashes it removes, and the journal-tier
+    // hashes of the segments it purges.
+    let mut footprint = entry_hashes;
+    footprint.extend(to_remove.iter().map(|(hash, _)| *hash));
+    for input in &consumed {
+        footprint.extend(view.extent_index.journal_hashes(*input));
+    }
+    let derive = derive_start.elapsed();
+
+    // Carried Delta locations are `Full` against the bare `gc/<new_ulid>`
+    // file, which is at `tmp_path` until the swap's rename; the
+    // gc-carried promote flips them to `Cached`.
+    let header_start = Instant::now();
+    let delta_body_source =
+        extentindex::DeltaBodySource::full_for_segment(&tmp_path, &entries, new_bss)?;
+    let header = header_start.elapsed();
+    let ctx = extentindex::SegmentRegistrationCtx {
+        segment_id: new_ulid,
+        body_section_start: new_bss,
+        body_tier: extentindex::RegistrationBodyTier::Cached,
+        delta_body_source,
+        inline: extentindex::InlineSource::Section(&handoff_inline),
+    };
+
+    let pre = layers.below(new_ulid);
+    let mut post = pre.clone();
+    let mut blocked: Vec<(u64, u32)> = Vec::new();
+    let mut removed = Blake3HashSet::default();
+    let gate_ranges =
+        LbaRanges::from_claims_and_ranges(&entries, input_claim_ranges.iter().copied());
+    let merge_start = Instant::now();
+    {
+        let index = Arc::make_mut(&mut post.extent_index);
+        for (i, e) in entries.iter().enumerate() {
+            index.register_entry_consuming_inputs(e, i as u32, &ctx, &consumed)?;
+        }
+        for (hash, old_ulid) in &to_remove {
+            if index.remove_owner_at(hash, *old_ulid) {
+                removed.insert(*hash);
+            }
+        }
+        // Journal-tier bodies are keyed by segment, so a consumed input's
+        // journal entries drop by segment. A journal segment is a plan
+        // input only as a whole-dead tombstone, so this drops nothing live.
+        for old_ulid in &consumed {
+            index.purge_journal_segment(*old_ulid);
+            index.purge_segment_delta_sources(*old_ulid);
+        }
+
+        // `register_entry_consuming_inputs` installs on a sub-range whose
+        // claimant is an input this apply consumes, or which holds this
+        // entry's hash at a lower ULID. A claimant with different content,
+        // or a higher ULID, keeps its sub-range: it marks a write the plan
+        // did not carry (`docs/design/lbamap-claimant-tracking.md`).
+        let lbamap = Arc::make_mut(&mut post.lbamap);
+        for e in &entries {
+            let took = lbamap.register_entry_consuming_inputs(e, new_ulid, &consumed);
+            if !e.kind.is_canonical_only() && took < e.lba_length {
+                blocked.push((e.start_lba, e.lba_length));
+            }
+        }
+    }
+    let merge = merge_start.elapsed();
+
+    let gate_start = Instant::now();
+    let orphaned = unresolvable_footprint_hashes(
+        &layers.above(new_ulid, post.clone()).materialised(),
+        &footprint,
+        &gate_ranges,
+        REFUSAL_SAMPLE_LIMIT,
+    );
+    let gate = gate_start.elapsed();
+    if orphaned.total > 0 {
+        let detail = orphaned
+            .sample
+            .iter()
+            .map(
+                |(lba, hash)| match to_remove.iter().find(|(h, _)| h == hash) {
+                    Some((_, input)) => {
+                        format!("lba={lba} hash={} was-at={input}", hash.to_hex())
+                    }
+                    None => format!("lba={lba} hash={}", hash.to_hex()),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "plan {new_ulid}: refusing fold — {} lbamap-referenced hash(es) would \
+             be unresolvable through the extent index after apply, first {}: \
+             [{detail}]; dropping output and plan",
+            orphaned.total,
+            orphaned.sample.len(),
+        );
+        remove_plan_output(&tmp_path, &plan_path);
+        return Ok(PlanFold::Cancelled);
+    }
+
+    // A carried entry that took fewer LBA blocks than it covers ran into
+    // a claimant this apply does not consume. Above `new_ulid` that is
+    // the plan-then-write race: the rebuild admits by highest claimant
+    // ULID, so it prefers the same claimant the merge did.
+    //
+    // Below `new_ulid` the two part. The rebuild hands the range to the
+    // fold, so a commit buys a volume that reads correctly until its next
+    // mount serves content the merge refused. The plan carried a hash
+    // another tier had superseded, which `gc_fork`'s liveness from a full
+    // rebuild plus a WAL replay exists to prevent. The refusal keeps the
+    // two in step and leaves the next pass to re-derive.
+    let superseded: Vec<(u64, u64, Ulid)> = blocked
+        .iter()
+        .flat_map(|(start, length)| pre.lbamap.extents_in_range(*start, start + *length as u64))
+        .filter(|x| x.claimant_ulid < new_ulid && !consumed.contains(&x.claimant_ulid))
+        .map(|x| (x.range_start, x.range_end, x.claimant_ulid))
+        .collect();
+    if let Some(identity) = refusal_identity(SUPERSEDED_CARRY, &superseded, inputs.len()) {
+        let detail = superseded
+            .iter()
+            .take(REFUSAL_SAMPLE_LIMIT)
+            .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::error!(
+            "plan {new_ulid}: refusing fold — {} lba run(s) carried by the plan are held by \
+             a lower-ULID claimant this apply does not consume, so the plan carries a hash \
+             another tier has superseded and a rebuild would prefer the fold, first {}: \
+             [{detail}]; dropping output and plan; {identity}",
+            superseded.len(),
+            superseded.len().min(REFUSAL_SAMPLE_LIMIT),
+        );
+        remove_plan_output(&tmp_path, &plan_path);
+        return Ok(PlanFold::Cancelled);
+    }
+
+    // The mirror of the check above. That one catches a fold that claims
+    // an LBA it should not; this one catches a fold that drops an LBA it
+    // should have carried. A claim the plan was right to drop cannot
+    // still name a consumed input, because a drop as dead means something
+    // else overwrote it and that something is the claimant. So a live
+    // claim held by an input over a range the output does not cover says
+    // the plan read that LBA as dead while the volume still serves it.
+    //
+    // The fold consumes its inputs, so on the next open that claim has no
+    // segment to come from and the LBA reverts to whatever older layer
+    // still holds it, or reads as a hole.
+    //
+    // Coverage is over LBA ranges: two of an input's entries can cover one
+    // LBA, the earlier dead on the anchor and dropped, the later carried.
+    assert_claims_within_input_ranges(&pre.lbamap, &consumed, &input_claim_ranges, new_ulid);
+    let covered = LbaRanges::from_claims(&entries);
+    let dropped: Vec<(u64, u64, Ulid)> = input_claim_ranges
+        .iter()
+        .flat_map(|(start, length)| pre.lbamap.extents_in_range(*start, start + *length as u64))
+        .filter(|x| consumed.contains(&x.claimant_ulid))
+        .filter_map(|x| {
+            covered
+                .first_gap_in(x.range_start, x.range_end)
+                .map(|(from, to)| (from, to, x.claimant_ulid))
+        })
+        .collect();
+    if let Some(identity) = refusal_identity(DROPPED_CLAIM, &dropped, inputs.len()) {
+        let detail = dropped
+            .iter()
+            .take(REFUSAL_SAMPLE_LIMIT)
+            .map(|(from, to, claimant)| format!("lba={from}..{to} held-by={claimant}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::error!(
+            "plan {new_ulid}: refusing fold — {} lba run(s) are claimed by an input this \
+             apply consumes and are absent from the output, so the plan read them dead while \
+             the volume still serves them, first {}: [{detail}]; dropping output and plan; \
+             {identity}",
+            dropped.len(),
+            dropped.len().min(REFUSAL_SAMPLE_LIMIT),
+        );
+        remove_plan_output(&tmp_path, &plan_path);
+        return Ok(PlanFold::Cancelled);
+    }
+
+    Ok(PlanFold::Landed(Box::new(PlanLanded {
+        new_ulid,
+        tmp_path,
+        plan_path,
+        gc_dir,
+        inputs,
+        post,
+        removed,
+        entries: entries.len(),
+        phases: PlanPhases {
+            derive,
+            header,
+            merge,
+            gate,
+        },
+    })))
+}
+
+/// Stress-only invariant: every live claim held by a segment this apply
+/// consumes lies inside the union of that segment's entry LBA ranges.
+///
+/// It is what makes the bounded walks of the dropped-claim refusal and
+/// the resolvability gate complete. Both query the map over the inputs'
+/// own entry ranges, so a claim keyed to an input from outside them is
+/// one they cannot see. A fold that drops it reports clean, and a purge
+/// that strands it passes the gate.
+///
+/// A claim reaches the map by registering an entry, and a split only
+/// narrows a range inside the original, so the property holds by
+/// construction. `LbaMap::set_claimant_if_matches` is the one path that
+/// re-keys claims, and it promotes a predecessor entry whole, the part
+/// below the range it was handed included. Its callers promote WAL
+/// writes, whose `insert` has already split any overlapping predecessor
+/// at that boundary, so the promoted claim is keyed at or above it.
+fn assert_claims_within_input_ranges(
+    pre_apply: &lbamap::LbaMap,
+    consumed: &std::collections::HashSet<Ulid>,
+    input_claim_ranges: &[(u64, u32)],
+    new_ulid: Ulid,
+) {
+    if !crate::volume_invariants_enabled() {
+        return;
+    }
+    let within = LbaRanges::new(
+        input_claim_ranges
+            .iter()
+            .map(|(start, length)| (*start, start + *length as u64)),
+    );
+    let outside: Vec<(u64, u64, Ulid)> = pre_apply
+        .iter_entries_with_claimant()
+        .filter(|(_, _, _, _, claimant)| consumed.contains(claimant))
+        .filter_map(|(lba, length, _, _, claimant)| {
+            within
+                .first_gap_in(lba, lba + length as u64)
+                .map(|(from, to)| (from, to, claimant))
+        })
+        .collect();
+    if !outside.is_empty() {
+        let mut msg = format!(
+            "claims-within-input-ranges invariant violation during [plan {new_ulid} apply]: \
+             {} claim(s) held by a consumed input sit outside its entry ranges, so the \
+             bounded walks of the dropped-claim refusal and the resolvability gate cannot \
+             see them",
+            outside.len()
+        );
+        for (from, to, claimant) in outside.iter().take(REFUSAL_SAMPLE_LIMIT) {
+            msg.push_str(&format!("\n  lba={from}..{to} held-by={claimant}"));
+        }
+        panic!("{msg}");
+    }
+}
+
+/// Resolvability of the hashes in `footprint` over `maps`, by the same
+/// rules as [`Volume::unresolvable_lbamap_hashes`] and counted per
+/// stranded claim like it. An unclaimed hash resolves vacuously; a
+/// claimed one resolves for every claimant at once through `inner` or a
+/// delta with a resolving source, and otherwise per claim through the
+/// claimant's journal map, the one tier whose resolution is
+/// claimant-keyed, which takes a walk over the claims to pair each with
+/// its claimant.
+///
+/// That walk covers the claims in `claim_ranges`, and it is shared: every
+/// hash the claimant-free tiers leave unresolved settles in one pass over
+/// those claims. A journal consolidation bucket lands its whole footprint
+/// in that residual, because journal hashes resolve only through their
+/// claimant, so the walk's cost is per call and proportional to the
+/// bucket; the wholly durable footprints of GC folds and close-pass
+/// buckets skip it.
+///
+/// `footprint` is the caller's declaration of every hash whose
+/// resolvability its mutation can change: each hash it removes or
+/// registers in either map, each hash whose lbamap claim it merges, and
+/// each journal-tier hash of a segment it purges. `claim_ranges` is the
+/// matching declaration of every LBA whose claim the mutation can
+/// re-point or whose claimant it can purge: the entry ranges of each
+/// input it consumes and of the output it registers. A claim over an
+/// undeclared hash, or outside the declared ranges, can only strand
+/// through a mutation that reaches outside its declaration; with the
+/// volume invariants on, the whole map is re-checked after every
+/// structural op, which is where that class is caught. A check of the
+/// declaration costs O(footprint + claims in range) against O(lbamap)
+/// for the map (#902).
+pub(in crate::volume) fn unresolvable_footprint_hashes(
+    maps: &Maps,
+    footprint: &Blake3HashSet,
+    claim_ranges: &LbaRanges,
+    sample_limit: usize,
+) -> UnresolvableHashes {
+    let mut found = UnresolvableHashes::default();
+    let mut residual: Blake3HashSet = Blake3HashSet::default();
+    for &hash in footprint {
+        if hash == ZERO_HASH || maps.lbamap.claim_refcount(&hash) == 0 {
+            continue;
+        }
+        if maps.extent_index.lookup(&hash).is_some() {
+            continue;
+        }
+        if maps.extent_index.lookup_delta(&hash).is_some_and(|loc| {
+            loc.options
+                .iter()
+                .any(|opt| maps.extent_index.lookup(&opt.source_hash).is_some())
+        }) {
+            continue;
+        }
+        residual.insert(hash);
+    }
+    if residual.is_empty() {
+        return found;
+    }
+    log::info!(
+        "resolvability gate: residual walk over {} journal-tier hash(es) in {} lba range(s)",
+        residual.len(),
+        claim_ranges.len(),
+    );
+    for (start, end) in claim_ranges.iter() {
+        for x in maps.lbamap.extents_in_range(start, end) {
+            if !residual.contains(&x.hash) {
+                continue;
+            }
+            if maps
+                .extent_index
+                .lookup_journal(x.claimant_ulid, &x.hash)
+                .is_none()
+            {
+                found.total += 1;
+                if found.sample.len() < sample_limit {
+                    found.sample.push((x.range_start, x.hash));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Filename of the per-volume liveness lock within a fork directory.
