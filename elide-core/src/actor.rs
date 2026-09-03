@@ -597,7 +597,8 @@ impl std::ops::DerefMut for WriteGuard<'_> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        self.stats.record_write_hold(self.acquired.elapsed());
+        let depth = self.guard.map_layers().frozen_depth();
+        self.stats.record_write_hold(self.acquired.elapsed(), depth);
     }
 }
 

@@ -175,6 +175,21 @@ const WAIT_BUCKET_EDGES_MS: [u64; 5] = [1, 10, 100, 1_000, 10_000];
 const WAIT_BUCKETS: usize = WAIT_BUCKET_EDGES_MS.len() + 1;
 
 /// Which bucket a wait falls in.
+/// Frozen depths a write hold is charged to: 0 to 4, and 5 or more.
+pub const DEPTH_BUCKETS: usize = 6;
+
+fn depth_bucket(depth: usize) -> usize {
+    depth.min(DEPTH_BUCKETS - 1)
+}
+
+fn depth_bucket_label(i: usize) -> String {
+    if i == DEPTH_BUCKETS - 1 {
+        format!("d{i}+")
+    } else {
+        format!("d{i}")
+    }
+}
+
 fn wait_bucket(wait: Duration) -> usize {
     let ms = wait.as_millis() as u64;
     WAIT_BUCKET_EDGES_MS
@@ -227,6 +242,20 @@ struct WriteCounters {
     peak_waiting: AtomicU64,
     /// Distribution of the waits, by [`wait_bucket`].
     wait_buckets: [AtomicU64; WAIT_BUCKETS],
+    /// The holds by the frozen depth the write ran under, by
+    /// [`depth_bucket`]. Each layer adds one descent to every lookup the
+    /// write makes, so the per-depth means give the cost of a layer.
+    by_depth: [DepthCounters; DEPTH_BUCKETS],
+    window_max_depth: AtomicU64,
+    peak_depth: AtomicU64,
+}
+
+/// The write holds charged at one frozen depth.
+#[derive(Default)]
+struct DepthCounters {
+    writes: AtomicU64,
+    hold_nanos: AtomicU64,
+    window_max_hold_nanos: AtomicU64,
 }
 
 /// Counters for every labelled acquisition of one volume's mutex.
@@ -339,16 +368,26 @@ impl LockStats {
         }
     }
 
-    /// Record what one guest write held the mutex for, on its release.
+    /// Record what one guest write held the mutex for, on its release,
+    /// and the frozen depth it ran under.
     ///
     /// Charged by every write, contended or not, so the mean covers the
     /// uncontended holds an actor loop would be waiting on too.
-    pub fn record_write_hold(&self, hold: Duration) {
+    pub fn record_write_hold(&self, hold: Duration, depth: usize) {
         let nanos = hold.as_nanos() as u64;
         self.writes.hold_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.writes
             .window_max_hold_nanos
             .fetch_max(nanos, Ordering::Relaxed);
+        let at = &self.writes.by_depth[depth_bucket(depth)];
+        at.writes.fetch_add(1, Ordering::Relaxed);
+        at.hold_nanos.fetch_add(nanos, Ordering::Relaxed);
+        at.window_max_hold_nanos.fetch_max(nanos, Ordering::Relaxed);
+        let depth = depth as u64;
+        self.writes
+            .window_max_depth
+            .fetch_max(depth, Ordering::Relaxed);
+        self.writes.peak_depth.fetch_max(depth, Ordering::Relaxed);
     }
 
     /// Fold the armed drain in, called by the write that emptied the
@@ -447,6 +486,24 @@ impl LockStats {
                 wait_buckets: std::array::from_fn(|i| {
                     self.writes.wait_buckets[i].load(Ordering::Relaxed)
                 }),
+                by_depth: std::array::from_fn(|i| {
+                    let at = &self.writes.by_depth[i];
+                    DepthSnapshot {
+                        writes: at.writes.load(Ordering::Relaxed),
+                        hold_nanos: at.hold_nanos.load(Ordering::Relaxed),
+                        max_hold_nanos: if close_window {
+                            at.window_max_hold_nanos.swap(0, Ordering::Relaxed)
+                        } else {
+                            at.window_max_hold_nanos.load(Ordering::Relaxed)
+                        },
+                    }
+                }),
+                max_depth: if close_window {
+                    self.writes.window_max_depth.swap(0, Ordering::Relaxed)
+                } else {
+                    self.writes.window_max_depth.load(Ordering::Relaxed)
+                },
+                peak_depth: self.writes.peak_depth.load(Ordering::Relaxed),
             },
         }
     }
@@ -499,6 +556,20 @@ pub struct WriteSnapshot {
     pub peak_waiting: u64,
     /// Waits by magnitude, bucketed on [`WAIT_BUCKET_EDGES_MS`].
     pub wait_buckets: [u64; WAIT_BUCKETS],
+    /// Holds by the frozen depth the write ran under.
+    pub by_depth: [DepthSnapshot; DEPTH_BUCKETS],
+    /// Deepest the frozen layers stood under a write within the window,
+    /// and since the volume opened.
+    pub max_depth: u64,
+    pub peak_depth: u64,
+}
+
+/// The write holds charged at one frozen depth, read at an instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DepthSnapshot {
+    pub writes: u64,
+    pub hold_nanos: u64,
+    pub max_hold_nanos: u64,
 }
 
 /// Every site's counters read at one instant.
@@ -583,6 +654,17 @@ impl LockStatsSnapshot {
                 wait_buckets: std::array::from_fn(|i| {
                     self.writes.wait_buckets[i].saturating_sub(earlier.writes.wait_buckets[i])
                 }),
+                by_depth: std::array::from_fn(|i| DepthSnapshot {
+                    writes: self.writes.by_depth[i]
+                        .writes
+                        .saturating_sub(earlier.writes.by_depth[i].writes),
+                    hold_nanos: self.writes.by_depth[i]
+                        .hold_nanos
+                        .saturating_sub(earlier.writes.by_depth[i].hold_nanos),
+                    max_hold_nanos: self.writes.by_depth[i].max_hold_nanos,
+                }),
+                max_depth: self.writes.max_depth,
+                peak_depth: self.writes.peak_depth,
             },
         }
     }
@@ -684,6 +766,25 @@ impl LockStatsSnapshot {
                 .collect();
             if !spread.is_empty() {
                 out.push_str(&format!(" [{}]", spread.join(" ")));
+            }
+            out.push_str(&format!(
+                "; depth max={} peak={}",
+                self.writes.max_depth, self.writes.peak_depth
+            ));
+            for (i, d) in self
+                .writes
+                .by_depth
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.writes > 0)
+            {
+                out.push_str(&format!(
+                    " {} n={} held={:.1}ms maxheld={:.1}ms",
+                    depth_bucket_label(i),
+                    d.writes,
+                    millis(d.hold_nanos),
+                    millis(d.max_hold_nanos),
+                ));
             }
         }
         Some(out)
@@ -980,10 +1081,10 @@ mod tests {
     fn a_write_charges_its_hold_whether_or_not_it_waited() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(2));
+        stats.record_write_hold(Duration::from_millis(2), 0);
         stats.record_write_parking();
         stats.record_write_blocked(Duration::from_millis(9));
-        stats.record_write_hold(Duration::from_millis(5));
+        stats.record_write_hold(Duration::from_millis(5), 0);
 
         let snap = stats.snapshot();
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
@@ -998,14 +1099,51 @@ mod tests {
     fn the_window_hold_maximum_resets_and_the_sum_does_not() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(6));
+        stats.record_write_hold(Duration::from_millis(6), 0);
         assert_eq!(stats.take_window().writes.max_hold_nanos, 6_000_000);
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1));
+        stats.record_write_hold(Duration::from_millis(1), 0);
         let snap = stats.snapshot();
         assert_eq!(snap.writes.max_hold_nanos, 1_000_000);
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
+    }
+
+    /// A write's hold is charged to the frozen depth it ran under, so
+    /// the cost of one more layer reads off the per-depth means. Depths
+    /// past the last bucket land in it, and the window maximum resets
+    /// while the peak stands.
+    #[test]
+    fn a_write_hold_is_charged_to_its_frozen_depth() {
+        let stats = LockStats::default();
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(1), 0);
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(3), 2);
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(2), 7);
+
+        let snap = stats.take_window();
+        assert_eq!(snap.writes.by_depth[0].writes, 1);
+        assert_eq!(snap.writes.by_depth[2].hold_nanos, 3_000_000);
+        assert_eq!(snap.writes.by_depth[DEPTH_BUCKETS - 1].writes, 1);
+        assert_eq!(snap.writes.max_depth, 7);
+        let report = snap.report().expect("the writes acquired");
+        assert!(
+            report.contains(
+                "depth max=7 peak=7 d0 n=1 held=1.0ms maxheld=1.0ms \
+                 d2 n=1 held=3.0ms maxheld=3.0ms d5+ n=1 held=2.0ms maxheld=2.0ms"
+            ),
+            "got: {report}"
+        );
+
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(1), 1);
+        let next = stats.snapshot();
+        assert_eq!(next.writes.max_depth, 1);
+        assert_eq!(next.writes.peak_depth, 7);
+        assert_eq!(next.writes.by_depth[2].max_hold_nanos, 0);
+        assert_eq!(next.writes.by_depth[2].hold_nanos, 3_000_000);
     }
 
     /// A drain is attributed to the site that released, sized by the
