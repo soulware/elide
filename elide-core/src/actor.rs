@@ -1410,6 +1410,10 @@ impl VolumeActor {
                 self.publish_snapshot();
                 if apply.is_ok() {
                     crate::volume::remove_promoted_wal(&result);
+                    if crate::volume_invariants_enabled() {
+                        self.lock_volume(LockSite::PromoteApply)
+                            .assert_promote_applied();
+                    }
                 }
                 self.on_promote_result();
 

@@ -3495,7 +3495,16 @@ impl Volume {
         let new_base = fold_promote_result(&layers, result)?;
         self.swap_promote(result, new_base, layers.base());
         remove_promoted_wal(result);
+        self.assert_promote_applied();
         Ok(())
+    }
+
+    /// The end of a promote, after the WAL unlink, where the volume
+    /// invariants are asserted: a disk rebuild replays a WAL that is
+    /// present under the WAL's own ULID, and the swap moved those claims
+    /// to the segment ULID.
+    pub fn assert_promote_applied(&self) {
+        self.assert_volume_invariants("apply_promote");
     }
 
     /// Install a promote's fold: the folded maps become base, the epoch's
