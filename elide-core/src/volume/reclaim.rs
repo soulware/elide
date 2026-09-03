@@ -467,6 +467,7 @@ impl Volume {
             .swap_below(folded_from, new_base, result.segment_ulid);
         self.has_new_segments = true;
         self.last_segment_ulid = Some(result.segment_ulid);
+        self.assert_volume_invariants("swap_reclaim");
     }
 }
 
