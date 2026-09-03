@@ -40,7 +40,7 @@ use ulid::Ulid;
 
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
-use crate::lock_stats::{LockSite, LockStats, LockStatsSnapshot};
+use crate::lock_stats::{AppendContext, LockSite, LockStats, LockStatsSnapshot};
 use crate::segment::{self, BoxFetcher};
 use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
@@ -564,11 +564,13 @@ fn lock_volume_for_write<'a>(
     WriteGuard::new(guard, stats)
 }
 
-/// A guest write's hold on the volume mutex, charged on drop.
+/// A guest write's hold on the volume mutex, charged on drop, with what
+/// was in flight when it took the mutex.
 pub(crate) struct WriteGuard<'a> {
     guard: MutexGuard<'a, Volume>,
     stats: &'a LockStats,
     acquired: Instant,
+    context: AppendContext,
 }
 
 impl<'a> WriteGuard<'a> {
@@ -577,6 +579,7 @@ impl<'a> WriteGuard<'a> {
             guard,
             stats,
             acquired: Instant::now(),
+            context: stats.append_context(),
         }
     }
 }
@@ -600,7 +603,7 @@ impl Drop for WriteGuard<'_> {
         let depth = self.guard.map_layers().frozen_depth();
         let wal = self.guard.take_wal_time();
         self.stats
-            .record_write_hold(self.acquired.elapsed(), depth, wal);
+            .record_write_hold(self.acquired.elapsed(), depth, wal, self.context);
     }
 }
 
@@ -614,9 +617,15 @@ impl Drop for WriteGuard<'_> {
 /// reaches are either still the WAL's or already durable in that segment.
 ///
 /// `None` is the no-WAL-open state, which is already durable.
-fn sync_wal_handle(handle: Option<Arc<fs::File>>) -> io::Result<()> {
+///
+/// The sync counts as in flight in `stats`, for the writes that append to
+/// the same inode meanwhile.
+fn sync_wal_handle(stats: &LockStats, handle: Option<Arc<fs::File>>) -> io::Result<()> {
     match handle {
-        Some(file) => file.sync_data(),
+        Some(file) => {
+            let _in_flight = stats.sync_in_flight();
+            file.sync_data()
+        }
         None => Ok(()),
     }
 }
@@ -1829,7 +1838,7 @@ impl VolumeActor {
                             let picked_up = Instant::now();
                             let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
                             let locked = Instant::now();
-                            let outcome = sync_wal_handle(handle);
+                            let outcome = sync_wal_handle(&self.lock_stats, handle);
                             let synced = Instant::now();
                             self.flush_cost.n += 1;
                             self.flush_cost.mailbox.record(picked_up - queued);
@@ -2203,7 +2212,7 @@ impl VolumeClient {
             (guard.needs_promote(), sync, previous)
         };
         drop(previous);
-        sync_wal_handle(sync)?;
+        sync_wal_handle(&self.lock_stats, sync)?;
         if needs_promote {
             self.signal_check_promote();
         }
@@ -2230,7 +2239,7 @@ impl VolumeClient {
             (guard.needs_promote(), sync, previous)
         };
         drop(previous);
-        sync_wal_handle(sync)?;
+        sync_wal_handle(&self.lock_stats, sync)?;
         if needs_promote {
             self.signal_check_promote();
         }
@@ -2648,12 +2657,17 @@ const WORKER_QUEUE_WAIT_FLOOR: Duration = Duration::from_millis(50);
 /// Receives jobs via `job_rx`, executes each, and sends the result back on
 /// `result_tx`.  Exits when `job_rx` disconnects (actor dropped the sender)
 /// or `result_tx` disconnects (actor gone).
-fn worker_thread(job_rx: Receiver<QueuedJob>, result_tx: Sender<WorkerResult>) {
+fn worker_thread(
+    job_rx: Receiver<QueuedJob>,
+    result_tx: Sender<WorkerResult>,
+    stats: Arc<LockStats>,
+) {
     let mut prior_cache = PriorSourceCache::default();
     while let Ok(QueuedJob { queued_at, job }) = job_rx.recv() {
         let label = job.label();
         let waited = queued_at.elapsed();
         let started = Instant::now();
+        let running = stats.worker_running();
         let msg = match job {
             WorkerJob::Promote(job) => {
                 WorkerResult::Promote(execute_promote(job, &mut prior_cache))
@@ -2675,6 +2689,7 @@ fn worker_thread(job_rx: Receiver<QueuedJob>, result_tx: Sender<WorkerResult>) {
                 WorkerResult::Barrier
             }
         };
+        drop(running);
         let ran = started.elapsed();
         if waited >= WORKER_QUEUE_WAIT_FLOOR {
             info!(
@@ -4309,9 +4324,10 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     // Worker channels: job channel bounded at 4, result channel matched.
     let (worker_job_tx, worker_job_rx) = bounded::<QueuedJob>(4);
     let (worker_result_tx, worker_result_rx) = bounded::<WorkerResult>(4);
+    let worker_stats = Arc::clone(&lock_stats);
     let worker_handle = std::thread::Builder::new()
         .name("volume-worker".into())
-        .spawn(move || worker_thread(worker_job_rx, worker_result_tx))
+        .spawn(move || worker_thread(worker_job_rx, worker_result_tx, worker_stats))
         .expect("failed to spawn worker thread");
 
     let actor = VolumeActor {
@@ -5156,7 +5172,7 @@ mod tests {
         assert!(handle.is_some(), "the write left a WAL open");
 
         client.promote_wal().unwrap();
-        sync_wal_handle(handle).unwrap();
+        sync_wal_handle(&client.lock_stats, handle).unwrap();
 
         client.shutdown();
         drop(client);

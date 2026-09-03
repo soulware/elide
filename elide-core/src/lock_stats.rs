@@ -245,7 +245,7 @@ struct WriteCounters {
     /// The holds by the frozen depth the write ran under, by
     /// [`depth_bucket`]. Each layer adds one descent to every lookup the
     /// write makes, so the per-depth means give the cost of a layer.
-    by_depth: [DepthCounters; DEPTH_BUCKETS],
+    by_depth: [HoldCounters; DEPTH_BUCKETS],
     window_max_depth: AtomicU64,
     peak_depth: AtomicU64,
     /// The hold split into the WAL file calls and the rest, which is the
@@ -255,14 +255,53 @@ struct WriteCounters {
     window_max_wal_nanos: AtomicU64,
     map_nanos: AtomicU64,
     window_max_map_nanos: AtomicU64,
+    /// The WAL time by what was in flight at the append, by
+    /// [`append_bucket`], so a long append reads as blocked behind a sync,
+    /// behind the worker's disk traffic, or behind neither.
+    by_append: [HoldCounters; APPEND_BUCKETS],
 }
 
-/// The write holds charged at one frozen depth.
+/// The write holds charged to one bucket: a frozen depth, or what was in
+/// flight at the append.
 #[derive(Default)]
-struct DepthCounters {
+struct HoldCounters {
     writes: AtomicU64,
     hold_nanos: AtomicU64,
     window_max_hold_nanos: AtomicU64,
+}
+
+/// What was in flight when a write began its WAL append: a sync on the
+/// WAL inode, a worker job, both, or neither.
+pub const APPEND_BUCKETS: usize = 4;
+
+const APPEND_BUCKET_LABELS: [&str; APPEND_BUCKETS] = ["idle", "sync", "worker", "both"];
+
+fn append_bucket(context: AppendContext) -> usize {
+    (context.sync_in_flight as usize) | ((context.worker_running as usize) << 1)
+}
+
+/// What a write found in flight when it took the mutex, read through
+/// [`LockStats::append_context`] and charged with its WAL time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppendContext {
+    pub sync_in_flight: bool,
+    pub worker_running: bool,
+}
+
+/// One sync or worker job in flight, counted while this is held.
+pub struct InFlight<'a>(&'a AtomicU64);
+
+impl<'a> InFlight<'a> {
+    fn new(count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Counters for every labelled acquisition of one volume's mutex.
@@ -276,6 +315,10 @@ pub struct LockStats {
     armed: ArmedDrain,
     /// Origin for the nanosecond stamps in [`ArmedDrain`].
     base: Instant,
+    /// Syncs of the WAL inode and worker jobs in flight right now, read
+    /// by a write at its append.
+    syncs_in_flight: AtomicU64,
+    worker_jobs_running: AtomicU64,
 }
 
 impl Default for LockStats {
@@ -285,11 +328,31 @@ impl Default for LockStats {
             writes: WriteCounters::default(),
             armed: ArmedDrain::default(),
             base: Instant::now(),
+            syncs_in_flight: AtomicU64::new(0),
+            worker_jobs_running: AtomicU64::new(0),
         }
     }
 }
 
 impl LockStats {
+    /// Count a `sync_data` of the WAL as in flight while the guard lives.
+    pub fn sync_in_flight(&self) -> InFlight<'_> {
+        InFlight::new(&self.syncs_in_flight)
+    }
+
+    /// Count a worker job as running while the guard lives.
+    pub fn worker_running(&self) -> InFlight<'_> {
+        InFlight::new(&self.worker_jobs_running)
+    }
+
+    /// What is in flight now, for a write to charge its WAL time against.
+    pub fn append_context(&self) -> AppendContext {
+        AppendContext {
+            sync_in_flight: self.syncs_in_flight.load(Ordering::Relaxed) > 0,
+            worker_running: self.worker_jobs_running.load(Ordering::Relaxed) > 0,
+        }
+    }
+
     /// Fold one completed acquisition in.
     pub fn record(&self, site: LockSite, wait: Duration, hold: Duration) {
         let counters = &self.sites[site.index()];
@@ -376,15 +439,26 @@ impl LockStats {
     }
 
     /// Record what one guest write held the mutex for, on its release,
-    /// the frozen depth it ran under, and the part of the hold spent
-    /// inside the WAL file calls.
+    /// the frozen depth it ran under, the part of the hold spent inside
+    /// the WAL file calls, and what was in flight when it took the mutex.
     ///
     /// Charged by every write, contended or not, so the mean covers the
     /// uncontended holds an actor loop would be waiting on too.
-    pub fn record_write_hold(&self, hold: Duration, depth: usize, wal: Duration) {
+    pub fn record_write_hold(
+        &self,
+        hold: Duration,
+        depth: usize,
+        wal: Duration,
+        context: AppendContext,
+    ) {
         let nanos = hold.as_nanos() as u64;
         let wal_nanos = wal.as_nanos() as u64;
         let map_nanos = nanos.saturating_sub(wal_nanos);
+        let by = &self.writes.by_append[append_bucket(context)];
+        by.writes.fetch_add(1, Ordering::Relaxed);
+        by.hold_nanos.fetch_add(wal_nanos, Ordering::Relaxed);
+        by.window_max_hold_nanos
+            .fetch_max(wal_nanos, Ordering::Relaxed);
         self.writes
             .wal_nanos
             .fetch_add(wal_nanos, Ordering::Relaxed);
@@ -510,7 +584,7 @@ impl LockStats {
                 }),
                 by_depth: std::array::from_fn(|i| {
                     let at = &self.writes.by_depth[i];
-                    DepthSnapshot {
+                    HoldSnapshot {
                         writes: at.writes.load(Ordering::Relaxed),
                         hold_nanos: at.hold_nanos.load(Ordering::Relaxed),
                         max_hold_nanos: if close_window {
@@ -538,6 +612,18 @@ impl LockStats {
                 } else {
                     self.writes.window_max_map_nanos.load(Ordering::Relaxed)
                 },
+                by_append: std::array::from_fn(|i| {
+                    let at = &self.writes.by_append[i];
+                    HoldSnapshot {
+                        writes: at.writes.load(Ordering::Relaxed),
+                        hold_nanos: at.hold_nanos.load(Ordering::Relaxed),
+                        max_hold_nanos: if close_window {
+                            at.window_max_hold_nanos.swap(0, Ordering::Relaxed)
+                        } else {
+                            at.window_max_hold_nanos.load(Ordering::Relaxed)
+                        },
+                    }
+                }),
             },
         }
     }
@@ -591,7 +677,7 @@ pub struct WriteSnapshot {
     /// Waits by magnitude, bucketed on [`WAIT_BUCKET_EDGES_MS`].
     pub wait_buckets: [u64; WAIT_BUCKETS],
     /// Holds by the frozen depth the write ran under.
-    pub by_depth: [DepthSnapshot; DEPTH_BUCKETS],
+    pub by_depth: [HoldSnapshot; DEPTH_BUCKETS],
     /// Deepest the frozen layers stood under a write within the window,
     /// and since the volume opened.
     pub max_depth: u64,
@@ -602,11 +688,13 @@ pub struct WriteSnapshot {
     pub max_wal_nanos: u64,
     pub map_nanos: u64,
     pub max_map_nanos: u64,
+    /// The WAL time by what was in flight at the append.
+    pub by_append: [HoldSnapshot; APPEND_BUCKETS],
 }
 
 /// The write holds charged at one frozen depth, read at an instant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DepthSnapshot {
+pub struct HoldSnapshot {
     pub writes: u64,
     pub hold_nanos: u64,
     pub max_hold_nanos: u64,
@@ -694,7 +782,7 @@ impl LockStatsSnapshot {
                 wait_buckets: std::array::from_fn(|i| {
                     self.writes.wait_buckets[i].saturating_sub(earlier.writes.wait_buckets[i])
                 }),
-                by_depth: std::array::from_fn(|i| DepthSnapshot {
+                by_depth: std::array::from_fn(|i| HoldSnapshot {
                     writes: self.writes.by_depth[i]
                         .writes
                         .saturating_sub(earlier.writes.by_depth[i].writes),
@@ -715,6 +803,15 @@ impl LockStatsSnapshot {
                     .map_nanos
                     .saturating_sub(earlier.writes.map_nanos),
                 max_map_nanos: self.writes.max_map_nanos,
+                by_append: std::array::from_fn(|i| HoldSnapshot {
+                    writes: self.writes.by_append[i]
+                        .writes
+                        .saturating_sub(earlier.writes.by_append[i].writes),
+                    hold_nanos: self.writes.by_append[i]
+                        .hold_nanos
+                        .saturating_sub(earlier.writes.by_append[i].hold_nanos),
+                    max_hold_nanos: self.writes.by_append[i].max_hold_nanos,
+                }),
             },
         }
     }
@@ -843,6 +940,22 @@ impl LockStatsSnapshot {
                 millis(self.writes.map_nanos),
                 millis(self.writes.max_map_nanos),
             ));
+            out.push_str("; append");
+            for (i, d) in self
+                .writes
+                .by_append
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.writes > 0)
+            {
+                out.push_str(&format!(
+                    " {} n={} held={:.1}ms maxheld={:.1}ms",
+                    APPEND_BUCKET_LABELS[i],
+                    d.writes,
+                    millis(d.hold_nanos),
+                    millis(d.max_hold_nanos),
+                ));
+            }
         }
         Some(out)
     }
@@ -1138,10 +1251,20 @@ mod tests {
     fn a_write_charges_its_hold_whether_or_not_it_waited() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(2), 0, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(2),
+            0,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         stats.record_write_parking();
         stats.record_write_blocked(Duration::from_millis(9));
-        stats.record_write_hold(Duration::from_millis(5), 0, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(5),
+            0,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
 
         let snap = stats.snapshot();
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
@@ -1156,14 +1279,78 @@ mod tests {
     fn the_window_hold_maximum_resets_and_the_sum_does_not() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(6), 0, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(6),
+            0,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         assert_eq!(stats.take_window().writes.max_hold_nanos, 6_000_000);
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 0, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(1),
+            0,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         let snap = stats.snapshot();
         assert_eq!(snap.writes.max_hold_nanos, 1_000_000);
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
+    }
+
+    /// A write's WAL time is charged to what was in flight when it took
+    /// the mutex: a sync on the WAL inode, a worker job, both, or neither,
+    /// so a long append reads as blocked behind one or the other.
+    #[test]
+    fn a_wal_append_is_charged_to_what_was_in_flight() {
+        let stats = LockStats::default();
+        assert_eq!(stats.append_context(), AppendContext::default());
+        {
+            let _sync = stats.sync_in_flight();
+            let context = stats.append_context();
+            assert!(context.sync_in_flight);
+            assert!(!context.worker_running);
+            stats.record_write_uncontended();
+            stats.record_write_hold(
+                Duration::from_millis(3),
+                0,
+                Duration::from_millis(2),
+                context,
+            );
+            let _worker = stats.worker_running();
+            let context = stats.append_context();
+            assert!(context.sync_in_flight);
+            assert!(context.worker_running);
+            stats.record_write_uncontended();
+            stats.record_write_hold(
+                Duration::from_millis(5),
+                0,
+                Duration::from_millis(4),
+                context,
+            );
+        }
+        assert_eq!(stats.append_context(), AppendContext::default());
+        stats.record_write_uncontended();
+        stats.record_write_hold(
+            Duration::from_millis(1),
+            0,
+            Duration::from_millis(1),
+            stats.append_context(),
+        );
+
+        let snap = stats.take_window();
+        assert_eq!(snap.writes.by_append[0].writes, 1);
+        assert_eq!(snap.writes.by_append[1].hold_nanos, 2_000_000);
+        assert_eq!(snap.writes.by_append[3].max_hold_nanos, 4_000_000);
+        let report = snap.report().expect("the writes acquired");
+        assert!(
+            report.contains(
+                "; append idle n=1 held=1.0ms maxheld=1.0ms \
+                 sync n=1 held=2.0ms maxheld=2.0ms both n=1 held=4.0ms maxheld=4.0ms"
+            ),
+            "got: {report}"
+        );
     }
 
     /// The hold splits into the WAL file calls and the map commit, each
@@ -1173,9 +1360,19 @@ mod tests {
     fn a_write_hold_splits_into_wal_time_and_map_time() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(5), 0, Duration::from_millis(4));
+        stats.record_write_hold(
+            Duration::from_millis(5),
+            0,
+            Duration::from_millis(4),
+            AppendContext::default(),
+        );
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(3), 0, Duration::from_millis(1));
+        stats.record_write_hold(
+            Duration::from_millis(3),
+            0,
+            Duration::from_millis(1),
+            AppendContext::default(),
+        );
 
         let snap = stats.take_window();
         assert_eq!(snap.writes.wal_nanos, 5_000_000);
@@ -1189,7 +1386,12 @@ mod tests {
         );
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 0, Duration::from_millis(1));
+        stats.record_write_hold(
+            Duration::from_millis(1),
+            0,
+            Duration::from_millis(1),
+            AppendContext::default(),
+        );
         let next = stats.snapshot();
         assert_eq!(next.writes.max_wal_nanos, 1_000_000);
         assert_eq!(next.writes.max_map_nanos, 0);
@@ -1204,11 +1406,26 @@ mod tests {
     fn a_write_hold_is_charged_to_its_frozen_depth() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 0, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(1),
+            0,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(3), 2, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(3),
+            2,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(2), 7, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(2),
+            7,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
 
         let snap = stats.take_window();
         assert_eq!(snap.writes.by_depth[0].writes, 1);
@@ -1225,7 +1442,12 @@ mod tests {
         );
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 1, Duration::ZERO);
+        stats.record_write_hold(
+            Duration::from_millis(1),
+            1,
+            Duration::ZERO,
+            AppendContext::default(),
+        );
         let next = stats.snapshot();
         assert_eq!(next.writes.max_depth, 1);
         assert_eq!(next.writes.peak_depth, 7);
