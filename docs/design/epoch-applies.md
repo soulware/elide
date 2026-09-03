@@ -1,7 +1,8 @@
 # Design: epoch applies
 
 **Status:** steps 1 to 4 shipped (#984, #985, #987, #988, #989, 2026-09-01),
-with the prep follow-ons #990 and #991 (2026-09-02). Step 5 is open. The
+with the prep follow-ons #990 and #991 (2026-09-02), and step 5 shipped
+(#993, #994, 2026-09-03). The
 measurements come from the `write_contention` simulator (2026-08-31, parked on
 the `wip-measurement-probes` branch) and the rig's per-site lock statistics
 (2026-09-01 and 2026-09-02). Builds on claimant tracking
@@ -273,8 +274,10 @@ of scope here.
    worker site holds under 3ms at the median; the worst write wait equals a
    guest write's own hold.
 5. The fold-equals-rebuild assertion after every swap in the
-   `volume-invariants` build, and a proptest that interleaves writes with
-   folds.
+   `volume-invariants` build (#993), and the volume proptests take, fold
+   and swap promotes as three ops with writes between them (#994). The
+   suite passes with the assertion on at the default case count, with
+   takes stacked to any depth.
 
 Each step is measured on the rig's `[lock …]` lines before the next starts.
 
