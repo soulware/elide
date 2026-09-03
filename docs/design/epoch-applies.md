@@ -2,10 +2,11 @@
 
 **Status:** steps 1 to 4 shipped (#984, #985, #987, #988, #989, 2026-09-01),
 with the prep follow-ons #990 and #991 (2026-09-02), and step 5 shipped
-(#993, #994, 2026-09-03). The
+(#993, #994, 2026-09-03). The frozen depth cost is measured (#995,
+2026-09-03). The
 measurements come from the `write_contention` simulator (2026-08-31, parked on
 the `wip-measurement-probes` branch) and the rig's per-site lock statistics
-(2026-09-01 and 2026-09-02). Builds on claimant tracking
+(2026-09-01 to 2026-09-03). Builds on claimant tracking
 (`lbamap-claimant-tracking.md`), the plan-apply gate (`gc-plan-handoff.md`) and
 the reap (`open-generation-reap.md`).
 
@@ -218,12 +219,21 @@ preconditions (`pre_promote_offsets`) hold by construction.
 
 ## Frozen depth
 
-Each promote in flight owns one frozen layer. The WAL-threshold promote and the
-GC checkpoint promote can overlap, so the list can hold two, and a promote the
-actor stashed after a failure keeps its layer across retries. A layer retires
-at its promote's swap, or at the swap of a `fold_below` that replayed it. A
-read pays one descent per layer, so the depth is a cost the lock line reports.
-`promotes_in_flight` bounds it today; the design keeps that bound.
+Each promote in flight owns one frozen layer. The actor preps a promote each
+time the WAL crosses the threshold, so the depth is the worker's queue plus
+one, and the write rate against the promote rate sets it. A promote the actor
+stashed after a failure keeps its layer across retries. A layer retires at its
+promote's swap, or at the swap of a `fold_below` that replayed it. A read pays
+one descent per layer, and the lock line charges each write hold to the depth
+the write ran under (#995).
+
+The rig measured the cost on v0.1.60-rc1 (2026-09-03, three pgbench arms at
+500 tps, 55 loaded windows). The mean write hold is 46.8 µs at depth 0 and
+46.2 µs at depth 1. The difference inside one window has a median of +1.6 µs
+(p25 -5.0 µs, p75 +5.0 µs, 53 windows). The window maximum depth was 1 in 49
+windows, 2 in 5, and 3 in 1. A layer costs less than the noise of one hold, so
+promotes stack to any depth. The tail of the write hold, 10 to 20 ms in the
+worst windows, sits at depth 0.
 
 ## Off-lock consumers of the maps
 
@@ -283,8 +293,6 @@ Each step is measured on the rig's `[lock …]` lines before the next starts.
 
 ## Open questions
 
-- The depth policy when a third promote would freeze while two layers are in
-  flight: wait, or stack.
 - `pending` and `delta` describe the same writes. Whether the worker can form
   the segment from the frozen layer plus the WAL file, and `pending` goes,
   decides how much state the freeze moves.
