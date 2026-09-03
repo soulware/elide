@@ -42,6 +42,7 @@ use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
 use crate::lock_stats::{AppendContext, LockSite, LockStats, LockStatsSnapshot};
 use crate::segment::{self, BoxFetcher};
+use crate::sync_gate::{GateSnapshot, RequestKind, SyncGate};
 use crate::volume::{
     AncestorLayer, CompactionStats, GcCheckpointPrep, GcPlanApplyJob, GcPlanApplyResult,
     NoopSkipStats, PromoteFailure, PromoteJob, PromoteResult, PromoteSegmentJob,
@@ -135,13 +136,6 @@ pub enum ReapStop {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum VolumeRequest {
-    Flush {
-        reply: Sender<io::Result<()>>,
-        /// Stamped by the caller before the send, so the actor can
-        /// separate time the request spent in the mailbox from the work
-        /// it does once picked up.
-        queued: Instant,
-    },
     /// Fire-and-forget signal from a direct writer that the WAL may have
     /// crossed the promote threshold.  The actor checks `needs_promote()`
     /// and dispatches a promote if so.  Idempotent; the actor's idle tick
@@ -215,12 +209,6 @@ pub(crate) enum VolumeRequest {
         park: crossbeam_channel::Receiver<()>,
         holds: Vec<crossbeam_channel::Receiver<()>>,
     },
-    /// Test seam: read the flush segment counters as the next `[flush]`
-    /// line would find them.
-    #[cfg(test)]
-    TestFlushCost {
-        reply: Sender<FlushCost>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +273,13 @@ pub struct VolumeActor {
     lock_stats_reported: LockStatsSnapshot,
     /// When that mark was taken, which is the span the next line covers.
     lock_stats_marked: Instant,
-    /// Flush segment timings since the last `[flush]` line.
-    flush_cost: FlushCost,
+    /// The sync gate the guest's FLUSH and FUA requests run through,
+    /// shared with the clients that run them.
+    gate: Arc<SyncGate>,
+    /// The gate counters as the last `[flush]` line left them.
+    gate_reported: GateSnapshot,
     /// When that line last went out, which is the span the next one covers.
-    flush_marked: Instant,
+    gate_marked: Instant,
     /// When the stashed-promotes warning last went out, so a persistent
     /// failure repeats on the report cadence.
     stash_marked: Instant,
@@ -313,12 +304,6 @@ struct PromotePipeline {
     /// every promote dispatched at or before `needed_gen` has either
     /// applied or failed and errored its waiters.
     completed_gen: u64,
-    /// FIFO queue of rotated WAL paths for promotes currently
-    /// dispatched but not yet completed.  Matches the worker's strict
-    /// dispatch order (single thread, bounded FIFO channel), and is
-    /// popped on every worker result.  `Flush` fsyncs each path so its
-    /// ack covers the epochs these promotes carry.
-    inflight_old_wals: VecDeque<PathBuf>,
     /// Parked GC checkpoint: the reply sender and GC ULIDs, waiting
     /// either for the GC promote (`u_flush`) to complete on the worker
     /// or, when the WAL was empty, for every promote dispatched before
@@ -380,65 +365,6 @@ struct ParkedCloseGeneration {
 struct ParkedPromoteWal {
     segment_ulid: Ulid,
     reply: Sender<io::Result<()>>,
-}
-
-/// One segment of a flush, summed over a report window.
-#[derive(Default, Clone)]
-struct FlushSegment {
-    sum: Duration,
-    max: Duration,
-}
-
-impl FlushSegment {
-    fn record(&mut self, d: Duration) {
-        self.sum += d;
-        if d > self.max {
-            self.max = d;
-        }
-    }
-
-    fn report(&self, n: u64) -> String {
-        let mean = if n == 0 {
-            0.0
-        } else {
-            self.sum.as_secs_f64() * 1e3 / n as f64
-        };
-        format!("mean={mean:.2}ms max={:.1}ms", self.max.as_secs_f64() * 1e3)
-    }
-}
-
-/// Where guest FLUSHes spent their time over a report window.
-///
-/// A flush is serial segments: waiting in the actor mailbox, taking the
-/// volume mutex for the WAL handle, the fsync of the current WAL, and —
-/// when rotated WALs have promotes in flight or stashed for retry — the
-/// fsync of each of those. The device boundary sees only the sum, so
-/// each segment is timed separately here. The actor owns this
-/// exclusively, so the counters are plain fields.
-#[derive(Default, Clone)]
-pub(crate) struct FlushCost {
-    /// Flushes that reached the end of their fsync in this window.
-    n: u64,
-    /// Of those, how many found rotated WALs to fsync.
-    rotated: u64,
-    mailbox: FlushSegment,
-    lock: FlushSegment,
-    fsync: FlushSegment,
-    rotated_fsync: FlushSegment,
-}
-
-impl FlushCost {
-    fn report(&self) -> String {
-        format!(
-            "n={} rotated={}; mailbox {}; lock {}; fsync {}; rotated-fsync {}",
-            self.n,
-            self.rotated,
-            self.mailbox.report(self.n),
-            self.lock.report(self.n),
-            self.fsync.report(self.n),
-            self.rotated_fsync.report(self.rotated),
-        )
-    }
 }
 
 /// State stashed while a `promote_segment` job is on the worker thread.
@@ -607,26 +533,23 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
-/// Sync a WAL file handle taken under the volume mutex, on a caller that
-/// has since released it.
-///
-/// Running off the mutex lets concurrent writers' device round trips
-/// overlap, so they land in one host filesystem commit.  The handle stays
-/// correct across a rotation because a promote unlinks the old WAL only
-/// once the segment carrying its bytes is committed, so the bytes this sync
-/// reaches are either still the WAL's or already durable in that segment.
-///
-/// `None` is the no-WAL-open state, which is already durable.
-///
-/// The sync counts as in flight in `stats`, for the writes that append to
-/// the same inode meanwhile.
-fn sync_wal_handle(stats: &LockStats, handle: Option<Arc<fs::File>>) -> io::Result<()> {
-    match handle {
-        Some(file) => {
-            let _in_flight = stats.sync_in_flight();
-            file.sync_data()
-        }
-        None => Ok(()),
+/// Acquire the volume mutex for a labelled site, timing the wait and the
+/// hold against it.
+fn lock_volume_timed<'a>(
+    volume: &'a Arc<Mutex<Volume>>,
+    stats: &'a LockStats,
+    site: LockSite,
+) -> TimedGuard<'a> {
+    let requested = Instant::now();
+    let guard = lock_volume(volume);
+    let acquired = Instant::now();
+    TimedGuard {
+        guard: Some(guard),
+        fair: false,
+        stats,
+        site,
+        wait: acquired.saturating_duration_since(requested),
+        acquired,
     }
 }
 
@@ -711,23 +634,31 @@ pub(crate) enum Publication {
     AppendsToWal,
 }
 
+/// What a publication leaves the caller: the snapshot it replaced, and
+/// the generation it published under.
+#[must_use]
+struct Published {
+    /// Its drop frees every map node the mutations since the last publish
+    /// path-copied, a cost proportional to their count, so the caller
+    /// drops it after it releases the mutex.
+    previous: Arc<ReadSnapshot>,
+    /// The point in the append order this publication holds, which a FUA
+    /// write hands the sync gate.
+    flush_gen: u64,
+}
+
 /// Bump the generations and publish a fresh `ReadSnapshot`.
 ///
 /// Must be called while holding the volume mutex (the `&Volume` argument
 /// is the live guard) so the (lbamap, extent_index, generations) tuple
 /// observed by the next `snapshot.load()` is internally consistent.
-///
-/// Returns the snapshot this one replaced. Its drop frees every map node
-/// the mutations since the last publish path-copied, a cost proportional
-/// to their count, so the caller drops it after it releases the mutex.
-#[must_use]
 fn publish_snapshot(
     volume: &Volume,
     snapshot: &ArcSwap<ReadSnapshot>,
     flush_gen: &AtomicU64,
     layout_gen: &AtomicU64,
     publication: Publication,
-) -> Arc<ReadSnapshot> {
+) -> Published {
     let new_flush = flush_gen.fetch_add(1, Ordering::SeqCst) + 1;
     // Read `layout_gen` back when this publication leaves the files alone, so
     // the snapshot carries the generation of the last one that did move them.
@@ -735,11 +666,15 @@ fn publish_snapshot(
         Publication::ReplacesFiles => layout_gen.fetch_add(1, Ordering::SeqCst) + 1,
         Publication::AppendsToWal => layout_gen.load(Ordering::SeqCst),
     };
-    snapshot.swap(Arc::new(ReadSnapshot {
+    let previous = snapshot.swap(Arc::new(ReadSnapshot {
         maps: volume.map_layers().clone(),
         flush_gen: new_flush,
         layout_gen: new_layout,
-    }))
+    }));
+    Published {
+        previous,
+        flush_gen: new_flush,
+    }
 }
 
 impl VolumeActor {
@@ -747,17 +682,7 @@ impl VolumeActor {
     /// `site`. Every actor-side acquisition carries a label, so a site
     /// cannot enter the mutex uncounted.
     fn lock_volume(&self, site: LockSite) -> TimedGuard<'_> {
-        let requested = Instant::now();
-        let guard = lock_volume(&self.volume);
-        let acquired = Instant::now();
-        TimedGuard {
-            guard: Some(guard),
-            fair: false,
-            stats: &self.lock_stats,
-            site,
-            wait: acquired.saturating_duration_since(requested),
-            acquired,
-        }
+        lock_volume_timed(&self.volume, &self.lock_stats, site)
     }
 
     /// Install the fail-stop hook invoked on [`StagedApply::Diverged`].
@@ -787,7 +712,7 @@ impl VolumeActor {
     /// readers' descriptors.
     fn publish_snapshot(&mut self) {
         let guard = self.lock_volume(LockSite::PublishSnapshot);
-        let previous = publish_snapshot(
+        let published = publish_snapshot(
             &guard,
             &self.snapshot,
             &self.flush_gen,
@@ -795,7 +720,7 @@ impl VolumeActor {
             Publication::ReplacesFiles,
         );
         drop(guard);
-        drop(previous);
+        drop(published.previous);
     }
 
     /// Apply a worker's repack result, publish the read snapshot, then
@@ -840,27 +765,10 @@ impl VolumeActor {
         Ok(stats)
     }
 
-    /// Fsync every rotated WAL the promote pipeline still owns — in
-    /// flight on the worker or stashed for retry — so a flush ack
-    /// covers the epochs those WALs carry.
-    fn sync_rotated_wals(&self) -> io::Result<()> {
-        let stashed = self
-            .pipeline
-            .failed_promotes
-            .iter()
-            .map(|j| &j.old_wal_path);
-        for path in self.pipeline.inflight_old_wals.iter().chain(stashed) {
-            std::fs::File::open(path).and_then(|f| f.sync_data())?;
-        }
-        Ok(())
-    }
-
     /// Called on each `WorkerResult::Promote` — after the apply for a
-    /// success, before the retry stash for a failure.  Pops the FIFO
-    /// head of `inflight_old_wals` (matching the worker's dispatch
-    /// order) and bumps `completed_gen`.
+    /// success, before the retry stash for a failure.  Bumps
+    /// `completed_gen`.
     fn on_promote_result(&mut self) {
-        self.pipeline.inflight_old_wals.pop_front();
         self.pipeline.completed_gen += 1;
     }
 
@@ -931,16 +839,14 @@ impl VolumeActor {
     }
 
     /// Dispatch a promote job to the worker and register it in the
-    /// pipeline (in-flight count, generation, rotated WAL path). A
-    /// failed dispatch stashes the job for retry instead, so its
-    /// rotated WAL stays in the flush fsync set.
+    /// pipeline (in-flight count, generation). A failed dispatch stashes
+    /// the job for retry instead; the volume keeps its rotated WAL in the
+    /// sync set either way.
     fn send_promote_job(&mut self, job: PromoteJob) -> io::Result<()> {
-        let old_wal_path = job.old_wal_path.clone();
         match self.send_worker_job(WorkerJob::Promote(job)) {
             Ok(()) => {
                 self.pipeline.promotes_in_flight += 1;
                 self.pipeline.promote_gen += 1;
-                self.pipeline.inflight_old_wals.push_back(old_wal_path);
                 Ok(())
             }
             Err((e, job)) => {
@@ -1749,23 +1655,24 @@ impl VolumeActor {
     /// Log which segment of the flush path the window's guest FLUSHes
     /// spent their time in, and move the mark.
     ///
-    /// The device boundary times a flush end to end, so a tail there is
-    /// unattributable on its own; this line splits the same interval into
-    /// the four segments a flush passes through.
-    fn report_flush_cost(&mut self) {
-        if self.flush_marked.elapsed() < LOCK_REPORT_INTERVAL {
+    /// The device boundary times a flush end to end; this line gives the
+    /// requests against the rounds that served them, the batching, and
+    /// the wait and sync times.
+    fn report_gate(&mut self) {
+        if self.gate_marked.elapsed() < LOCK_REPORT_INTERVAL {
             return;
         }
-        if self.flush_cost.n > 0 {
+        let now = self.gate.take_window();
+        if let Some(report) = now.since(&self.gate_reported).report() {
             info!(
                 "[flush {}] {}s: {}",
                 self.volume_label(),
-                self.flush_marked.elapsed().as_secs(),
-                self.flush_cost.report(),
+                self.gate_marked.elapsed().as_secs(),
+                report,
             );
         }
-        self.flush_cost = FlushCost::default();
-        self.flush_marked = Instant::now();
+        self.gate_reported = now;
+        self.gate_marked = Instant::now();
     }
 
     /// Warn while failed promotes sit stashed for retry, on the report
@@ -1804,7 +1711,7 @@ impl VolumeActor {
         let idle_tick = tick(IDLE_FLUSH_INTERVAL);
         loop {
             self.report_lock_stats();
-            self.report_flush_cost();
+            self.report_gate();
             self.report_stashed_promotes();
             crossbeam_channel::select! {
                 recv(self.rx) -> msg => {
@@ -1824,39 +1731,6 @@ impl VolumeActor {
                             if self.lock_volume(LockSite::CheckPromote).needs_promote() {
                                 self.dispatch_promote();
                             }
-                        }
-                        VolumeRequest::Flush { reply, queued } => {
-                            // Flush = fsync of the current WAL plus every
-                            // rotated WAL the promote pipeline still owns,
-                            // all on the actor thread, so the ack is
-                            // bounded by fsync cost alone.
-                            //
-                            // Promote dispatch, apply, and retry stash all
-                            // share this thread, so the handle plus the
-                            // pipeline's rotated set cover every epoch that
-                            // exists while this handler runs.
-                            let picked_up = Instant::now();
-                            let handle = self.lock_volume(LockSite::FlushHandle).wal_sync_handle();
-                            let locked = Instant::now();
-                            let outcome = sync_wal_handle(&self.lock_stats, handle);
-                            let synced = Instant::now();
-                            self.flush_cost.n += 1;
-                            self.flush_cost.mailbox.record(picked_up - queued);
-                            self.flush_cost.lock.record(locked - picked_up);
-                            self.flush_cost.fsync.record(synced - locked);
-                            let outcome = outcome.and_then(|()| {
-                                let rotated = self.pipeline.inflight_old_wals.len()
-                                    + self.pipeline.failed_promotes.len();
-                                if rotated == 0 {
-                                    return Ok(());
-                                }
-                                let swept = Instant::now();
-                                let r = self.sync_rotated_wals();
-                                self.flush_cost.rotated += 1;
-                                self.flush_cost.rotated_fsync.record(swept.elapsed());
-                                r
-                            });
-                            let _ = reply.send(outcome);
                         }
                         VolumeRequest::PromoteWal { reply } => {
                             // Promote the WAL to a pending/ segment via the
@@ -1989,10 +1863,6 @@ impl VolumeActor {
                             }
                         }
                         #[cfg(test)]
-                        VolumeRequest::TestFlushCost { reply } => {
-                            let _ = reply.send(self.flush_cost.clone());
-                        }
-                        #[cfg(test)]
                         VolumeRequest::TestParkThenDispatchBarriers { park, holds } => {
                             let _ = park.recv();
                             for hold in holds {
@@ -2074,6 +1944,9 @@ pub struct VolumeClient {
     /// Volume-mutex occupancy per labelled site, shared with the actor
     /// that records it. Read through [`VolumeClient::lock_stats`].
     lock_stats: Arc<LockStats>,
+    /// The sync gate FLUSH and FUA requests run through, shared with the
+    /// actor that reports it.
+    gate: Arc<SyncGate>,
 }
 
 /// Per-thread reader for a volume session.
@@ -2191,28 +2064,29 @@ impl VolumeClient {
     /// fine for real ublk traffic, where the kernel page cache filters
     /// unchanged pages and dedup hits are a small fraction of writes.
     ///
-    /// `fua` takes the WAL's file handle under the lock and syncs it after
-    /// releasing, so the write is durable when this returns and concurrent
-    /// FUA writers share one commit.  See [`sync_wal_handle`].
+    /// `fua` runs the write's generation through the sync gate after the
+    /// mutex is released, so the write is durable when this returns and
+    /// concurrent FUA writers share one round.  See [`Self::sync_through`].
     pub fn write(&self, lba: u64, data: &[u8], fua: bool) -> io::Result<()> {
         let hash = blake3::hash(data);
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
-        let (needs_promote, sync, previous) = {
+        let (needs_promote, published) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
-            let previous = publish_snapshot(
+            let published = publish_snapshot(
                 &guard,
                 &self.snapshot,
                 &self.flush_gen,
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            let sync = if fua { guard.wal_sync_handle() } else { None };
-            (guard.needs_promote(), sync, previous)
+            (guard.needs_promote(), published)
         };
-        drop(previous);
-        sync_wal_handle(&self.lock_stats, sync)?;
+        drop(published.previous);
+        if fua {
+            self.sync_through(published.flush_gen, RequestKind::Fua)?;
+        }
         if needs_promote {
             self.signal_check_promote();
         }
@@ -2225,21 +2099,22 @@ impl VolumeClient {
     /// See [`Volume::write_zeroes`] for details.
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
         let volume = self.volume()?;
-        let (needs_promote, sync, previous) = {
+        let (needs_promote, published) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
             guard.write_zeroes(start_lba, lba_count)?;
-            let previous = publish_snapshot(
+            let published = publish_snapshot(
                 &guard,
                 &self.snapshot,
                 &self.flush_gen,
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            let sync = if fua { guard.wal_sync_handle() } else { None };
-            (guard.needs_promote(), sync, previous)
+            (guard.needs_promote(), published)
         };
-        drop(previous);
-        sync_wal_handle(&self.lock_stats, sync)?;
+        drop(published.previous);
+        if fua {
+            self.sync_through(published.flush_gen, RequestKind::Fua)?;
+        }
         if needs_promote {
             self.signal_check_promote();
         }
@@ -2274,19 +2149,41 @@ impl VolumeClient {
             .map_err(|_| io::Error::other("volume actor reply channel closed"))
     }
 
-    /// Fsync the WAL.  Durability barrier — data survives a crash after
-    /// this returns.  Does not promote the WAL to a segment.
+    /// Durability barrier: every write that completed before this call
+    /// survives a crash once it returns. The WAL stays where it is.
     pub fn flush(&self) -> io::Result<()> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.tx
-            .send(VolumeRequest::Flush {
-                reply: reply_tx,
-                queued: Instant::now(),
-            })
-            .map_err(|_| io::Error::other("volume actor channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::other("volume actor reply channel closed"))?
+        let generation = self.flush_gen.load(Ordering::SeqCst);
+        self.sync_through(generation, RequestKind::Flush)
+    }
+
+    /// Run a durability request at `generation` through the sync gate.
+    ///
+    /// A round syncs the open WAL and every rotated WAL the volume holds,
+    /// through handles taken under the mutex after the round's start
+    /// generation is read, so the round covers every write at or below
+    /// that generation. The syncs count as in flight for the writes that
+    /// append meanwhile.
+    fn sync_through(&self, generation: u64, kind: RequestKind) -> io::Result<()> {
+        let volume = self.volume()?;
+        self.gate.sync_through(
+            generation,
+            kind,
+            || self.flush_gen.load(Ordering::SeqCst),
+            || {
+                let handles = lock_volume_timed(&volume, &self.lock_stats, LockSite::FlushHandle)
+                    .sync_handles();
+                let _in_flight = self.lock_stats.sync_in_flight();
+                for file in &handles {
+                    file.sync_data()?;
+                }
+                Ok(handles.len())
+            },
+        )
+    }
+
+    /// The sync gate's counters so far.
+    pub fn sync_gate(&self) -> GateSnapshot {
+        self.gate.snapshot()
     }
 
     /// Promote the WAL to a `pending/` segment.  Blocks until the segment
@@ -2320,16 +2217,6 @@ impl VolumeClient {
     #[cfg(test)]
     pub(crate) fn test_dispatch_barrier(&self, hold: crossbeam_channel::Receiver<()>) {
         let _ = self.tx.send(VolumeRequest::TestDispatchBarrier { hold });
-    }
-
-    /// Test seam: the flush segment counters accumulated so far.
-    #[cfg(test)]
-    pub(crate) fn test_flush_cost(&self) -> FlushCost {
-        let (reply_tx, reply_rx) = bounded(1);
-        let _ = self
-            .tx
-            .send(VolumeRequest::TestFlushCost { reply: reply_tx });
-        reply_rx.recv().unwrap_or_default()
     }
 
     /// Test seam: park the actor in-handler until `park` fires, then
@@ -4316,6 +4203,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
     let flush_gen = Arc::new(AtomicU64::new(0));
     let layout_gen = Arc::new(AtomicU64::new(0));
     let lock_stats = Arc::new(LockStats::default());
+    let gate = Arc::new(SyncGate::default());
 
     // Channel depth of 64: enough to absorb bursts without blocking callers
     // while still providing backpressure if the actor falls behind.
@@ -4347,8 +4235,9 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         lock_stats: Arc::clone(&lock_stats),
         lock_stats_reported: LockStatsSnapshot::default(),
         lock_stats_marked: Instant::now(),
-        flush_cost: FlushCost::default(),
-        flush_marked: Instant::now(),
+        gate: Arc::clone(&gate),
+        gate_reported: GateSnapshot::default(),
+        gate_marked: Instant::now(),
         stash_marked: Instant::now(),
     };
 
@@ -4362,6 +4251,7 @@ pub fn spawn(volume: Volume) -> (VolumeActor, VolumeClient) {
         flush_gen,
         layout_gen,
         lock_stats,
+        gate,
     };
 
     (actor, client)
@@ -5152,14 +5042,13 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A FUA write's sync runs off the volume lock, leaving a window for a
-    /// promote to rotate the WAL between the handle being taken and the
-    /// sync running.  Drive that ordering directly: take the handle, let a
-    /// promote consume the WAL, then sync the handle.  The sync succeeds
-    /// on the rotated-away file and the bytes recover, because the promote
-    /// commits the segment carrying them before unlinking the WAL.
+    /// A promote takes the WAL out from under a sync round's feet. The
+    /// volume keeps the taken WAL's handle until the promote's segment is
+    /// committed, so a round that starts after the rotation syncs the
+    /// epoch's bytes, and a sync through the handle after the unlink is
+    /// harmless because the segment carrying those bytes is committed.
     #[test]
-    fn fua_sync_survives_promote_between_handle_and_sync() {
+    fn a_sync_round_covers_a_rotated_wal_until_its_segment_commits() {
         let dir = temp_dir();
         let volume = Volume::open(&dir, &dir).unwrap();
         let (actor, client) = spawn(volume);
@@ -5167,12 +5056,19 @@ mod tests {
 
         let block = unique_block(21);
         client.write(9, &block, false).unwrap();
-
-        let handle = lock_volume(&client.volume().unwrap()).wal_sync_handle();
-        assert!(handle.is_some(), "the write left a WAL open");
+        let handles = lock_volume(&client.volume().unwrap()).sync_handles();
+        assert_eq!(handles.len(), 1, "the write left a WAL open");
 
         client.promote_wal().unwrap();
-        sync_wal_handle(&client.lock_stats, handle).unwrap();
+        assert!(
+            lock_volume(&client.volume().unwrap())
+                .sync_handles()
+                .is_empty(),
+            "the committed promote released its WAL from the sync set"
+        );
+        for file in handles {
+            file.sync_data().unwrap();
+        }
 
         client.shutdown();
         drop(client);
@@ -5234,11 +5130,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The `Flush` handler takes the WAL's file handle under the volume
-    /// lock and syncs it after releasing, so it has an open-WAL arm and a
-    /// no-WAL arm. Exercise both, plus the rotation that moves one to the
-    /// other: `promote_wal` leaves the volume WAL-less, and the flush that
-    /// follows resolves through the promote pipeline instead of a sync.
+    /// A sync round takes the WAL handles under the volume lock and syncs
+    /// them after releasing, so it has an open-WAL arm and a no-WAL arm.
+    /// Exercise both, plus the rotation that moves one to the other:
+    /// `promote_wal` leaves the volume WAL-less, and the flush that
+    /// follows finds an empty sync set.
     #[test]
     fn flush_spans_wal_open_and_wal_absent() {
         let dir = temp_dir();
@@ -5272,9 +5168,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A flush with a promote in flight fsyncs the rotated WAL itself
-    /// and acks while the promote is still queued on the worker; the
-    /// cost report attributes that fsync to `rotated-fsync`.
+    /// A flush with a promote in flight syncs the rotated WAL itself and
+    /// acks while the promote waits on the worker; the gate counts that
+    /// round as rotated.
     #[test]
     fn flush_syncs_rotated_wal_without_waiting_on_promote() {
         let dir = temp_dir();
@@ -5285,10 +5181,10 @@ mod tests {
         client.write(0, &unique_block(1), false).unwrap();
         client.flush().unwrap();
 
-        let quiet = client.test_flush_cost();
-        assert!(quiet.n >= 1, "setup: the flush was counted");
-        assert_eq!(quiet.rotated, 0, "no rotated WALs existed yet");
-        assert_eq!(quiet.rotated_fsync.max, Duration::ZERO);
+        let quiet = client.sync_gate();
+        assert_eq!(quiet.flush_requests, 1, "setup: the flush was counted");
+        assert_eq!(quiet.rounds, 1, "setup: the flush led a round");
+        assert_eq!(quiet.rotated_rounds, 0, "no rotated WALs existed yet");
 
         // Occupy the worker so a promote dispatches but cannot run.
         let (hold_tx, hold_rx) = bounded::<()>(1);
@@ -5319,17 +5215,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        // The promote is queued behind the barrier. The flush covers
-        // its rotated WAL by fsyncing it on the actor, so this call
+        // The promote is queued behind the barrier. The round covers
+        // its rotated WAL through the volume's sync set, so this call
         // returns while the barrier still holds the worker.
+        client.write(1, &unique_block(2), false).unwrap();
         client.flush().unwrap();
 
-        let after = client.test_flush_cost();
-        assert_eq!(after.rotated, 1, "the flush found a rotated WAL");
-        assert!(
-            after.rotated_fsync.max > Duration::ZERO,
-            "the rotated WAL's fsync was timed"
-        );
+        let after = client.sync_gate();
+        assert_eq!(after.rounds, 2, "the flush led a second round");
+        assert_eq!(after.rotated_rounds, 1, "the round found a rotated WAL");
 
         hold_tx.send(()).unwrap();
         promote_done.recv().unwrap().unwrap();

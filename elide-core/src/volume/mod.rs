@@ -921,6 +921,9 @@ pub struct Volume {
     /// calls: the open on a rotation and the append. The write guard takes
     /// it on release, which splits the hold into WAL time and map time.
     wal_time: Duration,
+    /// WAL files a promote has taken, each kept until its segment is
+    /// committed and the file unlinked. A sync round syncs every one.
+    rotated_wals: Vec<(PathBuf, Arc<fs::File>)>,
     /// DATA and REF extents written since the last promotion, each carrying
     /// where its body bytes sit in the WAL; used to write the clean segment
     /// file on the next promote(). Populated by `write_commit` and by
@@ -1248,6 +1251,7 @@ impl Volume {
             delta_policy: jobs::DeltaPolicy::from_env(),
             wal,
             wal_time: Duration::ZERO,
+            rotated_wals: Vec::new(),
             pending,
             pending_journal: std::collections::BTreeSet::new(),
             has_new_segments,
@@ -2921,6 +2925,7 @@ impl Volume {
     /// those buckets — violating the "new WAL above any prior checkpoint
     /// ULID" invariant `ensure_wal_open` maintains.
     fn restore_failed_promote(&mut self, job: PromoteJob) -> io::Result<()> {
+        self.forget_rotated_wal(&job.old_wal_path);
         let new_ulid = self.mint.next();
         let wal_dir = self.base_dir.join("wal");
         let new_path = wal_dir.join(new_ulid.to_string());
@@ -3392,6 +3397,19 @@ impl Volume {
         self.wal.as_ref().map(|open| open.wal.sync_handle())
     }
 
+    /// Every WAL file whose bytes may sit outside a committed segment: the
+    /// open WAL and the rotated ones. A sync round syncs each of them.
+    pub fn sync_handles(&self) -> Vec<Arc<fs::File>> {
+        self.wal_sync_handle()
+            .into_iter()
+            .chain(self.rotated_wals.iter().map(|(_, file)| Arc::clone(file)))
+            .collect()
+    }
+
+    fn forget_rotated_wal(&mut self, path: &Path) {
+        self.rotated_wals.retain(|(p, _)| p != path);
+    }
+
     /// The time the writes since the last take spent inside the WAL file
     /// calls, and a reset.
     pub fn take_wal_time(&mut self) -> Duration {
@@ -3473,6 +3491,8 @@ impl Volume {
             .take()
             .ok_or_else(|| io::Error::other("internal: pending writes non-empty but wal absent"))?;
         self.maps.freeze(open.ulid);
+        self.rotated_wals
+            .push((open.path.clone(), open.wal.sync_handle()));
         let journal_segment_ulid = self.mint.next();
         let mut search_dirs: Vec<PathBuf> = vec![self.base_dir.clone()];
         for layer in &self.ancestor_layers {
@@ -3577,6 +3597,7 @@ impl Volume {
         );
         self.maps
             .swap_promote(folded_from, new_base, result.old_wal_ulid);
+        self.forget_rotated_wal(&result.old_wal_path);
 
         // Extend the candidate map with what this promote sketched, so the
         // next formation can source against it. The journal partition

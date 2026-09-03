@@ -1,6 +1,6 @@
 # Design: the WAL sync gate
 
-**Status:** proposed (2026-09-03). The measurements come from the rig's
+**Status:** implemented (2026-09-03), measurement pending. The measurements come from the rig's
 `[lock …]`, `[flush …]` and `[ublk io]` lines on v0.1.60-rc2 (#997, 2026-09-03).
 Builds on the FUA sync off the mutex (#905) and the write-hold split (#997).
 Relates to the epoch applies (`epoch-applies.md`), which took the structural
