@@ -16,20 +16,20 @@ thread syncs the WAL and every rotated WAL the promote pipeline owns
 WAL's file handle under the volume mutex and syncs it on the ublk thread after
 the release (`sync_wal_handle`). Both end in `sync_data` on the same inode.
 
-A guest fdatasync on an ext4 filesystem over the device arrives as one FLUSH
-and one FUA write, the journal commit block. The rc2 loaded windows show the
-rates on pg35 under pgbench at 500 tps:
+The rc2 loaded windows show the rates on pg35 under pgbench at 500 tps:
 
 | per 10 s window | count |
 |---|---|
 | guest writes | 7,000 to 10,000 |
 | FLUSH ops | 3,500 to 4,000 |
-| FUA writes | about the same as FLUSH |
 
-So the WAL inode takes on the order of 800 fdatasync calls per second against
-700 to 1,000 appends per second. Each call that finds new appends is a full
-jbd2 commit, because every append extends the file. The FLUSH half runs
-strictly serially on the actor thread, each call after the previous one
+So the WAL inode takes about 400 fdatasync calls per second from the FLUSH
+path against 700 to 1,000 appends per second. A wchan sample of the volume
+process over one arm (2026-09-03) put the actor thread inside `fdatasync` in
+14% of the samples and caught the ublk job threads there in six, so the FUA
+path is a small fraction of the sync traffic. Each call that finds new appends
+is a full jbd2 commit, because every append extends the file. The FLUSH calls
+run strictly serially on the actor thread, each after the previous one
 returned, with two or three appends landed in between. The kernel's joiner
 window (`j_max_batch_time`) batches concurrent callers only, and these calls
 arrive one at a time.
@@ -41,9 +41,11 @@ actor thread is doing.
 
 The write-hold split (#997) put the tail of a guest write's mutex hold in the
 WAL append syscall: in 8 of the 10 worst windows the WAL maximum equals the hold
-maximum, at 9 to 13 ms. The append shares the inode with the syncs. Fewer syncs
-give the append fewer chances to block behind one, whichever kernel mechanism
-carries the block.
+maximum, at 9 to 13 ms. The wchan sample caught the append (`writev`) blocked
+in `do_get_write_access`, `__wait_on_buffer` and `jbd2_log_wait_commit`: the
+append's metadata update waits for a buffer the running journal commit holds,
+and the FLUSH syncs drive those commits. Fewer syncs give the append fewer
+commits to wait behind.
 
 ## The contract
 
