@@ -413,6 +413,14 @@ pub fn fold_promote_result(layers: &MapLayers, result: &PromoteResult) -> io::Re
     })
 }
 
+/// A promote's fold, held between [`Volume::fold_promote`] and
+/// [`Volume::swap_promote_fold`]. Writes that land between the two go to
+/// the delta layer above the fold's base.
+pub struct PromoteFold {
+    layers: MapLayers,
+    new_base: Maps,
+}
+
 /// Delete a promoted epoch's WAL file. Runs after the swap is published, so
 /// a reader on an older snapshot recovers through its `NotFound` retry.
 pub fn remove_promoted_wal(result: &PromoteResult) {
@@ -3491,12 +3499,42 @@ impl Volume {
     /// steps itself with the mutex released around the fold
     /// ([`fold_promote_result`], [`Self::swap_promote`]).
     pub fn apply_promote(&mut self, result: &PromoteResult) -> io::Result<()> {
+        let fold = self.fold_promote(result)?;
+        self.swap_promote_fold(result, fold);
+        Ok(())
+    }
+
+    /// The take of a promote for a caller that holds the epoch open: the
+    /// prep freezes the epoch and the worker's write runs inline. The
+    /// frozen layer and the WAL stay until [`Self::swap_promote_fold`],
+    /// so writes that land in between go to the delta above them.
+    pub fn take_promote_for_test(&mut self) -> io::Result<Option<PromoteResult>> {
+        let Some(job) = self.prepare_promote()? else {
+            return Ok(None);
+        };
+        match crate::actor::execute_promote(job, &mut crate::actor::PriorSourceCache::default()) {
+            Ok(result) => Ok(Some(result)),
+            Err(failure) => {
+                self.restore_failed_promote(*failure.job)?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// A promote's fold over a clone of the layers, for the caller to
+    /// install with [`Self::swap_promote_fold`].
+    pub fn fold_promote(&self, result: &PromoteResult) -> io::Result<PromoteFold> {
         let layers = self.maps.clone();
         let new_base = fold_promote_result(&layers, result)?;
-        self.swap_promote(result, new_base, layers.base());
+        Ok(PromoteFold { layers, new_base })
+    }
+
+    /// Install a [`Self::fold_promote`], delete the epoch's WAL, and assert
+    /// the volume invariants.
+    pub fn swap_promote_fold(&mut self, result: &PromoteResult, fold: PromoteFold) {
+        self.swap_promote(result, fold.new_base, fold.layers.base());
         remove_promoted_wal(result);
         self.assert_promote_applied();
-        Ok(())
     }
 
     /// The end of a promote, after the WAL unlink, where the volume
