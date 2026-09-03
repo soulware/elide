@@ -64,6 +64,9 @@ A presence-truthfulness invariant runs alongside the oracle: after every `Crash`
 |----|-------------|
 | `Write { lba, seed }` | `vol.write(lba, [seed; 4096])` |
 | `Flush` | `vol.flush_wal()` — promotes WAL to `pending/` |
+| `PromoteTake` | `vol.take_promote_for_test()` — freezes the epoch as a layer and commits the segment; the WAL and the layer stay until the swap, and later writes land in the delta above it |
+| `PromoteFold` | `vol.fold_promote()` on the oldest taken promote — holds the fold, so later writes land between the fold and its swap |
+| `PromoteSwap` | `vol.swap_promote_fold()` — installs the held fold, retires the layer, deletes the WAL, and asserts the invariants |
 | `SweepPending` | merges/deduplicates `pending/` segments |
 | `Repack` | `vol.repack(0.9)` density pass on `pending/` + S3-confirmed |
 | `DrainLocal` | simulates coordinator upload: `pending/` → `index/` + `cache/` |

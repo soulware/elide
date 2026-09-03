@@ -19,7 +19,7 @@ use std::path::Path;
 
 use elide_core::segment::EntryKind;
 use elide_core::signing::{self, VOLUME_PUB_FILE, read_snapshot_manifest};
-use elide_core::volume::{Volume, ZERO_HASH};
+use elide_core::volume::{PromoteFold, PromoteResult, Volume, ZERO_HASH};
 use proptest::prelude::*;
 use ulid::Ulid;
 
@@ -456,6 +456,118 @@ enum SimOp {
     /// suite generates. LBAs 96/97 are disjoint from every other op range
     /// (highest otherwise is 64).
     JournalDupWrite { journal_first: bool, seed: u8 },
+    /// Take the WAL into a promote and run the worker's write inline: the
+    /// epoch freezes as a layer, the segment commits, and the WAL stays
+    /// until the swap. Writes that follow land in the delta above the
+    /// frozen layer, and a second take stacks a second layer.
+    PromoteTake,
+    /// Fold the oldest taken promote over a clone of the layers and hold
+    /// the fold. Writes that follow land between the fold and its swap,
+    /// the actor's released-mutex window.
+    PromoteFold,
+    /// Install the held fold, or fold and install the oldest taken
+    /// promote: the base takes the fold, the layer retires, the WAL goes,
+    /// and the invariants build compares the layers with a disk rebuild.
+    PromoteSwap,
+}
+
+impl SimOp {
+    /// Whether the op runs while promotes are open. The actor serialises
+    /// every other op behind the in-flight promotes: an inline promote
+    /// swaps after the epochs taken before it, and the reap and the GC
+    /// plan apply wait for an empty pipeline.
+    fn keeps_promotes_open(&self) -> bool {
+        matches!(
+            self,
+            SimOp::Write { .. }
+                | SimOp::WriteLarge { .. }
+                | SimOp::WriteMulti { .. }
+                | SimOp::WriteZeroes { .. }
+                | SimOp::SameContentWrite { .. }
+                | SimOp::WriteNearDup { .. }
+                | SimOp::DeltaCycleWrite { .. }
+                | SimOp::DedupWrite { .. }
+                | SimOp::JournalDupWrite { .. }
+                | SimOp::JournalStraddleWrite { .. }
+                | SimOp::ReadUnwritten
+                | SimOp::ReadAfterDrain { .. }
+                | SimOp::EvictCacheBody
+                | SimOp::Crash
+                | SimOp::PromoteTake
+                | SimOp::PromoteFold
+                | SimOp::PromoteSwap
+        )
+    }
+}
+
+/// The promotes a runner holds open: the taken epochs in take order, and
+/// at most one fold that waits for its swap. The actor preps, folds and
+/// swaps on one thread, so a take lands the held fold first, and the
+/// folds run in take order.
+#[derive(Default)]
+struct OpenPromotes {
+    taken: std::collections::VecDeque<PromoteResult>,
+    folded: Option<(PromoteResult, PromoteFold)>,
+}
+
+impl OpenPromotes {
+    fn take(&mut self, vol: &mut Volume) {
+        if let Some((result, fold)) = self.folded.take() {
+            vol.swap_promote_fold(&result, fold);
+        }
+        if let Ok(Some(result)) = vol.take_promote_for_test() {
+            self.taken.push_back(result);
+        }
+    }
+
+    fn fold(&mut self, vol: &Volume) {
+        if self.folded.is_some() {
+            return;
+        }
+        if let Some(result) = self.taken.pop_front() {
+            let fold = vol.fold_promote(&result).expect("promote fold");
+            self.folded = Some((result, fold));
+        }
+    }
+
+    fn swap(&mut self, vol: &mut Volume) {
+        self.fold(vol);
+        if let Some((result, fold)) = self.folded.take() {
+            vol.swap_promote_fold(&result, fold);
+        }
+    }
+
+    fn settle(&mut self, vol: &mut Volume) {
+        while self.folded.is_some() || !self.taken.is_empty() {
+            self.swap(vol);
+        }
+    }
+
+    fn crash(&mut self) {
+        self.taken.clear();
+        self.folded = None;
+    }
+}
+
+/// Every oracle LBA reads back through the volume's layers.
+fn check_oracle(
+    vol: &Volume,
+    oracle: &std::collections::HashMap<u64, [u8; 4096]>,
+    after: &str,
+) -> Result<(), TestCaseError> {
+    for (&lba, expected) in oracle {
+        let actual = vol.read(lba, 1).map_err(|e| {
+            TestCaseError::fail(format!("read of lba {lba} failed after {after}: {e}"))
+        })?;
+        prop_assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
+            "lba {} wrong after {}",
+            lba,
+            after
+        );
+    }
+    Ok(())
 }
 
 fn arb_sim_op() -> impl Strategy<Value = SimOp> {
@@ -472,6 +584,9 @@ fn arb_sim_op() -> impl Strategy<Value = SimOp> {
         // (4096).  The body-entry lifecycle is exercised by WriteLarge below.
         (0u8..8, 0u8..128u8).prop_map(|(lba, seed)| SimOp::Write { lba, seed }),
         Just(SimOp::Flush),
+        Just(SimOp::PromoteTake),
+        Just(SimOp::PromoteFold),
+        Just(SimOp::PromoteSwap),
         Just(SimOp::SweepPending),
         Just(SimOp::Repack),
         Just(SimOp::DrainWithRedact),
@@ -867,8 +982,12 @@ proptest! {
         // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
         // input files to delete once its bare output commits).
         let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
+        let mut promotes = OpenPromotes::default();
 
         for op in &ops {
+            if !op.keeps_promotes_open() {
+                promotes.settle(&mut vol);
+            }
             let ulids_before = all_segment_ulids(fork_dir);
             let max_before = ulids_before
                 .iter()
@@ -890,6 +1009,22 @@ proptest! {
                             "flush produced ULID {u} ≤ existing max {max_before}"
                         );
                     }
+                }
+                SimOp::PromoteTake => {
+                    promotes.take(&mut vol);
+                    let after = all_segment_ulids(fork_dir);
+                    for u in after.difference(&ulids_before) {
+                        prop_assert!(
+                            *u > max_before,
+                            "promote take produced ULID {u} ≤ existing max {max_before}"
+                        );
+                    }
+                }
+                SimOp::PromoteFold => {
+                    promotes.fold(&vol);
+                }
+                SimOp::PromoteSwap => {
+                    promotes.swap(&mut vol);
                 }
                 SimOp::SweepPending => {
                     let frozen_before: std::collections::BTreeSet<Ulid> =
@@ -1147,6 +1282,7 @@ proptest! {
                     });
                 }
                 SimOp::Crash => {
+                    promotes.crash();
                     drop(vol);
                     vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
@@ -1410,8 +1546,12 @@ proptest! {
         // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
         // input files to delete once its bare output commits).
         let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
+        let mut promotes = OpenPromotes::default();
 
         for op in &ops {
+            if !op.keeps_promotes_open() {
+                promotes.settle(&mut vol);
+            }
             match op {
                 SimOp::Write { lba, seed } => {
                     let data = [*seed; 4096];
@@ -1420,6 +1560,18 @@ proptest! {
                 }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
+                }
+                SimOp::PromoteTake => {
+                    promotes.take(&mut vol);
+                    check_oracle(&vol, &oracle, "promote take")?;
+                }
+                SimOp::PromoteFold => {
+                    promotes.fold(&vol);
+                    check_oracle(&vol, &oracle, "promote fold")?;
+                }
+                SimOp::PromoteSwap => {
+                    promotes.swap(&mut vol);
+                    check_oracle(&vol, &oracle, "promote swap")?;
                 }
                 SimOp::SweepPending => {
                     let _ = vol.repack_open_for_test();
@@ -1576,6 +1728,7 @@ proptest! {
                     });
                 }
                 SimOp::Crash => {
+                    promotes.crash();
                     drop(vol);
                     vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
@@ -1859,8 +2012,12 @@ proptest! {
         // Plans emitted by GcPlan awaiting GcHandoffApply: (plan ULID,
         // input files to delete once its bare output commits).
         let mut staged_plans: Vec<(Ulid, Vec<std::path::PathBuf>)> = Vec::new();
+        let mut promotes = OpenPromotes::default();
 
         for op in &ops {
+            if !op.keeps_promotes_open() {
+                promotes.settle(&mut vol);
+            }
             match op {
                 SimOp::Write { lba, seed } => {
                     let data = [*seed; 4096];
@@ -1869,6 +2026,18 @@ proptest! {
                 }
                 SimOp::Flush => {
                     let _ = vol.flush_wal();
+                }
+                SimOp::PromoteTake => {
+                    promotes.take(&mut vol);
+                    check_oracle(&vol, &oracle, "promote take")?;
+                }
+                SimOp::PromoteFold => {
+                    promotes.fold(&vol);
+                    check_oracle(&vol, &oracle, "promote fold")?;
+                }
+                SimOp::PromoteSwap => {
+                    promotes.swap(&mut vol);
+                    check_oracle(&vol, &oracle, "promote swap")?;
                 }
                 SimOp::SweepPending => {
                     let _ = vol.repack_open_for_test();
@@ -2025,6 +2194,7 @@ proptest! {
                     });
                 }
                 SimOp::Crash => {
+                    promotes.crash();
                     drop(vol);
                     vol = common::open_with_captured_body_fetcher(fork_dir, &store_dir, delta);
                     pending_gc = None;
@@ -2547,4 +2717,107 @@ fn gc_fold_keeps_source_needed_by_dedup_ref_claim() {
     let vol = open_vol(fork_dir, true);
     let rebuilt = vol.read(52, 1).expect("read after crash rebuild");
     assert_eq!(rebuilt.as_slice(), a_prime.as_slice());
+}
+
+/// Two epochs open at once, with writes between every stage. The folds
+/// land in take order, each later write masks the epoch under it, and
+/// the reads agree live, after each swap, and across a crash rebuild.
+#[test]
+fn stacked_promotes_fold_in_take_order() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir_owned = dir.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir_owned).unwrap();
+    let fork_dir = fork_dir_owned.as_path();
+    common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
+    let mut vol = open_vol(fork_dir, false);
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+    let mut promotes = OpenPromotes::default();
+
+    fn write(
+        vol: &mut Volume,
+        oracle: &mut std::collections::HashMap<u64, [u8; 4096]>,
+        lba: u64,
+        seed: u8,
+    ) {
+        let data = incompressible_block(seed);
+        vol.write(lba, &data).unwrap();
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(&data);
+        oracle.insert(lba, block);
+    }
+
+    write(&mut vol, &mut oracle, 0, 1);
+    write(&mut vol, &mut oracle, 1, 2);
+    promotes.take(&mut vol);
+    write(&mut vol, &mut oracle, 1, 3);
+    write(&mut vol, &mut oracle, 2, 4);
+    promotes.take(&mut vol);
+    assert_eq!(promotes.taken.len(), 2, "two epochs open");
+    write(&mut vol, &mut oracle, 2, 5);
+    check_oracle(&vol, &oracle, "two takes").unwrap();
+
+    promotes.fold(&vol);
+    write(&mut vol, &mut oracle, 0, 6);
+    check_oracle(&vol, &oracle, "a write between the fold and its swap").unwrap();
+    promotes.swap(&mut vol);
+    assert_eq!(promotes.taken.len(), 1, "the first epoch swapped");
+    check_oracle(&vol, &oracle, "the first swap").unwrap();
+    promotes.swap(&mut vol);
+    assert!(promotes.taken.is_empty(), "the second epoch swapped");
+    check_oracle(&vol, &oracle, "the second swap").unwrap();
+
+    promotes.take(&mut vol);
+    promotes.swap(&mut vol);
+    check_oracle(&vol, &oracle, "the delta writes promoted").unwrap();
+
+    drop(vol);
+    let vol = open_vol(fork_dir, false);
+    check_oracle(&vol, &oracle, "crash rebuild").unwrap();
+}
+
+/// A crash with two epochs open leaves two WALs and two committed
+/// segments on disk. The rebuild reads every LBA at its last write.
+#[test]
+fn a_crash_with_two_open_epochs_rebuilds_them() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fork_dir_owned = dir.path().join(Ulid::new().to_string());
+    std::fs::create_dir_all(&fork_dir_owned).unwrap();
+    let fork_dir = fork_dir_owned.as_path();
+    common::write_test_keypair(fork_dir);
+    stamp_journal_window(fork_dir);
+    let mut vol = open_vol(fork_dir, false);
+    let mut oracle: std::collections::HashMap<u64, [u8; 4096]> = std::collections::HashMap::new();
+    let mut promotes = OpenPromotes::default();
+
+    for (lba, seed) in [(0u64, 1u8), (1, 2)] {
+        let data = incompressible_block(seed);
+        vol.write(lba, &data).unwrap();
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(&data);
+        oracle.insert(lba, block);
+    }
+    promotes.take(&mut vol);
+    for (lba, seed) in [(1u64, 3u8), (2, 4)] {
+        let data = incompressible_block(seed);
+        vol.write(lba, &data).unwrap();
+        let mut block = [0u8; 4096];
+        block.copy_from_slice(&data);
+        oracle.insert(lba, block);
+    }
+    promotes.take(&mut vol);
+    promotes.fold(&vol);
+    let data = incompressible_block(5);
+    vol.write(0, &data).unwrap();
+    let mut block = [0u8; 4096];
+    block.copy_from_slice(&data);
+    oracle.insert(0, block);
+    assert_eq!(promotes.taken.len(), 1);
+    assert!(promotes.folded.is_some());
+
+    promotes.crash();
+    drop(vol);
+    let mut vol = open_vol(fork_dir, false);
+    common::assert_promote_recovery(&mut vol, fork_dir);
+    check_oracle(&vol, &oracle, "crash rebuild with two open epochs").unwrap();
 }
