@@ -917,6 +917,10 @@ pub struct Volume {
     /// write opens a fresh one at `mint.next()`. Keeps idle volumes from
     /// churning the WAL on every GC tick.
     pub(in crate::volume) wal: Option<OpenWal>,
+    /// The time the writes since the last take spent inside the WAL file
+    /// calls: the open on a rotation and the append. The write guard takes
+    /// it on release, which splits the hold into WAL time and map time.
+    wal_time: Duration,
     /// DATA and REF extents written since the last promotion, each carrying
     /// where its body bytes sit in the WAL; used to write the clean segment
     /// file on the next promote(). Populated by `write_commit` and by
@@ -1243,6 +1247,7 @@ impl Volume {
             sketch_index: Arc::new(sketch_index),
             delta_policy: jobs::DeltaPolicy::from_env(),
             wal,
+            wal_time: Duration::ZERO,
             pending,
             pending_journal: std::collections::BTreeSet::new(),
             has_new_segments,
@@ -1542,6 +1547,7 @@ impl Volume {
         let codec = segment::Codec::from_wal_flags(wal_flags);
 
         let stored_length = bytes_to_write.len() as u32;
+        let wal_started = Instant::now();
         let (body_offset, wal_ulid) = {
             let open = self.ensure_wal_open()?;
             let offset = open
@@ -1549,6 +1555,7 @@ impl Volume {
                 .append_data(lba, lba_length, &hash, wal_flags, bytes_to_write)?;
             (offset, open.ulid)
         };
+        self.wal_time += wal_started.elapsed();
         self.maps
             .delta_lbamap_mut()
             .insert(lba, lba_length, hash, wal_ulid);
@@ -1636,11 +1643,13 @@ impl Volume {
     /// Commit one boundary-aligned zero run: one WAL record, one LBA claim,
     /// one pending entry.
     fn zero_commit(&mut self, start_lba: u64, lba_count: u32) -> io::Result<()> {
+        let wal_started = Instant::now();
         let wal_ulid = {
             let open = self.ensure_wal_open()?;
             open.wal.append_zero(start_lba, lba_count)?;
             open.ulid
         };
+        self.wal_time += wal_started.elapsed();
         self.maps
             .delta_lbamap_mut()
             .insert(start_lba, lba_count, ZERO_HASH, wal_ulid);
@@ -3381,6 +3390,12 @@ impl Volume {
     /// satisfies the caller.
     pub fn wal_sync_handle(&self) -> Option<Arc<fs::File>> {
         self.wal.as_ref().map(|open| open.wal.sync_handle())
+    }
+
+    /// The time the writes since the last take spent inside the WAL file
+    /// calls, and a reset.
+    pub fn take_wal_time(&mut self) -> Duration {
+        std::mem::take(&mut self.wal_time)
     }
 
     /// Prep phase of the off-actor promote.  Runs on the actor thread.
