@@ -1,6 +1,7 @@
 # Design: the WAL sync gate
 
-**Status:** implemented (2026-09-03), measurement pending. The measurements come from the rig's
+**Status:** implemented (#1001) and measured on v0.1.60-rc4 (2026-09-03); the
+result is at the end. The measurements come from the rig's
 `[lock …]`, `[flush …]` and `[ublk io]` lines on v0.1.60-rc2 (#997, 2026-09-03).
 Builds on the FUA sync off the mutex (#905) and the write-hold split (#997).
 Relates to the epoch applies (`epoch-applies.md`), which took the structural
@@ -200,6 +201,38 @@ The readings that decide the result, on the same arms as rc2:
    `maxwal` says the append blocks on something else, and the flush gain
    stands on its own.
 4. pgbench latency and the worst 10 s window.
+
+## Result
+
+v0.1.60-rc4 ran the three arms on pg35, 52 loaded windows, against the rc2
+and rc3 sets on the same volume and machine.
+
+**The batch is one.** 209,831 requests (209,397 FLUSH, 434 FUA) took 209,410
+rounds, 389 a second, with a batch maximum of 2 in every window and 0.2% of
+requests covered on arrival. The guest's ext4 journal commits serially, so one
+FLUSH is in flight at a time, and the gate has one request to serve per round.
+
+**The actor hop was the cost.** A request's wait now equals its sync: mean
+0.68 ms, window maximum median 15 ms, p95 54 ms, maximum 373 ms, which is the
+fdatasync itself under the worker's segment writes. The rc2 and rc3 lines put
+the old flush at 0.84 ms mean with a mailbox wait whose window maximum ran a
+median of 168 to 191 ms and a p95 of 332 ms.
+
+**The guest saw it.** pgbench mean latency per arm 6.9 / 5.3 / 15.4 ms with
+worst 10 s windows of 28 / 9 / 164 ms, against rc3's 29.7 / 12.0 / 13.4 ms and
+234 / 18 / 24 ms. The second arm is the cleanest of the series. The third arm
+carried one of the read bursts the series has seen since rc32.
+
+**The write hold is where it was.** The sync count is the same, and the append
+buckets show it: the sync bucket's mean append fell from 35.2 to 22.0 µs and
+the both bucket's from 34.6 to 27.6 µs, the window WAL maximum sits in idle
+16 / sync 11 / worker 10 / both 17 windows, and the write wait median is
+5.6 ms against 5.5 ms. The 296 ms hold of the rc3 series is absent, and the
+worst hold of this set is 10.3 ms.
+
+The joiner delay stays at zero. A delay could batch a serial stream only by
+holding each request for the next, which is the latency the guest just got
+back.
 
 ## Tests
 
