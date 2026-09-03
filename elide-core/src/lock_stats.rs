@@ -248,6 +248,13 @@ struct WriteCounters {
     by_depth: [DepthCounters; DEPTH_BUCKETS],
     window_max_depth: AtomicU64,
     peak_depth: AtomicU64,
+    /// The hold split into the WAL file calls and the rest, which is the
+    /// map commit and the snapshot publish, so a long hold reads as one
+    /// or the other.
+    wal_nanos: AtomicU64,
+    window_max_wal_nanos: AtomicU64,
+    map_nanos: AtomicU64,
+    window_max_map_nanos: AtomicU64,
 }
 
 /// The write holds charged at one frozen depth.
@@ -369,12 +376,27 @@ impl LockStats {
     }
 
     /// Record what one guest write held the mutex for, on its release,
-    /// and the frozen depth it ran under.
+    /// the frozen depth it ran under, and the part of the hold spent
+    /// inside the WAL file calls.
     ///
     /// Charged by every write, contended or not, so the mean covers the
     /// uncontended holds an actor loop would be waiting on too.
-    pub fn record_write_hold(&self, hold: Duration, depth: usize) {
+    pub fn record_write_hold(&self, hold: Duration, depth: usize, wal: Duration) {
         let nanos = hold.as_nanos() as u64;
+        let wal_nanos = wal.as_nanos() as u64;
+        let map_nanos = nanos.saturating_sub(wal_nanos);
+        self.writes
+            .wal_nanos
+            .fetch_add(wal_nanos, Ordering::Relaxed);
+        self.writes
+            .window_max_wal_nanos
+            .fetch_max(wal_nanos, Ordering::Relaxed);
+        self.writes
+            .map_nanos
+            .fetch_add(map_nanos, Ordering::Relaxed);
+        self.writes
+            .window_max_map_nanos
+            .fetch_max(map_nanos, Ordering::Relaxed);
         self.writes.hold_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.writes
             .window_max_hold_nanos
@@ -504,6 +526,18 @@ impl LockStats {
                     self.writes.window_max_depth.load(Ordering::Relaxed)
                 },
                 peak_depth: self.writes.peak_depth.load(Ordering::Relaxed),
+                wal_nanos: self.writes.wal_nanos.load(Ordering::Relaxed),
+                max_wal_nanos: if close_window {
+                    self.writes.window_max_wal_nanos.swap(0, Ordering::Relaxed)
+                } else {
+                    self.writes.window_max_wal_nanos.load(Ordering::Relaxed)
+                },
+                map_nanos: self.writes.map_nanos.load(Ordering::Relaxed),
+                max_map_nanos: if close_window {
+                    self.writes.window_max_map_nanos.swap(0, Ordering::Relaxed)
+                } else {
+                    self.writes.window_max_map_nanos.load(Ordering::Relaxed)
+                },
             },
         }
     }
@@ -562,6 +596,12 @@ pub struct WriteSnapshot {
     /// and since the volume opened.
     pub max_depth: u64,
     pub peak_depth: u64,
+    /// The hold split into the WAL file calls and the map commit, summed
+    /// and with the longest single one within the window.
+    pub wal_nanos: u64,
+    pub max_wal_nanos: u64,
+    pub map_nanos: u64,
+    pub max_map_nanos: u64,
 }
 
 /// The write holds charged at one frozen depth, read at an instant.
@@ -665,6 +705,16 @@ impl LockStatsSnapshot {
                 }),
                 max_depth: self.writes.max_depth,
                 peak_depth: self.writes.peak_depth,
+                wal_nanos: self
+                    .writes
+                    .wal_nanos
+                    .saturating_sub(earlier.writes.wal_nanos),
+                max_wal_nanos: self.writes.max_wal_nanos,
+                map_nanos: self
+                    .writes
+                    .map_nanos
+                    .saturating_sub(earlier.writes.map_nanos),
+                max_map_nanos: self.writes.max_map_nanos,
             },
         }
     }
@@ -786,6 +836,13 @@ impl LockStatsSnapshot {
                     millis(d.max_hold_nanos),
                 ));
             }
+            out.push_str(&format!(
+                "; wal held={:.1}ms maxheld={:.1}ms map held={:.1}ms maxheld={:.1}ms",
+                millis(self.writes.wal_nanos),
+                millis(self.writes.max_wal_nanos),
+                millis(self.writes.map_nanos),
+                millis(self.writes.max_map_nanos),
+            ));
         }
         Some(out)
     }
@@ -1081,10 +1138,10 @@ mod tests {
     fn a_write_charges_its_hold_whether_or_not_it_waited() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(2), 0);
+        stats.record_write_hold(Duration::from_millis(2), 0, Duration::ZERO);
         stats.record_write_parking();
         stats.record_write_blocked(Duration::from_millis(9));
-        stats.record_write_hold(Duration::from_millis(5), 0);
+        stats.record_write_hold(Duration::from_millis(5), 0, Duration::ZERO);
 
         let snap = stats.snapshot();
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
@@ -1099,14 +1156,44 @@ mod tests {
     fn the_window_hold_maximum_resets_and_the_sum_does_not() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(6), 0);
+        stats.record_write_hold(Duration::from_millis(6), 0, Duration::ZERO);
         assert_eq!(stats.take_window().writes.max_hold_nanos, 6_000_000);
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 0);
+        stats.record_write_hold(Duration::from_millis(1), 0, Duration::ZERO);
         let snap = stats.snapshot();
         assert_eq!(snap.writes.max_hold_nanos, 1_000_000);
         assert_eq!(snap.writes.hold_nanos, 7_000_000);
+    }
+
+    /// The hold splits into the WAL file calls and the map commit, each
+    /// summed and with its window maximum, so a long hold reads as one
+    /// or the other. The window maxima reset with the window.
+    #[test]
+    fn a_write_hold_splits_into_wal_time_and_map_time() {
+        let stats = LockStats::default();
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(5), 0, Duration::from_millis(4));
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(3), 0, Duration::from_millis(1));
+
+        let snap = stats.take_window();
+        assert_eq!(snap.writes.wal_nanos, 5_000_000);
+        assert_eq!(snap.writes.max_wal_nanos, 4_000_000);
+        assert_eq!(snap.writes.map_nanos, 3_000_000);
+        assert_eq!(snap.writes.max_map_nanos, 2_000_000);
+        let report = snap.report().expect("the writes acquired");
+        assert!(
+            report.contains("; wal held=5.0ms maxheld=4.0ms map held=3.0ms maxheld=2.0ms"),
+            "got: {report}"
+        );
+
+        stats.record_write_uncontended();
+        stats.record_write_hold(Duration::from_millis(1), 0, Duration::from_millis(1));
+        let next = stats.snapshot();
+        assert_eq!(next.writes.max_wal_nanos, 1_000_000);
+        assert_eq!(next.writes.max_map_nanos, 0);
+        assert_eq!(next.writes.wal_nanos, 6_000_000);
     }
 
     /// A write's hold is charged to the frozen depth it ran under, so
@@ -1117,11 +1204,11 @@ mod tests {
     fn a_write_hold_is_charged_to_its_frozen_depth() {
         let stats = LockStats::default();
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 0);
+        stats.record_write_hold(Duration::from_millis(1), 0, Duration::ZERO);
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(3), 2);
+        stats.record_write_hold(Duration::from_millis(3), 2, Duration::ZERO);
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(2), 7);
+        stats.record_write_hold(Duration::from_millis(2), 7, Duration::ZERO);
 
         let snap = stats.take_window();
         assert_eq!(snap.writes.by_depth[0].writes, 1);
@@ -1138,7 +1225,7 @@ mod tests {
         );
 
         stats.record_write_uncontended();
-        stats.record_write_hold(Duration::from_millis(1), 1);
+        stats.record_write_hold(Duration::from_millis(1), 1, Duration::ZERO);
         let next = stats.snapshot();
         assert_eq!(next.writes.max_depth, 1);
         assert_eq!(next.writes.peak_depth, 7);
