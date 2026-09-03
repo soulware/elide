@@ -1,9 +1,10 @@
 # Design: epoch applies
 
 **Status:** steps 1 to 4 shipped (#984, #985, #987, #988, #989, 2026-09-01),
-step 5 open. The measurements come from the `write_contention` simulator
-(2026-08-31, parked on the `wip-measurement-probes` branch) and the rig's
-per-site lock statistics (2026-09-01). Builds on claimant tracking
+with the prep follow-ons #990 and #991 (2026-09-02). Step 5 is open. The
+measurements come from the `write_contention` simulator (2026-08-31, parked on
+the `wip-measurement-probes` branch) and the rig's per-site lock statistics
+(2026-09-01 and 2026-09-02). Builds on claimant tracking
 (`lbamap-claimant-tracking.md`), the plan-apply gate (`gc-plan-handoff.md`) and
 the reap (`open-generation-reap.md`).
 
@@ -262,10 +263,15 @@ of scope here.
    10-100ms band 2554 to 1805 per million, the series low.
 3. The drain flip and the reclaim as fold and swap (#988). Rig (rc29):
    `promote-segment-apply` max 78.2 to 0.3ms; the 10-100ms band 1805 to
-   1394 per million; `gc-plan-apply` and `repack-apply` are 99.6% of the
+   1394 per million; `gc-plan-apply` and `repack-apply` are 86% of the
    lock hold that remains.
 4. GC plan apply, repack buckets and the reap, with the swap removal check
-   (#989).
+   (#989). Rig (rc30): `gc-plan-apply` max 64.3 to 0.5ms, `repack-apply`
+   max 48.0 to 0.3ms; the 10-100ms band 1394 to 175 per million. The preps
+   then hand the worker the base index (#990, `gc-plan-prep` max 25.1 to
+   0.0ms) and the map layers (#991, `close-prep` max 11.3 to 1.2ms). Every
+   worker site holds under 3ms at the median; the worst write wait equals a
+   guest write's own hold.
 5. The fold-equals-rebuild assertion after every swap in the
    `volume-invariants` build, and a proptest that interleaves writes with
    folds.
