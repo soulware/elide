@@ -47,6 +47,24 @@ append's metadata update waits for a buffer the running journal commit holds,
 and the FLUSH syncs drive those commits. Fewer syncs give the append fewer
 commits to wait behind.
 
+The append buckets (#999, v0.1.60-rc3, 3 arms, 55 loaded windows) charge each
+append to what was in flight when the write took the mutex:
+
+| in flight | writes | mean append | windows whose WAL maximum sits here |
+|---|---|---|---|
+| idle | 74.0% | 16.7 µs | 13 |
+| a sync | 5.7% | 35.2 µs | 7 |
+| a worker job | 18.6% | 19.5 µs | 20 |
+| both | 1.7% | 34.6 µs | 15 |
+
+A sync in flight doubles the mean append. The tail sits with both in flight:
+1.7% of the writes carry the window maximum in 15 of 55 windows, about fifty
+times the idle rate per write, and the sync and worker buckets each sit near
+seven times it. The commit the append waits behind runs while the worker's
+segment writes load the disk, which is where the worker's own fsyncs wait in
+`rq_qos_wait`. The single longest hold of the series, 295.8 ms, was an append
+with a sync in flight.
+
 ## The contract
 
 The block layer promises two things, and only these two.
