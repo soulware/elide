@@ -107,9 +107,5 @@ publish and the swap hold is `fair`.
 ## Next
 
 The actor owns the nodes a swap retires, and frees them after its publish.
-Two shapes do that:
-
-1. Each swap returns the `Maps` it replaced, and the apply holds them in a
-   list it drops after its publish. Ownership is explicit at the swap.
-2. The apply keeps every bucket's clone of the layers in a list it drops
-   after its publish. The promote arms have this shape by scope.
+Each swap returns the base it replaced, and the apply holds the bases until
+after its publish (`retired-base.md`).

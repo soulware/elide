@@ -784,9 +784,11 @@ impl VolumeActor {
     /// two holds that clone and swap handles. Both holds release to a
     /// waiting guest write with the fair handoff, since this loop would
     /// win the lock straight back. The single publish at the end keeps
-    /// readers seeing the whole pass at once.
+    /// readers seeing the whole pass at once. The bases the swaps retired
+    /// live until after that publish, so this thread frees them.
     fn apply_repack_and_publish(&mut self, result: RepackResult) -> io::Result<CompactionStats> {
         let (mut acc, buckets) = RepackApply::new(result);
+        let mut retired = Vec::with_capacity(buckets.len());
         for bucket in &buckets {
             let layers = self
                 .lock_volume(LockSite::RepackApply)
@@ -796,9 +798,11 @@ impl VolumeActor {
             if let crate::volume::RepackFold::Landed(landed) =
                 crate::volume::fold_repack_bucket(&layers, bucket, &mut acc)?
             {
-                self.lock_volume(LockSite::RepackApply)
-                    .fair()
-                    .swap_repack_bucket(bucket, landed, layers.base(), &mut acc);
+                retired.extend(
+                    self.lock_volume(LockSite::RepackApply)
+                        .fair()
+                        .swap_repack_bucket(bucket, landed, layers.base(), &mut acc),
+                );
             }
         }
         let (stats, consumed_inputs) = self
@@ -807,6 +811,7 @@ impl VolumeActor {
         if stats.segments_compacted > 0 || !consumed_inputs.is_empty() {
             self.publish_snapshot();
         }
+        drop(retired);
         crate::volume::unlink_consumed_inputs(&consumed_inputs)?;
         self.lock_volume(LockSite::RepackUnlink)
             .assert_consumed_inputs_removed();
@@ -1129,13 +1134,18 @@ impl VolumeActor {
         }
         let layers = self.lock_volume(LockSite::ReapApply).map_layers().clone();
         let fold = crate::volume::fold_reap(&layers, parsed);
-        let (stats, unlink) = self
+        let crate::volume::ReapSwap {
+            stats,
+            unlink,
+            retired,
+        } = self
             .lock_volume(LockSite::ReapApply)
             .swap_reap(fold, layers.base());
         if unlink.is_empty() || stop == ReapStop::BeforePublish {
             return Ok(stats);
         }
         self.publish_snapshot();
+        drop(retired);
         if stop == ReapStop::BeforeUnlink {
             return Ok(stats);
         }
@@ -1299,15 +1309,17 @@ impl VolumeActor {
     }
 
     /// One GC plan apply: the prep and the swap under the volume mutex,
-    /// the fold between them on this thread with the mutex released.
-    /// Plans arrive in batches the actor folds back to back, so both
-    /// holds release to a waiting guest write with the fair handoff, for
-    /// the same reason the repack bucket loop does.
+    /// the fold between them on this thread with the mutex released, and
+    /// the publish of an applied swap. Plans arrive in batches the actor
+    /// folds back to back, so both holds release to a waiting guest write
+    /// with the fair handoff, for the same reason the repack bucket loop
+    /// does. The base the swap retired lives until after the publish, so
+    /// this thread frees it.
     fn apply_gc_plan(
         &mut self,
         result: crate::volume::GcPlanApplyResult,
     ) -> io::Result<crate::volume::StagedApply> {
-        use crate::volume::{PlanFold, PlanSwapPrep, StagedApply};
+        use crate::volume::{PlanFold, PlanSwap, PlanSwapPrep, StagedApply};
         let layers = match self
             .lock_volume(LockSite::GcPlanApply)
             .fair()
@@ -1325,14 +1337,21 @@ impl VolumeActor {
             PlanFold::Cancelled => return Ok(StagedApply::Cancelled),
             PlanFold::Landed(landed) => landed,
         };
-        let outcome = self
+        let swap = self
             .lock_volume(LockSite::GcPlanApply)
             .fair()
             .swap_plan_apply(&landed, layers.base())?;
-        if outcome == StagedApply::Cancelled {
-            landed.remove_output();
+        match swap {
+            PlanSwap::Applied(retired) => {
+                self.publish_snapshot();
+                drop(retired);
+                Ok(StagedApply::Applied)
+            }
+            PlanSwap::Cancelled => {
+                landed.remove_output();
+                Ok(StagedApply::Cancelled)
+            }
         }
-        Ok(outcome)
     }
 
     /// Whether any worker job is dispatched but not yet resolved.
@@ -1359,13 +1378,17 @@ impl VolumeActor {
                     .lock_volume(LockSite::PromoteApply)
                     .map_layers()
                     .clone();
-                let apply = crate::volume::fold_promote_result(&layers, &result).map(|new_base| {
+                let swap = crate::volume::fold_promote_result(&layers, &result).map(|new_base| {
                     self.lock_volume(LockSite::PromoteApply).swap_promote(
                         &result,
                         new_base,
                         layers.base(),
-                    );
+                    )
                 });
+                let apply: io::Result<()> = match &swap {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                };
                 if let Err(e) = &apply {
                     // The segment is committed and the old WAL was kept, so
                     // reads stay resolvable; the in-memory maps are missing
@@ -1374,6 +1397,7 @@ impl VolumeActor {
                     error!("apply of promoted segment {ulid} failed: {e}");
                 }
                 self.publish_snapshot();
+                drop(swap);
                 if apply.is_ok() {
                     crate::volume::remove_promoted_wal(&result);
                     if crate::volume_invariants_enabled() {
@@ -1471,15 +1495,17 @@ impl VolumeActor {
                             .lock_volume(LockSite::PromoteSegmentApply)
                             .map_layers()
                             .clone();
-                        let apply_result = crate::volume::fold_promote_segment_result(&layers, &r)
-                            .map(|new_base| {
+                        let swap = crate::volume::fold_promote_segment_result(&layers, &r).map(
+                            |new_base| {
                                 self.lock_volume(LockSite::PromoteSegmentApply)
-                                    .swap_promote_segment(&r, new_base, layers.base());
-                            });
-                        if apply_result.is_ok() {
+                                    .swap_promote_segment(&r, new_base, layers.base())
+                            },
+                        );
+                        if swap.is_ok() {
                             self.publish_snapshot();
                         }
-                        let apply_result = apply_result.and_then(|()| {
+                        let apply_result = swap.and_then(|retired| {
+                            drop(retired);
                             crate::volume::remove_promoted_segment_sources(&self.base_dir, &r)
                         });
                         self.reply_parked_promote_segment(ulid, apply_result);
@@ -1530,12 +1556,11 @@ impl VolumeActor {
                             .clone();
                         match crate::volume::fold_reclaim_result(&layers, &r) {
                             Ok(crate::volume::ReclaimFold::Landed { new_base, outcome }) => {
-                                self.lock_volume(LockSite::ReclaimApply).swap_reclaim(
-                                    &r,
-                                    new_base,
-                                    layers.base(),
-                                );
+                                let retired = self
+                                    .lock_volume(LockSite::ReclaimApply)
+                                    .swap_reclaim(&r, new_base, layers.base());
                                 self.publish_snapshot();
+                                drop(retired);
                                 Ok(outcome)
                             }
                             Ok(crate::volume::ReclaimFold::NoSwap(outcome)) => Ok(outcome),
@@ -1603,7 +1628,6 @@ impl VolumeActor {
         let applied = self.apply_gc_plan(*result);
         match applied {
             Ok(crate::volume::StagedApply::Applied) => {
-                self.publish_snapshot();
                 if let Some(ref mut parked) = self.parked.handoffs {
                     parked.applied_count += 1;
                 }

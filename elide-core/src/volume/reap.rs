@@ -27,7 +27,7 @@ use super::Volume;
 use crate::blake3_id_hasher::Blake3HashSet;
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
-use crate::map_layers::{MapLayers, Maps};
+use crate::map_layers::{MapLayers, Maps, RetiredBase};
 use crate::segment::{self, EntryKind};
 
 /// Entries one pass may remove under the volume mutex — four
@@ -278,6 +278,14 @@ pub struct ReapFold {
     reaped: Vec<ReapSegment>,
 }
 
+/// What [`Volume::swap_reap`] leaves: the pass totals, the reaped files to
+/// unlink after the publish, and the base the swap retired.
+pub struct ReapSwap {
+    pub stats: ReapStats,
+    pub unlink: Vec<PathBuf>,
+    pub retired: Option<RetiredBase>,
+}
+
 /// The fold of a reap pass over a clone of `base`, with the volume mutex
 /// released.
 ///
@@ -344,7 +352,7 @@ impl Volume {
     /// snapshot first and then passes them to
     /// [`Self::remove_consumed_inputs`], the publish-before-unlink
     /// discipline every rewrite apply carries.
-    pub fn swap_reap(&mut self, fold: ReapFold, folded_from: &Maps) -> (ReapStats, Vec<PathBuf>) {
+    pub fn swap_reap(&mut self, fold: ReapFold, folded_from: &Maps) -> ReapSwap {
         let ReapFold {
             stats,
             post,
@@ -352,7 +360,11 @@ impl Volume {
             reaped,
         } = fold;
         if reaped.is_empty() {
-            return (stats, Vec::new());
+            return ReapSwap {
+                stats,
+                unlink: Vec::new(),
+                retired: None,
+            };
         }
         if let Some(hash) = self.maps.delta_claims_any(&removed) {
             log::info!(
@@ -363,9 +375,13 @@ impl Volume {
                 segments_refused: stats.segments_refused + reaped.len() as u64,
                 ..ReapStats::default()
             };
-            return (refused, Vec::new());
+            return ReapSwap {
+                stats: refused,
+                unlink: Vec::new(),
+                retired: None,
+            };
         }
-        self.maps.swap_base(folded_from, post);
+        let retired = self.maps.swap_base(folded_from, post);
         let mut unlink = Vec::with_capacity(reaped.len());
         let mut reaped_fmt: Vec<String> = Vec::with_capacity(reaped.len());
         for seg in reaped {
@@ -380,7 +396,11 @@ impl Volume {
             stats.entries_removed,
             stats.bytes_reclaimed,
         );
-        (stats, unlink)
+        ReapSwap {
+            stats,
+            unlink,
+            retired: Some(retired),
+        }
     }
 
     /// Apply phase of the reap on one thread: [`fold_reap`] then
@@ -388,7 +408,13 @@ impl Volume {
     pub fn apply_reap(&mut self, segments: Vec<ReapSegment>) -> (ReapStats, Vec<PathBuf>) {
         let fold = fold_reap(&self.maps, segments);
         let folded_from = self.maps.base().clone();
-        self.swap_reap(fold, &folded_from)
+        let ReapSwap {
+            stats,
+            unlink,
+            retired,
+        } = self.swap_reap(fold, &folded_from);
+        drop(retired);
+        (stats, unlink)
     }
 
     /// One whole reap pass, inline on the current thread: sweep the live

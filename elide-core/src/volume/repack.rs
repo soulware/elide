@@ -12,7 +12,7 @@ use ulid::Ulid;
 use crate::{
     blake3_id_hasher::Blake3HashSet,
     extentindex,
-    map_layers::{MapLayers, Maps},
+    map_layers::{MapLayers, Maps, RetiredBase},
     segment::{self},
     segment_cache,
 };
@@ -744,7 +744,7 @@ impl Volume {
     ) -> io::Result<()> {
         if let RepackFold::Landed(landed) = fold_repack_bucket(&self.maps, bucket, acc)? {
             let folded_from = self.maps.base().clone();
-            self.swap_repack_bucket(bucket, landed, &folded_from, acc);
+            drop(self.swap_repack_bucket(bucket, landed, &folded_from, acc));
         }
         Ok(())
     }
@@ -756,13 +756,15 @@ impl Volume {
     /// An applied bucket queues `pending/<input_ulid>` into `acc`'s unlink
     /// list, for an all-dead bucket too. The worker has already written
     /// `pending/<new_ulid>`. Each input's file-cache fd is evicted.
+    /// Returns the base an applied bucket retired.
+    #[must_use]
     pub fn swap_repack_bucket(
         &mut self,
         bucket: &RepackedBucket,
         landed: RepackLanded,
         folded_from: &Maps,
         acc: &mut RepackApply,
-    ) {
+    ) -> Option<RetiredBase> {
         let started = Instant::now();
         let RepackLanded {
             post,
@@ -779,9 +781,9 @@ impl Volume {
             );
             refuse_bucket(bucket, acc);
             acc.in_bucket += started.elapsed();
-            return;
+            return None;
         }
-        self.maps.swap_base(folded_from, post);
+        let retired = self.maps.swap_base(folded_from, post);
         acc.stats.extents_removed += removed.len();
 
         if let Some(out) = &bucket.output {
@@ -820,6 +822,7 @@ impl Volume {
             ),
         }
         acc.in_bucket += started.elapsed();
+        Some(retired)
     }
 
     /// Close out a repack apply pass: record what the journal tier now

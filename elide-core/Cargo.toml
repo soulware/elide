@@ -113,3 +113,7 @@ harness = false
 [[bench]]
 name = "journal_flip_apply"
 harness = false
+
+[[bench]]
+name = "retired_base_drop"
+harness = false

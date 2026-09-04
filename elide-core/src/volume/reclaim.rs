@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::map_layers::{MapLayers, Maps};
+use crate::map_layers::{MapLayers, Maps, RetiredBase};
 use crate::{extentindex, lbamap, segment};
 
 use super::{Volume, ZERO_HASH, latest_snapshot};
@@ -455,19 +455,26 @@ impl Volume {
         match fold_reclaim_result(&layers, &result)? {
             ReclaimFold::NoSwap(outcome) => Ok(outcome),
             ReclaimFold::Landed { new_base, outcome } => {
-                self.swap_reclaim(&result, new_base, layers.base());
+                drop(self.swap_reclaim(&result, new_base, layers.base()));
                 Ok(outcome)
             }
         }
     }
 
     /// Install a reclaim's fold. O(1) in the maps.
-    pub fn swap_reclaim(&mut self, result: &ReclaimResult, new_base: Maps, folded_from: &Maps) {
-        self.maps
+    pub fn swap_reclaim(
+        &mut self,
+        result: &ReclaimResult,
+        new_base: Maps,
+        folded_from: &Maps,
+    ) -> RetiredBase {
+        let retired = self
+            .maps
             .swap_below(folded_from, new_base, result.segment_ulid);
         self.has_new_segments = true;
         self.last_segment_ulid = Some(result.segment_ulid);
         self.assert_volume_invariants("swap_reclaim");
+        retired
     }
 }
 
