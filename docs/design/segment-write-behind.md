@@ -74,14 +74,32 @@ window maximum of the sync fell from a p95 of 46.2 / 32.0 ms and a maximum of
 median across all windows fell from 15.3 to 10.6 ms, and the mean sync held at
 0.66 ms against 0.68 ms.
 
-**The first arm keeps a tail of its own.** Both sets ran their first arm in the
-minute after the deploy restarted the coordinator, and both carry four windows
-over 50 ms there, with a maximum of 372.8 ms on rc4 and 300.0 ms on rc5. Those
-windows hold four GC bucket outputs, a repack pass and the uploads of the
-backlog. The 249.9 ms window at 08:10:58 held only three uploads of 27.5 MiB
-and one promote of 35 ms, so the read side of the backlog loads the disk on its
-own. This tail sets the p95 across all windows, 54.0 ms on rc4 against 112.5 ms
-on rc5, and it is the next thing to name.
+**The first arm's tail is the host's disk after a VM reboot.** A deploy
+reboots the rig VM, and both sets ran their first arm in the minutes after it.
+Both carry four windows over 50 ms there, with a maximum of 372.8 ms on rc4 and
+300.0 ms on rc5, and in those windows a guest read and the WAL fdatasync stall
+to the same value (267.4 against 267.0 ms) while the volume mutex, the lock
+sites and the coordinator's work look as they do in every other window. This
+tail sets the p95 across all windows, 54.0 ms on rc4 against 112.5 ms on rc5.
+
+Four arms with a one-second `/proc/diskstats` sampler on the data disk named
+it. An arm after `echo 3 > drop_caches` read 128 MiB from the disk in its first
+window at a 1.4 ms await and its worst sync was 35.6 ms; a warm arm and a second
+dropped arm had no second with a read or write await over 8 ms. An arm started
+45 s after `fly machine restart` reproduced the stalls, sync maxima of 413.2,
+382.0 and 447.2 ms, with the disk at 17 to 25% busy and at most three requests
+in flight. Its sampler holds four seconds in which a handful of reads took
+hundreds of milliseconds between them: 74 reads at a 17.1 ms mean in the
+413 ms window, 16 reads at 24.0 ms in the 382 ms window, 22 reads at 20.6 ms in
+the 447 ms window, and 4 reads at 35.0 ms in a 69 ms window. Each is one
+request of 380 to 450 ms that the virtio disk held, and the fdatasync's own
+writes hit the same requests. The stalls sat 100 to 300 s after boot in every
+set. The disk serves a request in hundreds of milliseconds now and then in the
+first five minutes after the VM boots, and a guest-side page cache drop leaves
+that host-side state warm.
+
+So the first arm after a deploy is not an arm. A set that follows a deploy
+waits ten minutes after the boot, or discards its first arm.
 
 **The cursor costs nothing the rig resolves.** The repack pass's write phase
 ran a median of 111 ms against 115 ms, with a maximum of 162 ms against
@@ -105,7 +123,5 @@ The 1 MiB window stands. The cost read gives a wider window nothing to buy.
 
 ## Open questions
 
-- What loads the disk in the first minute after a coordinator restart. The
-  upload reads and the GC bucket materialisation are the candidates.
 - Whether the segment fetch paths, which land a whole object from S3 and sync
   once, want the same cursor.
