@@ -91,6 +91,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as LE};
 
 use crate::chunk_tree;
+use crate::write_behind::WriteBehindFile;
 
 // --- constants ---
 
@@ -1207,7 +1208,7 @@ pub fn write_segment_full(
     header.signature.copy_from_slice(&sig_bytes);
 
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(WriteBehindFile::new(file));
 
     w.write_all(header.as_bytes())?;
     w.write_all(&index_buf)?;
@@ -1238,10 +1239,10 @@ pub fn write_segment_full(
     // keeping it makes the file size invariant explicit regardless of how
     // entries are ordered.
     let expected_len = body_section_start + body_length + delta_body.len() as u64;
-    w.get_ref().set_len(expected_len)?;
+    w.get_ref().file().set_len(expected_len)?;
 
     w.flush()?;
-    w.get_ref().sync_data()?;
+    w.get_ref().file().sync_data()?;
     Ok((body_section_start, entries))
 }
 
@@ -1485,13 +1486,13 @@ pub fn rewrite_with_deltas(
         .write(true)
         .create_new(true)
         .open(dst_path)?;
-    let mut w = BufWriter::new(dst);
+    let mut w = BufWriter::new(WriteBehindFile::new(dst));
     w.write_all(header.as_bytes())?;
     w.write_all(&new_index_buf)?;
     w.write_all(&inline_body)?;
     w.write_all(delta_body)?;
     w.flush()?;
-    w.get_ref().sync_data()?;
+    w.get_ref().file().sync_data()?;
 
     Ok(())
 }
@@ -2603,26 +2604,31 @@ pub fn promote_to_cache(src_path: &Path, body_path: &Path, present_path: &Path) 
     // `.delta` and `.present` are both already committed.
     let body_tmp = tmp_sibling(body_path)?;
     {
-        let mut dst = fs::OpenOptions::new()
+        let dst = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&body_tmp)?;
         dst.set_len(body_length)?;
+        let mut dst = WriteBehindFile::new(dst);
         for entry in &entries {
             if !entry.kind.is_data() || entry.stored_length == 0 {
                 continue;
             }
             src.seek(SeekFrom::Start(body_section_start + entry.stored_offset))?;
-            dst.seek(SeekFrom::Start(entry.stored_offset))?;
+            dst.file_mut().seek(SeekFrom::Start(entry.stored_offset))?;
             // io::copy uses copy_file_range/sendfile/fcopyfile where available,
             // keeping the extent bytes in the kernel on Linux.
-            let n = io::copy(&mut (&mut src).take(entry.stored_length as u64), &mut dst)?;
+            let n = io::copy(
+                &mut (&mut src).take(entry.stored_length as u64),
+                dst.file_mut(),
+            )?;
             if n != entry.stored_length as u64 {
                 return Err(io::Error::other("short read promoting segment body"));
             }
+            dst.written(entry.stored_offset + n)?;
         }
-        dst.sync_data()?;
+        dst.file().sync_data()?;
     }
 
     // Commit .delta first so that once .body appears, .delta is

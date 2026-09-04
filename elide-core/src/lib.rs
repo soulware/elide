@@ -37,6 +37,7 @@ pub mod ulid_mint;
 pub mod volume;
 pub mod volume_event;
 pub mod volume_ipc;
+pub mod write_behind;
 pub mod writelog;
 pub mod wtrace;
 
