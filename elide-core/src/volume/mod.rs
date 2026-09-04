@@ -40,7 +40,7 @@ use crate::{
     blake3_id_hasher::Blake3HashSet,
     extentindex::{self, BodySource},
     lbamap::{self, LbaMap},
-    map_layers::{MapLayers, Maps},
+    map_layers::{MapLayers, Maps, RetiredBase},
     rewrite_plan,
     segment::{self, EntryKind},
     segment_cache,
@@ -84,7 +84,7 @@ pub(crate) use read::{
 };
 pub use readonly::ReadonlyVolume;
 pub use reap::{
-    BodyBytes, ReapCandidate, ReapFold, ReapSegment, ReapStats, Sweep, fold_reap,
+    BodyBytes, ReapCandidate, ReapFold, ReapSegment, ReapStats, ReapSwap, Sweep, fold_reap,
     list_open_segments, parse_reap_candidates, sweep_unreachable,
 };
 pub use reclaim::{
@@ -1931,11 +1931,16 @@ impl Volume {
                 PlanFold::Cancelled => return Ok(StagedApply::Cancelled),
                 PlanFold::Landed(landed) => landed,
             };
-        let outcome = self.swap_plan_apply(&landed, layers.base())?;
-        if outcome == StagedApply::Cancelled {
-            landed.remove_output();
+        match self.swap_plan_apply(&landed, layers.base())? {
+            PlanSwap::Applied(retired) => {
+                drop(retired);
+                Ok(StagedApply::Applied)
+            }
+            PlanSwap::Cancelled => {
+                landed.remove_output();
+                Ok(StagedApply::Cancelled)
+            }
         }
-        Ok(outcome)
     }
 
     /// The first hold of a GC plan apply: the worker's own cancel, the
@@ -1989,7 +1994,7 @@ impl Volume {
         &mut self,
         landed: &PlanLanded,
         folded_from: &Maps,
-    ) -> io::Result<StagedApply> {
+    ) -> io::Result<PlanSwap> {
         let new_ulid = landed.new_ulid;
         if let Some(hash) = self.maps.delta_claims_any(&landed.removed) {
             log::warn!(
@@ -1997,7 +2002,7 @@ impl Volume {
                  dropped its location; dropping output and plan",
                 hash.to_hex(),
             );
-            return Ok(StagedApply::Cancelled);
+            return Ok(PlanSwap::Cancelled);
         }
 
         let fs_start = Instant::now();
@@ -2013,7 +2018,8 @@ impl Volume {
         let bare_path = landed.gc_dir.join(new_ulid.to_string());
         fs::rename(&landed.tmp_path, &bare_path)?;
         let _ = fs::remove_file(&landed.plan_path);
-        self.maps
+        let retired = self
+            .maps
             .swap_below(folded_from, landed.post.clone(), new_ulid);
         log::info!(
             "plan {new_ulid}: apply phases entries={} removed={} inputs={} \
@@ -2038,7 +2044,7 @@ impl Volume {
         }
 
         self.assert_volume_invariants("apply_plan_apply_result_applied");
-        Ok(StagedApply::Applied)
+        Ok(PlanSwap::Applied(retired))
     }
 
     /// Stress-only invariant: rebuild the lbamap from disk + WAL and panic
@@ -2748,7 +2754,7 @@ impl Volume {
     pub fn apply_promote_segment_result(&mut self, result: PromoteSegmentResult) -> io::Result<()> {
         let layers = self.maps.clone();
         let new_base = fold_promote_segment_result(&layers, &result)?;
-        self.swap_promote_segment(&result, new_base, layers.base());
+        drop(self.swap_promote_segment(&result, new_base, layers.base()));
         remove_promoted_segment_sources(&self.base_dir, &result)
     }
 
@@ -2759,7 +2765,7 @@ impl Volume {
         result: &PromoteSegmentResult,
         new_base: Maps,
         folded_from: &Maps,
-    ) {
+    ) -> RetiredBase {
         self.own_segments.insert(result.ulid);
         if result.tombstone || !result.is_drain {
             for old_ulid in &result.parsed.inputs {
@@ -2771,7 +2777,7 @@ impl Volume {
             // the new cache body.
             self.evict_cached_segment(result.ulid);
         }
-        self.maps.swap_base(folded_from, new_base);
+        let retired = self.maps.swap_base(folded_from, new_base);
         let caller = if result.tombstone {
             "apply_promote_segment_result_tombstone"
         } else if result.is_drain {
@@ -2780,6 +2786,7 @@ impl Volume {
             "apply_promote_segment_result_gc_carried"
         };
         self.assert_volume_invariants(caller);
+        retired
     }
 
     /// Finalize a completed GC handoff by deleting the bare `gc/<ulid>` file.
@@ -3535,7 +3542,7 @@ impl Volume {
     /// ([`fold_promote_result`], [`Self::swap_promote`]).
     pub fn apply_promote(&mut self, result: &PromoteResult) -> io::Result<()> {
         let fold = self.fold_promote(result)?;
-        self.swap_promote_fold(result, fold);
+        drop(self.swap_promote_fold(result, fold));
         Ok(())
     }
 
@@ -3566,10 +3573,11 @@ impl Volume {
 
     /// Install a [`Self::fold_promote`], delete the epoch's WAL, and assert
     /// the volume invariants.
-    pub fn swap_promote_fold(&mut self, result: &PromoteResult, fold: PromoteFold) {
-        self.swap_promote(result, fold.new_base, fold.layers.base());
+    pub fn swap_promote_fold(&mut self, result: &PromoteResult, fold: PromoteFold) -> RetiredBase {
+        let retired = self.swap_promote(result, fold.new_base, fold.layers.base());
         remove_promoted_wal(result);
         self.assert_promote_applied();
+        retired
     }
 
     /// The end of a promote, after the WAL unlink, where the volume
@@ -3583,7 +3591,12 @@ impl Volume {
     /// Install a promote's fold: the folded maps become base, the epoch's
     /// frozen layer retires, and the bookkeeping the apply owns lands. O(1)
     /// in the maps; the sketch inserts are per primary entry.
-    pub fn swap_promote(&mut self, result: &PromoteResult, new_base: Maps, folded_from: &Maps) {
+    pub fn swap_promote(
+        &mut self,
+        result: &PromoteResult,
+        new_base: Maps,
+        folded_from: &Maps,
+    ) -> RetiredBase {
         self.has_new_segments = true;
         // The journal segment ULID is the higher of the pair; the
         // snapshot-pinning invariant needs the max here.
@@ -3595,7 +3608,8 @@ impl Volume {
                 .unwrap_or(result.segment_ulid)
                 .max(result.segment_ulid),
         );
-        self.maps
+        let retired = self
+            .maps
             .swap_promote(folded_from, new_base, result.old_wal_ulid);
         self.forget_rotated_wal(&result.old_wal_path);
 
@@ -3608,6 +3622,7 @@ impl Volume {
         }
         self.record_dedup_mint_stats(result.old_wal_ulid, result.dedup);
         self.evict_cached_segment(result.old_wal_ulid);
+        retired
     }
 
     // ------------------------------------------------------------------
@@ -3842,6 +3857,25 @@ fn describe_stale_cancel(stale: &[(blake3::Hash, Ulid)], lbamap: &lbamap::LbaMap
         let _ = write!(out, "; ...+{} more", stale.len() - 3);
     }
     out
+}
+
+/// What [`Volume::swap_plan_apply`] leaves.
+pub enum PlanSwap {
+    /// The fold is `base`. The holder drops the retired base after its
+    /// publish.
+    Applied(RetiredBase),
+    /// A write claimed a hash the fold dropped, so the maps keep their
+    /// handles.
+    Cancelled,
+}
+
+impl PlanSwap {
+    pub fn outcome(&self) -> StagedApply {
+        match self {
+            PlanSwap::Applied(_) => StagedApply::Applied,
+            PlanSwap::Cancelled => StagedApply::Cancelled,
+        }
+    }
 }
 
 /// What [`Volume::prepare_plan_swap`] hands the fold.

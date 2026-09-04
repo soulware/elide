@@ -6370,7 +6370,7 @@ fn a_drain_flips_a_clone_of_base_under_the_delta() {
         Some(BodySource::Cached(0))
     ));
 
-    vol.swap_promote_segment(&result, new_base, layers.base());
+    drop(vol.swap_promote_segment(&result, new_base, layers.base()));
     assert!(
         !vol.maps.delta_is_empty(),
         "the concurrent write stays in the delta"
@@ -6443,7 +6443,7 @@ fn a_promote_freezes_its_epoch_and_the_swap_retires_it() {
     );
     assert_eq!(new_base.lbamap.claimant_at(8), Some(segment_ulid));
 
-    vol.swap_promote(&result, new_base, layers.base());
+    drop(vol.swap_promote(&result, new_base, layers.base()));
     assert_eq!(vol.maps.frozen_depth(), 0, "the swap retired the layer");
     assert!(
         !vol.maps.delta_is_empty(),
@@ -6551,7 +6551,9 @@ fn a_gc_plan_swap_refuses_a_claim_written_after_its_fold() {
     // The hazard: the dropped content returns as a dedup claim in delta.
     vol.write(5, &x).unwrap();
     assert_eq!(
-        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        vol.swap_plan_apply(&landed, layers.base())
+            .unwrap()
+            .outcome(),
         StagedApply::Cancelled
     );
     landed.remove_output();
@@ -6578,7 +6580,9 @@ fn a_gc_plan_swap_refuses_a_claim_written_after_its_fold() {
         PlanFold::Cancelled => panic!("the fold refused the plan"),
     };
     assert_eq!(
-        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        vol.swap_plan_apply(&landed, layers.base())
+            .unwrap()
+            .outcome(),
         StagedApply::Applied
     );
     assert!(gc_dir.join(new_ulid.to_string()).exists());
@@ -6702,7 +6706,7 @@ fn a_repack_swap_refuses_a_claim_written_after_its_fold() {
 
     // The hazard: the dropped content returns as a dedup claim in delta.
     vol.write(5, &x).unwrap();
-    vol.swap_repack_bucket(bucket, landed, layers.base(), &mut acc);
+    drop(vol.swap_repack_bucket(bucket, landed, layers.base(), &mut acc));
     let (stats, consumed) = vol.finish_repack_apply(acc).unwrap();
     assert_eq!(stats.buckets_refused, 1);
     assert!(consumed.is_empty(), "a refused bucket keeps its inputs");
@@ -6776,7 +6780,7 @@ fn a_reap_swap_refuses_a_claim_written_after_its_fold() {
 
     // The hazard: the dropped content returns as a dedup claim in delta.
     vol.write(5, &x).unwrap();
-    let (stats, unlink) = vol.swap_reap(fold, layers.base());
+    let ReapSwap { stats, unlink, .. } = vol.swap_reap(fold, layers.base());
     assert_eq!(stats.segments_refused, 1);
     assert_eq!(stats.segments_reaped, 0);
     assert!(unlink.is_empty());
@@ -6874,7 +6878,9 @@ fn a_gc_plan_prep_hands_the_worker_the_base_index() {
         PlanFold::Cancelled => panic!("the fold refused the plan"),
     };
     assert_eq!(
-        vol.swap_plan_apply(&landed, layers.base()).unwrap(),
+        vol.swap_plan_apply(&landed, layers.base())
+            .unwrap()
+            .outcome(),
         StagedApply::Applied
     );
     assert!(gc_dir.join(new_ulid.to_string()).exists());

@@ -46,6 +46,14 @@ impl Default for Maps {
     }
 }
 
+/// The `base` a swap replaced. Its drop frees every map node the fold
+/// diverged from it, a cost proportional to their count, so the holder
+/// drops it on its own thread after it publishes the swap.
+#[must_use]
+pub struct RetiredBase {
+    _maps: Maps,
+}
+
 /// One WAL epoch between its promote's freeze and swap.
 #[derive(Clone)]
 struct FrozenLayer {
@@ -238,9 +246,15 @@ impl MapLayers {
     }
 
     /// Install a promote's fold as `base` and retire its frozen layer.
-    pub fn swap_promote(&mut self, folded_from: &Maps, new_base: Maps, wal_ulid: Ulid) {
-        self.swap_base(folded_from, new_base);
+    pub fn swap_promote(
+        &mut self,
+        folded_from: &Maps,
+        new_base: Maps,
+        wal_ulid: Ulid,
+    ) -> RetiredBase {
+        let retired = self.swap_base(folded_from, new_base);
         self.frozen.retain(|l| l.wal_ulid != wal_ulid);
+        retired
     }
 
     /// A base-only apply's fold: `apply` run over a clone of `base`. `self`
@@ -266,13 +280,15 @@ impl MapLayers {
     /// only mutator of `base`, and it runs the fold and this swap on its own
     /// thread with no other apply between them, so the two are the same
     /// handles; the assertion states that invariant.
-    pub fn swap_base(&mut self, folded_from: &Maps, new_base: Maps) {
+    pub fn swap_base(&mut self, folded_from: &Maps, new_base: Maps) -> RetiredBase {
         debug_assert!(
             Arc::ptr_eq(&self.base.lbamap, &folded_from.lbamap)
                 && Arc::ptr_eq(&self.base.extent_index, &folded_from.extent_index),
             "base moved between a fold and its swap"
         );
-        self.base = new_base;
+        RetiredBase {
+            _maps: std::mem::replace(&mut self.base, new_base),
+        }
     }
 
     /// A clone of `base` with every frozen layer below `ulid` replayed in,
@@ -306,9 +322,10 @@ impl MapLayers {
     /// Install a [`Self::fold_below`] as `base` and retire the layers it
     /// replayed. A promote whose layer retires here still folds and swaps:
     /// its replay finds the layer gone and its locations in `base`.
-    pub fn swap_below(&mut self, folded_from: &Maps, new_base: Maps, ulid: Ulid) {
-        self.swap_base(folded_from, new_base);
+    pub fn swap_below(&mut self, folded_from: &Maps, new_base: Maps, ulid: Ulid) -> RetiredBase {
+        let retired = self.swap_base(folded_from, new_base);
         self.frozen.retain(|l| l.wal_ulid >= ulid);
+        retired
     }
 
     /// The layers above `ulid` over `base`: how a [`Self::fold_below`]
@@ -538,7 +555,7 @@ mod tests {
             "the fold leaves the live base alone"
         );
 
-        layers.swap_promote(&folded_from, new_base, seg(10));
+        drop(layers.swap_promote(&folded_from, new_base, seg(10)));
         assert_eq!(layers.frozen_depth(), 1);
         assert_eq!(layers.base().lbamap.claimant_at(2), Some(seg(20)));
         assert_eq!(
@@ -574,7 +591,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        layers.swap_promote(&folded_from, new_base, seg(10));
+        drop(layers.swap_promote(&folded_from, new_base, seg(10)));
         assert_eq!(layers.base().lbamap.claimant_at(0), Some(seg(20)));
         assert_eq!(layers.base().lbamap.claimant_at(8), Some(seg(30)));
     }
@@ -715,7 +732,7 @@ mod tests {
             "the fold leaves the live layers alone"
         );
 
-        layers.swap_base(before.base(), new_base);
+        drop(layers.swap_base(before.base(), new_base));
         assert_eq!(layers.frozen_depth(), 1);
         assert!(!layers.delta_is_empty());
         assert_eq!(
@@ -775,7 +792,7 @@ mod tests {
             "layers 12 and 13 mask the fold, layer 10 is under it"
         );
 
-        layers.swap_below(before.base(), new_base, seg(11));
+        drop(layers.swap_below(before.base(), new_base, seg(11)));
         assert_eq!(layers.frozen_depth(), 1, "layer 10 retired, layer 12 stays");
         assert!(!layers.delta_is_empty());
         assert_eq!(
