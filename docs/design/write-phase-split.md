@@ -1,6 +1,7 @@
 # Design: the guest write phase split
 
-**Status:** instrument, unmeasured. Follows the segment write-behind
+**Status:** measured at v0.1.60-rc6. The tail is the drop of the previous
+read snapshot after a repack bucket swap. Follows the segment write-behind
 (`segment-write-behind.md`), whose rc5 read left the guest's write tail as the
 largest steady-state figure on the guest side.
 
@@ -57,7 +58,58 @@ Three arms on the rig, read from the `[lock …]` line per loaded window:
    tail, and `bytes` says whether it is a merged write.
 3. `maxpre` and `maxpost` against `maxheld`, across the windows.
 
-## Open questions
+## Result
 
-- Whether the queue wait in front of the worker, which the clock starts
-  after, carries a share. The `[ublk io]` maximum minus `maxtotal` bounds it.
+Three arms at v0.1.60-rc6 on the rig, pgbench at 500 tps, 52 loaded windows.
+The guest side matches the rc5 set: latency 6.4, 5.0 and 5.7 ms, worst
+windows 11.0, 7.3 and 18.4 ms.
+
+| window maximum | med | p95 | max |
+|---|---|---|---|
+| `maxpre` | 3.0 | 7.3 | 35.5 |
+| `maxwait` | 5.9 | 9.2 | 41.7 |
+| `maxheld` | 4.1 | 6.9 | 29.7 |
+| `maxpost` | 26.0 | 50.6 | 56.6 |
+| `maxfua` | 0.9 | 9.3 | 13.5 |
+| `maxtotal` | 27.4 | 51.1 | 57.7 |
+| `[ublk io]` write max | 11.4 | 48.1 | 56.3 |
+
+`maxtotal` and the `[ublk io]` write maximum agree to within a millisecond in
+every loaded window, so the queue wait in front of the worker carries none of
+the tail. The mean phases per write are 39 us pre, 8 us post and 149 us total.
+
+The `post` phase carries the slowest write in 35 of the 52 windows. Its
+twelve worst writes hold 43 to 57 ms in `post`, under 0.2 ms in `held`, under
+0.8 ms in `wait`, and carry 4 to 40 KiB. `wait` carries 9 windows, `held` 4,
+`fua` 2 and `pre` 2.
+
+`post` is the drop of the previous read snapshot. Every one of the 30 windows
+whose slowest write holds 20 ms or more in `post` has a `repack-apply` site
+count of 7 or 9, and every window with a `repack-apply` count of 0 has a
+slowest `post` of 16 ms or less. The `check-promote` count is at most 5 in
+any window, so every promote signal lands in the mailbox without a block.
+
+The mechanism is in `VolumeActor::apply_repack_and_publish`. Each bucket
+clones the map layers, folds the bucket into a clone of `base` with the
+mutex released, and swaps the fold in under a `fair` hold. The `fair`
+release hands the mutex to a queued guest write. That write publishes a
+snapshot over the new `base` and drops the previous snapshot, which is the
+last holder of the old `base`. The bucket's clone of the layers is gone at
+the end of the loop iteration, and the actor's own publish comes after the
+last bucket. So the guest write frees every map node the fold diverged from
+the old `base`, on its own thread, in `post`.
+
+The promote applies keep their clone of the layers alive until after their
+publish, so the actor frees a promote's diverged nodes itself.
+`VolumeActor::apply_gc_plan` has the repack shape: the clone dies before the
+publish and the swap hold is `fair`.
+
+## Next
+
+The actor owns the nodes a swap retires, and frees them after its publish.
+Two shapes do that:
+
+1. Each swap returns the `Maps` it replaced, and the apply holds them in a
+   list it drops after its publish. Ownership is explicit at the swap.
+2. The apply keeps every bucket's clone of the layers in a list it drops
+   after its publish. The promote arms have this shape by scope.
