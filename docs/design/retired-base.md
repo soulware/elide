@@ -1,6 +1,7 @@
 # Design: a swap returns the base it retired
 
-**Status:** built, bench measured, rig unmeasured. Follows the write phase split
+**Status:** measured at v0.1.60-rc7. The guest write's `post` phase is
+clear. Follows the write phase split
 (`write-phase-split.md`), whose rc6 read put the guest write tail in the drop
 of the previous read snapshot after a repack bucket swap.
 
@@ -87,3 +88,52 @@ Three arms on the rig, read from the `[lock …]` line per loaded window:
 2. `maxtotal` and the `[ublk io]` write maximum, which should follow.
 3. The `repack-apply` site's hold and the repack apply line, for the cost the
    actor takes over.
+
+## Result
+
+Three arms at v0.1.60-rc7 on pg35, started nine and a half minutes after the
+deploy's boot, 53 loaded windows, against the rc6 set on the same volume and
+machine.
+
+| window maximum, ms | rc6 med | rc6 p95 | rc6 max | rc7 med | rc7 p95 | rc7 max |
+|---|---|---|---|---|---|---|
+| `maxpost` | 26.0 | 50.6 | 56.6 | 1.3 | 6.2 | 17.3 |
+| `maxtotal` | 27.4 | 51.1 | 57.7 | 7.0 | 15.4 | 27.2 |
+| `[ublk io]` write max | 11.4 | 48.1 | 56.3 | 6.4 | 11.8 | 27.3 |
+| `maxwait` | 5.9 | 9.2 | 41.7 | 5.4 | 11.0 | 20.5 |
+| `maxheld` | 4.1 | 6.9 | 29.7 | 4.6 | 8.6 | 24.4 |
+| `maxpre` | 3.0 | 7.3 | 35.5 | 4.3 | 9.0 | 26.4 |
+| `maxfua` | 0.9 | 9.3 | 13.5 | 0.8 | 6.4 | 9.9 |
+
+**The `post` phase is clear.** On rc6 the slowest write's `post` was 20 ms or
+more in 30 of 52 windows and carried the slowest write in 35. On rc7 it is
+under 20 ms in all 53 windows and carries the slowest write in none. The
+mean `post` per write fell from 8.4 to 4.7 us. The slowest write per window
+now sits at 7 to 27 ms, and `pre` carries it in 18 windows, `wait` in 17,
+`held` in 15 and `fua` in 3.
+
+**The repack hold held.** The `repack-apply` site's hold maximum per window
+reads a median of 0.3 ms against 0.4 and a p95 of 1.4 against 2.2, with the
+same wait, so the free lands outside the hold. The actor's own time in the
+free has no counter, and the guest sees none of it.
+
+**Reads held.** The `[ublk io]` read maximum per busy window reads a median
+of 5.7 ms on rc6 and 5.3 ms on rc7. Both sets carry four windows with a read
+maximum over 100 ms, and in every one of them the WAL sync maximum of the
+same window reads the same value, which is one request the virtio disk
+held. Those windows sit at 10.7 to 15 minutes after the boot in both sets.
+They are the reboot tail (`segment-write-behind.md`), which runs to fifteen
+minutes after the boot.
+
+**Guest.** Arm 3 reads the cleanest arm of any set on this volume: latency
+4.5 ms, standard deviation 5.6 ms, worst window 6.0 ms. Arms 1 and 2 carry
+the reboot tail: one 650 ms window in arm 2 at fifteen minutes after the
+boot holds a 337.5 ms read and a 328.1 ms sync, and the arm reads 59 ms.
+
+## Next
+
+The slowest guest write per window is 7 to 27 ms, split across `pre`,
+`wait` and `held`. `pre` is the blake3 hash and the zstd compress of an 8 to
+16 KiB write, at 8 to 26 ms in its worst windows against a mean of 38 us, so
+those writes lost the CPU. The next read is what runs on the volume's cores
+in those windows.
