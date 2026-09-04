@@ -40,7 +40,7 @@ use ulid::Ulid;
 
 use crate::extentindex::ExtentIndex;
 use crate::lbamap::LbaMap;
-use crate::lock_stats::{AppendContext, LockSite, LockStats, LockStatsSnapshot};
+use crate::lock_stats::{AppendContext, LockSite, LockStats, LockStatsSnapshot, WritePhases};
 use crate::segment::{self, BoxFetcher};
 use crate::sync_gate::{GateSnapshot, RequestKind, SyncGate};
 use crate::volume::{
@@ -475,6 +475,54 @@ fn lock_volume(volume: &Arc<Mutex<Volume>>) -> MutexGuard<'_, Volume> {
 /// The returned guard charges what the write held on drop. An actor loop
 /// that yields to the queue standing behind it pays that hold once per
 /// waiting write, so it is the term that sizes the yield.
+/// The clock a guest write runs against. It marks the call, the ask for
+/// the mutex, and the return, and turns the marks into [`WritePhases`].
+struct WriteClock {
+    started: Instant,
+}
+
+impl WriteClock {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    /// The instant the write asks for the mutex. Everything before it is
+    /// the pre phase.
+    fn asked(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// The phases from the marks: `taken` is the mutex acquisition,
+    /// `released` its release, `synced` the FUA round's duration. The post
+    /// phase is the remainder of the total.
+    fn phases(
+        &self,
+        bytes: u64,
+        asked: Instant,
+        taken: Instant,
+        released: Instant,
+        synced: Option<Duration>,
+    ) -> WritePhases {
+        let total = self.started.elapsed();
+        let pre = asked.duration_since(self.started);
+        let wait = taken.duration_since(asked);
+        let held = released.duration_since(taken);
+        let fua = synced.unwrap_or(Duration::ZERO);
+        let post = total.saturating_sub(pre + wait + held + fua);
+        WritePhases {
+            bytes,
+            pre,
+            wait,
+            held,
+            post,
+            fua: synced,
+            total,
+        }
+    }
+}
+
 fn lock_volume_for_write<'a>(
     volume: &'a Arc<Mutex<Volume>>,
     stats: &'a LockStats,
@@ -2068,11 +2116,14 @@ impl VolumeClient {
     /// mutex is released, so the write is durable when this returns and
     /// concurrent FUA writers share one round.  See [`Self::sync_through`].
     pub fn write(&self, lba: u64, data: &[u8], fua: bool) -> io::Result<()> {
+        let clock = WriteClock::start();
         let hash = blake3::hash(data);
         let compressed = crate::volume::maybe_compress(data);
         let volume = self.volume()?;
-        let (needs_promote, published) = {
+        let asked = clock.asked();
+        let (needs_promote, published, taken) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
+            let taken = Instant::now();
             guard.write_precomputed(lba, data, hash, compressed.as_deref())?;
             let published = publish_snapshot(
                 &guard,
@@ -2081,15 +2132,27 @@ impl VolumeClient {
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            (guard.needs_promote(), published)
+            (guard.needs_promote(), published, taken)
         };
+        let released = Instant::now();
         drop(published.previous);
-        if fua {
+        let synced = if fua {
+            let began = Instant::now();
             self.sync_through(published.flush_gen, RequestKind::Fua)?;
-        }
+            Some(began.elapsed())
+        } else {
+            None
+        };
         if needs_promote {
             self.signal_check_promote();
         }
+        self.lock_stats.record_write_phases(clock.phases(
+            data.len() as u64,
+            asked,
+            taken,
+            released,
+            synced,
+        ));
         Ok(())
     }
 
@@ -2098,9 +2161,12 @@ impl VolumeClient {
     /// Writes a single zero-extent WAL record — no hashing, no data payload.
     /// See [`Volume::write_zeroes`] for details.
     pub fn write_zeroes(&self, start_lba: u64, lba_count: u32, fua: bool) -> io::Result<()> {
+        let clock = WriteClock::start();
         let volume = self.volume()?;
-        let (needs_promote, published) = {
+        let asked = clock.asked();
+        let (needs_promote, published, taken) = {
             let mut guard = lock_volume_for_write(&volume, &self.lock_stats);
+            let taken = Instant::now();
             guard.write_zeroes(start_lba, lba_count)?;
             let published = publish_snapshot(
                 &guard,
@@ -2109,15 +2175,27 @@ impl VolumeClient {
                 &self.layout_gen,
                 Publication::AppendsToWal,
             );
-            (guard.needs_promote(), published)
+            (guard.needs_promote(), published, taken)
         };
+        let released = Instant::now();
         drop(published.previous);
-        if fua {
+        let synced = if fua {
+            let began = Instant::now();
             self.sync_through(published.flush_gen, RequestKind::Fua)?;
-        }
+            Some(began.elapsed())
+        } else {
+            None
+        };
         if needs_promote {
             self.signal_check_promote();
         }
+        self.lock_stats.record_write_phases(clock.phases(
+            lba_count as u64 * 4096,
+            asked,
+            taken,
+            released,
+            synced,
+        ));
         Ok(())
     }
 

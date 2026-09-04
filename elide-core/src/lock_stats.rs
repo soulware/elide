@@ -259,6 +259,45 @@ struct WriteCounters {
     /// [`append_bucket`], so a long append reads as blocked behind a sync,
     /// behind the worker's disk traffic, or behind neither.
     by_append: [HoldCounters; APPEND_BUCKETS],
+    /// The whole guest write, from the ublk call to its return, in phases
+    /// around the mutex, so a slow write reads as one phase.
+    phases: PhaseCounters,
+}
+
+/// The phases of one guest write, from the ublk call to its return.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WritePhases {
+    pub bytes: u64,
+    /// The hash and the compress, before the mutex.
+    pub pre: Duration,
+    pub wait: Duration,
+    pub held: Duration,
+    /// The snapshot drop and the promote signal, after the mutex.
+    pub post: Duration,
+    /// The sync round a FUA write waited.
+    pub fua: Option<Duration>,
+    pub total: Duration,
+}
+
+/// The six figures kept for the write that set a window's maximum total:
+/// bytes, then the pre, wait, held, post and fua nanos.
+pub const SLOWEST_FIELDS: usize = 6;
+
+#[derive(Default)]
+struct PhaseCounters {
+    pre_nanos: AtomicU64,
+    window_max_pre_nanos: AtomicU64,
+    post_nanos: AtomicU64,
+    window_max_post_nanos: AtomicU64,
+    fua_writes: AtomicU64,
+    fua_nanos: AtomicU64,
+    window_max_fua_nanos: AtomicU64,
+    total_nanos: AtomicU64,
+    window_max_total_nanos: AtomicU64,
+    peak_total_nanos: AtomicU64,
+    /// The write that set the window maximum total. Two writes that set
+    /// it in the same instant interleave their fields.
+    slowest: [AtomicU64; SLOWEST_FIELDS],
 }
 
 /// The write holds charged to one bucket: a frozen depth, or what was in
@@ -486,6 +525,43 @@ impl LockStats {
         self.writes.peak_depth.fetch_max(depth, Ordering::Relaxed);
     }
 
+    /// Record the phases of one guest write, on its return.
+    pub fn record_write_phases(&self, phases: WritePhases) {
+        let nanos = |d: Duration| d.as_nanos() as u64;
+        let ph = &self.writes.phases;
+        let pre = nanos(phases.pre);
+        let post = nanos(phases.post);
+        let total = nanos(phases.total);
+        let fua = phases.fua.map(nanos);
+        ph.pre_nanos.fetch_add(pre, Ordering::Relaxed);
+        ph.window_max_pre_nanos.fetch_max(pre, Ordering::Relaxed);
+        ph.post_nanos.fetch_add(post, Ordering::Relaxed);
+        ph.window_max_post_nanos.fetch_max(post, Ordering::Relaxed);
+        if let Some(fua) = fua {
+            ph.fua_writes.fetch_add(1, Ordering::Relaxed);
+            ph.fua_nanos.fetch_add(fua, Ordering::Relaxed);
+            ph.window_max_fua_nanos.fetch_max(fua, Ordering::Relaxed);
+        }
+        ph.total_nanos.fetch_add(total, Ordering::Relaxed);
+        ph.peak_total_nanos.fetch_max(total, Ordering::Relaxed);
+        let before = ph
+            .window_max_total_nanos
+            .fetch_max(total, Ordering::Relaxed);
+        if total > before {
+            let fields = [
+                phases.bytes,
+                pre,
+                nanos(phases.wait),
+                nanos(phases.held),
+                post,
+                fua.unwrap_or(0),
+            ];
+            for (slot, value) in ph.slowest.iter().zip(fields) {
+                slot.store(value, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Fold the armed drain in, called by the write that emptied the
     /// queue. The swap leaves a later arm for the next such write.
     fn close_drain(&self) {
@@ -624,6 +700,29 @@ impl LockStats {
                         },
                     }
                 }),
+                phases: {
+                    let ph = &self.writes.phases;
+                    let window = |max: &AtomicU64| {
+                        if close_window {
+                            max.swap(0, Ordering::Relaxed)
+                        } else {
+                            max.load(Ordering::Relaxed)
+                        }
+                    };
+                    PhaseSnapshot {
+                        pre_nanos: ph.pre_nanos.load(Ordering::Relaxed),
+                        max_pre_nanos: window(&ph.window_max_pre_nanos),
+                        post_nanos: ph.post_nanos.load(Ordering::Relaxed),
+                        max_post_nanos: window(&ph.window_max_post_nanos),
+                        fua_writes: ph.fua_writes.load(Ordering::Relaxed),
+                        fua_nanos: ph.fua_nanos.load(Ordering::Relaxed),
+                        max_fua_nanos: window(&ph.window_max_fua_nanos),
+                        total_nanos: ph.total_nanos.load(Ordering::Relaxed),
+                        max_total_nanos: window(&ph.window_max_total_nanos),
+                        peak_total_nanos: ph.peak_total_nanos.load(Ordering::Relaxed),
+                        slowest: std::array::from_fn(|i| window(&ph.slowest[i])),
+                    }
+                },
             },
         }
     }
@@ -690,6 +789,27 @@ pub struct WriteSnapshot {
     pub max_map_nanos: u64,
     /// The WAL time by what was in flight at the append.
     pub by_append: [HoldSnapshot; APPEND_BUCKETS],
+    /// The whole write in phases around the mutex.
+    pub phases: PhaseSnapshot,
+}
+
+/// The guest write phases read at an instant. The sums cover every write;
+/// the maxima and `slowest` cover the window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseSnapshot {
+    pub pre_nanos: u64,
+    pub max_pre_nanos: u64,
+    pub post_nanos: u64,
+    pub max_post_nanos: u64,
+    pub fua_writes: u64,
+    pub fua_nanos: u64,
+    pub max_fua_nanos: u64,
+    pub total_nanos: u64,
+    pub max_total_nanos: u64,
+    pub peak_total_nanos: u64,
+    /// The write that set `max_total_nanos`: bytes, then the pre, wait,
+    /// held, post and fua nanos.
+    pub slowest: [u64; SLOWEST_FIELDS],
 }
 
 /// The write holds charged at one frozen depth, read at an instant.
@@ -812,6 +932,34 @@ impl LockStatsSnapshot {
                         .saturating_sub(earlier.writes.by_append[i].hold_nanos),
                     max_hold_nanos: self.writes.by_append[i].max_hold_nanos,
                 }),
+                phases: PhaseSnapshot {
+                    pre_nanos: self
+                        .writes
+                        .phases
+                        .pre_nanos
+                        .saturating_sub(earlier.writes.phases.pre_nanos),
+                    post_nanos: self
+                        .writes
+                        .phases
+                        .post_nanos
+                        .saturating_sub(earlier.writes.phases.post_nanos),
+                    fua_writes: self
+                        .writes
+                        .phases
+                        .fua_writes
+                        .saturating_sub(earlier.writes.phases.fua_writes),
+                    fua_nanos: self
+                        .writes
+                        .phases
+                        .fua_nanos
+                        .saturating_sub(earlier.writes.phases.fua_nanos),
+                    total_nanos: self
+                        .writes
+                        .phases
+                        .total_nanos
+                        .saturating_sub(earlier.writes.phases.total_nanos),
+                    ..self.writes.phases
+                },
             },
         }
     }
@@ -956,6 +1104,28 @@ impl LockStatsSnapshot {
                     millis(d.max_hold_nanos),
                 ));
             }
+            let ph = &self.writes.phases;
+            out.push_str(&format!(
+                "; phase pre={:.1}ms maxpre={:.1}ms post={:.1}ms maxpost={:.1}ms \
+                 fua n={} held={:.1}ms maxfua={:.1}ms total={:.1}ms maxtotal={:.1}ms peaktotal={:.1}ms; \
+                 slowest bytes={} pre={:.2}ms wait={:.2}ms held={:.2}ms post={:.2}ms fua={:.2}ms",
+                millis(ph.pre_nanos),
+                millis(ph.max_pre_nanos),
+                millis(ph.post_nanos),
+                millis(ph.max_post_nanos),
+                ph.fua_writes,
+                millis(ph.fua_nanos),
+                millis(ph.max_fua_nanos),
+                millis(ph.total_nanos),
+                millis(ph.max_total_nanos),
+                millis(ph.peak_total_nanos),
+                ph.slowest[0],
+                millis(ph.slowest[1]),
+                millis(ph.slowest[2]),
+                millis(ph.slowest[3]),
+                millis(ph.slowest[4]),
+                millis(ph.slowest[5]),
+            ));
         }
         Some(out)
     }
@@ -1190,6 +1360,55 @@ mod tests {
     /// Every guest write counts, but only the ones that blocked carry a
     /// wait — an uncontended write reads no clock, so a zero wait would
     /// be indistinguishable from an unmeasured one without `blocked`.
+    #[test]
+    fn the_slowest_write_keeps_its_phases_for_the_window() {
+        let stats = LockStats::default();
+        let ms = Duration::from_millis;
+        stats.record_write_phases(WritePhases {
+            bytes: 4096,
+            pre: ms(1),
+            wait: ms(2),
+            held: ms(3),
+            post: ms(4),
+            fua: None,
+            total: ms(10),
+        });
+        stats.record_write_phases(WritePhases {
+            bytes: 65536,
+            pre: ms(5),
+            wait: ms(1),
+            held: ms(20),
+            post: ms(2),
+            fua: Some(ms(12)),
+            total: ms(40),
+        });
+
+        let ph = stats.take_window().writes().phases;
+        assert_eq!(ph.pre_nanos, ms(6).as_nanos() as u64);
+        assert_eq!(ph.max_pre_nanos, ms(5).as_nanos() as u64);
+        assert_eq!(ph.post_nanos, ms(6).as_nanos() as u64);
+        assert_eq!(ph.fua_writes, 1);
+        assert_eq!(ph.max_fua_nanos, ms(12).as_nanos() as u64);
+        assert_eq!(ph.max_total_nanos, ms(40).as_nanos() as u64);
+        assert_eq!(
+            ph.slowest,
+            [
+                65536,
+                ms(5).as_nanos() as u64,
+                ms(1).as_nanos() as u64,
+                ms(20).as_nanos() as u64,
+                ms(2).as_nanos() as u64,
+                ms(12).as_nanos() as u64,
+            ]
+        );
+
+        let next = stats.take_window().writes().phases;
+        assert_eq!(next.max_total_nanos, 0);
+        assert_eq!(next.slowest, [0; SLOWEST_FIELDS]);
+        assert_eq!(next.peak_total_nanos, ms(40).as_nanos() as u64);
+        assert_eq!(next.total_nanos, ms(50).as_nanos() as u64);
+    }
+
     #[test]
     fn writes_count_always_and_time_only_when_blocked() {
         let stats = LockStats::default();
