@@ -1,6 +1,6 @@
 # Design: a swap returns the base it retired
 
-**Status:** built, unmeasured. Follows the write phase split
+**Status:** built, bench measured, rig unmeasured. Follows the write phase split
 (`write-phase-split.md`), whose rc6 read put the guest write tail in the drop
 of the previous read snapshot after a repack bucket swap.
 
@@ -47,6 +47,35 @@ path-copied, and the list drop frees the fold's nodes.
 
 The volume-level applies that hold the mutex across fold and swap drop the
 base at once.
+
+## Bench
+
+`elide-core/benches/retired_base_drop.rs` runs the swap on a pair of maps of
+`n` extents, with `k` extents re-pointed by a previous fold and again by the
+fold under test, and times three drops: the retired base alone, a guest
+write's publish and drop of the previous snapshot as the old base's last
+holder, and the same publish and drop with the retired base alive. Read on
+a MacBook, medians:
+
+| shape | `n` | `k` | retired drop | snapshot, last holder | snapshot, retired held |
+|---|---|---|---|---|---|
+| scattered | 200k | 512 | 218 us | 211 us | 107 ns |
+| scattered | 200k | 2048 | 1.19 ms | 1.21 ms | 126 ns |
+| scattered | 200k | 8192 | 2.96 ms | 2.96 ms | 259 ns |
+| carry | 200k | 8192 | 2.40 ms | 2.45 ms | 260 ns |
+| scattered | 50k | 8192 | 1.80 ms | 1.85 ms | 230 ns |
+| scattered | 800k | 8192 | 5.11 ms | 4.93 ms | 530 ns |
+
+The last holder pays the whole free, whichever thread it is, and the write's
+drop with the retired base alive costs a quarter of a microsecond. The free
+grows with `k` and with `n`, at 0.4 to 0.6 us per re-pointed extent, because
+a re-pointed extent copies its path of 64-way map chunks.
+
+The rig's figure for the same drop is 43 to 57 ms per bucket, fifteen times
+the bench at the rig's size. The bench frees on a quiet heap under the macOS
+allocator; the rig frees under glibc in a process whose worker threads
+allocate segment buffers at the same time. The rig arms below carry the
+absolute.
 
 ## Measurement
 
