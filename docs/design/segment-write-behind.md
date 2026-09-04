@@ -95,11 +95,12 @@ the 447 ms window, and 4 reads at 35.0 ms in a 69 ms window. Each is one
 request of 380 to 450 ms that the virtio disk held, and the fdatasync's own
 writes hit the same requests. The stalls sat 100 to 300 s after boot in every
 set. The disk serves a request in hundreds of milliseconds now and then in the
-first five minutes after the VM boots, and a guest-side page cache drop leaves
-that host-side state warm.
+first fifteen minutes after the VM boots (the rc6 and rc7 sets carry them at
+10.7 to 15 minutes, `retired-base.md`), and a guest-side page cache drop
+leaves that host-side state warm.
 
-So the first arm after a deploy is not an arm. A set that follows a deploy
-waits ten minutes after the boot, or discards its first arm.
+So the first arms after a deploy are not arms. A set that follows a deploy
+waits twenty minutes after the boot, or discards its first two arms.
 
 **The cursor costs nothing the rig resolves.** The repack pass's write phase
 ran a median of 111 ms against 115 ms, with a maximum of 162 ms against
