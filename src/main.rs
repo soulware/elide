@@ -2680,7 +2680,10 @@ mod tests {
     fn write_volume_config(dir: &Path, name: Option<&str>, ublk: Option<Option<i32>>) {
         let cfg = elide_core::config::VolumeConfig {
             name: name.map(str::to_owned),
-            ublk: ublk.map(|dev_id| elide_core::config::UblkConfig { dev_id }),
+            ublk: ublk.map(|dev_id| elide_core::config::UblkConfig {
+                dev_id,
+                workers: None,
+            }),
             ..Default::default()
         };
         cfg.write(dir).expect("write volume.toml");

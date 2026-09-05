@@ -9,8 +9,9 @@
 //! - One `smol::LocalExecutor` running on the queue thread.
 //! - `QUEUE_DEPTH` async tasks, one per tag, each owning an `IoBuf`, an
 //!   eventfd, and a shared `AtomicI32` result slot.
-//! - `WORKERS_PER_QUEUE` std::thread workers, each owning its own
-//!   `VolumeReader`, draining `Job`s from a crossbeam channel.
+//! - `[ublk] workers` std::thread workers per queue, `WORKERS_PER_QUEUE` by
+//!   default, each owning its own `VolumeReader`, draining `Job`s from a
+//!   crossbeam channel.
 //!
 //! **I/O flow for one tag.**
 //! 1. `submit_io_prep_cmd` → await first kernel request for this tag.
@@ -210,11 +211,11 @@ mod imp {
     /// spends on many-core hosts.
     const MAX_QUEUES: u16 = 4;
 
-    /// Backend worker threads per queue. Each worker owns a `VolumeReader`
-    /// and drains jobs from the queue's crossbeam channel. At depth 64 we
-    /// bottleneck on either the actor mailbox (writes) or the reader's fd
-    /// cache miss / S3 demand-fetch (reads); 8 workers is plenty for the
-    /// latter and writes serialise at the actor anyway.
+    /// Backend worker threads per queue when `[ublk] workers` is absent
+    /// from `volume.toml`. Each worker owns a `VolumeReader` and drains
+    /// jobs from the queue's crossbeam channel. A worker blocks for the
+    /// whole of a WAL `fdatasync` or an S3 demand fetch, so the count
+    /// bounds how many of those one queue serves at once.
     const WORKERS_PER_QUEUE: usize = 8;
 
     const UBLK_IO_OP_READ: u32 = libublk::sys::UBLK_IO_OP_READ;
@@ -635,9 +636,15 @@ mod imp {
         // creating a kernel device. Both are permanent host conditions →
         // Config, so the supervisor parks instead of respawn-looping.
         let link_paths = elide_coordinator::dev_link::LinkPaths::system();
-        let link_name = elide_core::config::VolumeConfig::read(dir)
-            .map_err(|e| io::Error::other(format!("reading volume config: {e}")))?
-            .name;
+        let volume_config = elide_core::config::VolumeConfig::read(dir)
+            .map_err(|e| io::Error::other(format!("reading volume config: {e}")))?;
+        let workers_per_queue = volume_config
+            .ublk
+            .as_ref()
+            .and_then(|u| u.workers)
+            .unwrap_or(WORKERS_PER_QUEUE)
+            .max(1);
+        let link_name = volume_config.name;
         if let Some(name) = &link_name {
             elide_coordinator::dev_link::preflight(
                 &link_paths,
@@ -806,7 +813,13 @@ mod imp {
                 // the same prctl already succeeded at process startup and
                 // CAP_SYS_RESOURCE is never dropped.
                 set_io_flusher().expect("PR_SET_IO_FLUSHER re-assert on queue thread");
-                q_fn(qid, dev, client.clone(), Arc::clone(&io_stats));
+                q_fn(
+                    qid,
+                    dev,
+                    client.clone(),
+                    Arc::clone(&io_stats),
+                    workers_per_queue,
+                );
             }
         };
 
@@ -1123,7 +1136,13 @@ mod imp {
     /// Per-queue entry point. Runs on a dedicated thread spawned by
     /// libublk's `run_target`. Owns the queue's io_uring, the worker pool,
     /// and the per-tag async tasks.
-    fn q_fn(qid: u16, dev: &UblkDev, client: VolumeClient, io_stats: Arc<IoStats>) {
+    fn q_fn(
+        qid: u16,
+        dev: &UblkDev,
+        client: VolumeClient,
+        io_stats: Arc<IoStats>,
+        workers_per_queue: usize,
+    ) {
         let queue = match UblkQueue::new(qid, dev) {
             Ok(q) => Rc::new(q),
             Err(e) => {
@@ -1133,7 +1152,8 @@ mod imp {
         };
 
         let (job_tx, job_rx) = unbounded::<Job>();
-        let worker_handles: Vec<_> = (0..WORKERS_PER_QUEUE)
+        tracing::info!("ublk queue {qid}: {workers_per_queue} workers");
+        let worker_handles: Vec<_> = (0..workers_per_queue)
             .map(|widx| {
                 let rx = job_rx.clone();
                 let reader = client.reader();
