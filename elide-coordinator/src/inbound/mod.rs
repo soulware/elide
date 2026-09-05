@@ -3183,7 +3183,10 @@ mod tests {
             ulid: ulid::Ulid::from_string(vol_ulid).ok(),
             name: Some(name.to_owned()),
             size: Some(SAMPLE_SIZE),
-            ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig { dev_id: Some(id) }),
+            ublk: ublk_dev_id.map(|id| elide_core::config::UblkConfig {
+                dev_id: Some(id),
+                workers: None,
+            }),
             lazy: None,
             journal: None,
         }
