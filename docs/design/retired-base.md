@@ -135,5 +135,5 @@ boot holds a 337.5 ms read and a 328.1 ms sync, and the arm reads 59 ms.
 The slowest guest write per window is 7 to 27 ms, split across `pre`,
 `wait` and `held`. `pre` is the blake3 hash and the zstd compress of an 8 to
 16 KiB write, at 8 to 26 ms in its worst windows against a mean of 38 us, so
-those writes lost the CPU. The next read is what runs on the volume's cores
-in those windows.
+those writes lost the CPU. The CPU sampler names it: the wait for a core on
+the rig's two-core VM (`docs/finding-write-tail-cpu-scheduling.md`).
