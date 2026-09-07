@@ -1,7 +1,8 @@
 # Finding: ublk worker threads per queue against the guest write tail
 
 **Status:** measured 2026-09-05 at v0.1.60-rc8 on the rig (Fly, two vCPUs),
-twelve arms, 30 minutes after the boot. Follows
+twelve arms, 30 minutes after the boot. Decided 2026-09-07: the default is
+2 per queue. Follows
 `docs/finding-write-tail-cpu-scheduling.md`, which read sixteen ublk worker
 threads that wait 1.1 s per second for a core at 0.15 cores of work, and
 named the count as the first lever.
@@ -81,11 +82,20 @@ The `post` tail after a promote-segment apply is the remaining write-path
 class in this set, 75.7 ms once in twelve arms. `docs/design/retired-base.md`
 closed the same class for the repack bucket swap.
 
-## Options
+## Decision
 
-- A default of 2 per queue, with the field for an operator who reads
-  differently on another machine.
-- A default tied to the core count, so a two-core host runs 2 per queue and
-  a larger host keeps 8.
-- The priority lever of `docs/finding-write-tail-cpu-scheduling.md`, which
-  keeps the count and takes the cores from the background threads.
+The default is 2 per queue, `WORKERS_PER_QUEUE` in `src/ublk.rs`. The
+queue count tracks the core count up to 4, so the default holds a volume
+to two ublk threads per core on every host, the ratio of the clean arm on
+the rig. `[ublk] workers` in `volume.toml` sets the count per volume.
+
+The measurement covers a warm volume. In the hydration window after a
+claim, a guest read that misses in `cache/` ahead of the warmers takes its
+own S3 GET on the ublk worker, so the count bounds the guest's GETs in
+flight per queue. The size of that cost, and the count
+on a host with more cores, are open. The reads that settle them are a claim
+on a rig with the cache absent and postgres started at once, at 2 and at
+8 per queue, and the same warm set on a four-core and an eight-core host.
+
+The priority lever of `docs/finding-write-tail-cpu-scheduling.md`, which
+takes the cores from the background threads, is open at any count.

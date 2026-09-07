@@ -215,8 +215,12 @@ mod imp {
     /// from `volume.toml`. Each worker owns a `VolumeReader` and drains
     /// jobs from the queue's crossbeam channel. A worker blocks for the
     /// whole of a WAL `fdatasync` or an S3 demand fetch, so the count
-    /// bounds how many of those one queue serves at once.
-    const WORKERS_PER_QUEUE: usize = 8;
+    /// bounds how many of those one queue serves at once, and the second
+    /// worker keeps the queue's reads in service while the first blocks.
+    /// `pick_nr_queues` tracks the core count, so two per queue holds the
+    /// volume to two ublk threads per core, which is the count the write
+    /// path's scheduling tail follows.
+    const WORKERS_PER_QUEUE: usize = 2;
 
     const UBLK_IO_OP_READ: u32 = libublk::sys::UBLK_IO_OP_READ;
     const UBLK_IO_OP_WRITE: u32 = libublk::sys::UBLK_IO_OP_WRITE;
