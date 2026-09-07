@@ -67,6 +67,9 @@ pub struct UblkConfig {
     /// stamp; this field is the local hint for which id to look at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dev_id: Option<i32>,
+    /// Backend worker threads per ublk queue. Absent = the serve's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<usize>,
 }
 
 impl VolumeConfig {
@@ -288,6 +291,16 @@ mod tests {
         write_config(tmp.path(), "[ublk]\ndev_id = 7\n");
         let cfg = VolumeConfig::read(tmp.path()).unwrap();
         assert_eq!(cfg.ublk.unwrap().dev_id, Some(7));
+    }
+
+    #[test]
+    fn ublk_workers_survive_dev_id_write_back() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), "[ublk]\nworkers = 2\n");
+        VolumeConfig::set_bound_ublk_id(tmp.path(), 4).unwrap();
+        let ublk = VolumeConfig::read(tmp.path()).unwrap().ublk.unwrap();
+        assert_eq!(ublk.workers, Some(2));
+        assert_eq!(ublk.dev_id, Some(4));
     }
 
     #[test]

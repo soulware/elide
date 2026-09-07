@@ -445,7 +445,10 @@ mod tests {
     /// optional bound ublk dev id.
     fn write_cfg(vol_dir: &Path, dev_id: Option<i32>) {
         let cfg = elide_core::config::VolumeConfig {
-            ublk: Some(elide_core::config::UblkConfig { dev_id }),
+            ublk: Some(elide_core::config::UblkConfig {
+                dev_id,
+                workers: None,
+            }),
             ..Default::default()
         };
         cfg.write(vol_dir).unwrap();

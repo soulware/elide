@@ -354,7 +354,10 @@ mod tests {
             ulid: Some(our_fork),
             name: Some("prod".to_owned()),
             size: None,
-            ublk: Some(elide_core::config::UblkConfig { dev_id: Some(7) }),
+            ublk: Some(elide_core::config::UblkConfig {
+                dev_id: Some(7),
+                workers: None,
+            }),
             lazy: None,
             journal: None,
         }
